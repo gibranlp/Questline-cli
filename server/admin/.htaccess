@@ -1,0 +1,52 @@
+# ── Questline Admin Panel — Hardening ────────────────────────────
+
+Options -Indexes
+
+# Allow index.php; deny every other PHP file in this directory
+<FilesMatch "\.php$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+<Files "index.php">
+    <IfModule mod_authz_core.c>
+        Require all granted
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order deny,allow
+        Allow from all
+    </IfModule>
+</Files>
+
+# Block sensitive files
+<FilesMatch "(^\.env|\.sql|\.log|\.sh)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# ── Security headers ──────────────────────────────────────────────
+<IfModule mod_headers.c>
+    Header always unset X-Powered-By
+    Header always unset Server
+    Header always set X-Content-Type-Options  "nosniff"
+    Header always set X-Frame-Options         "DENY"
+    Header always set Referrer-Policy         "no-referrer"
+    Header always set X-Permitted-Cross-Domain-Policies "none"
+    Header always set Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'"
+    # Never cache admin pages — they contain sensitive data
+    Header always set Cache-Control "no-store, no-cache, must-revalidate, private"
+    Header always set Pragma        "no-cache"
+    Header always set Expires       "Thu, 01 Jan 1970 00:00:00 GMT"
+</IfModule>
+
+# Limit POST body on admin actions to 1 MB
+LimitRequestBody 1048576

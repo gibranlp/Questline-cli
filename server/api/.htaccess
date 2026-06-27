@@ -1,0 +1,59 @@
+# ── Questline API — Security ──────────────────────────────────────
+
+Options -Indexes
+
+# Block sensitive files
+<FilesMatch "(^\.env|\.sql|\.log|load_env\.php)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Block hidden files
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Only allow GET, POST, OPTIONS (OPTIONS is needed for CORS preflight)
+<LimitExcept GET POST OPTIONS>
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</LimitExcept>
+
+# ── Security headers ──────────────────────────────────────────────
+<IfModule mod_headers.c>
+    Header always unset X-Powered-By
+    Header always unset Server
+    Header always set X-Content-Type-Options  "nosniff"
+    Header always set X-Frame-Options         "DENY"
+    Header always set Referrer-Policy         "no-referrer"
+    Header always set X-Permitted-Cross-Domain-Policies "none"
+    Header always set Cache-Control           "no-store, no-cache, must-revalidate"
+    Header always set Pragma                  "no-cache"
+</IfModule>
+
+# Max request body: 50 MB (covers large backups and sync payloads)
+LimitRequestBody 52428800
+
+# ── Rewrite all paths to index.php ───────────────────────────────
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteCond %{REQUEST_FILENAME} !-f
+    RewriteCond %{REQUEST_FILENAME} !-d
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>

@@ -1,0 +1,25 @@
+[package]
+name = "questline"
+version = "1.0.6"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.26.1"
+crossterm = { version = "0.27.0", features = ["event-stream"] }
+tokio = { version = "1.37.0", features = ["full"] }
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.115"
+anyhow = "1.0.82"
+uuid = { version = "1.8.0", features = ["v4", "serde"] }
+chrono = { version = "0.4.38", features = ["serde"] }
+directories = "5.0.1"
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+rand = "0.8.5"
+rodio = "0.17.3"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+ureq = { version = "2.9.7", features = ["json"] }
+toml = "0.8.12"
+base64 = "0.22.1"
+souvlaki = "0.7.0"
+
+

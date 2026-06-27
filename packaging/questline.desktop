@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Questline
+Comment=A terminal-native productivity RPG
+Exec=questline
+Icon=questline
+Terminal=true
+Type=Application
+Categories=Office;Utility;Game;
+Keywords=productivity;rpg;terminal;tui;task;todo;
