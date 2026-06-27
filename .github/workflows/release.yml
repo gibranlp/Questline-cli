@@ -64,16 +64,19 @@ jobs:
         if: runner.os == 'Linux' && !matrix.aarch64_cross
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y libdbus-1-dev pkg-config
+          sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
 
-      - name: Instalar gcc y dbus arm64 para cross-compilar Linux aarch64
+      - name: Instalar gcc y dependencias arm64 para cross-compilar Linux aarch64
         if: matrix.aarch64_cross
         run: |
           sudo apt-get update -q
           sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
           sudo dpkg --add-architecture arm64
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
+          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
           sudo apt-get update -q
-          sudo apt-get install -y libdbus-1-dev:arm64
+          sudo apt-get install -y libdbus-1-dev:arm64 libasound2-dev:arm64
 
       - name: Compilar (Linux aarch64 con linker externo)
         if: matrix.aarch64_cross
