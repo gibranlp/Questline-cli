@@ -1,0 +1,45 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.status
+
+# PHP / Composer
+vendor/
+
+# Environment configurations (credentials)
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+*.env.local
+server/.env
+
+# Databases & Backups
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.questline-export
+questline.db
+
+# Logs
+*.log
+debug_picker.log
+
+# IDEs and Editors
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*~
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Release binaries (built by scripts/build_release.sh, uploaded to server manually)
+server/releases/

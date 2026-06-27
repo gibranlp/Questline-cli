@@ -1,0 +1,2610 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// project_workspace.rs — el workspace donde ocurre todo: tareas, notas, journal y milestones
+// ─────────────────────────────────────────────────────────────────────────────
+use crate::app::{App, DueDateType, ModalType};
+use crate::milestone_templates::{self, ProjectStats, Tier};
+use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
+use crate::screens::intro::centered_rect;
+use crate::theme::Theme;
+use chrono::Utc;
+use ratatui::{
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph},
+    Frame,
+};
+
+// El jefe máximo de renderizado — desde aquí se coordina todo el workspace
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
+    let size = f.size();
+    let accent_color = theme.primary;
+
+    let p_id = app.active_project_id.unwrap();
+    let project = app.projects.iter().find(|p| p.id == p_id).unwrap();
+    let is_shared = project.is_shared;
+    let active_tab = app.workspace_tab_idx;
+
+    let tasks = &app.all_tasks;
+    let notes = &app.all_notes;
+    let journals = &app.all_journals;
+    let milestones = app
+        .db
+        .get_milestones_for_project(project.id)
+        .unwrap_or_default();
+
+    // Armamos las stats del proyecto — se usan para calcular el progreso de milestones
+    let streak = app.db.get_streak().unwrap_or(crate::models::Streak {
+        id: String::new(),
+        current_streak: 0,
+        best_streak: 0,
+        last_active_day: None,
+    });
+    let project_stats = ProjectStats {
+        project_age_days: (Utc::now() - project.created_at).num_days(),
+        completed_tasks_in_project: tasks
+            .iter()
+            .filter(|t| t.project_id == Some(p_id) && t.completed && t.parent_task_id.is_none())
+            .count() as i64,
+        notes_in_project: notes
+            .iter()
+            .filter(|n| n.project_id == Some(p_id))
+            .count() as i64,
+        journal_entries_in_project: journals
+            .iter()
+            .filter(|j| j.project_id == p_id)
+            .count() as i64,
+        active_days_in_project: app
+            .db
+            .get_active_days_for_project(p_id)
+            .unwrap_or(0),
+        total_completed_tasks: tasks.iter().filter(|t| t.completed && t.parent_task_id.is_none()).count() as i64,
+        current_streak: streak.current_streak as i64,
+        focus_sessions_total: app.db.get_focus_sessions().unwrap_or_default().len() as i64,
+        daily_adventures_completed: app
+            .db
+            .get_daily_adventures_completed_count()
+            .unwrap_or(0),
+    };
+
+    let selected_item_idx = match active_tab {
+        0 => app.selected_task_idx,
+        1 => app.selected_notes_flat_idx,
+        2 => app.selected_journal_idx,
+        3 => app.selected_milestone_idx,
+        _ => 0,
+    };
+
+    let modal = &app.modal_state;
+    let overlay = &app.overlay_modal;
+    let searching = app.searching;
+    let search_query = &app.search_query;
+    let task_filter = &app.task_filter;
+    let task_sort = &app.task_sort;
+
+    // Build task list — tiene que quedar idéntica al handler o se pierde el índice seleccionado
+    let sorted_tasks: Vec<&Task> = if let Some(parent_id) = app.viewing_step_for_task {
+        // Modo drill-down: mostramos solo los steps del padre, abiertos primero
+        let mut steps: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.parent_task_id == Some(parent_id))
+            .collect();
+        steps.sort_by(|a, b| {
+            a.completed.cmp(&b.completed).then_with(|| a.created_at.cmp(&b.created_at))
+        });
+        steps
+    } else {
+        // Vista principal: padres filtrados y ordenados, con sus steps inline debajo
+        let mut parents: Vec<&Task> = tasks
+            .iter()
+            .filter(|t| t.project_id == Some(project.id) && t.parent_task_id.is_none())
+            .filter(|t| match task_filter.as_str() {
+                "Incomplete" => !t.completed,
+                "Completed" => t.completed,
+                _ => true,
+            })
+            .filter(|t| {
+                if searching && !search_query.is_empty() {
+                    t.title.to_lowercase().contains(&search_query.to_lowercase())
+                        || t.description
+                            .as_deref()
+                            .unwrap_or("")
+                            .to_lowercase()
+                            .contains(&search_query.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .collect();
+        // Órale, aquí aplicamos el sort según lo que eligió el usuario
+        match task_sort.as_str() {
+            "DueDate" => parents.sort_by(|a, b| {
+                a.completed.cmp(&b.completed).then_with(|| match (a.due_date, b.due_date) {
+                    (Some(d1), Some(d2)) => d1.cmp(&d2),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => a.created_at.cmp(&b.created_at),
+                })
+            }),
+            "Priority" => parents.sort_by(|a, b| {
+                a.completed.cmp(&b.completed).then_with(|| b.priority.cmp(&a.priority))
+            }),
+            _ => parents.sort_by(|a, b| {
+                a.completed.cmp(&b.completed).then_with(|| b.created_at.cmp(&a.created_at))
+            }),
+        }
+        // Intercalamos los steps incompletos justo debajo de su padre — así queda la lista plana
+        let mut flat: Vec<&Task> = Vec::new();
+        for parent in parents {
+            flat.push(parent);
+            if !parent.completed {
+                let mut steps: Vec<&Task> = tasks
+                    .iter()
+                    .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
+                    .collect();
+                steps.sort_by_key(|s| s.created_at);
+                flat.extend(steps);
+            }
+        }
+        flat
+    };
+
+    let filtered_notes: Vec<&Note> = notes
+        .iter()
+        .filter(|n| n.project_id == Some(project.id))
+        .filter(|n| {
+            if searching && !search_query.is_empty() {
+                n.title
+                    .to_lowercase()
+                    .contains(&search_query.to_lowercase())
+                    || n.markdown_content
+                        .to_lowercase()
+                        .contains(&search_query.to_lowercase())
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    let filtered_journals: Vec<&JournalEntry> = journals
+        .iter()
+        .filter(|j| j.project_id == project.id)
+        .filter(|j| {
+            if searching && !search_query.is_empty() {
+                j.content
+                    .to_lowercase()
+                    .contains(&search_query.to_lowercase())
+                    || j.entry_date.to_string().contains(search_query)
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    // Layout de 3-4 zonas: header, body (sidebar+content), barra de búsqueda opcional, footer de ayuda
+    let constraints = if searching {
+        vec![
+            Constraint::Length(3), // Workspace Header
+            Constraint::Min(5),    // Body splits
+            Constraint::Length(3), // Search bar
+            Constraint::Length(3), // Keyboard help
+        ]
+    } else {
+        vec![
+            Constraint::Length(3), // Workspace Header
+            Constraint::Min(5),    // Body splits
+            Constraint::Length(3), // Keyboard help
+        ]
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(size);
+
+    // 1. Header (Project Name)
+    let header_text = format!("Realm War Room: {}", project.name);
+    let header = Paragraph::new(header_text)
+        .style(
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(theme.border)),
+        );
+    f.render_widget(header, chunks[0]);
+
+    // 2. Main split area: Left (Menu tabs), Right (Context pane)
+    let body_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(20), // Left menu width
+            Constraint::Min(10),    // Right content width
+        ])
+        .split(chunks[1]);
+
+    // 2a. Left tab options list
+    let menu_items = [
+        "  1 Quests",
+        "  2 Scrolls",
+        "  3 Chronicles",
+        "  4 Overview",
+    ];
+    let list_items: Vec<ListItem> = menu_items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let style = if i == active_tab {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            ListItem::new(*item).style(style)
+        })
+        .collect();
+    let sidebar_border_style = if app.workspace_sidebar_focused {
+        Style::default().fg(accent_color)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let menu_list = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(sidebar_border_style)
+            .title(" Workspace "),
+    );
+    f.render_widget(menu_list, body_chunks[0]);
+
+    // 2b. El panel derecho cambia según el tab activo — aquí resolvemos qué va ahí
+    let task_assignees: Vec<(String, String)> = if is_shared && active_tab == 0 {
+        sorted_tasks
+            .get(selected_item_idx)
+            .and_then(|t| {
+                app.db
+                    .get_task_assignments(&t.id.to_string())
+                    .ok()
+            })
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    let sidebar_focused = app.workspace_sidebar_focused;
+    let viewing_step_for_task = app.viewing_step_for_task;
+    // Título del padre para el breadcrumb cuando estamos viendo steps
+    let parent_quest_title = viewing_step_for_task.and_then(|parent_id| {
+        tasks.iter().find(|t| t.id == parent_id).map(|t| t.title.clone())
+    });
+    match active_tab {
+        0 => draw_tasks_tab(
+            f,
+            body_chunks[1],
+            &sorted_tasks,
+            selected_item_idx,
+            task_filter,
+            task_sort,
+            &task_assignees,
+            theme,
+            sidebar_focused,
+            &tasks,
+            viewing_step_for_task,
+            parent_quest_title.as_deref(),
+        ),
+        1 => draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices),
+        2 => draw_journal_tab(
+            f,
+            body_chunks[1],
+            &filtered_journals,
+            selected_item_idx,
+            theme,
+            sidebar_focused,
+            is_shared,
+        ),
+        _ => draw_overview_tab(
+            f,
+            body_chunks[1],
+            project,
+            &tasks,
+            &notes,
+            &journals,
+            &milestones,
+            selected_item_idx,
+            &project_stats,
+            theme,
+            sidebar_focused,
+        ),
+    }
+
+    // 3. Barra de búsqueda — solo aparece cuando el usuario presionó '/'
+    let help_chunk_idx = if searching {
+        let search_text = format!("Lore search: {}_", search_query);
+        let search_p = Paragraph::new(search_text).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color)),
+        );
+        f.render_widget(search_p, chunks[2]);
+        3
+    } else {
+        2
+    };
+
+    // 4. Footer de ayuda contextual — los keybinds cambian según el tab activo
+    let help_span = match active_tab {
+        0 => {
+            let mut tab0_spans = if viewing_step_for_task.is_some() {
+                vec![
+                    Span::styled(" Steps | ", Style::default().fg(accent_color)),
+                    Span::styled(
+                        "n",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" New Step | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "e",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Edit | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "Space",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Complete | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "Delete",
+                        Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Remove | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "← / Esc",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Back to Quests", Style::default().fg(theme.muted)),
+                ]
+            } else {
+                vec![
+                    Span::styled(" Tasks | ", Style::default().fg(accent_color)),
+                    Span::styled(
+                        "n",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" New Task | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "Enter",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Edit | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "Space",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Toggle Complete | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "Delete",
+                        Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Delete | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "→",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" View Steps | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "+",
+                        Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Add Step | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "f",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Cycle Filter | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "s",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Cycle Sort", Style::default().fg(theme.muted)),
+                ]
+            };
+            // Solo mostramos [a] Assign si el proyecto es compartido — pues no tiene caso si no
+            if is_shared {
+                tab0_spans.extend(vec![
+                    Span::styled(" | ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        "a",
+                        Style::default()
+                            .fg(accent_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(" Assign ", Style::default().fg(theme.muted)),
+                ]);
+            }
+            tab0_spans
+        },
+        1 => vec![
+            Span::styled(" Notes | ", Style::default().fg(accent_color)),
+            Span::styled(
+                "n",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" New Note | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "d",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" New Codex | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "r",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Move to Codex | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "Enter / e",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Edit | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "Delete",
+                Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Remove | ", Style::default().fg(theme.muted)),
+        ],
+        2 => vec![
+            Span::styled(" Journal | ", Style::default().fg(accent_color)),
+            Span::styled(
+                "j",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" New Journal Log | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "v",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Visibility | ", Style::default().fg(theme.muted)),
+        ],
+        _ => vec![
+            Span::styled(" Overview | ", Style::default().fg(accent_color)),
+            Span::styled(
+                "m",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" New Milestone | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "Space",
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Toggle Milestone | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "Delete",
+                Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Slay Milestone | ", Style::default().fg(theme.muted)),
+            Span::styled(
+                "c",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Conquer Project | ", Style::default().fg(theme.muted)),
+        ],
+    };
+
+    let mut global_help = vec![
+        Span::styled(
+            "| 1-4",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Tabs | ", Style::default().fg(theme.muted)),
+        Span::styled(
+            "/",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Search | ", Style::default().fg(theme.muted)),
+        Span::styled(
+            "ESC",
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Exit ", Style::default().fg(theme.muted)),
+    ];
+    let mut footer_spans = help_span;
+    footer_spans.append(&mut global_help);
+
+    let footer = Paragraph::new(Line::from(footer_spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
+    );
+    f.render_widget(footer, chunks[help_chunk_idx]);
+
+    // 5. Los modales van encima de todo — cuál se muestra depende del ModalType activo
+    match modal {
+        ModalType::NewTask {
+            title,
+            desc,
+            desc_cursor,
+            priority,
+            due_date_type,
+            due_date_val,
+            focus_idx,
+            parent_task_id,
+        } => {
+            let modal_title = if parent_task_id.is_some() {
+                " Create Step Quest "
+            } else {
+                " Create Task Quest "
+            };
+            let is_step = parent_task_id.is_some();
+            draw_task_modal(
+                f,
+                modal_title,
+                title,
+                desc,
+                *desc_cursor,
+                *priority,
+                *due_date_type,
+                due_date_val,
+                *focus_idx,
+                theme,
+                None,
+                0,
+                is_step,
+            );
+        }
+        ModalType::EditTask {
+            id,
+            title,
+            desc,
+            desc_cursor,
+            priority,
+            due_date_type,
+            due_date_val,
+            focus_idx,
+            step_selected_idx,
+            is_step,
+        } => {
+            let steps: Vec<&Task> = tasks.iter()
+                .filter(|t| t.parent_task_id == Some(*id))
+                .collect();
+            draw_task_modal(
+                f,
+                " Edit Task Quest ",
+                title,
+                desc,
+                *desc_cursor,
+                *priority,
+                *due_date_type,
+                due_date_val,
+                *focus_idx,
+                theme,
+                Some(&steps),
+                *step_selected_idx,
+                *is_step,
+            );
+        }
+        ModalType::NewJournalEntry { content } => {
+            draw_journal_modal(f, content, theme);
+        }
+        ModalType::MilestoneTierSelect { selected_idx, .. } => {
+            draw_tier_select_modal(f, *selected_idx, theme);
+        }
+        ModalType::MilestoneTemplateSelect {
+            tier,
+            selected_idx,
+            ..
+        } => {
+            draw_template_select_modal(f, *tier, *selected_idx, theme);
+        }
+        ModalType::AssignTask {
+            selected_member_idx,
+            ..
+        } => {
+            draw_assign_task_modal(f, app, *selected_member_idx, theme);
+        }
+        ModalType::ShareNote { permission_idx, .. } => {
+            draw_share_note_modal(f, *permission_idx, theme);
+        }
+        ModalType::JournalVisibility { visibility_idx, .. } => {
+            draw_journal_visibility_modal(f, *visibility_idx, theme);
+        }
+        ModalType::NewCodex { name } => {
+            draw_new_codex_modal(f, name, theme);
+        }
+        ModalType::RenameCodex { name, .. } => {
+            draw_rename_codex_modal(f, name, theme);
+        }
+        ModalType::RefileScroll { selected_idx, .. } => {
+            draw_refile_scroll_modal(f, &app.codices, *selected_idx, theme);
+        }
+        _ => {}
+    }
+
+    // 6. Overlay modal — NewTask encima del EditTask cuando agregas un step desde ahí
+    // No manches, dos modales apilados — overlay_modal es el de arriba
+    if let ModalType::NewTask {
+        title,
+        desc,
+        desc_cursor,
+        priority,
+        due_date_type,
+        due_date_val,
+        focus_idx,
+        parent_task_id,
+    } = overlay
+    {
+        let modal_title = if parent_task_id.is_some() {
+            " Create Step Quest "
+        } else {
+            " Create Task Quest "
+        };
+        let is_step = parent_task_id.is_some();
+        draw_task_modal(
+            f,
+            modal_title,
+            title,
+            desc,
+            *desc_cursor,
+            *priority,
+            *due_date_type,
+            due_date_val,
+            *focus_idx,
+            theme,
+            None,
+            0,
+            is_step,
+        );
+    }
+}
+
+fn draw_new_codex_modal(f: &mut Frame, name: &str, theme: &Theme) {
+    use ratatui::layout::Margin;
+    let size = f.size();
+    let area = ratatui::layout::Rect {
+        x: size.width / 4,
+        y: size.height / 3,
+        width: size.width / 2,
+        height: 5,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(" New Codex ");
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+    f.render_widget(block, area);
+    let inner = area.inner(&Margin { vertical: 1, horizontal: 2 });
+    let text = format!("Name: {}█", name);
+    let p = Paragraph::new(text).style(Style::default().fg(Color::White));
+    f.render_widget(p, inner);
+}
+
+fn draw_rename_codex_modal(f: &mut Frame, name: &str, theme: &Theme) {
+    use ratatui::layout::Margin;
+    let size = f.size();
+    let area = ratatui::layout::Rect {
+        x: size.width / 4,
+        y: size.height / 3,
+        width: size.width / 2,
+        height: 5,
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(" Rename Codex ");
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+    f.render_widget(block, area);
+    let inner = area.inner(&Margin { vertical: 1, horizontal: 2 });
+    let text = format!("Name: {}█", name);
+    let p = Paragraph::new(text).style(Style::default().fg(Color::White));
+    f.render_widget(p, inner);
+}
+
+// Modal para mover un scroll (note) a otro codex — lista todos los codices disponibles
+fn draw_refile_scroll_modal(f: &mut Frame, codices: &[crate::models::Codex], selected_idx: usize, theme: &Theme) {
+    let size = f.size();
+    let item_count = (codices.len() + 1) as u16; // +1 por la opción "Ungrouped"
+    let height = (item_count + 4).min(size.height.saturating_sub(4));
+    let width = (size.width / 3).max(36).min(50);
+    let area = ratatui::layout::Rect {
+        x: (size.width.saturating_sub(width)) / 2,
+        y: (size.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(" Move Scroll to Codex ");
+    f.render_widget(block, area);
+
+    use ratatui::layout::Margin;
+    let inner = area.inner(&Margin { vertical: 1, horizontal: 1 });
+
+    let mut items: Vec<ListItem> = Vec::new();
+    // Option 0: Ungrouped
+    let ungrouped_style = if selected_idx == 0 {
+        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    items.push(ListItem::new("  ── Ungrouped ──").style(ungrouped_style));
+    // Options 1..=n: each codex
+    for (i, codex) in codices.iter().enumerate() {
+        let style = if selected_idx == i + 1 {
+            Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        items.push(ListItem::new(format!("  ◆ {}", codex.name)).style(style));
+    }
+
+    let hint = Paragraph::new("↑↓ navigate · Enter confirm · Esc cancel")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    f.render_widget(List::new(items), chunks[0]);
+    f.render_widget(hint, chunks[1]);
+}
+
+// Renderiza el tab de tareas — lista de quests a la izquierda, detalles de la seleccionada a la derecha
+fn draw_tasks_tab(
+    f: &mut Frame,
+    area: Rect,
+    tasks: &[&Task],
+    selected_idx: usize,
+    filter: &str,
+    sort: &str,
+    assignees: &[(String, String)],
+    theme: &Theme,
+    sidebar_focused: bool,
+    all_tasks: &[Task],
+    viewing_step_for_task: Option<uuid::Uuid>,
+    parent_quest_title: Option<&str>,
+) {
+    let accent_color = theme.primary;
+    let content_border = if sidebar_focused { theme.border } else { accent_color };
+
+    let sub_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(50), // Left list (Active Quests)
+            Constraint::Percentage(50), // Right details (Task Ledger)
+        ])
+        .split(area);
+
+    let empty_msg = if viewing_step_for_task.is_some() {
+        "  No steps yet. Press [n] to add a step."
+    } else {
+        "  No matching quests. Press [n] for new."
+    };
+    let list_items: Vec<ListItem> = if tasks.is_empty() {
+        vec![ListItem::new(empty_msg)]
+    } else {
+        tasks
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                let status = if t.completed { "[x]" } else { "[ ]" };
+                let is_sel = i == selected_idx;
+
+                // Si tiene parent y no estamos en modo drill-down, es un step inline — se indenta distinto
+                let is_inline_step = t.parent_task_id.is_some() && viewing_step_for_task.is_none();
+
+                if is_inline_step {
+                    let (prefix_style, title_style) = if is_sel {
+                        (
+                            Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                            Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD),
+                        )
+                    } else {
+                        (
+                            Style::default().fg(theme.secondary),
+                            Style::default().fg(theme.muted),
+                        )
+                    };
+                    let prefix = if is_sel { "   > o " } else { "     o " };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(prefix, prefix_style),
+                        Span::styled(format!("{} ", status), prefix_style),
+                        Span::styled(&t.title, title_style),
+                    ]))
+                } else {
+                    // Fila de tarea padre — coloreamos según prioridad, chido
+                    let prio_style = match t.priority {
+                        TaskPriority::High => Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                        TaskPriority::Medium => Style::default().fg(theme.warning),
+                        TaskPriority::Low => Style::default().fg(Color::Cyan),
+                    };
+                    let select_style = if is_sel {
+                        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::White)
+                    };
+
+                    // Badge de progreso de steps [done/total] — solo para padres completados
+                    let step_badge = if viewing_step_for_task.is_none() && t.parent_task_id.is_none() && t.completed {
+                        let total = all_tasks.iter().filter(|s| s.parent_task_id == Some(t.id)).count();
+                        if total > 0 {
+                            let done = all_tasks.iter().filter(|s| s.parent_task_id == Some(t.id) && s.completed).count();
+                            format!(" [{}/{}]", done, total)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        String::new()
+                    };
+
+                    if t.completed {
+                        let (fg, bg) = if is_sel { (theme.muted, accent_color) } else { (theme.muted, Color::Reset) };
+                        let mut spans = vec![
+                            Span::styled(format!(" {} ", status), Style::default().fg(fg).bg(bg)),
+                            Span::styled(format!("({}) ", t.priority.name()), Style::default().fg(fg).bg(bg)),
+                            Span::styled(&t.title, Style::default().fg(fg).bg(bg).add_modifier(Modifier::CROSSED_OUT)),
+                        ];
+                        if !step_badge.is_empty() {
+                            spans.push(Span::styled(step_badge, Style::default().fg(fg).bg(bg)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    } else {
+                        let mut spans = vec![
+                            Span::styled(format!(" {} ", status), select_style),
+                            Span::styled(format!("({}) ", t.priority.name()), prio_style),
+                            Span::styled(&t.title, select_style),
+                        ];
+                        if !step_badge.is_empty() {
+                            spans.push(Span::styled(step_badge, Style::default().fg(theme.muted)));
+                        }
+                        ListItem::new(Line::from(spans))
+                    }
+                }
+            })
+            .collect()
+    };
+
+    let list_title = if let Some(parent_title) = parent_quest_title {
+        format!(" Steps for: {} ", parent_title)
+    } else {
+        let sort_label = match sort {
+            "DueDate" => "Due Date",
+            "Priority" => "Priority",
+            _ => "Created Date",
+        };
+        format!(
+            " Quests [Filter: {}] [Sort: {} — open first] ",
+            filter, sort_label
+        )
+    };
+
+    let list_widget = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(content_border))
+            .title(list_title),
+    );
+    f.render_widget(list_widget, sub_chunks[0]);
+
+    // Panel derecho de detalles — muestra todo lo importante de la quest seleccionada
+    let details_widget = if tasks.is_empty() || selected_idx >= tasks.len() {
+        Paragraph::new("\n  Select a quest details report.").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Task Ledger "),
+        )
+    } else {
+        let t = tasks[selected_idx];
+        let desc = t
+            .description
+            .as_deref()
+            .unwrap_or("No description provided.");
+        let due_str = t
+            .due_date
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "None".to_string());
+
+        let mut text = vec![
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Task Title:  ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    &t.title,
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Priority:    ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    t.priority.name(),
+                    match t.priority {
+                        TaskPriority::High => {
+                            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD)
+                        }
+                        TaskPriority::Medium => Style::default().fg(theme.warning),
+                        TaskPriority::Low => Style::default().fg(Color::Cyan),
+                    },
+                ),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Due Date:    ", Style::default().fg(theme.muted)),
+                Span::styled(due_str, Style::default().fg(Color::White)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("  Status:      ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    if t.completed {
+                        "Completed Quest"
+                    } else {
+                        "Active Adventure"
+                    },
+                    if t.completed {
+                        Style::default().fg(theme.success)
+                    } else {
+                        Style::default().fg(theme.warning)
+                    },
+                ),
+            ]),
+            Line::from(""),
+            Line::from("  Description:"),
+        ];
+        for line in desc.lines() {
+            text.push(Line::from(Span::styled(
+                format!("  {}", line),
+                Style::default().fg(theme.text),
+            )));
+        }
+        // Los steps de esta tarea van al final del panel de detalles
+        let steps: Vec<&Task> = all_tasks
+            .iter()
+            .filter(|s| s.parent_task_id == Some(t.id))
+            .collect();
+        if !steps.is_empty() {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                "  Steps:",
+                Style::default().fg(theme.muted),
+            )));
+            for s in &steps {
+                let check = if s.completed { "[x]" } else { "[ ]" };
+                let due_str = s
+                    .due_date
+                    .map(|d| format!(" - {}", d.format("%Y-%m-%d")))
+                    .unwrap_or_default();
+                let (fg, modifier) = if s.completed {
+                    (theme.muted, Modifier::CROSSED_OUT)
+                } else {
+                    (Color::White, Modifier::empty())
+                };
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {} ", check),
+                        Style::default().fg(if s.completed { theme.muted } else { theme.success }),
+                    ),
+                    Span::styled(
+                        format!("{}{}", s.title, due_str),
+                        Style::default().fg(fg).add_modifier(modifier),
+                    ),
+                ]));
+            }
+        }
+
+        if !assignees.is_empty() {
+            let names: Vec<&str> = assignees.iter().map(|(_, name)| name.as_str()).collect();
+            text.push(Line::from(""));
+            text.push(Line::from(vec![
+                Span::styled("  Assigned:    ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    names.join(", "),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]));
+        }
+
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border))
+                    .title(" Task Ledger "),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true })
+    };
+    f.render_widget(details_widget, sub_chunks[1]);
+}
+
+// ── Markdown preview helpers ─────────────────────────────────────────────────
+
+// Parser de markdown inline — maneja bold, italic, code, links y URLs de a poco, caracter por caracter
+fn md_inline(text: &str, base: Style, accent: Color, muted: Color) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut s = text;
+
+    while !s.is_empty() {
+        // **bold**
+        if let Some(rest) = s.strip_prefix("**") {
+            if let Some(end) = rest.find("**") {
+                spans.push(Span::styled(rest[..end].to_string(), base.add_modifier(Modifier::BOLD)));
+                s = &rest[end + 2..];
+                continue;
+            }
+        }
+        // ~~strikethrough~~
+        if let Some(rest) = s.strip_prefix("~~") {
+            if let Some(end) = rest.find("~~") {
+                spans.push(Span::styled(rest[..end].to_string(), base.add_modifier(Modifier::CROSSED_OUT)));
+                s = &rest[end + 2..];
+                continue;
+            }
+        }
+        // *italic* (single, not **)
+        if s.starts_with('*') && !s.starts_with("**") {
+            let rest = &s[1..];
+            if let Some(end) = rest.find('*') {
+                spans.push(Span::styled(rest[..end].to_string(), base.add_modifier(Modifier::ITALIC)));
+                s = &rest[end + 1..];
+                continue;
+            }
+        }
+        // _italic_
+        if s.starts_with('_') {
+            let rest = &s[1..];
+            if let Some(end) = rest.find('_') {
+                spans.push(Span::styled(rest[..end].to_string(), base.add_modifier(Modifier::ITALIC)));
+                s = &rest[end + 1..];
+                continue;
+            }
+        }
+        // `inline code`
+        if s.starts_with('`') {
+            let rest = &s[1..];
+            if let Some(end) = rest.find('`') {
+                spans.push(Span::styled(
+                    format!("`{}`", &rest[..end]),
+                    Style::default().fg(accent),
+                ));
+                s = &rest[end + 1..];
+                continue;
+            }
+        }
+        // [text](url)
+        if s.starts_with('[') {
+            if let Some(bracket_end) = s[1..].find(']') {
+                let link_text = &s[1..bracket_end + 1];
+                let after = &s[bracket_end + 2..];
+                if after.starts_with('(') {
+                    if let Some(paren_end) = after[1..].find(')') {
+                        let url = &after[1..paren_end + 1];
+                        spans.push(Span::styled(
+                            link_text.to_string(),
+                            base.fg(accent).add_modifier(Modifier::UNDERLINED),
+                        ));
+                        spans.push(Span::styled(
+                            format!(" ↗ {}", url),
+                            Style::default().fg(muted),
+                        ));
+                        s = &after[paren_end + 2..];
+                        continue;
+                    }
+                }
+            }
+        }
+        // bare URL
+        if s.starts_with("https://") || s.starts_with("http://") {
+            let end = s.find(char::is_whitespace).unwrap_or(s.len());
+            spans.push(Span::styled(
+                s[..end].to_string(),
+                Style::default().fg(accent).add_modifier(Modifier::UNDERLINED),
+            ));
+            s = &s[end..];
+            continue;
+        }
+        // Texto plano — avanzamos hasta el siguiente token de markdown potencial
+        let next = s
+            .find(|c: char| matches!(c, '*' | '`' | '[' | '_' | '~'))
+            .and_then(|p| {
+                // also check for URL starts
+                let url_pos = [s.find("https://"), s.find("http://")]
+                    .into_iter()
+                    .flatten()
+                    .min();
+                Some(url_pos.map_or(p, |u| p.min(u)))
+            })
+            .unwrap_or(s.len());
+        let take = next.max(s.chars().next().map(|c| c.len_utf8()).unwrap_or(1));
+        spans.push(Span::styled(s[..take].to_string(), base));
+        s = &s[take..];
+    }
+
+    spans
+}
+
+// Convierte una línea de markdown a un Line de ratatui — detecta headers, bullets, blockquotes etc.
+fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
+    let trimmed = raw.trim_start();
+    let leading = raw.len() - trimmed.len();
+    let default_style = Style::default().fg(theme.text);
+    let accent = theme.primary;
+    let muted = theme.muted;
+
+    // Blank line
+    if trimmed.is_empty() {
+        return Line::from("");
+    }
+
+    // Horizontal rule
+    if trimmed.len() >= 3
+        && (trimmed.chars().all(|c| c == '-')
+            || trimmed.chars().all(|c| c == '*')
+            || trimmed.chars().all(|c| c == '='))
+    {
+        return Line::from(Span::styled(
+            "  ──────────────────────────────────────",
+            Style::default().fg(theme.muted),
+        ));
+    }
+
+    // Task-list items (must come before plain bullet)
+    if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        let mut spans = vec![Span::styled("  ☐ ".to_string(), Style::default().fg(muted))];
+        spans.extend(md_inline(rest, default_style, accent, muted));
+        return Line::from(spans);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("- [x] ")
+        .or_else(|| trimmed.strip_prefix("- [X] "))
+    {
+        let mut spans = vec![Span::styled("  ☑ ".to_string(), Style::default().fg(theme.success))];
+        spans.extend(md_inline(
+            rest,
+            Style::default().fg(muted).add_modifier(Modifier::CROSSED_OUT),
+            accent,
+            muted,
+        ));
+        return Line::from(spans);
+    }
+
+    // Headings
+    if let Some(rest) = trimmed.strip_prefix("# ") {
+        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+        spans.extend(md_inline(
+            rest,
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED),
+            accent,
+            muted,
+        ));
+        return Line::from(spans);
+    }
+    if let Some(rest) = trimmed.strip_prefix("## ") {
+        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+        spans.extend(md_inline(
+            rest,
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            accent,
+            muted,
+        ));
+        return Line::from(spans);
+    }
+    if let Some(rest) = trimmed.strip_prefix("### ") {
+        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+        spans.extend(md_inline(
+            rest,
+            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            accent,
+            muted,
+        ));
+        return Line::from(spans);
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("#### ")
+        .or_else(|| trimmed.strip_prefix("##### "))
+        .or_else(|| trimmed.strip_prefix("###### "))
+    {
+        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
+        spans.extend(md_inline(rest, Style::default().fg(theme.warning), accent, muted));
+        return Line::from(spans);
+    }
+
+    // Blockquote
+    if let Some(rest) = trimmed.strip_prefix("> ").or_else(|| trimmed.strip_prefix('>')) {
+        let mut spans = vec![Span::styled("  │ ".to_string(), Style::default().fg(muted))];
+        spans.extend(md_inline(
+            rest.trim(),
+            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+            accent,
+            muted,
+        ));
+        return Line::from(spans);
+    }
+
+    // Unordered bullets (- * +), with indent awareness
+    let bullet_style = Style::default().fg(accent);
+    if let Some(rest) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) {
+        let prefix = if leading >= 4 {
+            "      ◦ "
+        } else if leading >= 2 {
+            "    ◦ "
+        } else {
+            "  • "
+        };
+        let mut spans = vec![Span::styled(prefix.to_string(), bullet_style)];
+        spans.extend(md_inline(rest, default_style, accent, muted));
+        return Line::from(spans);
+    }
+
+    // Numbered list "N. text"
+    if let Some(dot) = trimmed.find(". ") {
+        let maybe_num = &trimmed[..dot];
+        if !maybe_num.is_empty() && maybe_num.chars().all(|c| c.is_ascii_digit()) {
+            let rest = &trimmed[dot + 2..];
+            let prefix = format!("  {}. ", maybe_num);
+            let mut spans =
+                vec![Span::styled(prefix, Style::default().fg(accent).add_modifier(Modifier::BOLD))];
+            spans.extend(md_inline(rest, default_style, accent, muted));
+            return Line::from(spans);
+        }
+    }
+
+    // Regular paragraph — preserve leading indentation up to 8 spaces, then inline parse
+    let pad = " ".repeat(leading.min(8) + 2);
+    let mut spans = vec![Span::raw(pad)];
+    spans.extend(md_inline(trimmed, default_style, accent, muted));
+    Line::from(spans)
+}
+
+// Tab de notas — lista de scrolls a la izquierda (agrupados por codex), preview con markdown a la derecha
+fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx: usize, theme: &Theme, sidebar_focused: bool, codices: &[crate::models::Codex]) {
+    let accent_color = theme.primary;
+    let content_border = if sidebar_focused { theme.border } else { accent_color };
+
+    let sub_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(40), // Note index
+            Constraint::Percentage(60), // Selected note preview
+        ])
+        .split(area);
+
+    // Lista plana: headers de codex + sus notas ordenadas, luego las notas sin grupo al final
+    // Cada ítem: (texto, Option<note_idx>, es_header) — el índice plano es lo que usamos para selección
+    let mut flat_list: Vec<(String, Option<usize>, bool)> = Vec::new();
+    for codex in codices {
+        flat_list.push((format!(" ◆ {} ", codex.name), None, true));
+        let mut codex_notes: Vec<(usize, &&Note)> = notes.iter().enumerate()
+            .filter(|(_, n)| n.codex_id == Some(codex.id))
+            .collect();
+        codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        for (idx, note) in codex_notes {
+            flat_list.push((format!("   · {} ", note.title), Some(idx), false));
+        }
+    }
+    let mut ungrouped: Vec<usize> = notes.iter().enumerate()
+        .filter(|(_, n)| n.codex_id.is_none() || !codices.iter().any(|c| Some(c.id) == n.codex_id))
+        .map(|(i, _)| i)
+        .collect();
+    ungrouped.sort_by(|&a, &b| notes[a].title.to_lowercase().cmp(&notes[b].title.to_lowercase()));
+    if !codices.is_empty() && !ungrouped.is_empty() {
+        flat_list.push(("  ── Ungrouped ──".to_string(), None, false)); // divider
+    }
+    for idx in &ungrouped {
+        flat_list.push((format!("   · {} ", notes[*idx].title), Some(*idx), false));
+    }
+
+    let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {
+        vec![ListItem::new("  No project scrolls. Press [n] to write.")]
+    } else if flat_list.is_empty() {
+        // No codices — plain note list
+        notes.iter().enumerate().map(|(i, n)| {
+            let style = if i == selected_flat_idx {
+                Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(format!(" {} ", n.title)).style(style)
+        }).collect()
+    } else {
+        flat_list.iter().enumerate().map(|(flat_i, (text, note_idx, is_header))| {
+            if note_idx.is_none() && !is_header {
+                // Divider
+                ListItem::new(text.as_str()).style(Style::default().fg(theme.muted))
+            } else if *is_header {
+                let style = if flat_i == selected_flat_idx {
+                    Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+                };
+                ListItem::new(text.as_str()).style(style)
+            } else {
+                let style = if flat_i == selected_flat_idx {
+                    Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(text.as_str()).style(style)
+            }
+        }).collect()
+    };
+
+    let list_widget = List::new(list_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(content_border))
+            .title(" Project Scrolls "),
+    );
+    f.render_widget(list_widget, sub_chunks[0]);
+
+    // Convertimos la posición plana a índice real de nota — los headers no tienen nota
+    let selected_note_idx: Option<usize> = flat_list.get(selected_flat_idx)
+        .and_then(|(_, ni, _)| *ni)
+        .or_else(|| if !notes.is_empty() && flat_list.is_empty() && selected_flat_idx < notes.len() {
+            Some(selected_flat_idx)
+        } else {
+            None
+        });
+
+    // Note preview panel
+    let preview_widget = if notes.is_empty() || selected_note_idx.map_or(true, |i| i >= notes.len()) {
+        Paragraph::new("\n  No scroll selected.").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Document Preview "),
+        )
+    } else {
+        let n = notes[selected_note_idx.unwrap()];
+
+        let mut lines: Vec<Line> = vec![
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    n.title.clone(),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(
+                format!(
+                    "  {}",
+                    n.updated_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M")
+                ),
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(Span::styled(
+                "  ──────────────────────────────────────",
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(""),
+        ];
+
+        // Renderizamos el markdown — los code blocks van amarillos, el resto pasa por md_line
+        if n.markdown_content.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  (empty)",
+                Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
+            )));
+        } else {
+            let mut in_code_block = false;
+            for raw_line in n.markdown_content.lines() {
+                if raw_line.trim_start().starts_with("```") {
+                    in_code_block = !in_code_block;
+                    lines.push(Line::from(Span::styled(
+                        "  ─── code ─────────────────────────",
+                        Style::default().fg(theme.muted),
+                    )));
+                } else if in_code_block {
+                    lines.push(Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(
+                            raw_line.to_string(),
+                            Style::default().fg(theme.warning),
+                        ),
+                    ]));
+                } else {
+                    lines.push(md_line(raw_line, theme));
+                }
+            }
+        }
+
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.border))
+                    .title(" Document Preview "),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: false })
+    };
+    f.render_widget(preview_widget, sub_chunks[1]);
+}
+
+// El tab de journal — muestra las entradas cronológicas del proyecto, con autor si es proyecto compartido
+fn draw_journal_tab(
+    f: &mut Frame,
+    area: Rect,
+    journals: &[&JournalEntry],
+    selected_idx: usize,
+    theme: &Theme,
+    sidebar_focused: bool,
+    is_shared: bool,
+) {
+    let accent_color = theme.primary;
+    let content_border = if sidebar_focused { theme.border } else { accent_color };
+
+    let items: Vec<ListItem> = if journals.is_empty() {
+        vec![ListItem::new(
+            "  No daily logs recorded. Press [j] to write chronicle.",
+        )]
+    } else {
+        journals
+            .iter()
+            .enumerate()
+            .map(|(i, j)| {
+                let bullet = if i == selected_idx { ">" } else { "-" };
+                let date_str = j.entry_date.to_string();
+                let highlight_style = if i == selected_idx {
+                    Style::default()
+                        .fg(accent_color)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.warning)
+                };
+
+                let mut header_spans = vec![
+                    Span::styled(format!("{} ", bullet), highlight_style),
+                    Span::styled(format!("[{}] ", date_str), highlight_style),
+                ];
+                if is_shared && !j.author_username.is_empty() {
+                    header_spans.push(Span::styled(
+                        format!("by {} ", j.author_username),
+                        Style::default().fg(theme.muted),
+                    ));
+                }
+                let mut spans = vec![Line::from(header_spans)];
+
+                for line in j.content.lines() {
+                    spans.push(Line::from(Span::styled(
+                        format!("     {}", line),
+                        Style::default().fg(Color::White),
+                    )));
+                }
+                spans.push(Line::from(""));
+
+                ListItem::new(spans)
+            })
+            .collect()
+    };
+
+    let list_widget = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(content_border))
+            .title(" Project Chronicles "),
+    );
+    f.render_widget(list_widget, area);
+}
+
+// El tab de overview — métricas del proyecto, barra de progreso y lista de milestones con su avance
+fn draw_overview_tab(
+    f: &mut Frame,
+    area: Rect,
+    project: &Project,
+    tasks: &[Task],
+    notes: &[Note],
+    journals: &[JournalEntry],
+    milestones: &[Milestone],
+    selected_milestone_idx: usize,
+    project_stats: &ProjectStats,
+    theme: &Theme,
+    sidebar_focused: bool,
+) {
+    let accent_color = theme.primary;
+    let content_border = if sidebar_focused { theme.border } else { accent_color };
+
+    let proj_tasks: Vec<&Task> = tasks
+        .iter()
+        .filter(|t| t.project_id == Some(project.id))
+        .collect();
+    let completed_count = proj_tasks.iter().filter(|t| t.completed).count();
+    let remaining_count = proj_tasks.iter().filter(|t| !t.completed).count();
+
+    let now = Utc::now();
+    let overdue_count = proj_tasks
+        .iter()
+        .filter(|t| !t.completed && t.due_date.map(|d| d < now).unwrap_or(false))
+        .count();
+
+    let note_count = notes
+        .iter()
+        .filter(|n| n.project_id == Some(project.id))
+        .count();
+    let journal_count = journals
+        .iter()
+        .filter(|j| j.project_id == project.id)
+        .count();
+
+    // Porcentaje de completion — si no hay tareas se considera 100% para no llorar
+    let completion_pct = if proj_tasks.is_empty() {
+        100.0
+    } else {
+        (completed_count as f64 / proj_tasks.len() as f64) * 100.0
+    };
+
+    // Calculate project age
+    let diff = Utc::now().signed_duration_since(project.created_at);
+    let age_str = if diff.num_days() == 0 {
+        "0 days old (Initialized today)".to_string()
+    } else {
+        format!("{} days old", diff.num_days())
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(5), // Project Metadata
+            Constraint::Length(4), // Progress Bar
+            Constraint::Min(4),    // Bottom section split: Stats & Milestones
+        ])
+        .split(area);
+
+    // 1. Metadata Block
+    let metadata_text = vec![
+        Line::from(vec![
+            Span::styled("  Description: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                project.description.as_deref().unwrap_or("None"),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Created At:  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                project.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  Chronicle Age: ", Style::default().fg(theme.muted)),
+            Span::styled(age_str, Style::default().fg(theme.warning)),
+        ]),
+    ];
+    let metadata_p = Paragraph::new(metadata_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Chronicle Context "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(metadata_p, chunks[0]);
+
+    // 2. Progress Gauge
+    let gauge = Gauge::default()
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Quest Completion Index "),
+        )
+        .gauge_style(Style::default().fg(accent_color).bg(Color::Rgb(30, 30, 30)))
+        .label(format!("{:.1}% Resolved", completion_pct))
+        .ratio(completion_pct / 100.0);
+    f.render_widget(gauge, chunks[1]);
+
+    // 3. Bottom horizontal split
+    let bottom_split = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[2]);
+
+    // 3a. Stats details
+    let stats_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  RESOLVED QUESTS:   ", Style::default().fg(theme.success)),
+            Span::styled(
+                format!("{}  ", completed_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  PENDING ADVENTURES: ", Style::default().fg(theme.warning)),
+            Span::styled(
+                format!("{}  ", remaining_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  OVERDUE PENALTIES:  ", Style::default().fg(theme.danger)),
+            Span::styled(
+                format!("{}  ", overdue_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("  SCROLLS (NOTES):    ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{}  ", note_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "  CHRONICLES (LOGS):  ",
+                Style::default().fg(Color::Magenta),
+            ),
+            Span::styled(
+                format!("{}  ", journal_count),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+
+    let stats_p = Paragraph::new(stats_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(content_border))
+            .title(" Adventure Metrics "),
+    );
+    f.render_widget(stats_p, bottom_split[0]);
+
+    // 3b. Lista de milestones — cada uno muestra su progreso de requisitos si tiene template
+    let milestone_items: Vec<ListItem> = if milestones.is_empty() {
+        vec![ListItem::new(
+            "  No milestones established. Press [m] to formulate one.",
+        )]
+    } else {
+        milestones
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, m)| {
+                let check = if m.completed { "[x]" } else { "[ ]" };
+                let highlight = if idx == selected_milestone_idx { "> " } else { "  " };
+                let is_selected = idx == selected_milestone_idx;
+                let name_style = if is_selected {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+                let arrow_style = Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD);
+
+                // Tier label
+                let tier_label = match m.tier {
+                    1 => " [T1-Initiate]",
+                    2 => " [T2-Veteran]",
+                    3 => " [T3-Legendary]",
+                    _ => "",
+                };
+
+                let header = ListItem::new(Line::from(vec![
+                    Span::styled(highlight, arrow_style),
+                    Span::styled(format!("{} ", check), Style::default()),
+                    Span::styled(&m.name, name_style),
+                    Span::styled(
+                        format!(" +{} XP", m.xp_reward),
+                        Style::default().fg(theme.warning),
+                    ),
+                    Span::styled(tier_label, Style::default().fg(theme.muted)),
+                ]));
+
+                let mut rows: Vec<ListItem> = vec![header];
+
+                // Si tiene template y no está completo, mostramos cada requisito con ✓ o ✗ — qué chido
+                if !m.completed && !m.template_id.is_empty() {
+                    if let Some(tmpl) = milestone_templates::get_template_by_id(&m.template_id) {
+                        let progress =
+                            milestone_templates::compute_progress(tmpl.requirements, project_stats);
+                        for req in &progress {
+                            let icon = if req.met { "  ✓ " } else { "  ✗ " };
+                            let icon_color = if req.met { theme.success } else { theme.danger };
+                            let val_str = format!("{}/{}", req.current, req.target);
+                            rows.push(ListItem::new(Line::from(vec![
+                                Span::styled(icon, Style::default().fg(icon_color)),
+                                Span::styled(
+                                    req.label.clone(),
+                                    Style::default().fg(theme.muted),
+                                ),
+                                Span::styled(
+                                    format!(": {}", val_str),
+                                    Style::default().fg(theme.text),
+                                ),
+                            ])));
+                        }
+                    }
+                }
+
+                rows
+            })
+            .collect()
+    };
+
+    let mil_list = List::new(milestone_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(content_border))
+            .title(" Project Milestones — [Space] Toggle | [Delete] Slay | [m] New "),
+    );
+    f.render_widget(mil_list, bottom_split[1]);
+}
+
+// El modal más complejo del workspace — sirve tanto para crear como para editar tareas y sus steps
+fn draw_task_modal(
+    f: &mut Frame,
+    title: &str,
+    task_title: &str,
+    task_desc: &str,
+    desc_cursor: usize,
+    priority: TaskPriority,
+    due_date_type: DueDateType,
+    due_date_val: &str,
+    focus_idx: usize,
+    theme: &Theme,
+    // None = NewTask (no steps section); Some(slice) = EditTask (always show steps section)
+    steps_opt: Option<&[&Task]>,
+    step_selected_idx: usize,
+    hide_desc: bool,
+) {
+    let show_steps = steps_opt.is_some();
+    let steps: &[&Task] = steps_opt.unwrap_or(&[]);
+
+    // Los índices de chunk cambian según si mostramos description o no — no manches qué rollo
+    // Con desc:    [0]=Title [1]=Desc [2]=Prio/Due [3]=Steps? [last]=Help
+    // Sin desc:    [0]=Title [1]=Prio/Due [2]=Steps? [last]=Help
+    let prio_chunk = if hide_desc { 1 } else { 2 };
+    let steps_chunk = if hide_desc { 2 } else { 3 };
+
+    let modal_height = match (hide_desc, show_steps) {
+        (false, true)  => 92,
+        (false, false) => 78,
+        (true,  true)  => 72,
+        (true,  false) => 45,
+    };
+    let area = centered_rect(65, modal_height, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+
+    let mut constraints = vec![Constraint::Length(3)]; // Title
+    if !hide_desc {
+        constraints.push(Constraint::Length(16)); // Description
+    }
+    constraints.push(Constraint::Length(3)); // Priority & Due
+    if show_steps {
+        constraints.push(Constraint::Min(1)); // Steps (fills remaining space)
+    }
+    constraints.push(Constraint::Length(2)); // Help
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints(constraints)
+        .split(area);
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(main_block, area);
+
+    // Title Input
+    let title_border_style = if focus_idx == 0 {
+        Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let title_owned;
+    let title_text = if task_title.is_empty() {
+        if focus_idx == 0 { "_" } else { "" }
+    } else if focus_idx == 0 {
+        title_owned = format!("{}_", task_title);
+        &title_owned
+    } else {
+        task_title
+    };
+    let title_p = Paragraph::new(title_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(title_border_style)
+            .title(" Task Title "),
+    );
+    f.render_widget(title_p, chunks[0]);
+
+    // Description con cursor real y scroll vertical — el cursor se resalta en la posición exacta
+    if !hide_desc {
+        let desc_border_style = if focus_idx == 1 {
+            Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.border)
+        };
+
+        // Cuántas líneas caben en el box de descripción — fijo en 14 por el tamaño del modal
+        let visible_lines: usize = 14;
+
+        // Split desc into lines and locate cursor line/col
+        let lines: Vec<&str> = task_desc.split('\n').collect();
+        let cursor = desc_cursor.min(task_desc.len());
+        let (cursor_line, cursor_col) = {
+            let mut pos = 0usize;
+            let mut cl = 0usize;
+            let mut cc = 0usize;
+            for (i, line) in lines.iter().enumerate() {
+                let end = pos + line.len();
+                if cursor <= end || i + 1 == lines.len() {
+                    cl = i;
+                    cc = cursor - pos;
+                    break;
+                }
+                pos = end + 1; // +1 for '\n'
+            }
+            (cl, cc)
+        };
+
+        // Scroll para mantener el cursor visible — se ajusta automáticamente al escribir
+        let scroll_top = if cursor_line >= visible_lines {
+            cursor_line + 1 - visible_lines
+        } else {
+            0
+        };
+
+        let desc_lines: Vec<Line> = if task_desc.is_empty() && focus_idx == 1 {
+            vec![Line::from(Span::styled("_", Style::default().fg(accent_color)))]
+        } else {
+            lines.iter().enumerate()
+                .skip(scroll_top)
+                .take(visible_lines)
+                .map(|(i, line)| {
+                    if focus_idx == 1 && i == cursor_line {
+                        // Render cursor highlight at cursor_col
+                        let col = cursor_col.min(line.len());
+                        let before = &line[..col];
+                        let (cur_char, after) = if col < line.len() {
+                            let next = line[col..].char_indices().nth(1).map(|(j, _)| col + j).unwrap_or(line.len());
+                            (&line[col..next], &line[next..])
+                        } else {
+                            ("_", "")
+                        };
+                        Line::from(vec![
+                            Span::raw(before),
+                            Span::styled(cur_char, Style::default().fg(Color::Black).bg(theme.selection)),
+                            Span::raw(after),
+                        ])
+                    } else {
+                        Line::from(*line)
+                    }
+                })
+                .collect()
+        };
+
+        let desc_p = Paragraph::new(desc_lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(desc_border_style)
+                    .title(" Task Description "),
+            );
+        f.render_widget(desc_p, chunks[1]);
+    }
+
+    // Priority & Due Date side-by-side row
+    let row_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[prio_chunk]);
+
+    // Priority selector field
+    let prio_border_style = if focus_idx == 2 {
+        Style::default()
+            .fg(accent_color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let priority_span = match priority {
+        TaskPriority::Low => Span::styled(
+            "Low",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TaskPriority::Medium => Span::styled(
+            "Medium",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ),
+        TaskPriority::High => Span::styled(
+            "High",
+            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+        ),
+    };
+    let prio_p = Paragraph::new(Line::from(vec![priority_span])).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(prio_border_style)
+            .title(" Priority Level "),
+    );
+    f.render_widget(prio_p, row_chunks[0]);
+
+    // Due Date Row
+    match due_date_type {
+        DueDateType::InDays | DueDateType::Specific => {
+            let due_sub_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                .split(row_chunks[1]);
+
+            let type_border_style = if focus_idx == 3 {
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.border)
+            };
+            let type_text = due_date_type.name();
+            let type_p = Paragraph::new(type_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(type_border_style)
+                    .title(" Due Type "),
+            );
+            f.render_widget(type_p, due_sub_chunks[0]);
+
+            let val_border_style = if focus_idx == 4 {
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.border)
+            };
+            let val_placeholder = if due_date_val.is_empty() {
+                if focus_idx == 4 {
+                    "_"
+                } else {
+                    match due_date_type {
+                        DueDateType::Specific => "yyyy-mm-dd",
+                        _ => "Value",
+                    }
+                }
+            } else if focus_idx == 4 {
+                &format!("{}_", due_date_val)
+            } else {
+                due_date_val
+            };
+            let val_title = match due_date_type {
+                DueDateType::InDays => " Days ",
+                _ => " Date (yyyy-mm-dd) ",
+            };
+            let val_p = Paragraph::new(val_placeholder)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(val_border_style)
+                        .title(val_title),
+                )
+                .style(if due_date_val.is_empty() && focus_idx != 4 {
+                    Style::default().fg(theme.muted)
+                } else {
+                    Style::default().fg(Color::White)
+                });
+            f.render_widget(val_p, due_sub_chunks[1]);
+        }
+        _ => {
+            let due_border_style = if focus_idx == 3 {
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.border)
+            };
+            let due_p = Paragraph::new(due_date_type.name()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(due_border_style)
+                    .title(" Due Date "),
+            );
+            f.render_widget(due_p, row_chunks[1]);
+        }
+    }
+
+    // Sección de steps — solo aparece en EditTask, muestra el progreso de steps con scroll
+    let help_chunk_idx = if show_steps {
+        let steps_border_style = if focus_idx == 5 {
+            Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.border)
+        };
+
+        // Filas visibles del box de steps — dinámico según el espacio que queda en el modal
+        let steps_visible: usize = chunks[steps_chunk].height.saturating_sub(2) as usize;
+        let steps_scroll_top: usize = if focus_idx == 5 && step_selected_idx >= steps_visible {
+            step_selected_idx + 1 - steps_visible
+        } else {
+            0
+        };
+
+        let step_items: Vec<Line> = if steps.is_empty() {
+            vec![
+                Line::from(Span::styled(
+                    "  No steps yet.",
+                    Style::default().fg(theme.muted),
+                )),
+                Line::from(Span::styled(
+                    "  Press [n] or [+] to add a step.",
+                    Style::default().fg(theme.muted),
+                )),
+            ]
+        } else {
+            steps.iter().enumerate().map(|(i, s)| {
+                let check = if s.completed { "[x]" } else { "[ ]" };
+                let due_str = s.due_date
+                    .map(|d| format!(" - {}", d.format("%Y-%m-%d")))
+                    .unwrap_or_default();
+                let is_sel = focus_idx == 5 && i == step_selected_idx;
+                let style = if is_sel {
+                    Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                } else if s.completed {
+                    Style::default().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                Line::from(Span::styled(format!("  {} {}{}", check, s.title, due_str), style))
+            }).collect()
+        };
+
+        let steps_title = format!(" Steps [{}/{}] ", steps.iter().filter(|s| s.completed).count(), steps.len());
+        let steps_p = Paragraph::new(step_items)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(steps_border_style)
+                    .title(steps_title),
+            )
+            .scroll((steps_scroll_top as u16, 0));
+        f.render_widget(steps_p, chunks[steps_chunk]);
+        steps_chunk + 1
+    } else {
+        prio_chunk + 1
+    };
+
+    // Help Text
+    let helper_text = if focus_idx == 5 {
+        "↑/↓: select step | Space: toggle | Del: remove | n/+: new step | Tab: back"
+    } else if focus_idx == 1 && !hide_desc {
+        "Tab: cycle field | Enter: newline | ESC: cancel"
+    } else {
+        "Tab: cycle field | Space/L/R: Priority & Due Type | Enter: save | ESC: cancel"
+    };
+    let helper = Paragraph::new(helper_text)
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(helper, chunks[help_chunk_idx]);
+}
+
+// Modal sencillo para escribir la entrada de journal del día — sin mucho rollo
+fn draw_journal_modal(f: &mut Frame, content: &str, theme: &Theme) {
+    let area = centered_rect(55, 30, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(2)
+        .constraints([
+            Constraint::Min(3),    // Content textbox
+            Constraint::Length(2), // Help line
+        ])
+        .split(area);
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Write Daily Chronicle (Journal) ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(main_block, area);
+
+    let content_text = if content.is_empty() { "_" } else { content };
+    let content_p = Paragraph::new(content_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(" Today's Chronicle Log "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(content_p, chunks[0]);
+
+    let helper = Paragraph::new("Enter: save chronicle | ESC: cancel")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(helper, chunks[1]);
+}
+
+// Primer paso de creación de milestone — el usuario elige entre Initiate, Veteran o Legendary
+fn draw_tier_select_modal(f: &mut Frame, selected_idx: usize, theme: &Theme) {
+    let area = centered_rect(60, 50, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Select Milestone Tier ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = main_block.inner(area);
+    f.render_widget(main_block, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // Tier 1
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // Tier 2
+            Constraint::Length(1), // spacer
+            Constraint::Length(3), // Tier 3
+            Constraint::Min(1),    // spacer
+            Constraint::Length(1), // help
+        ])
+        .split(inner);
+
+    let tiers = [
+        (Tier::Initiate, 0usize),
+        (Tier::Veteran, 1usize),
+        (Tier::Legendary, 2usize),
+    ];
+
+    for (tier, tier_idx) in &tiers {
+        let is_sel = *tier_idx == selected_idx;
+        let marker = if is_sel { "> " } else { "  " };
+        let bg = if is_sel {
+            Color::Rgb(30, 30, 50)
+        } else {
+            Color::Reset
+        };
+        let name_style = if is_sel {
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let border_style = if is_sel {
+            Style::default().fg(accent_color)
+        } else {
+            Style::default().fg(theme.border)
+        };
+
+        let tier_text = vec![
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent_color).add_modifier(Modifier::BOLD)),
+                Span::styled(tier.name(), name_style),
+                Span::styled(
+                    format!("  ({})", tier.xp_range()),
+                    Style::default().fg(theme.muted),
+                ),
+            ]),
+            Line::from(vec![
+                Span::raw("    "),
+                Span::styled(tier.description(), Style::default().fg(theme.text)),
+            ]),
+        ];
+
+        let chunk_idx = tier_idx * 2 + 1; // índices impares: 1, 3, 5 (los pares son spacers)
+        let tier_p = Paragraph::new(tier_text)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(border_style)
+                    .style(Style::default().bg(bg)),
+            );
+        f.render_widget(tier_p, chunks[chunk_idx]);
+    }
+
+    let help = Paragraph::new("↑/↓ Navigate | Enter: Select | ESC: Cancel")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[7]);
+}
+
+// Segundo paso — muestra todos los templates del tier elegido con sus requisitos y XP reward
+fn draw_template_select_modal(f: &mut Frame, tier: u8, selected_idx: usize, theme: &Theme) {
+    let area = centered_rect(70, 80, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+
+    let tier_enum = Tier::from_u8(tier).unwrap_or(Tier::Initiate);
+    let templates: Vec<&'static crate::milestone_templates::MilestoneTemplate> =
+        milestone_templates::templates_for_tier(tier_enum).collect();
+
+    let title = format!(
+        " Select {} Milestone Template ",
+        tier_enum.name()
+    );
+
+    let main_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner = main_block.inner(area);
+    f.render_widget(main_block, area);
+
+    let n = templates.len();
+    // Cada template ocupa un bloque de altura mínima 5 — nombre+XP, requisitos, flavor text
+    let mut constraints: Vec<Constraint> = Vec::new();
+    for _ in 0..n {
+        constraints.push(Constraint::Min(5));
+    }
+    constraints.push(Constraint::Length(1)); // help line
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints(constraints)
+        .split(inner);
+
+    for (idx, tmpl) in templates.iter().enumerate() {
+        let is_sel = idx == selected_idx;
+        let marker = if is_sel { "> " } else { "  " };
+        let border_style = if is_sel {
+            Style::default().fg(accent_color)
+        } else {
+            Style::default().fg(theme.border)
+        };
+        let name_style = if is_sel {
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+
+        let mut lines = vec![
+            Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent_color).add_modifier(Modifier::BOLD)),
+                Span::styled(tmpl.name, name_style),
+                Span::styled(
+                    format!("  +{} XP", tmpl.xp_reward),
+                    Style::default().fg(theme.warning),
+                ),
+            ]),
+        ];
+
+        // Requirements line
+        let req_parts: Vec<Span> = {
+            let mut parts = vec![Span::styled("    Req: ", Style::default().fg(theme.muted))];
+            for (i, req) in tmpl.requirements.iter().enumerate() {
+                if i > 0 {
+                    parts.push(Span::styled(", ", Style::default().fg(theme.muted)));
+                }
+                parts.push(Span::styled(
+                    format!("{} ≥{}", req.short_label(), req.target()),
+                    Style::default().fg(theme.text),
+                ));
+            }
+            parts
+        };
+        lines.push(Line::from(req_parts));
+
+        // Flavor text
+        lines.push(Line::from(vec![Span::styled(
+            format!("    \"{}\"", tmpl.flavor_text),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
+        )]));
+
+        let p = Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(border_style),
+            )
+            .wrap(ratatui::widgets::Wrap { trim: true });
+        f.render_widget(p, chunks[idx]);
+    }
+
+    let help = Paragraph::new("↑/↓ Navigate | Enter: Create Milestone | ESC: Back")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(help, chunks[n]);
+}
+
+// Modal para asignar una tarea a un compañero del proyecto — solo proyectos compartidos llegan aquí
+fn draw_assign_task_modal(f: &mut Frame, app: &App, selected_member_idx: usize, theme: &Theme) {
+    let area = centered_rect(50, 40, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+    let proj_id = app.active_project_id.unwrap().to_string();
+    let members = app.db.get_project_members(&proj_id).unwrap_or_default();
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Assign Task to Companion ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Spacer
+            Constraint::Min(5),    // Member list
+            Constraint::Length(2), // Help line
+        ])
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    let mut list_lines = Vec::new();
+    if members.is_empty() {
+        list_lines.push(Line::from(
+            "  No companions in this project's fellowship yet.",
+        ));
+    } else {
+        for (idx, m) in members.iter().enumerate() {
+            let is_sel = idx == selected_member_idx;
+            let marker = if is_sel { " > " } else { "   " };
+            let style = if is_sel {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            list_lines.push(Line::from(vec![
+                Span::styled(marker, Style::default().fg(accent_color)),
+                Span::styled(format!("{} ({})", m.1, m.2), style),
+            ]));
+        }
+    }
+
+    let list_p = Paragraph::new(list_lines);
+    f.render_widget(list_p, inner_layout[1]);
+
+    let helper = Paragraph::new("↑↓: select companion | Enter: toggle assignment | ESC: close")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(helper, inner_layout[2]);
+}
+
+// Popup para definir los permisos del scroll compartido: solo lectura, editable, o colaborativo
+fn draw_share_note_modal(f: &mut Frame, permission_idx: usize, theme: &Theme) {
+    let area = centered_rect(50, 30, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+    let permissions = ["Read Only", "Editable", "Collaborative"];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Share Scroll Note Permissions ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Permission choices
+            Constraint::Length(2), // Help line
+        ])
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    let mut spans = Vec::new();
+    for (idx, perm) in permissions.iter().enumerate() {
+        let is_sel = idx == permission_idx;
+        let style = if is_sel {
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.panel)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        spans.push(Span::styled(format!(" {} ", perm), style));
+        if idx < permissions.len() - 1 {
+            spans.push(Span::styled(" | ", Style::default().fg(theme.muted)));
+        }
+    }
+
+    let choice_p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    f.render_widget(choice_p, inner_layout[1]);
+
+    let helper = Paragraph::new("←→: change permission | Enter: share note | ESC: close")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(helper, inner_layout[2]);
+}
+
+// Popup de visibilidad del journal — privado, visible al proyecto, o al fellowship completo
+fn draw_journal_visibility_modal(f: &mut Frame, visibility_idx: usize, theme: &Theme) {
+    let area = centered_rect(50, 30, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+    let accent_color = theme.primary;
+    let options = ["Private", "Project Visible", "Fellowship Visible"];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Set Journal Entry Visibility ",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ));
+
+    let inner_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // Spacer
+            Constraint::Length(3), // Visibility choices
+            Constraint::Length(2), // Help line
+        ])
+        .split(block.inner(area));
+
+    f.render_widget(block, area);
+
+    let mut spans = Vec::new();
+    for (idx, opt) in options.iter().enumerate() {
+        let is_sel = idx == visibility_idx;
+        let style = if is_sel {
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD)
+                .bg(theme.panel)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        spans.push(Span::styled(format!(" {} ", opt), style));
+        if idx < options.len() - 1 {
+            spans.push(Span::styled(" | ", Style::default().fg(theme.muted)));
+        }
+    }
+
+    let choice_p = Paragraph::new(Line::from(spans)).alignment(Alignment::Center);
+    f.render_widget(choice_p, inner_layout[1]);
+
+    let helper = Paragraph::new("←→: change visibility | Enter: save visibility | ESC: close")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+    f.render_widget(helper, inner_layout[2]);
+}

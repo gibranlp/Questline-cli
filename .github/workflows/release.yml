@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: questline-linux-x86_64
+            binary: questline
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: questline-linux-aarch64
+            binary: questline
+            aarch64_cross: true
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: questline-windows-x86_64.exe
+            binary: questline.exe
+
+          - os: macos-13
+            target: x86_64-apple-darwin
+            artifact: questline-macos-x86_64
+            binary: questline
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: questline-macos-arm64
+            binary: questline
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar toolchain de Rust con el target correcto
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache de Cargo para no recompilar dependencias en cada run
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Instalar dependencias de sistema para Linux x86_64
+        if: runner.os == 'Linux' && !matrix.aarch64_cross
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: Instalar gcc y dbus arm64 para cross-compilar Linux aarch64
+        if: matrix.aarch64_cross
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update -q
+          sudo apt-get install -y libdbus-1-dev:arm64
+
+      - name: Compilar (Linux aarch64 con linker externo)
+        if: matrix.aarch64_cross
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          PKG_CONFIG_ALLOW_CROSS: "1"
+          PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Compilar (resto de plataformas)
+        if: '!matrix.aarch64_cross'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Copiar binario con el nombre final (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.artifact }}
+
+      - name: Copiar binario con el nombre final (Windows)
+        if: runner.os == 'Windows'
+        run: cp target/${{ matrix.target }}/release/${{ matrix.binary }} ${{ matrix.artifact }}
+        shell: bash
+
+      - name: Subir artefacto para que el job de release lo tome
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}
+
+  release:
+    name: Publicar Release en GitHub
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Bajar todos los artefactos compilados
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Crear release y adjuntar binarios
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            questline-linux-x86_64
+            questline-linux-aarch64
+            questline-windows-x86_64.exe
+            questline-macos-x86_64
+            questline-macos-arm64
