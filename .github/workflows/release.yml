@@ -21,12 +21,6 @@ jobs:
             artifact: questline-linux-x86_64
             binary: questline
 
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            artifact: questline-linux-aarch64
-            binary: questline
-            aarch64_cross: true
-
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact: questline-windows-x86_64.exe
@@ -60,34 +54,13 @@ jobs:
           key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ matrix.target }}-cargo-
 
-      - name: Instalar dependencias de sistema para Linux x86_64
-        if: runner.os == 'Linux' && !matrix.aarch64_cross
+      - name: Instalar dependencias de sistema para Linux
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
 
-      - name: Instalar gcc y dependencias arm64 para cross-compilar Linux aarch64
-        if: matrix.aarch64_cross
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y gcc-aarch64-linux-gnu pkg-config
-          sudo dpkg --add-architecture arm64
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble main restricted universe multiverse" | sudo tee /etc/apt/sources.list.d/arm64-ports.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-updates main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
-          echo "deb [arch=arm64] http://ports.ubuntu.com/ubuntu-ports noble-security main restricted universe multiverse" | sudo tee -a /etc/apt/sources.list.d/arm64-ports.list
-          sudo apt-get update -q
-          sudo apt-get install -y libdbus-1-dev:arm64 libasound2-dev:arm64
-
-      - name: Compilar (Linux aarch64 con linker externo)
-        if: matrix.aarch64_cross
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-          PKG_CONFIG_ALLOW_CROSS: "1"
-          PKG_CONFIG_PATH_aarch64_unknown_linux_gnu: /usr/lib/aarch64-linux-gnu/pkgconfig
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Compilar (resto de plataformas)
-        if: '!matrix.aarch64_cross'
+      - name: Compilar
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Copiar binario con el nombre final (Unix)
@@ -121,7 +94,6 @@ jobs:
           generate_release_notes: true
           files: |
             questline-linux-x86_64
-            questline-linux-aarch64
             questline-windows-x86_64.exe
             questline-macos-x86_64
             questline-macos-arm64
