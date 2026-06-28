@@ -26,7 +26,7 @@ jobs:
             artifact: questline-windows-x86_64.exe
             binary: questline.exe
 
-          - os: macos-13
+          - os: macos-latest
             target: x86_64-apple-darwin
             artifact: questline-macos-x86_64
             binary: questline
