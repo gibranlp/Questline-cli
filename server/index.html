@@ -22,6 +22,27 @@
       --text:       #d4d4d4;
       --text-dim:   #999;
       --text-dimmer:#2a2a2a;
+
+      --accent:     rgb(168, 85, 247);
+    }
+
+    /* Nuevos Estilos */
+    .class-theme-active h2 .accent,
+    .class-theme-active h3,
+    .class-theme-active .accent,
+    .class-theme-active #logo {
+      animation: none !important;
+      color: var(--accent) !important;
+      text-shadow: 0 0 28px var(--accent) !important;
+    }
+
+    .class-card {
+      cursor: pointer;
+      transition: transform 0.25s, border-color 0.25s !important;
+    }
+    .class-card.selected {
+      border-color: var(--class-color) !important;
+      transform: translateY(-5px);
     }
 
     * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -156,7 +177,7 @@
       border:1px solid var(--bg-border); background:var(--bg-card);
       padding:1.5rem; position:relative; transition:transform 0.2s;
     }
-    .class-card:hover { transform:translateY(-3px); }
+    .class-card:hover { transform:translateY(-3px); border-color: var(--class-color) !important;}
     .class-card::before {
       content:''; position:absolute; top:0;left:0;right:0; height:2px;
       background:var(--class-color);
@@ -375,6 +396,7 @@
     <li><a href="#manual">Manual</a></li>
     <li><a href="#identity">Identity</a></li>
     <li><a href="#download">Download</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" style="color:var(--accent); font-weight:bold;">Discord</a></li>
     <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
   </ul>
 </nav>
@@ -522,6 +544,22 @@ The Chronicle turns to the next page.</pre>
       if you want your productivity guilt to follow you across devices. The interface looks like it was
       built by someone who loved both spreadsheets and dungeons, because it was.
     </p>
+
+    <!-- Simulador de Terminal -->
+    <div class="interactive-terminal-container" style="margin-top:2.5rem; margin-bottom:2.5rem;">
+      <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Interactive Terminal Demo (Type commands here)</p>
+      <div class="term" id="demo-term" style="min-height:320px; max-height:450px; overflow-y:auto; cursor:text; font-family:'JetBrains Mono', monospace; font-size:0.9rem; text-align:left;">
+        <div id="term-output">
+          <span class="comment"># Questline Interactive Terminal v1.0.6</span>
+          <span class="comment"># Type 'help' to view commands.</span>
+          <br>
+        </div>
+        <div class="term-input-line" style="display:flex; align-items:center; margin-top:0.5rem;">
+          <span class="cmd" style="color:var(--accent); font-weight:bold; margin-right:0.5rem;">$</span>
+          <input type="text" id="term-input" style="background:none; border:none; color:var(--text); outline:none; font-family:inherit; font-size:inherit; flex:1; width:100%;" autocomplete="off" spellcheck="false" placeholder="type 'help' and press Enter...">
+        </div>
+      </div>
+    </div>
 
     <div class="two-col">
       <div class="card">
@@ -744,70 +782,70 @@ The Chronicle turns to the next page.</pre>
 
     <div class="features-grid">
       <div class="feature-row">
-        <div class="feature-icon">⚔</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Projects &amp; Tasks</div>
           <div class="feature-desc">Organize work into projects. Break projects into tasks. Prioritize ruthlessly. Complete things. The backlog will grow regardless — the difference is whether you have a plan or a pile.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">📜</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">The Chronicle &amp; Notes</div>
           <div class="feature-desc">Every project has a journal for tracking progress and a notes tab for capturing everything that doesn't fit anywhere else. Your future self will thank you, then immediately ignore the notes they wrote.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">🌲</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">The Zen Tree</div>
           <div class="feature-desc">A companion that grows from consistency, not intensity. Water it daily. Complete focus sessions. It progresses from Acorn to World Tree over time. It does not respond to motivational speeches. It has heard them before.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">⏱</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Focus Sessions</div>
           <div class="feature-desc">15, 25, 45, 60, or 90-minute deep work blocks with optional ambient soundscapes. Eight soundscapes available: forest sounds, rain, ocean, white noise, LoFi, and "Music for Programming," which is exactly what it sounds like.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">✦</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Daily Adventures</div>
           <div class="feature-desc">Three daily quests regenerate each morning: complete tasks, write notes, update the journal, water your tree, finish high-priority work. Small. Achievable. Surprisingly effective at keeping momentum when motivation has quietly left the building.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">🔥</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Streak Tracking</div>
           <div class="feature-desc">Your current and best streaks are always visible. The Chronicle records every active day. Missing one resets the counter, not the record. The best streak is a fact. The current streak is a commitment.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">🏆</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Project Milestones</div>
           <div class="feature-desc">Three tiers of milestone templates — Initiate, Veteran, Legendary — each with specific requirements around project age, task completion, journal entries, streaks, and focus sessions. They cannot be farmed. The system was tested. Someone tried.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">📚</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">The Lore Library</div>
           <div class="feature-desc">Achievements unlock lore entries across multiple categories: world history, class tales, creature studies, and achievement records. The descriptions are honest, occasionally unkind, and accurate.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">🤝</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Fellowship &amp; Shared Realms</div>
           <div class="feature-desc">Invite collaborators to shared projects. Members see shared tasks, notes, and a live Project Chronicle. Sync happens across devices via cryptographic Ed25519 authentication. The technology is impressive. Whether it helps you ship faster depends on the team.</div>
         </div>
       </div>
       <div class="feature-row">
-        <div class="feature-icon">♾</div>
+        <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">Rituals &amp; Reflections</div>
           <div class="feature-desc">Reusable daily or weekly tasks that award XP on completion. Daily Reflections capture what went well and what can improve. The Ritual of "checking tasks off without doing them" has been deliberately excluded.</div>
@@ -1147,16 +1185,22 @@ The Chronicle turns to the next page.</pre>
       </p>
 
       <div style="margin:1.5rem 0 0.5rem; text-align:left;">
-        <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Linux &amp; macOS</p>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+          <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin:0;">// Linux &amp; macOS</p>
+          <button class="badge" onclick="copyToClipboard('linux-cmd', this)" style="cursor:pointer; padding:0.15rem 0.5rem; font-size:0.72rem; border-color:var(--bg-border);">Copy</button>
+        </div>
         <div class="term" style="text-align:left;margin:0;">
-          <pre style="margin-top:0.25rem;"><span class="cmd">$ curl -fsSL https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install.sh | bash</span></pre>
+          <pre style="margin-top:0.25rem;"><span class="cmd">$ <span id="linux-cmd">curl -fsSL https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install.sh | bash</span></span></pre>
         </div>
       </div>
 
       <div style="margin:1.25rem 0 0.5rem; text-align:left;">
-        <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Windows (PowerShell)</p>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.6rem;">
+          <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin:0;">// Windows (PowerShell)</p>
+          <button class="badge" onclick="copyToClipboard('win-cmd', this)" style="cursor:pointer; padding:0.15rem 0.5rem; font-size:0.72rem; border-color:var(--bg-border);">Copy</button>
+        </div>
         <div class="term" style="text-align:left;margin:0;">
-          <pre style="margin-top:0.25rem;"><span class="cmd">PS&gt; irm https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install.ps1 | iex</span></pre>
+          <pre style="margin-top:0.25rem;"><span class="cmd">PS&gt; <span id="win-cmd">irm https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install.ps1 | iex</span></span></pre>
         </div>
       </div>
 
@@ -1173,11 +1217,58 @@ The Chronicle turns to the next page.</pre>
         <span class="badge">Windows x86_64</span>
       </div>
 
+      <div style="margin-top:2.25rem;">
+        <p style="font-size:0.8rem;letter-spacing:0.15em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.75rem;">// Join the Realm</p>
+        <a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="badge" style="background:#5865F2; color:#fff; border:none; text-decoration:none; font-weight:bold; padding:0.6rem 2rem; display:inline-block; transition:transform 0.2s; cursor:pointer; font-size:0.92rem; letter-spacing:0.05em;">
+          Join the Discord Server
+        </a>
+      </div>
+
       <p style="font-size:0.78rem;color:var(--text-dim);margin-top:1.75rem;line-height:1.9;">
         Piping a script from a stranger's GitHub into your shell? Bold choice.<br>
         The source is public. You could read it before running it. Most people don't. The backlog is still there either way.<br>
         <a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener" style="color:var(--text);letter-spacing:0.05em;text-decoration:none;border-bottom:1px solid var(--bg-border);">github.com/gibranlp/Questline-cli</a>
       </p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ SUPPORT -->
+<section id="support" style="border-top:1px solid var(--bg-border); background:rgba(15,15,15,0.4); padding: 5rem 0;">
+  <div class="container" style="text-align:center;">
+    <p class="section-header">// Keep the Chronicle Alive</p>
+    <h2>Support <span class="accent">Questline</span></h2>
+    <hr class="divider" style="margin: 0 auto 2.5rem; max-width: 400px;">
+    <p class="intro-text" style="text-align:center; max-width: 750px; margin: 0 auto 2.5rem;">
+      Questline is independent, open-source, and free of tracking or ads. 
+      The sync server, Fellowship collaboration network, and updates are entirely funded by community support. 
+      If Questline helps you defeat the Great Backlog or build daily consistency, consider keeping the developer caffeinated.
+    </p>
+
+    <div class="two-col" style="max-width: 800px; margin: 0 auto;">
+      <div class="card" style="padding: 2rem; display: flex; flex-direction: column; justify-content: space-between; align-items: center; border-color: var(--chrono);">
+        <div>
+          <h3 style="color: var(--chrono); margin-bottom: 0.75rem;">Ko-Fi</h3>
+          <p style="font-size: 0.95rem; margin-bottom: 1.5rem; line-height: 1.6;">
+            Support development directly. Buy a coffee, fund new soundscapes, or chip in for server costs. Every drop helps.
+          </p>
+        </div>
+        <a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener" class="badge" style="background: var(--chrono); color: #000; font-weight: bold; border: none; text-decoration: none; display: inline-block; padding: 0.6rem 1.5rem; transition: transform 0.2s;">
+          Support on Ko-Fi
+        </a>
+      </div>
+
+      <div class="card" style="padding: 2rem; display: flex; flex-direction: column; justify-content: space-between; align-items: center; border-color: var(--warlock);">
+        <div>
+          <h3 style="color: var(--warlock); margin-bottom: 0.75rem;">GitHub Sponsors</h3>
+          <p style="font-size: 0.95rem; margin-bottom: 1.5rem; line-height: 1.6;">
+            Become a recurring sponsor or give a one-time contribution. Help shape the future of Questline's development.
+          </p>
+        </div>
+        <a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener" class="badge" style="background: var(--warlock); color: #000; font-weight: bold; border: none; text-decoration: none; display: inline-block; padding: 0.6rem 1.5rem; transition: transform 0.2s;">
+          Sponsor on GitHub
+        </a>
+      </div>
     </div>
   </div>
 </section>
@@ -1189,18 +1280,12 @@ The Chronicle turns to the next page.</pre>
     <br>
     <p><span>QUESTLINE</span> &nbsp;·&nbsp; A terminal-first productivity RPG &nbsp;·&nbsp; Every task is a quest. Every project is an adventure.</p>
     <br>
-    <p><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;letter-spacing:0.05em;">github.com/gibranlp/Questline-cli</a> &nbsp;·&nbsp; Open source. No, that doesn't mean someone else will close your tickets.</p>
+    <p><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;letter-spacing:0.05em;">github.com/gibranlp/Questline-cli</a> &nbsp;·&nbsp; <a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" style="color:var(--text-dim);text-decoration:none;letter-spacing:0.05em;">discord.gg/b64a3c9qFw</a> &nbsp;·&nbsp; Open source. No, that doesn't mean someone else will close your tickets.</p>
     <br>
     <p style="color:#111;">The backlog is doing pushups while you read this.</p>
   </div>
 </footer>
 
-<!-- KO-FI BUTTON -->
-<div style="position:fixed;bottom:1.25rem;right:1.25rem;z-index:9000;">
-  <a href='https://ko-fi.com/Y4H021XN7F' target='_blank'>
-    <img height='36' style='border:0;height:36px;display:block;opacity:0.85;transition:opacity 0.2s;' src='https://storage.ko-fi.com/cdn/kofi2.png?v=6' border='0' alt='Keep the Chronicle Alive' onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'" />
-  </a>
-</div>
 
 <!-- LIGHTBOX -->
 <div id="lightbox" class="lightbox">
@@ -1314,16 +1399,153 @@ The Chronicle turns to the next page.</pre>
     if (e.key === 'ArrowRight')  lbNav(1);
   });
 
-  // ── Zen Tree dot ambience — cycle through class colors
+  // ── Zen Tree dot ambience — cycle through class colors and growth stages
   const dots = document.querySelectorAll('.tree-stage .stage-dot');
+  const stageItems = document.querySelectorAll('.tree-stage');
+  const treeAscii = document.querySelector('.tree-ascii');
   const colors = ['rgb(168,85,247)','rgb(255,105,180)','rgb(6,182,212)','rgb(59,130,246)','rgb(249,115,22)','rgb(245,158,11)','rgb(6,182,212)'];
+  
+  const treeStages = [
+    // Stage 1 - Acorn
+    `\n\n\n\n      .\n     ( )`,
+    // Stage 2 - Sapling
+    `\n\n\n      ,\n     /|\n      |`,
+    // Stage 3 - Treekin
+    `\n\n\n     \\|/\n      |\n      |`,
+    // Stage 4 - Grovekeeper
+    `\n\n     /*\\\n    /***\\\\\n      |\n      |`,
+    // Stage 5 - Ancient Warden
+    `\n     .ooo.\n   .oQOOPQo.\n    OOPQOQO\n     |  |\n     |  |`,
+    // Stage 6 - Forest Elder
+    `\n      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n     || ||\n     || ||`,
+    // Stage 7 - World Tree
+    `      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n  .oQOQOQOQOQo.\n    ||| |||\n    ||| |||`
+  ];
+
   let cur = 0;
   setInterval(() => {
     dots.forEach(d => { d.style.background = ''; d.style.boxShadow = ''; });
+    stageItems.forEach(item => item.classList.remove('active'));
+
     dots[cur].style.background = colors[cur];
     dots[cur].style.boxShadow = '0 0 8px ' + colors[cur];
+    stageItems[cur].classList.add('active');
+    
+    if (treeAscii) {
+      treeAscii.textContent = treeStages[cur];
+    }
+
     cur = (cur + 1) % dots.length;
   }, 900);
+
+  // ── Copy to Clipboard Helper ────────────────────────────────────────
+  window.copyToClipboard = function(id, btn) {
+    const text = document.getElementById(id).textContent;
+    navigator.clipboard.writeText(text).then(() => {
+      const originalText = btn.textContent;
+      btn.textContent = 'Copied!';
+      setTimeout(() => { btn.textContent = originalText; }, 2000);
+    });
+  };
+
+  // ── Class Selector Accent Customization ──────────────────────────────
+  document.querySelectorAll('.class-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const isSelected = card.classList.contains('selected');
+      document.querySelectorAll('.class-card').forEach(c => c.classList.remove('selected'));
+      
+      if (isSelected) {
+        document.body.classList.remove('class-theme-active');
+      } else {
+        card.classList.add('selected');
+        const color = card.style.getPropertyValue('--class-color');
+        document.documentElement.style.setProperty('--accent', color);
+        document.body.classList.add('class-theme-active');
+      }
+    });
+  });
+
+  // ── Interactive Terminal Simulator ──────────────────────────────────
+  const termInput = document.getElementById('term-input');
+  const termOutput = document.getElementById('term-output');
+  const demoTerm = document.getElementById('demo-term');
+
+  if (demoTerm) {
+    demoTerm.addEventListener('click', () => termInput.focus());
+  }
+
+  const commands = {
+    help: () => `Available commands:
+  <span style="color:var(--accent);">quests</span>   - View active tasks and objectives
+  <span style="color:var(--accent);">status</span>   - View simulated hero attributes & progress
+  <span style="color:var(--accent);">tree</span>     - Query the Zen Tree growth status
+  <span style="color:var(--accent);">about</span>    - Display info about Questline
+  <span style="color:var(--accent);">clear</span>    - Clear the terminal screen`,
+    
+    quests: () => `<span style="color:var(--accent); font-weight:bold;">Active Quests:</span>
+  [ ] Complete 3 Tasks (0/3)
+  [ ] Water Your Zen Tree (0/1)
+  [ ] Write 1 Scroll/Note (0/1)
+  
+  Type <span style="color:var(--accent);">status</span> to inspect details.`,
+    
+    status: () => `<span style="color:var(--accent); font-weight:bold;">Adventurer Stats:</span>
+  Name ........ Traveler
+  Level ....... 1
+  XP .......... 0 / 220
+  Class ....... Onlooker (Pick one below!)`,
+    
+    tree: () => `      <span style="color:var(--sage);">.   ,
+     (\\./)
+     .---.
+    /     \\
+   |   O   |
+    \\     /
+     '---'</span>
+  Zen Tree Status: Sapling
+  Growth ........ 0
+  Water Today ... 0/2`,
+    
+    about: () => `Questline is a local-first, terminal-first productivity game.
+Your tasks are quests, and you level up by completing them.
+Check the <a href="#download" style="color:var(--text); text-decoration:underline;">Download</a> section to install the real app!`
+  };
+
+  if (termInput) {
+    termInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const inputVal = termInput.value.trim().toLowerCase();
+        termInput.value = '';
+
+        if (!inputVal) return;
+
+        // Print input line
+        const cmdLine = document.createElement('div');
+        cmdLine.innerHTML = `<span style="color:var(--accent); font-weight:bold; margin-right:0.5rem;">$</span> <span style="color:var(--text);">${inputVal}</span>`;
+        termOutput.appendChild(cmdLine);
+
+        // Process command
+        const outputLine = document.createElement('div');
+        outputLine.style.marginTop = '0.25rem';
+        outputLine.style.marginBottom = '0.5rem';
+
+        if (inputVal === 'clear') {
+          termOutput.innerHTML = '';
+        } else if (commands[inputVal]) {
+          outputLine.innerHTML = commands[inputVal]().replace(/\\n/g, '<br>');
+          termOutput.appendChild(outputLine);
+        } else {
+          outputLine.innerHTML = `Command not found: '${inputVal}'. Type <span style="color:var(--accent);">help</span> for a list of commands.`;
+          termOutput.appendChild(outputLine);
+        }
+
+        // Scroll to bottom
+        if (demoTerm) {
+          demoTerm.scrollTop = demoTerm.scrollHeight;
+        }
+      }
+    });
+  }
 </script>
 
 </body>
