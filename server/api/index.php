@@ -104,16 +104,94 @@ try {
             INDEX idx_gc_timestamp (timestamp)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
-    // Migración: agregar username a users si no existe — los installs viejos no lo tienen
-    try {
-        $pdo->exec("ALTER TABLE users ADD COLUMN username VARCHAR(255) NULL");
-    } catch (PDOException $e) {
-        if (strpos($e->getMessage(), '1060') === false) { throw $e; } // 1060 = Duplicate column, ignorar
+    // Migraciones: agregar columnas de stats y tabla de webhooks
+    $cols = [
+        'username' => 'VARCHAR(255) NULL',
+        'class' => 'VARCHAR(50) NULL',
+        'level' => 'INT NOT NULL DEFAULT 1',
+        'streak' => 'INT NOT NULL DEFAULT 0',
+        'xp' => 'INT NOT NULL DEFAULT 0'
+    ];
+    foreach ($cols as $col => $type) {
+        try {
+            $pdo->exec("ALTER TABLE users ADD COLUMN $col $type");
+        } catch (PDOException $e) {
+            if (strpos($e->getMessage(), '1060') === false) { throw $e; }
+        }
     }
+
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS webhooks (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            url VARCHAR(512) NOT NULL,
+            events VARCHAR(255) NOT NULL,
+            secret VARCHAR(64) NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
 } catch (PDOException $e) {
     error_log("[Questline API] DB connection failed: " . $e->getMessage());
     http_response_code(500);
     echo json_encode(["error" => "Service temporarily unavailable"]);
+    exit;
+}
+
+// ── Parse Route early for public bypass ────
+$requestUri = $_SERVER['REQUEST_URI'] ?? '';
+$apiPath = parse_url($requestUri, PHP_URL_PATH);
+$pathSegments = explode('/api/', $apiPath);
+$route = isset($pathSegments[1]) ? rtrim($pathSegments[1], '/') : '';
+if (str_starts_with($route, 'index.php/')) {
+    $route = substr($route, 10);
+} else if ($route === 'index.php') {
+    $route = '';
+}
+if (empty($route)) {
+    $route = $_GET['route'] ?? '';
+}
+
+if ($route === 'public/chapter_stats') {
+    $chapter_id = $_GET['chapter_id'] ?? 'chapter_one';
+    $chapter_id = preg_replace('/[^a-z0-9_]/', '', strtolower($chapter_id));
+    if (empty($chapter_id)) { $chapter_id = 'chapter_one'; }
+    $stmt = $pdo->prepare("SELECT completed, completed_at FROM chapter_progress WHERE chapter_id = ?");
+    $stmt->execute([$chapter_id]);
+    $progress = $stmt->fetch() ?: ["completed" => 0, "completed_at" => null];
+    $stmt = $pdo->prepare("SELECT objective_type, current_value, target_value FROM chapter_objectives WHERE chapter_id = ?");
+    $stmt->execute([$chapter_id]);
+    $objectives = $stmt->fetchAll();
+    echo json_encode(["status" => "success", "chapter_id" => $chapter_id, "completed" => $progress['completed'], "completed_at" => $progress['completed_at'], "objectives" => $objectives]);
+    exit;
+}
+
+if ($route === 'public/profile') {
+    $username = $_GET['username'] ?? '';
+    $username = trim($username);
+    if (empty($username)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Username parameter is required"]);
+        exit;
+    }
+    $stmt = $pdo->prepare("SELECT username, class, level, streak, xp FROM users WHERE username = ?");
+    $stmt->execute([$username]);
+    $profile = $stmt->fetch();
+    if (!$profile) {
+        http_response_code(404);
+        echo json_encode(["error" => "User profile not found"]);
+        exit;
+    }
+    echo json_encode(["status" => "success", "profile" => $profile]);
+    exit;
+}
+
+if ($route === 'public/webhook/test') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+        exit;
+    }
+    echo json_encode(["status" => "success", "message" => "Webhook test successful"]);
     exit;
 }
 
@@ -307,15 +385,94 @@ try {
             $stmt = $pdo->prepare("INSERT INTO devices (id, user_id, device_name) VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE device_name = ?, last_seen = CURRENT_TIMESTAMP");
             $stmt->execute([$deviceId, $userId, $deviceName, $deviceName]);
 
-            // Guardar username en users y project_members para que el activity feed lo encuentre
+            // Guardar username y stats en la tabla users
+            $class = $data['class'] ?? null;
+            $level = isset($data['level']) ? intval($data['level']) : null;
+            $streak = isset($data['streak']) ? intval($data['streak']) : null;
+            $xp = isset($data['xp']) ? intval($data['xp']) : null;
+
+            $updateFields = [];
+            $params = [];
+
             if ($realUsername && trim($realUsername) !== '') {
-                $stmt = $pdo->prepare("UPDATE users SET username = ? WHERE id = ?");
-                $stmt->execute([$realUsername, $userId]);
+                $updateFields[] = "username = ?";
+                $params[] = $realUsername;
+
+                // Actualizar en project_members también
                 $stmt = $pdo->prepare("UPDATE project_members SET user_username = ? WHERE user_identity = ?");
                 $stmt->execute([$realUsername, $identity]);
             }
+            if ($class !== null) {
+                $updateFields[] = "class = ?";
+                $params[] = $class;
+            }
+            if ($level !== null) {
+                $updateFields[] = "level = ?";
+                $params[] = $level;
+            }
+            if ($streak !== null) {
+                $updateFields[] = "streak = ?";
+                $params[] = $streak;
+            }
+            if ($xp !== null) {
+                $updateFields[] = "xp = ?";
+                $params[] = $xp;
+            }
+
+            if (!empty($updateFields)) {
+                $params[] = $userId;
+                $sql = "UPDATE users SET " . implode(", ", $updateFields) . " WHERE id = ?";
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute($params);
+            }
 
             echo json_encode(["status" => "success", "message" => "Device registered/updated successfully"]);
+            break;
+
+        case 'webhooks/register':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                send_method_not_allowed();
+            }
+            $data = json_decode($body, true);
+            $url = $data['url'] ?? null;
+            $events = $data['events'] ?? '*';
+            $secret = $data['secret'] ?? null;
+
+            if (!$url || filter_var($url, FILTER_VALIDATE_URL) === false) {
+                http_response_code(400);
+                echo json_encode(["error" => "A valid webhook URL is required"]);
+                exit;
+            }
+
+            $stmt = $pdo->prepare("INSERT INTO webhooks (user_id, url, events, secret) VALUES (?, ?, ?, ?)");
+            $stmt->execute([$userId, $url, $events, $secret]);
+            echo json_encode(["status" => "success", "message" => "Webhook registered successfully", "id" => $pdo->lastInsertId()]);
+            break;
+
+        case 'webhooks/list':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            $stmt = $pdo->prepare("SELECT id, url, events, created_at FROM webhooks WHERE user_id = ? ORDER BY created_at DESC");
+            $stmt->execute([$userId]);
+            $webhooks = $stmt->fetchAll();
+            echo json_encode($webhooks);
+            break;
+
+        case 'webhooks/delete':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                send_method_not_allowed();
+            }
+            $data = json_decode($body, true);
+            $webhookId = $data['id'] ?? null;
+            if (!$webhookId) {
+                http_response_code(400);
+                echo json_encode(["error" => "Webhook ID is required"]);
+                exit;
+            }
+            $stmt = $pdo->prepare("DELETE FROM webhooks WHERE id = ? AND user_id = ?");
+            $stmt->execute([$webhookId, $userId]);
+            echo json_encode(["status" => "success", "message" => "Webhook deleted successfully"]);
             break;
             
         case 'devices':
@@ -361,6 +518,11 @@ try {
                     $e['timestamp']
                 ]);
                 $inserted += $stmt->rowCount();
+
+                // Disparar webhooks registrados si el tipo de entidad coincide
+                if (in_array($e['entity_type'], ['milestone', 'task', 'user_stats', 'streak', 'zen_tree'])) {
+                    trigger_webhooks($pdo, $userId, $e['entity_type'], $e['operation'], $e['content'] ?? '');
+                }
 
                 // Si el evento pertenece a un proyecto compartido, replicarlo a los compañeros
                 $projectId = null;
@@ -843,6 +1005,7 @@ try {
                     "INSERT IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp) VALUES (?, ?, ?, ?, ?)"
                 );
                 $stmt->execute([$id, $hero, $event_type, $description, $ts]);
+                trigger_global_webhook($hero, $event_type, $description);
                 echo json_encode(["ok" => true]);
             } else {
                 http_response_code(405);
@@ -1293,5 +1456,161 @@ function setup_tables($pdo) {
     ('Observer', 'chat', 1);
     ";
     $pdo->exec($sql);
+}
+
+function trigger_webhooks($pdo, $userId, $eventType, $operation, $payload) {
+    try {
+        $stmt = $pdo->prepare("SELECT url, events, secret FROM webhooks WHERE user_id = ?");
+        $stmt->execute([$userId]);
+        $webhooks = $stmt->fetchAll();
+        if (empty($webhooks)) return;
+
+        $body = json_encode([
+            "event" => $eventType,
+            "operation" => $operation,
+            "user_id" => $userId,
+            "timestamp" => date(DATE_RFC3339),
+            "payload" => json_decode($payload, true) ?: $payload
+        ]);
+
+        foreach ($webhooks as $wh) {
+            $allowedEvents = explode(',', $wh['events']);
+            if (!in_array('*', $allowedEvents) && !in_array($eventType, $allowedEvents)) {
+                continue;
+            }
+
+            $postBody = $body;
+            if (str_contains($wh['url'], 'discord.com/api/webhooks/')) {
+                $nameStmt = $pdo->prepare("SELECT username, class, level FROM users WHERE id = ?");
+                $nameStmt->execute([$userId]);
+                $userObj = $nameStmt->fetch() ?: ["username" => "Traveler", "class" => "Neutral", "level" => 1];
+
+                $user_name = $userObj['username'] ?? 'Traveler';
+                $event_msg = "";
+
+                $contentObj = json_decode($payload, true);
+                if (!is_array($contentObj)) {
+                    $contentObj = $payload;
+                }
+
+                if ($eventType === 'milestone') {
+                    $mName = is_array($contentObj) ? ($contentObj['name'] ?? 'Milestone') : 'Milestone';
+                    $event_msg = "{$user_name} has completed the {$mName} milestone.";
+                } elseif ($eventType === 'streak') {
+                    $sCount = is_array($contentObj) ? ($contentObj['streak_count'] ?? '0') : $contentObj;
+                    $event_msg = "{$user_name} has maintained a streak of {$sCount} days.";
+                } elseif ($eventType === 'zen_tree') {
+                    $event_msg = "{$user_name} has nurtured the Zen Tree.";
+                } elseif ($eventType === 'task') {
+                    $tName = is_array($contentObj) ? ($contentObj['title'] ?? 'Task') : 'Task';
+                    $event_msg = "{$user_name} has completed: {$tName}.";
+                } elseif ($eventType === 'user_stats') {
+                    $lvl = is_array($contentObj) ? ($contentObj['level'] ?? $userObj['level']) : $userObj['level'];
+                    $event_msg = "{$user_name} has reached Level {$lvl}.";
+                } else {
+                    $event_msg = "{$user_name} has updated the Chronicle ({$eventType}).";
+                }
+
+                $ironic_quotes = [
+                    "The Realm grows stronger. Or at least, slightly less disorganized.",
+                    "A monumental achievement that will be forgotten by tomorrow.",
+                    "The Chronicle is impressed. The Zen Tree remains completely indifferent.",
+                    "The Notification Swarm retreated, if only out of sheer embarrassment.",
+                    "Proof that sufficient database entries can simulate actual productivity.",
+                    "Somewhere, a manager is wondering why you aren't doing actual work instead of leveling up.",
+                    "The Realm survives. Unfortunately, so does the backlog.",
+                    "A triumph of discipline over common sense.",
+                    "A significant milestone on the journey to doing exactly what you were supposed to do three days ago.",
+                    "A heroic effort, assuming the standard for heroism has dropped considerably."
+                ];
+                $quote = $ironic_quotes[array_rand($ironic_quotes)];
+
+                $messageText = "━━━━━━━━━━━━━━━━━━━━━━\nTHE CHRONICLER RECORDS\n━━━━━━━━━━━━━━━━━━━━━━\n\n{$event_msg}\n\n{$quote}";
+
+                $discordPayload = [
+                    "username" => "Questline Chronicle",
+                    "content" => $messageText
+                ];
+                $postBody = json_encode($discordPayload);
+            }
+
+            $ch = curl_init($wh['url']);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $postBody);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 3);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+
+            $headers = [
+                'Content-Type: application/json',
+                'User-Agent: Questline-Webhook/1.0'
+            ];
+            if ($postBody === $body && !empty($wh['secret'])) {
+                $signature = hash_hmac('sha256', $body, $wh['secret']);
+                $headers[] = 'X-Questline-Signature: ' . $signature;
+            }
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+
+            curl_exec($ch);
+            curl_close($ch);
+        }
+    } catch (Exception $e) {
+        // Suppress errors to keep sync transaction atomic and fast
+    }
+}
+
+function trigger_global_webhook($hero, $eventType, $description) {
+    try {
+        $webhookUrl = getenv('DISCORD_WEBHOOK_URL');
+        if (empty($webhookUrl)) return;
+
+        $event_msg = "";
+        if ($eventType === 'LevelUp') {
+            $event_msg = "{$hero} has reached Level " . preg_replace('/[^0-9]/', '', $description) . ".";
+        } elseif ($eventType === 'Streak') {
+            $event_msg = "{$hero} has maintained a streak of " . preg_replace('/[^0-9]/', '', $description) . " days.";
+        } elseif ($eventType === 'TreeWatering' || $eventType === 'ZenTree') {
+            $event_msg = "{$hero} has nurtured the Zen Tree.";
+        } elseif ($eventType === 'Milestone') {
+            $event_msg = "{$hero} has completed a milestone: {$description}.";
+        } elseif ($eventType === 'QuestComplete' || $eventType === 'task') {
+            $event_msg = "{$hero} has completed: {$description}.";
+        } else {
+            $event_msg = "{$hero}: {$description}";
+        }
+
+        $ironic_quotes = [
+            "The Realm grows stronger. Or at least, slightly less disorganized.",
+            "A monumental achievement that will be forgotten by tomorrow.",
+            "The Chronicle is impressed. The Zen Tree remains completely indifferent.",
+            "The Notification Swarm retreated, if only out of sheer embarrassment.",
+            "Proof that sufficient database entries can simulate actual productivity.",
+            "Somewhere, a manager is wondering why you aren't doing actual work instead of leveling up.",
+            "The Realm survives. Unfortunately, so does the backlog.",
+            "A triumph of discipline over common sense.",
+            "A significant milestone on the journey to doing exactly what you were supposed to do three days ago.",
+            "A heroic effort, assuming the standard for heroism has dropped considerably."
+        ];
+        $quote = $ironic_quotes[array_rand($ironic_quotes)];
+
+        $messageText = "━━━━━━━━━━━━━━━━━━━━━━\nTHE CHRONICLER RECORDS\n━━━━━━━━━━━━━━━━━━━━━━\n\n{$event_msg}\n\n{$quote}";
+
+        $discordPayload = [
+            "username" => "Questline Chronicle",
+            "content" => $messageText
+        ];
+
+        $ch = curl_init($webhookUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($discordPayload));
+        curl_setopt($ch, CURLOPT_TIMEOUT, 3);
+        curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_exec($ch);
+        curl_close($ch);
+    } catch (Exception $e) {
+        // Suppress errors
+    }
 }
 ?>

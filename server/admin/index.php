@@ -91,6 +91,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $stmt->execute([$user_id]);
                 $success_msg = "Backup successfully deleted.";
             }
+        } elseif ($action === 'add_webhook') {
+            $user_id = $_POST['user_id'] ?? '';
+            $url = $_POST['url'] ?? '';
+            if (!empty($user_id) && !empty($url)) {
+                $stmt = $pdo->prepare("INSERT INTO webhooks (user_id, url, events) VALUES (?, ?, '*')");
+                $stmt->execute([$user_id, $url]);
+                $success_msg = "Webhook registered successfully.";
+            }
+        } elseif ($action === 'delete_webhook') {
+            $webhook_id = $_POST['webhook_id'] ?? '';
+            if (!empty($webhook_id)) {
+                $stmt = $pdo->prepare("DELETE FROM webhooks WHERE id = ?");
+                $stmt->execute([$webhook_id]);
+                $success_msg = "Webhook deleted successfully.";
+            }
         } elseif ($action === 'clear_logs') {
             $pdo->exec("TRUNCATE TABLE api_logs");
             $success_msg = "API logs cleared.";
@@ -144,13 +159,14 @@ $messages_count = $pdo->query("SELECT COUNT(*) FROM chronicle_messages")->fetchC
 $errors_count = $pdo->query("SELECT COUNT(*) FROM api_logs WHERE log_type = 'API_ERROR' OR log_type = 'AUTH_FAILURE'")->fetchColumn();
 $backups_count = $pdo->query("SELECT COUNT(*) FROM backups")->fetchColumn();
 
-// Usuarios con nombre resuelto — project_members primero, luego chronicle si no aparece
+// Usuarios con nombre resuelto — users.username primero, luego project_members, luego chronicle
 $users = $pdo->query("
     SELECT
         u.id,
         u.public_key,
         u.created_at,
         COALESCE(
+            NULLIF(u.username, ''),
             (SELECT pm.user_username FROM project_members pm
              WHERE pm.user_identity = u.public_key LIMIT 1),
             (SELECT cm.sender_username FROM chronicle_messages cm
@@ -178,6 +194,9 @@ $backups = $pdo->query("SELECT b.user_id, b.created_at, LENGTH(b.backup_data) as
 // Logs de errores y auth failures — los primeros 20 más recientes
 $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs ORDER BY created_at DESC LIMIT 20")->fetchAll();
 
+// Webhooks registrados
+$webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.username, '—') as username FROM webhooks w LEFT JOIN users u ON w.user_id = u.id ORDER BY w.created_at DESC")->fetchAll();
+
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -185,19 +204,26 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Questline Cloud Chronicle Admin Dashboard</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
     <style>
         :root {
-            --bg-color: #0d0e12;
-            --panel-bg: #14161f;
-            --accent-primary: #8b5cf6;
-            --accent-secondary: #06b6d4;
-            --text-color: #e2e8f0;
-            --text-muted: #64748b;
-            --border-color: #272a37;
-            --success: #10b981;
-            --warning: #f59e0b;
-            --danger: #ef4444;
+            --warlock:    rgb(168,  85, 247);
+            --paladin:    rgb(255, 105, 180);
+            --sage:       rgb(  6, 182, 212);
+            --architect:  rgb( 59, 130, 246);
+            --chrono:     rgb(249, 115,  22);
+            --accountant: rgb(245, 158,  11);
+
+            --bg:         #080808;
+            --bg-card:    #0f0f0f;
+            --bg-border:  #1c1c1c;
+            --text:       #d4d4d4;
+            --text-dim:   #999;
+            --text-dimmer:#2a2a2a;
+
+            --success:    #10b981;
+            --warning:    var(--accountant);
+            --danger:     #ef4444;
         }
 
         * {
@@ -206,10 +232,23 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             padding: 0;
         }
 
+        /* scanline overlay */
+        body::before {
+            content: '';
+            pointer-events: none;
+            position: fixed;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg, transparent, transparent 2px,
+                rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px
+            );
+            z-index: 9999;
+        }
+
         body {
-            background-color: var(--bg-color);
-            color: var(--text-color);
-            font-family: 'Outfit', sans-serif;
+            background-color: var(--bg);
+            color: var(--text);
+            font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
             line-height: 1.6;
             padding: 2rem;
         }
@@ -219,32 +258,42 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             justify-content: space-between;
             align-items: center;
             margin-bottom: 2rem;
-            border-bottom: 2px solid var(--border-color);
+            border-bottom: 1px solid var(--bg-border);
             padding-bottom: 1rem;
         }
 
         header h1 {
-            font-size: 2rem;
-            font-weight: 800;
-            background: linear-gradient(135deg, var(--accent-primary), var(--accent-secondary));
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent;
+            font-size: 1.5rem;
+            font-weight: 700;
+            letter-spacing: 0.1em;
+            text-transform: uppercase;
+            animation: cycleColor 9s linear infinite;
+        }
+
+        @keyframes cycleColor {
+            0%   { color: var(--warlock);    text-shadow: 0 0 15px rgba(168, 85, 247, 0.4);    }
+            16%  { color: var(--paladin);    text-shadow: 0 0 15px rgba(255, 105, 180, 0.4);    }
+            33%  { color: var(--sage);       text-shadow: 0 0 15px rgba(6, 182, 212, 0.4);       }
+            50%  { color: var(--architect);  text-shadow: 0 0 15px rgba(59, 130, 246, 0.4);  }
+            66%  { color: var(--chrono);     text-shadow: 0 0 15px rgba(249, 115, 22, 0.4);     }
+            83%  { color: var(--accountant); text-shadow: 0 0 15px rgba(245, 158, 11, 0.4); }
+            100% { color: var(--warlock);    text-shadow: 0 0 15px rgba(168, 85, 247, 0.4);    }
         }
 
         header a {
-            background-color: var(--panel-bg);
-            color: var(--text-color);
-            border: 1px solid var(--border-color);
+            background-color: var(--bg-card);
+            color: var(--text);
+            border: 1px solid var(--bg-border);
             padding: 0.5rem 1rem;
             text-decoration: none;
-            border-radius: 6px;
             font-weight: 600;
             transition: all 0.2s ease;
         }
 
         header a:hover {
-            border-color: var(--accent-primary);
-            color: var(--accent-primary);
+            border-color: var(--warlock);
+            color: #fff;
+            box-shadow: 0 0 10px rgba(168, 85, 247, 0.3);
         }
 
         .stats-grid {
@@ -255,18 +304,17 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .stat-card {
-            background-color: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
+            background-color: var(--bg-card);
+            border: 1px solid var(--bg-border);
             padding: 1.5rem;
             text-align: center;
             position: relative;
-            overflow: hidden;
-            transition: transform 0.2s ease;
+            transition: transform 0.2s ease, border-color 0.2s;
         }
 
         .stat-card:hover {
-            transform: translateY(-4px);
+            transform: translateY(-2px);
+            border-color: var(--text-dimmer);
         }
 
         .stat-card::before {
@@ -274,13 +322,13 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             position: absolute;
             top: 0;
             left: 0;
-            width: 4px;
-            height: 100%;
-            background-color: var(--accent-primary);
+            right: 0;
+            height: 2px;
+            background-color: var(--warlock);
         }
 
         .stat-card.cyan::before {
-            background-color: var(--accent-secondary);
+            background-color: var(--sage);
         }
 
         .stat-card.danger::before {
@@ -292,16 +340,16 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .stat-value {
-            font-size: 2.5rem;
-            font-weight: 800;
-            font-family: 'JetBrains Mono', monospace;
+            font-size: 2.2rem;
+            font-weight: 700;
             margin: 0.5rem 0;
+            color: #fff;
         }
 
         .stat-label {
-            color: var(--text-muted);
+            color: var(--text-dim);
             text-transform: uppercase;
-            font-size: 0.8rem;
+            font-size: 0.75rem;
             letter-spacing: 1px;
             font-weight: 600;
         }
@@ -319,45 +367,46 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .panel {
-            background-color: var(--panel-bg);
-            border: 1px solid var(--border-color);
-            border-radius: 12px;
+            background-color: var(--bg-card);
+            border: 1px solid var(--bg-border);
             padding: 1.5rem;
             margin-bottom: 2rem;
         }
 
         .panel-title {
-            font-size: 1.25rem;
+            font-size: 1.1rem;
             font-weight: 700;
             margin-bottom: 1.2rem;
             display: flex;
             align-items: center;
             justify-content: space-between;
-            color: var(--accent-secondary);
+            color: var(--sage);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
         }
 
         table {
             width: 100%;
             border-collapse: collapse;
-            font-size: 0.9rem;
+            font-size: 0.85rem;
         }
 
         th, td {
             padding: 0.75rem 1rem;
             text-align: left;
-            border-bottom: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--bg-border);
         }
 
         th {
-            color: var(--text-muted);
+            color: var(--text-dim);
             font-weight: 600;
             text-transform: uppercase;
-            font-size: 0.75rem;
+            font-size: 0.72rem;
             letter-spacing: 0.5px;
         }
 
         td {
-            font-family: 'JetBrains Mono', monospace;
+            color: var(--text);
         }
 
         tr:last-child td {
@@ -365,21 +414,22 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .mono {
-            font-family: 'JetBrains Mono', monospace;
+            font-family: inherit;
         }
 
         .badge {
             display: inline-block;
-            padding: 0.2rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
+            padding: 0.15rem 0.4rem;
+            border-radius: 2px;
+            font-size: 0.7rem;
             font-weight: 700;
+            text-transform: uppercase;
         }
 
-        .badge-success { background-color: rgba(16, 185, 129, 0.2); color: var(--success); }
-        .badge-danger { background-color: rgba(239, 68, 68, 0.2); color: var(--danger); }
-        .badge-info { background-color: rgba(6, 182, 212, 0.2); color: var(--accent-secondary); }
-        .badge-warning { background-color: rgba(245, 158, 11, 0.2); color: var(--warning); }
+        .badge-success { background-color: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
+        .badge-danger { background-color: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+        .badge-info { background-color: rgba(6, 182, 212, 0.15); color: var(--sage); border: 1px solid rgba(6, 182, 212, 0.3); }
+        .badge-warning { background-color: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
 
         .error-message {
             color: var(--danger);
@@ -388,12 +438,11 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .btn {
-            background-color: var(--panel-bg);
-            color: var(--text-color);
-            border: 1px solid var(--border-color);
+            background-color: var(--bg-card);
+            color: var(--text);
+            border: 1px solid var(--bg-border);
             padding: 0.3rem 0.6rem;
             text-decoration: none;
-            border-radius: 4px;
             font-size: 0.8rem;
             font-weight: 600;
             cursor: pointer;
@@ -401,13 +450,14 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
         }
 
         .btn:hover {
-            border-color: var(--accent-primary);
-            color: var(--accent-primary);
+            border-color: var(--warlock);
+            color: #fff;
+            box-shadow: 0 0 8px rgba(168, 85, 247, 0.2);
         }
 
         .btn-danger {
             color: var(--danger);
-            border-color: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.3);
             background-color: rgba(239, 68, 68, 0.05);
         }
 
@@ -415,11 +465,12 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             color: #fff;
             background-color: var(--danger);
             border-color: var(--danger);
+            box-shadow: 0 0 8px rgba(239, 68, 68, 0.4);
         }
         
         .btn-warning {
             color: var(--warning);
-            border-color: rgba(245, 158, 11, 0.2);
+            border-color: rgba(245, 158, 11, 0.3);
             background-color: rgba(245, 158, 11, 0.05);
         }
 
@@ -427,6 +478,7 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             color: #fff;
             background-color: var(--warning);
             border-color: var(--warning);
+            box-shadow: 0 0 8px rgba(245, 158, 11, 0.4);
         }
 
         .key-cell {
@@ -435,23 +487,21 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
             gap: 0.5rem;
         }
         .key-text {
-            color: var(--accent-secondary);
-            font-family: 'JetBrains Mono', monospace;
-            font-size: 0.82rem;
+            color: var(--sage);
+            font-size: 0.8rem;
             letter-spacing: 0.03em;
             cursor: default;
         }
         .btn-copy {
             flex-shrink: 0;
             padding: 0.15rem 0.5rem;
-            font-size: 0.72rem;
+            font-size: 0.7rem;
         }
         .btn-copy.copied {
             color: var(--success);
             border-color: var(--success);
         }
         .username-cell {
-            font-family: 'Outfit', sans-serif;
             font-weight: 600;
             color: #fff;
         }
@@ -670,6 +720,61 @@ $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs OR
                                 <form method="POST" style="display:inline;" onsubmit="return confirm('Are you sure you want to delete this backup?');">
                                     <input type="hidden" name="action" value="delete_backup">
                                     <input type="hidden" name="user_id" value="<?= htmlspecialchars($b['user_id']) ?>">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                                    <button type="submit" class="btn btn-danger">Delete</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    <!-- Panel: Webhooks — configure dynamic updates to Discord, Slack, etc. -->
+    <div class="panel">
+        <div class="panel-title">Webhook Integration Manager</div>
+        <div style="background: rgba(255,255,255,0.03); padding: 1rem; border-radius: 4px; margin-bottom: 1.5rem;">
+            <h4 style="margin-top:0; color:#fff; font-size:0.9rem; margin-bottom:0.5rem;">Add Webhook Integration</h4>
+            <form method="POST" style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center;">
+                <input type="hidden" name="action" value="add_webhook">
+                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                
+                <select name="user_id" required style="background:#111; border:1px solid #333; color:#fff; padding:0.4rem; font-family:inherit;">
+                    <option value="" disabled selected>Select Adventurer...</option>
+                    <?php foreach ($users as $u): ?>
+                        <option value="<?= htmlspecialchars($u['id']) ?>"><?= htmlspecialchars($u['username']) ?> (<?= substr($u['id'],0,8) ?>...)</option>
+                    <?php endforeach; ?>
+                </select>
+                
+                <input type="url" name="url" placeholder="https://discord.com/api/webhooks/..." required style="background:#111; border:1px solid #333; color:#fff; padding:0.4rem; flex:1; min-width:250px; font-family:inherit;">
+                
+                <button type="submit" class="btn" style="background:var(--accent-secondary); color:#000; font-weight:bold;">Register Webhook</button>
+            </form>
+        </div>
+        
+        <table>
+            <thead>
+                <tr>
+                    <th>Adventurer</th>
+                    <th>Target URL</th>
+                    <th>Subscribed Events</th>
+                    <th style="text-align: right;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (empty($webhooks)): ?>
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-muted)">No webhooks registered.</td></tr>
+                <?php else: ?>
+                    <?php foreach ($webhooks as $wh): ?>
+                        <tr>
+                            <td><strong><?= htmlspecialchars($wh['username']) ?></strong></td>
+                            <td title="<?= htmlspecialchars($wh['url']) ?>" style="color: var(--accent-secondary)"><?= substr($wh['url'], 0, 50) ?>...</td>
+                            <td><code><?= htmlspecialchars($wh['events']) ?></code></td>
+                            <td style="text-align: right;">
+                                <form method="POST" style="display:inline;">
+                                    <input type="hidden" name="action" value="delete_webhook">
+                                    <input type="hidden" name="webhook_id" value="<?= htmlspecialchars($wh['id']) ?>">
                                     <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
                                     <button type="submit" class="btn btn-danger">Delete</button>
                                 </form>
