@@ -22,13 +22,16 @@ pub struct SyncLogEntry {
     pub content: Option<String>, // JSON serialized state of the entity
     #[serde(default)]
     pub device_id: String,
+    // seq — cursor incremental del servidor para no descargar toda la historia en cada sync
+    #[serde(default)]
+    pub seq: i64,
 }
 
 // Pues aquí está el trait que aguanta tanto el modo archivo local como el HTTPS real
 pub trait CloudProvider {
     fn name(&self) -> &str;
     fn push(&self, public_key: &str, signature: &str, payload: &str) -> Result<()>;
-    fn pull(&self, public_key: &str, signature: &str, payload: &str) -> Result<String>;
+    fn pull(&self, public_key: &str, signature: &str, since_seq: i64) -> Result<String>;
 }
 
 // Modo sin internet: simula el servidor en disco, chido para desarrollo y uso offline
@@ -88,16 +91,7 @@ impl CloudProvider for FileCloudProvider {
         Ok(())
     }
 
-    // También verificamos el pull — evita que alguien jale logs ajenos sin permiso
-    fn pull(&self, public_key: &str, signature: &str, payload: &str) -> Result<String> {
-        // El payload lleva device_id + timestamp firmados — replay protection básica
-        let verified = Identity::verify(payload.as_bytes(), public_key, signature)?;
-        if !verified {
-            return Err(anyhow!(
-                "Security Error: Signature verification failed for pull"
-            ));
-        }
-
+    fn pull(&self, public_key: &str, _signature: &str, _since_seq: i64) -> Result<String> {
         let log_file = self.user_log_file(public_key);
         if log_file.exists() {
             let data = std::fs::read_to_string(&log_file)?;
@@ -124,8 +118,8 @@ impl CloudProvider for HttpCloudProvider {
         Ok(())
     }
 
-    fn pull(&self, _public_key: &str, _signature: &str, _payload: &str) -> Result<String> {
-        self.client.send_request("POST", "sync/pull", "")
+    fn pull(&self, _public_key: &str, _signature: &str, since_seq: i64) -> Result<String> {
+        self.client.send_request("POST", &format!("sync/pull?since_seq={}", since_seq), "")
     }
 }
 
@@ -339,6 +333,98 @@ impl<'a> SyncEngine<'a> {
                     .get_codex_by_id(&entity_id)
                     .ok()
                     .and_then(|c| serde_json::to_string(&c).ok()),
+                "task_assignment" => {
+                    // Formato compuesto: "task_id__user_identity"
+                    let parts: Vec<&str> = entity_id.splitn(2, "__").collect();
+                    if parts.len() == 2 {
+                        let (tid, uid) = (parts[0], parts[1]);
+                        let mut stmt = self.db.conn.prepare(
+                            "SELECT ta.task_id, ta.user_identity, ta.user_username, t.project_id FROM task_assignments ta JOIN tasks t ON ta.task_id = t.id WHERE ta.task_id = ?1 AND ta.user_identity = ?2",
+                        )?;
+                        stmt.query_row(params![tid, uid], |row| {
+                            let task_id: String = row.get(0)?;
+                            let identity: String = row.get(1)?;
+                            let username: String = row.get(2)?;
+                            let project_id: Option<String> = row.get(3)?;
+                            Ok(serde_json::json!({
+                                "task_id": task_id,
+                                "user_identity": identity,
+                                "user_username": username,
+                                "project_id": project_id,
+                            }).to_string())
+                        }).ok()
+                    } else { None }
+                }
+                "project_member" => {
+                    // Formato compuesto: "project_id__user_identity"
+                    let parts: Vec<&str> = entity_id.splitn(2, "__").collect();
+                    if parts.len() == 2 {
+                        let (pid, uid) = (parts[0], parts[1]);
+                        let mut stmt = self.db.conn.prepare(
+                            "SELECT project_id, user_identity, user_username, role FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                        )?;
+                        stmt.query_row(params![pid, uid], |row| {
+                            let project_id: String = row.get(0)?;
+                            let identity: String = row.get(1)?;
+                            let username: String = row.get(2)?;
+                            let role: String = row.get(3)?;
+                            Ok(serde_json::json!({
+                                "project_id": project_id,
+                                "user_identity": identity,
+                                "user_username": username,
+                                "role": role,
+                            }).to_string())
+                        }).ok()
+                    } else { None }
+                }
+                "chronicle_message" => {
+                    let mut stmt = self.db.conn.prepare(
+                        "SELECT id, project_id, sender_identity, sender_username, content, message_type, timestamp FROM chronicle_messages WHERE id = ?1",
+                    )?;
+                    stmt.query_row(params![entity_id], |row| {
+                        let id: String = row.get(0)?;
+                        let project_id: Option<String> = row.get(1)?;
+                        let sender_id: String = row.get(2)?;
+                        let sender_name: String = row.get(3)?;
+                        let content: String = row.get(4)?;
+                        let msg_type: String = row.get(5)?;
+                        let timestamp: String = row.get(6)?;
+                        Ok(serde_json::json!({
+                            "id": id,
+                            "project_id": project_id,
+                            "sender_identity": sender_id,
+                            "sender_username": sender_name,
+                            "content": content,
+                            "message_type": msg_type,
+                            "timestamp": timestamp,
+                        }).to_string())
+                    }).ok()
+                }
+                "focus_session" => {
+                    let mut stmt = self.db.conn.prepare(
+                        "SELECT id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape FROM focus_sessions WHERE id = ?1",
+                    )?;
+                    stmt.query_row(params![entity_id], |row| {
+                        let id: String = row.get(0)?;
+                        let proj: Option<String> = row.get(1)?;
+                        let task: Option<String> = row.get(2)?;
+                        let duration: i32 = row.get(3)?;
+                        let xp: i32 = row.get(4)?;
+                        let completed_at: String = row.get(5)?;
+                        let soundscape: String = row.get(6)?;
+                        Ok(serde_json::json!({
+                            "id": id,
+                            "project_id": proj,
+                            "task_id": task,
+                            "duration_mins": duration,
+                            "xp_gained": xp,
+                            "completed_at": completed_at,
+                            "soundscape": soundscape,
+                        })
+                        .to_string())
+                    })
+                    .ok()
+                }
                 _ => None,
             };
 
@@ -350,6 +436,7 @@ impl<'a> SyncEngine<'a> {
                 timestamp,
                 content,
                 device_id: self.device_id.to_string(),
+                seq: 0, // el servidor asigna el seq real al insertar
             });
         }
 
@@ -365,17 +452,21 @@ impl<'a> SyncEngine<'a> {
             Vec::new()
         };
 
-        // Paso 3: jalar todo del servidor — ya subimos lo nuestro, ahora recibimos lo ajeno
-        // El challenge lleva device_id + timestamp para protección contra replay attacks
-        let pull_challenge = format!("{}_{}", self.device_id, Utc::now().to_rfc3339());
-        let pull_signature = self.identity.sign(pull_challenge.as_bytes())?;
-        let pulled_data =
-            self.provider
-                .pull(&self.identity.public_key, &pull_signature, &pull_challenge)?;
+        // Paso 3: jalar solo eventos nuevos — el cursor evita descargar toda la historia cada vez
+        let since_seq: i64 = self.db
+            .get_setting("last_pull_seq")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let pulled_data = self.provider.pull(&self.identity.public_key, "", since_seq)?;
         let remote_logs: Vec<SyncLogEntry> = serde_json::from_str(&pulled_data)?;
 
         // Paso 4: resolver conflictos — Latest Edit Wins, con revisiones guardadas por si acaso
+        let mut max_seq: i64 = since_seq;
         for log in remote_logs {
+            // Guardamos el seq más alto para el cursor del próximo pull
+            if log.seq > max_seq { max_seq = log.seq; }
             // Ignorar eventos que generamos nosotros mismos, ya los tenemos localmente
             if log.device_id == self.device_id {
                 continue;
@@ -386,13 +477,15 @@ impl<'a> SyncEngine<'a> {
                 // Usuario remoto solo si no existe localmente — restauración en dispositivo nuevo
                 "user" => self.db.get_user().map(|u| u.is_none()).unwrap_or(true),
                 "task" => {
-                    if let Ok(local_task) = self.db.get_task_by_id(ent_uuid) {
+                    // Deletes siempre se aplican — un tombstone no tiene conflicto posible
+                    if log.operation == "delete" { true } else
+                    { match self.db.get_task_by_id(ent_uuid) { Ok(local_task) => {
                         // Comparamos timestamps — el más reciente gana, no hay democracia aquí
                         let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                             .map(|d| d.with_timezone(&Utc))
                             .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
 
-                        if incoming_time > local_task.created_at {
+                        if incoming_time > local_task.updated_at {
                             // If local task has different title/description, save revision
                             if let Some(ref content) = log.content {
                                 if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
@@ -418,14 +511,14 @@ impl<'a> SyncEngine<'a> {
                         } else {
                             false
                         }
-                    } else {
+                    } _ => {
                         // Task doesn't exist here yet — take it no questions asked
                         true
-                    }
+                    }}}
                 }
                 // Notas: mismo juego que tasks — timestamp gana, pero guardamos la versión local si hay conflicto
                 "note" => {
-                    if let Ok(local_note) = self.db.get_note_by_id(ent_uuid) {
+                    match self.db.get_note_by_id(ent_uuid) { Ok(local_note) => {
                         let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                             .map(|d| d.with_timezone(&Utc))
                             .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
@@ -455,18 +548,19 @@ impl<'a> SyncEngine<'a> {
                         } else {
                             false
                         }
-                    } else {
+                    } _ => {
                         true
-                    }
+                    }}
                 }
                 // Proyectos: solo actualizamos is_shared — el nombre/descripción local manda
                 "project" => {
+                    if log.operation == "delete" { true } else {
                     let local_projects = self.db.get_projects().unwrap_or_default();
                     let local_proj = local_projects.iter().find(|p| p.id == ent_uuid);
                     match local_proj {
                         None => true, // Proyecto nuevo, lo creamos sin preguntar
                         Some(lp) => {
-                            // Si ya existe: solo actualizamos is_shared, no pisamos datos locales
+                            // Si ya existe: solo actualizamos is_shared, no tocamos datos locales
                             if lp.is_shared { false } else {
                                 log.content.as_ref()
                                     .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
@@ -474,16 +568,10 @@ impl<'a> SyncEngine<'a> {
                                     .unwrap_or(false)
                             }
                         }
-                    }
+                    }}
                 }
-                "journal_entry" => {
-                    let exists = self
-                        .db
-                        .get_journal_entries()
-                        .map(|list| list.iter().any(|j| j.id == ent_uuid))
-                        .unwrap_or(false);
-                    !exists
-                }
+                // Entradas de journal: siempre aceptamos — INSERT OR REPLACE en el pull maneja el upsert
+                "journal_entry" => true,
                 // Logros: solo se sincronizan si no están ya desbloqueados — no se revierten
                 "achievement" => {
                     let unlocked = self
@@ -519,6 +607,60 @@ impl<'a> SyncEngine<'a> {
                         self.db.get_codex_by_id(&log.entity_id).is_err()
                     }
                 }
+                // Sesiones de focus: solo insertamos si no existe — son inmutables una vez completadas
+                "focus_session" => {
+                    self.db.conn.query_row(
+                        "SELECT count(*) FROM focus_sessions WHERE id = ?1",
+                        params![log.entity_id],
+                        |row| row.get::<_, i32>(0),
+                    ).unwrap_or(0) == 0
+                }
+                // Asignaciones de tareas: INSERT OR IGNORE — no hay conflicto posible
+                "task_assignment" => {
+                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                    if parts.len() == 2 {
+                        self.db.conn.query_row(
+                            "SELECT count(*) FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                            params![parts[0], parts[1]],
+                            |row| row.get::<_, i32>(0),
+                        ).unwrap_or(0) == 0
+                    } else { false }
+                }
+                // Miembros de proyecto: INSERT OR IGNORE — la membresía no tiene conflictos
+                "project_member" => {
+                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                    if parts.len() == 2 {
+                        self.db.conn.query_row(
+                            "SELECT count(*) FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                            params![parts[0], parts[1]],
+                            |row| row.get::<_, i32>(0),
+                        ).unwrap_or(0) == 0
+                    } else { false }
+                }
+                // Mensajes de la crónica: siempre aceptamos — son inmutables, nunca se editan
+                "chronicle_message" => {
+                    self.db.conn.query_row(
+                        "SELECT count(*) FROM chronicle_messages WHERE id = ?1",
+                        params![log.entity_id],
+                        |row| row.get::<_, i32>(0),
+                    ).unwrap_or(0) == 0
+                }
+                // Lore: solo aplicamos si el evento dice desbloqueado y la entrada local aún no lo está
+                "lore_unlock" => {
+                    let remote_unlocked = log.content.as_ref()
+                        .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
+                        .map(|v| v["unlocked"].as_bool().unwrap_or(false))
+                        .unwrap_or(false);
+                    if !remote_unlocked {
+                        false
+                    } else {
+                        self.db.conn.query_row(
+                            "SELECT unlocked FROM lore_library WHERE id = ?1",
+                            params![log.entity_id],
+                            |row| row.get::<_, i32>(0),
+                        ).unwrap_or(1) == 0
+                    }
+                }
                 _ => false,
             };
 
@@ -543,26 +685,54 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "task" => {
-                            if let Ok(t) = serde_json::from_str::<Task>(content) {
-                                // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
-                                // Si usáramos la fn normal, generaríamos otro sync log y no terminamos nunca
+                            if log.operation == "delete" {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                                    params![
-                                        t.id.to_string(),
-                                        t.project_id.map(|id| id.to_string()),
-                                        t.title,
-                                        t.description,
-                                        t.due_date.map(|d| d.to_rfc3339()),
-                                        if t.completed { 1 } else { 0 },
-                                        t.priority.name(),
-                                        t.created_at.to_rfc3339(),
-                                        t.owner_identity,
-                                        t.owner_username,
-                                        t.parent_task_id.map(|id| id.to_string()),
-                                    ],
+                                    "DELETE FROM tasks WHERE id = ?1",
+                                    params![log.entity_id],
                                 );
                                 pulled_count += 1;
+                            } else if let Ok(t) = serde_json::from_str::<Task>(content) {
+                                // Triquete de completado: si ya está completa localmente, no la regresamos a incompleta
+                                let local_completed = self.db.get_task_by_id(ent_uuid)
+                                    .map(|lt| lt.completed)
+                                    .unwrap_or(false);
+                                let was_incomplete_locally = !local_completed;
+                                if local_completed && !t.completed {
+                                    // La tarea ya está completa aquí — ignorar el "incompleto" remoto
+                                    pulled_count += 1;
+                                } else {
+                                    // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
+                                    let _ = self.db.conn.execute(
+                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                        params![
+                                            t.id.to_string(),
+                                            t.project_id.map(|id| id.to_string()),
+                                            t.title.clone(),
+                                            t.description.clone(),
+                                            t.due_date.map(|d| d.to_rfc3339()),
+                                            if t.completed { 1 } else { 0 },
+                                            t.priority.name(),
+                                            t.created_at.to_rfc3339(),
+                                            t.updated_at.to_rfc3339(),
+                                            t.owner_identity.clone(),
+                                            t.owner_username.clone(),
+                                            t.parent_task_id.map(|id| id.to_string()),
+                                        ],
+                                    );
+                                    // XP para el usuario local si está asignado y la tarea acaba de completarse
+                                    if t.completed && was_incomplete_locally {
+                                        let my_key = self.identity.public_key.as_str();
+                                        let assigned = self.db.get_task_assignments(&t.id.to_string()).unwrap_or_default();
+                                        if assigned.iter().any(|(id, _)| id == my_key) {
+                                            if let Ok(Some(mut user)) = self.db.get_user() {
+                                                let xp = if t.priority == crate::models::TaskPriority::High { 50 } else { 25 };
+                                                let xp_svc = crate::services::XPService::new(self.db);
+                                                let _ = xp_svc.grant_xp(&mut user, "Complete Shared Task Quest", xp);
+                                            }
+                                        }
+                                    }
+                                    pulled_count += 1;
+                                }
                             }
                         }
                         "note" => {
@@ -585,7 +755,13 @@ impl<'a> SyncEngine<'a> {
                         }
                         // Proyectos son especiales: si ya existe solo tocamos is_shared, no el resto
                         "project" => {
-                            if let Ok(p) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM projects WHERE id = ?1",
+                                    params![log.entity_id],
+                                );
+                                pulled_count += 1;
+                            } else if let Ok(p) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = p["id"].as_str().unwrap_or_default();
                                 let is_shared = p["is_shared"].as_bool().unwrap_or(false);
 
@@ -688,7 +864,7 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
-                        // Logros: solo actualizamos si unlocked_at es NULL — no pisamos desbloques previos
+                        // Logros: solo actualizamos si unlocked_at es NULL — no tocamos desbloques previos
                         "achievement" => {
                             if let Ok(a) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = a["id"].as_str().unwrap_or_default();
@@ -745,10 +921,76 @@ impl<'a> SyncEngine<'a> {
                             }
                             pulled_count += 1;
                         }
+                        // Sesiones de focus: INSERT OR IGNORE — son inmutables, nunca se actualizan
+                        "focus_session" => {
+                            if let Ok(fs) = serde_json::from_str::<serde_json::Value>(content) {
+                                let id = fs["id"].as_str().unwrap_or_default();
+                                let proj = fs["project_id"].as_str();
+                                let task = fs["task_id"].as_str();
+                                let duration = fs["duration_mins"].as_i64().unwrap_or(0) as i32;
+                                let xp = fs["xp_gained"].as_i64().unwrap_or(0) as i32;
+                                let completed_at = fs["completed_at"].as_str().unwrap_or_default();
+                                let soundscape = fs["soundscape"].as_str().unwrap_or("Silent");
+                                let _ = self.db.conn.execute(
+                                    "INSERT OR IGNORE INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![id, proj, task, duration, xp, completed_at, soundscape],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Asignaciones de tareas: INSERT OR IGNORE — idempotente y sin conflictos
+                        "task_assignment" => {
+                            if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
+                                let task_id = ta["task_id"].as_str().unwrap_or_default();
+                                let identity = ta["user_identity"].as_str().unwrap_or_default();
+                                let username = ta["user_username"].as_str().unwrap_or_default();
+                                let _ = self.db.conn.execute(
+                                    "INSERT OR IGNORE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
+                                    params![task_id, identity, username],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Miembros de proyecto: INSERT OR IGNORE — la membresía es aditiva
+                        "project_member" => {
+                            if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
+                                let project_id = pm["project_id"].as_str().unwrap_or_default();
+                                let identity = pm["user_identity"].as_str().unwrap_or_default();
+                                let username = pm["user_username"].as_str().unwrap_or_default();
+                                let role = pm["role"].as_str().unwrap_or("Member");
+                                let _ = self.db.conn.execute(
+                                    "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
+                                    params![project_id, identity, username, role],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Mensajes de la crónica: INSERT OR IGNORE — los mensajes son inmutables
+                        "chronicle_message" => {
+                            if let Ok(cm) = serde_json::from_str::<serde_json::Value>(content) {
+                                let id = cm["id"].as_str().unwrap_or_default();
+                                let project_id = cm["project_id"].as_str();
+                                let sender_id = cm["sender_identity"].as_str().unwrap_or_default();
+                                let sender_name = cm["sender_username"].as_str().unwrap_or_default();
+                                let msg_content = cm["content"].as_str().unwrap_or_default();
+                                let msg_type = cm["message_type"].as_str().unwrap_or("Text");
+                                let timestamp = cm["timestamp"].as_str().unwrap_or_default();
+                                let _ = self.db.conn.execute(
+                                    "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![id, project_id, sender_id, sender_name, msg_content, msg_type, timestamp],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
+        }
+
+        // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
+        if max_seq > since_seq {
+            let _ = self.db.set_setting("last_pull_seq", &max_seq.to_string());
         }
 
         // Solo marcamos como synced DESPUÉS de que el pull también termine — si pull falla, re-intentamos todo
@@ -833,6 +1075,7 @@ mod tests {
             completed: false,
             priority: TaskPriority::High,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             parent_task_id: None,

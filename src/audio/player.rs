@@ -32,8 +32,8 @@ impl AudioPlayer {
         let mut handle = None;
         let mut sink = None;
 
-        if let Ok((s, h)) = OutputStream::try_default() {
-            if let Ok(sk) = Sink::try_new(&h) {
+        match OutputStream::try_default() { Ok((s, h)) => {
+            match Sink::try_new(&h) { Ok(sk) => {
                 _stream = Some(s);
                 handle = Some(h);
                 // volumen default al 50%, ni muy alto ni muy bajo
@@ -45,22 +45,22 @@ impl AudioPlayer {
                     "Audio output stream initialized successfully.",
                     None,
                 );
-            } else {
+            } _ => {
                 crate::services::log_structured(
                     "ERROR",
                     "audio_init",
                     "Failed to create audio playback sink.",
                     None,
                 );
-            }
-        } else {
+            }}
+        } _ => {
             crate::services::log_structured(
                 "WARNING",
                 "audio_init",
                 "Failed to initialize default audio output stream. Running in silent mode.",
                 None,
             );
-        }
+        }}
 
         let player = Self {
             _stream,

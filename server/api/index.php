@@ -130,6 +130,19 @@ try {
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    // Migraciones: agregar device_id y seq a sync_events para filtrar propios eventos y cursor incremental
+    try {
+        $pdo->exec("ALTER TABLE sync_events ADD COLUMN device_id VARCHAR(36) NOT NULL DEFAULT ''");
+        $pdo->exec("ALTER TABLE sync_events ADD INDEX idx_sync_events_device (user_id, device_id)");
+    } catch (PDOException $e) {
+        if (strpos($e->getMessage(), '1060') === false && strpos($e->getMessage(), '1061') === false) { throw $e; }
+    }
+    try {
+        $pdo->exec("ALTER TABLE sync_events ADD COLUMN seq BIGINT NOT NULL AUTO_INCREMENT, ADD KEY idx_seq (seq)");
+        $pdo->exec("ALTER TABLE sync_events ADD INDEX idx_sync_events_seq (user_id, seq)");
+    } catch (PDOException $e) {
+        if (strpos($e->getMessage(), '1060') === false && strpos($e->getMessage(), '1061') === false) { throw $e; }
+    }
 } catch (PDOException $e) {
     error_log("[Questline API] DB connection failed: " . $e->getMessage());
     http_response_code(500);
@@ -499,15 +512,16 @@ try {
             
             $inserted = 0;
             $pdo->beginTransaction();
-            $stmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
-            
+            $stmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+
             // Prepared statements listos para replicar a los otros miembros del proyecto
             $memberStmt = $pdo->prepare("SELECT user_identity FROM project_members WHERE project_id = ? AND user_identity != ?");
             $userIdStmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
-            $replicateInsertStmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+            $replicateInsertStmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
             foreach ($entries as $e) {
                 if (empty($e['id'])) continue;
+                $eventDeviceId = $e['device_id'] ?? $deviceId ?? '';
                 $stmt->execute([
                     $e['id'],
                     $userId,
@@ -515,7 +529,8 @@ try {
                     $e['entity_id'],
                     $e['operation'],
                     $e['content'] ?? '',
-                    $e['timestamp']
+                    $e['timestamp'],
+                    $eventDeviceId
                 ]);
                 $inserted += $stmt->rowCount();
 
@@ -528,7 +543,7 @@ try {
                 $projectId = null;
                 if ($e['entity_type'] === 'project') {
                     $projectId = $e['entity_id'];
-                } elseif (in_array($e['entity_type'], ['task', 'note', 'journal_entry', 'milestone'])) {
+                } elseif (in_array($e['entity_type'], ['task', 'note', 'journal_entry', 'milestone', 'focus_session', 'codex', 'task_assignment', 'project_member', 'chronicle_message'])) {
                     if (!empty($e['content'])) {
                         $payloadObj = json_decode($e['content'], true);
                         if (!empty($payloadObj['project_id'])) {
@@ -552,7 +567,8 @@ try {
                                 $e['entity_id'],
                                 $e['operation'],
                                 $e['content'] ?? '',
-                                $e['timestamp']
+                                $e['timestamp'],
+                                $eventDeviceId
                             ]);
                         }
                     }
@@ -567,9 +583,11 @@ try {
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
-            // Jala todos los eventos del usuario para sincronizar — ordenados por fecha
-            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp FROM sync_events WHERE user_id = ? ORDER BY created_at ASC");
-            $stmt->execute([$userId]);
+            // Filtramos propios eventos y aplicamos cursor incremental para no descargar todo en cada sync
+            $pullDeviceId = $deviceId ?? '';
+            $sinceSeq = isset($_GET['since_seq']) ? (int)$_GET['since_seq'] : 0;
+            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp, device_id, seq FROM sync_events WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT 500");
+            $stmt->execute([$userId, $pullDeviceId, $sinceSeq]);
             $events = $stmt->fetchAll();
             echo json_encode($events);
             break;
