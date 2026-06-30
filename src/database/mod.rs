@@ -26,14 +26,27 @@ impl Database {
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
 
-        // Sin foreign keys el castillo de datos se cae — además le damos 3s para reintentar en caso de lock
+        // WAL mode: permite lecturas concurrentes mientras el sync thread escribe — sin esto la UI puede congelarse
+        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+        // Sin foreign keys el castillo de datos se cae — además le damos 5s para reintentar en caso de lock
         conn.execute("PRAGMA foreign_keys = ON;", [])?;
-        conn.execute_batch("PRAGMA busy_timeout = 3000;")?;
+        conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
         // Crea todas las tablas si no existen — el schema base
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
 
         // Migraciones por columna — ALTER TABLE si el campo no existe todavía (upgrades de versiones viejas)
+        let has_task_updated_at: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='updated_at'",
+            [],
+            |row| { let cnt: i32 = row.get(0)?; Ok(cnt > 0) },
+        )?;
+        if !has_task_updated_at {
+            conn.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';", [])?;
+            // Rellenar updated_at con created_at para tareas existentes — sin esto quedan vacías
+            conn.execute("UPDATE tasks SET updated_at = created_at WHERE updated_at = '';", [])?;
+        }
+
         let has_priority_col: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='priority'",
             [],
@@ -499,16 +512,11 @@ impl Database {
             ("class_chronomancer_30", "Class", "Rivalries", "Chronomancers frequently argue with Mind Sages.\n\nChronomancers believe notes should be brief.\n\nMind Sages believe brevity is reckless.\n\nThese debates often last several hours.\n\nWhich greatly annoys the Chronomancers.", 0, None),
         ];
 
-        // Borra las historias de clase viejas para reemplazarlas con las actualizadas
-        conn.execute(
-            "DELETE FROM lore_library WHERE category = 'Class'",
-            [],
-        )?;
-
+        // INSERT OR IGNORE: preserva el estado unlocked del usuario — no borramos ni reemplazamos filas existentes
         for (id, cat, title, content, unlocked, unlocked_at) in default_lore {
             let unlocked_at_str = unlocked_at;
             conn.execute(
-                "INSERT OR REPLACE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![id, cat, title, content, unlocked, unlocked_at_str],
             )?;
         }
@@ -771,6 +779,8 @@ impl Database {
 
     // Deletes an archived project permanently.
     pub fn delete_project_permanently(&self, id: Uuid) -> Result<()> {
+        // Tombstone antes de borrar — los otros dispositivos necesitan saber que este proyecto ya no existe
+        let _ = self.log_change("project", &id.to_string(), "delete");
         self.conn.execute(
             "DELETE FROM projects WHERE id = ?1",
             params![id.to_string()],
@@ -781,7 +791,7 @@ impl Database {
     // Crea una tarea nueva — también guarda revisión para historial de cambios
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 task.id.to_string(),
                 task.project_id.map(|id| id.to_string()),
@@ -791,6 +801,7 @@ impl Database {
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
                 task.created_at.to_rfc3339(),
+                task.updated_at.to_rfc3339(),
                 task.owner_identity,
                 task.owner_username,
                 task.parent_task_id.map(|id| id.to_string())
@@ -805,7 +816,7 @@ impl Database {
 
     // Lists all tasks.
     pub fn get_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, owner_identity, owner_username, parent_task_id FROM tasks")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -815,9 +826,10 @@ impl Database {
             let completed_int: i32 = row.get(5)?;
             let priority_str: String = row.get(6)?;
             let created_str: String = row.get(7)?;
-            let owner_identity: Option<String> = row.get(8)?;
-            let owner_username: Option<String> = row.get(9)?;
-            let parent_task_id_str: Option<String> = row.get(10)?;
+            let updated_str: String = row.get(8)?;
+            let owner_identity: Option<String> = row.get(9)?;
+            let owner_username: Option<String> = row.get(10)?;
+            let parent_task_id_str: Option<String> = row.get(11)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -837,6 +849,9 @@ impl Database {
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
                 Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
@@ -852,6 +867,7 @@ impl Database {
                 completed: completed_int != 0,
                 priority,
                 created_at,
+                updated_at,
                 owner_identity,
                 owner_username,
                 parent_task_id,
@@ -867,7 +883,7 @@ impl Database {
 
     // Lists tasks for a project.
     pub fn get_tasks_for_project(&self, project_id: Uuid) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE project_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -877,9 +893,10 @@ impl Database {
             let completed_int: i32 = row.get(5)?;
             let priority_str: String = row.get(6)?;
             let created_str: String = row.get(7)?;
-            let owner_identity: Option<String> = row.get(8)?;
-            let owner_username: Option<String> = row.get(9)?;
-            let parent_task_id_str: Option<String> = row.get(10)?;
+            let updated_str: String = row.get(8)?;
+            let owner_identity: Option<String> = row.get(9)?;
+            let owner_username: Option<String> = row.get(10)?;
+            let parent_task_id_str: Option<String> = row.get(11)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -891,12 +908,13 @@ impl Database {
                 None => None,
             };
             let created_at = DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
                 Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Task { id, project_id, title, description, due_date, completed: completed_int != 0, priority, created_at, owner_identity, owner_username, parent_task_id })
+            Ok(Task { id, project_id, title, description, due_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id })
         })?;
         let mut tasks = Vec::new();
         for r in rows { tasks.push(r?); }
@@ -909,8 +927,9 @@ impl Database {
         let old_task = self.get_task_by_id(task.id).ok();
         let was_completed = old_task.map(|t| t.completed).unwrap_or(false);
 
+        let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, completed = ?5, priority = ?6, owner_identity = ?7, owner_username = ?8, parent_task_id = ?9 WHERE id = ?10",
+            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, completed = ?5, priority = ?6, updated_at = ?7, owner_identity = ?8, owner_username = ?9, parent_task_id = ?10 WHERE id = ?11",
             params![
                 task.project_id.map(|id| id.to_string()),
                 task.title,
@@ -918,6 +937,7 @@ impl Database {
                 task.due_date.map(|d| d.to_rfc3339()),
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
+                now,
                 task.owner_identity,
                 task.owner_username,
                 task.parent_task_id.map(|id| id.to_string()),
@@ -940,6 +960,8 @@ impl Database {
 
     // Deletes a task.
     pub fn delete_task(&self, id: Uuid) -> Result<()> {
+        // Tombstone — sin esto la tarea resucita en el próximo pull desde otro dispositivo
+        let _ = self.log_change("task", &id.to_string(), "delete");
         self.conn
             .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
         Ok(())
@@ -1453,11 +1475,10 @@ impl Database {
             |row| row.get(0)
         ).optional()?.unwrap_or_else(|| "None".to_string());
 
-        let days_elapsed = if let Ok(created_str) =
-            self.conn
+        let days_elapsed = match self.conn
                 .query_row("SELECT created_at FROM users LIMIT 1", [], |row| {
                     row.get::<_, String>(0)
-                }) {
+                }) { Ok(created_str) => {
             if let Ok(created_at) = DateTime::parse_from_rfc3339(&created_str) {
                 let diff = Utc::now()
                     .signed_duration_since(created_at.with_timezone(&Utc))
@@ -1466,9 +1487,9 @@ impl Database {
             } else {
                 1
             }
-        } else {
+        } _ => {
             1
-        };
+        }};
 
         let avg_tasks_per_day = tasks_completed as f64 / days_elapsed as f64;
         let avg_xp_per_day = total_xp_earned as f64 / days_elapsed as f64;
@@ -1531,6 +1552,8 @@ impl Database {
                 sess.soundscape,
             ],
         )?;
+        // Registrar sesión de focus — el XP ganado debe replicarse entre dispositivos
+        let _ = self.log_change("focus_session", &sess.id.to_string(), "insert");
         Ok(())
     }
 
@@ -1922,7 +1945,7 @@ impl Database {
     // --- STAGE 5A IDENTITY, SYNC & CLOUD REVISION HELPERS ---
 
     pub fn get_task_by_id(&self, id: Uuid) -> Result<Task> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE id = ?1")?;
         let task = stmt.query_row(params![id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -1932,9 +1955,10 @@ impl Database {
             let completed_int: i32 = row.get(5)?;
             let priority_str: String = row.get(6)?;
             let created_str: String = row.get(7)?;
-            let owner_identity: Option<String> = row.get(8)?;
-            let owner_username: Option<String> = row.get(9)?;
-            let parent_task_id_str: Option<String> = row.get(10)?;
+            let updated_str: String = row.get(8)?;
+            let owner_identity: Option<String> = row.get(9)?;
+            let owner_username: Option<String> = row.get(10)?;
+            let parent_task_id_str: Option<String> = row.get(11)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -1954,6 +1978,9 @@ impl Database {
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
                 Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
@@ -1969,6 +1996,7 @@ impl Database {
                 completed: completed_int != 0,
                 priority,
                 created_at,
+                updated_at,
                 owner_identity,
                 owner_username,
                 parent_task_id,
@@ -2220,6 +2248,15 @@ impl Database {
         Ok(())
     }
 
+    pub fn cleanup_old_sync_logs(&self, days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM sync_log WHERE synced = 1 AND timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -2458,6 +2495,9 @@ impl Database {
             "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
             params![project_id, identity, username, role],
         )?;
+        // Registrar membresía — los demás miembros del proyecto necesitan saber que alguien se unió
+        let compound_id = format!("{}__{}", project_id, identity);
+        let _ = self.log_change("project_member", &compound_id, "add");
         Ok(())
     }
 
@@ -2570,10 +2610,13 @@ impl Database {
         msg_type: &str,
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
+        let ts = Utc::now().to_rfc3339();
         self.conn.execute(
             "INSERT INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, project_id, sender_identity, sender_username, content, msg_type, Utc::now().to_rfc3339()],
+            params![id, project_id, sender_identity, sender_username, content, msg_type, ts],
         )?;
+        // Registrar mensaje — sin esto los compañeros del proyecto no verán este mensaje
+        let _ = self.log_change("chronicle_message", &id, "create");
         Ok(id)
     }
 
@@ -2782,6 +2825,9 @@ impl Database {
             "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
             params![task_id, user_identity, user_username],
         )?;
+        // Registrar asignación — sin esto el colaborador nunca sabe que tiene esta tarea
+        let compound_id = format!("{}__{}", task_id, user_identity);
+        let _ = self.log_change("task_assignment", &compound_id, "assign");
         Ok(())
     }
 
@@ -2961,24 +3007,25 @@ impl Database {
 
     // Desbloquea un título legendario sólo si no estaba ya — retorna true si fue nuevo
     pub fn unlock_legendary_title(&self, title_id: &str) -> Result<bool> {
-        let already_unlocked: i32 = self
+        let already_unlocked: Option<i32> = self
             .conn
             .query_row(
                 "SELECT unlocked FROM legendary_titles WHERE title_id = ?1",
                 params![title_id],
                 |row| row.get(0),
             )
-            .optional()?
-            .unwrap_or(0);
+            .optional()?;
 
-        if already_unlocked == 0 {
-            self.conn.execute(
-                "UPDATE legendary_titles SET unlocked = 1 WHERE title_id = ?1",
-                params![title_id],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
+        match already_unlocked {
+            None => Ok(false),
+            Some(1) => Ok(false),
+            Some(_) => {
+                let changed = self.conn.execute(
+                    "UPDATE legendary_titles SET unlocked = 1 WHERE title_id = ?1 AND unlocked = 0",
+                    params![title_id],
+                )?;
+                Ok(changed > 0)
+            }
         }
     }
 
@@ -3028,24 +3075,25 @@ impl Database {
     }
 
     pub fn unlock_relic(&self, id: &str) -> Result<bool> {
-        let already_unlocked: i32 = self
+        let already_unlocked: Option<i32> = self
             .conn
             .query_row(
                 "SELECT unlocked FROM relics WHERE id = ?1",
                 params![id],
                 |row| row.get(0),
             )
-            .optional()?
-            .unwrap_or(0);
+            .optional()?;
 
-        if already_unlocked == 0 {
-            self.conn.execute(
-                "UPDATE relics SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1",
-                params![id, Utc::now().to_rfc3339()],
-            )?;
-            Ok(true)
-        } else {
-            Ok(false)
+        match already_unlocked {
+            None => Ok(false),
+            Some(1) => Ok(false),
+            Some(_) => {
+                let changed = self.conn.execute(
+                    "UPDATE relics SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1 AND unlocked = 0",
+                    params![id, Utc::now().to_rfc3339()],
+                )?;
+                Ok(changed > 0)
+            }
         }
     }
 
@@ -3133,23 +3181,14 @@ impl Database {
         Ok(list)
     }
 
-    // Desbloquea lore por ID — retorna true si fue primera vez, para saber si mostrar notificación
+    // Desbloquea lore por ID — atómico: solo retorna true si realmente cambió de 0 a 1
     pub fn unlock_lore_entry(&self, id: &str) -> Result<bool> {
-        let already_unlocked: i32 = self
-            .conn
-            .query_row(
-                "SELECT unlocked FROM lore_library WHERE id = ?1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-
-        if already_unlocked == 0 {
-            self.conn.execute(
-                "UPDATE lore_library SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1",
-                params![id, Utc::now().to_rfc3339()],
-            )?;
+        // UPDATE condicional elimina la carrera SELECT→UPDATE: si unlocked ya es 1 o la fila no existe, changed=0
+        let changed = self.conn.execute(
+            "UPDATE lore_library SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1 AND unlocked = 0",
+            params![id, Utc::now().to_rfc3339()],
+        )?;
+        if changed > 0 {
             let _ = self.log_change("lore_unlock", id, "unlock");
             Ok(true)
         } else {

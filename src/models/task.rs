@@ -33,6 +33,10 @@ impl TaskPriority {
     }
 }
 
+fn default_now() -> DateTime<Utc> {
+    Utc::now()
+}
+
 // Model representing a task, optionally bound to a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -44,6 +48,9 @@ pub struct Task {
     pub completed: bool,
     pub priority: TaskPriority,
     pub created_at: DateTime<Utc>,
+    // updated_at — crítico para resolver conflictos entre dispositivos con Latest Edit Wins
+    #[serde(default = "default_now")]
+    pub updated_at: DateTime<Utc>,
     pub owner_identity: Option<String>,
     pub owner_username: Option<String>,
     #[serde(default)]
