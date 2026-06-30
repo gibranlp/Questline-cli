@@ -42,6 +42,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     completed INTEGER NOT NULL DEFAULT 0,
     priority TEXT NOT NULL DEFAULT 'Medium',
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     owner_identity TEXT,
     owner_username TEXT,
     parent_task_id TEXT,

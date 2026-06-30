@@ -117,15 +117,15 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
 
     // Jala la tarea de la DB — puede fallar si el DB está ocupado, no manches
     let task_title = if let Some(t_id) = active.task_id {
-        if let Ok(all_tasks) = app.db.get_tasks() {
+        match app.db.get_tasks() { Ok(all_tasks) => {
             all_tasks
                 .into_iter()
                 .find(|t| t.id == t_id)
                 .map(|t| t.title)
                 .unwrap_or_else(|| "Unknown Quest".to_string())
-        } else {
+        } _ => {
             "Unknown Quest".to_string()
-        }
+        }}
     } else {
         "General Mind Cleansing".to_string()
     };

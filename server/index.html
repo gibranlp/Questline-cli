@@ -26,7 +26,7 @@
       --accent:     rgb(168, 85, 247);
     }
 
-    /* Nuevos Estilos */
+    /* Class theme styling overrides */
     .class-theme-active h2 .accent,
     .class-theme-active h3,
     .class-theme-active .accent,
@@ -177,7 +177,7 @@
       border:1px solid var(--bg-border); background:var(--bg-card);
       padding:1.5rem; position:relative; transition:transform 0.2s;
     }
-    .class-card:hover { transform:translateY(-3px); border-color: var(--class-color) !important;}
+    .class-card:hover { transform:translateY(-3px); }
     .class-card::before {
       content:''; position:absolute; top:0;left:0;right:0; height:2px;
       background:var(--class-color);
@@ -545,7 +545,7 @@ The Chronicle turns to the next page.</pre>
       built by someone who loved both spreadsheets and dungeons, because it was.
     </p>
 
-    <!-- Simulador de Terminal -->
+    <!-- INTERACTIVE TERMINAL SIMULATOR -->
     <div class="interactive-terminal-container" style="margin-top:2.5rem; margin-bottom:2.5rem;">
       <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Interactive Terminal Demo (Type commands here)</p>
       <div class="term" id="demo-term" style="min-height:320px; max-height:450px; overflow-y:auto; cursor:text; font-family:'JetBrains Mono', monospace; font-size:0.9rem; text-align:left;">
@@ -1286,6 +1286,12 @@ The Chronicle turns to the next page.</pre>
   </div>
 </footer>
 
+<!-- KO-FI BUTTON -->
+<div style="position:fixed;bottom:1.25rem;right:1.25rem;z-index:9000;">
+  <a href='https://ko-fi.com/Y4H021XN7F' target='_blank'>
+    <img height='36' style='border:0;height:36px;display:block;opacity:0.85;transition:opacity 0.2s;' src='https://storage.ko-fi.com/cdn/kofi2.png?v=6' border='0' alt='Keep the Chronicle Alive' onmouseover="this.style.opacity='1'" onmouseout="this.style.opacity='0.85'" />
+  </a>
+</div>
 
 <!-- LIGHTBOX -->
 <div id="lightbox" class="lightbox">
@@ -1399,42 +1405,14 @@ The Chronicle turns to the next page.</pre>
     if (e.key === 'ArrowRight')  lbNav(1);
   });
 
-  // ── Zen Tree dot ambience — cycle through class colors and growth stages
+  // ── Zen Tree dot ambience — cycle through class colors
   const dots = document.querySelectorAll('.tree-stage .stage-dot');
-  const stageItems = document.querySelectorAll('.tree-stage');
-  const treeAscii = document.querySelector('.tree-ascii');
   const colors = ['rgb(168,85,247)','rgb(255,105,180)','rgb(6,182,212)','rgb(59,130,246)','rgb(249,115,22)','rgb(245,158,11)','rgb(6,182,212)'];
-  
-  const treeStages = [
-    // Stage 1 - Acorn
-    `\n\n\n\n      .\n     ( )`,
-    // Stage 2 - Sapling
-    `\n\n\n      ,\n     /|\n      |`,
-    // Stage 3 - Treekin
-    `\n\n\n     \\|/\n      |\n      |`,
-    // Stage 4 - Grovekeeper
-    `\n\n     /*\\\n    /***\\\\\n      |\n      |`,
-    // Stage 5 - Ancient Warden
-    `\n     .ooo.\n   .oQOOPQo.\n    OOPQOQO\n     |  |\n     |  |`,
-    // Stage 6 - Forest Elder
-    `\n      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n     || ||\n     || ||`,
-    // Stage 7 - World Tree
-    `      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n  .oQOQOQOQOQo.\n    ||| |||\n    ||| |||`
-  ];
-
   let cur = 0;
   setInterval(() => {
     dots.forEach(d => { d.style.background = ''; d.style.boxShadow = ''; });
-    stageItems.forEach(item => item.classList.remove('active'));
-
     dots[cur].style.background = colors[cur];
     dots[cur].style.boxShadow = '0 0 8px ' + colors[cur];
-    stageItems[cur].classList.add('active');
-    
-    if (treeAscii) {
-      treeAscii.textContent = treeStages[cur];
-    }
-
     cur = (cur + 1) % dots.length;
   }, 900);
 
