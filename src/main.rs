@@ -125,6 +125,8 @@ async fn main() -> Result<()> {
     let mut app = match App::new(&db_path) {
         Ok(a) => a,
         Err(e) => {
+            print!("\x1b]111\x07");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             disable_raw_mode()?;
             execute!(io::stdout(), LeaveAlternateScreen)?;
             return Err(e);
@@ -229,6 +231,23 @@ async fn main() -> Result<()> {
             // Pinta el fondo con el color del tema activo para limpiar artefactos del frame anterior
             let bg_block = Block::default().style(Style::default().bg(theme.background));
             f.render_widget(bg_block, size);
+
+            // Ajusta el color de fondo de la terminal (para pintar el padding/borde)
+            match theme.background {
+                Color::Rgb(r, g, b) => {
+                    print!("\x1b]11;#{:02x}{:02x}{:02x}\x07", r, g, b);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                Color::Black => {
+                    print!("\x1b]11;#000000\x07");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                Color::White => {
+                    print!("\x1b]11;#ffffff\x07");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
+                _ => {}
+            }
 
             match app.active_screen {
                 ActiveScreen::Intro => {
@@ -402,8 +421,12 @@ async fn main() -> Result<()> {
                         ])
                     ];
 
-                    // Muestra el status del sync solo los primeros 10 segundos — luego desaparece solo
-                    let sync_line = if let Some(t) = app.last_sync_status_time {
+                    // Sync status: 10s transient para éxito/fallo — permanente si hay 3+ fallos consecutivos
+                    let sync_line = if app.sync_failure_count >= 3 {
+                        Line::from(vec![
+                            Span::styled("⚠ Sync offline", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+                        ])
+                    } else if let Some(t) = app.last_sync_status_time {
                         if t.elapsed().as_secs() < 10 {
                             let color = if app.sync_status_msg.starts_with("Sync failed") {
                                 Color::Red
@@ -1437,6 +1460,8 @@ async fn main() -> Result<()> {
     app.audio_player.stop();
 
     // Restaura la terminal a su estado normal — sin esto la consola queda cagada
+    print!("\x1b]111\x07");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

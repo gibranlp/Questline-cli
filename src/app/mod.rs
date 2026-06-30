@@ -350,7 +350,7 @@ fn pick_sprite_message() -> String {
     use rand::seq::SliceRandom;
     use rand::Rng;
     let mut rng = rand::thread_rng();
-    if rng.gen::<f64>() < 0.008 {
+    if rng.r#gen::<f64>() < 0.008 {
         return SPRITE_MSG_RARE_CHRONICLE.choose(&mut rng).copied().unwrap_or("").to_string();
     }
     let pools = [SPRITE_MSG_USELESS, SPRITE_MSG_SATIRE, SPRITE_MSG_CLASS_LORE, SPRITE_MSG_SPEAKING];
@@ -521,6 +521,7 @@ pub struct App {
     pub auto_sync: bool,
     pub sync_status_msg: String,
     pub sync_conflicts: Vec<String>,
+    pub sync_failure_count: u32,
     pub config: crate::services::Config,
     pub last_auto_sync: std::time::Instant,
     pub last_sync_status_time: Option<std::time::Instant>,
@@ -1207,7 +1208,7 @@ impl App {
 
         let mut class_opt = None;
 
-        if let Some(ref u) = user {
+        if let Some(u) = user {
             let mut class_pool = Vec::new();
             match u.class {
                 ClassType::CodeWarlock => {
@@ -1426,7 +1427,7 @@ impl App {
 
         // Revisa si ya existe identity.key antes de generarlo — si existe sin usuario local,
         // es un héroe en máquina nueva que copió su llave para restaurar desde la nube
-        let identity_key_existed = {
+        let _identity_key_existed = {
             let storage_dir = crate::storage::get_storage_dir().unwrap_or_default();
             storage_dir.join("identity.key").exists()
         };
@@ -1462,7 +1463,12 @@ impl App {
         };
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
-        if identity_key_existed && user.is_none() && config.sync_enabled {
+        #[cfg(not(test))]
+        let should_recover = _identity_key_existed && user.is_none() && config.sync_enabled;
+        #[cfg(test)]
+        let should_recover = false;
+
+        if should_recover {
             let client = crate::services::api_client::ApiClient::new(
                 &server_url,
                 identity.clone(),
@@ -1482,7 +1488,12 @@ impl App {
             }
         }
 
-        if config.sync_enabled {
+        #[cfg(not(test))]
+        let should_register_device = config.sync_enabled;
+        #[cfg(test)]
+        let should_register_device = false;
+
+        if should_register_device {
             let client = crate::services::api_client::ApiClient::new(
                 &server_url,
                 identity.clone(),
@@ -1586,6 +1597,7 @@ impl App {
             auto_sync,
             sync_status_msg: "Idle".to_string(),
             sync_conflicts: Vec::new(),
+            sync_failure_count: 0,
             config,
             last_auto_sync: std::time::Instant::now(),
             last_sync_status_time: None,
@@ -1855,6 +1867,7 @@ impl App {
                     completed: true,
                     priority: crate::models::TaskPriority::High,
                     created_at: Utc::now() - chrono::Duration::hours(2),
+                    updated_at: Utc::now(),
                     owner_identity: Some("alex_key".to_string()),
                     owner_username: Some("Alex".to_string()),
                     parent_task_id: None,
@@ -1874,6 +1887,7 @@ impl App {
                     completed: false,
                     priority: crate::models::TaskPriority::Medium,
                     created_at: Utc::now(),
+                    updated_at: Utc::now(),
                     owner_identity: Some("alex_key".to_string()),
                     owner_username: Some("Alex".to_string()),
                     parent_task_id: None,
@@ -2053,7 +2067,7 @@ impl App {
                 self.active_tab_idx = 13;
                 self.about_scroll = 0;
                 use rand::Rng;
-                self.about_fact_seed = rand::thread_rng().gen();
+                self.about_fact_seed = rand::thread_rng().r#gen();
                 return Ok(());
             }
         }
@@ -3544,7 +3558,7 @@ impl App {
                 selected_member_idx,
             } => {
                 let mut sel = selected_member_idx;
-                if let Ok(task) = self.db.get_task_by_id(task_id) {
+                match self.db.get_task_by_id(task_id) { Ok(task) => {
                     if let Some(proj_id) = task.project_id {
                         let members = self
                             .db
@@ -3606,9 +3620,9 @@ impl App {
                     } else {
                         self.modal_state = ModalType::None;
                     }
-                } else {
+                } _ => {
                     self.modal_state = ModalType::None;
-                }
+                }}
                 Ok(true)
             }
             ModalType::JournalVisibility {
@@ -4615,7 +4629,7 @@ impl App {
                                         json.clone()
                                     };
 
-                                    if let Ok(_) = self.db.import_from_json(&decoded_json) {
+                                    match self.db.import_from_json(&decoded_json) { Ok(_) => {
                                         self.sync_status_msg =
                                             "Cloud Restore Complete! Reloading...".to_string();
                                         self.reload_data()?;
@@ -4623,10 +4637,10 @@ impl App {
                                             message: "Database Restored from Cloud!".to_string(),
                                             unlocked_at: std::time::Instant::now(),
                                         });
-                                    } else {
+                                    } _ => {
                                         self.sync_status_msg =
                                             "Restore Failed: Invalid data structure".to_string();
-                                    }
+                                    }}
                                 } else {
                                     self.sync_status_msg =
                                         "Restore Failed: Empty backup content".to_string();
@@ -5070,7 +5084,7 @@ impl App {
                                 flat.len() - 1
                             };
                         }
-                    } else if let Ok(rituals) = self.db.get_rituals() {
+                    } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() {
                             self.selected_ritual_idx = if self.selected_ritual_idx > 0 {
                                 self.selected_ritual_idx - 1
@@ -5078,7 +5092,7 @@ impl App {
                                 rituals.len() - 1
                             };
                         }
-                    }
+                    } _ => {}}}
                 } else if self.active_screen == ActiveScreen::About {
                     self.about_scroll = self.about_scroll.saturating_sub(1);
                 } else if self.active_screen == ActiveScreen::GreatChronicle {
@@ -5237,12 +5251,12 @@ impl App {
                             self.selected_dashboard_task_idx =
                                 (self.selected_dashboard_task_idx + 1) % flat.len();
                         }
-                    } else if let Ok(rituals) = self.db.get_rituals() {
+                    } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() {
                             self.selected_ritual_idx =
                                 (self.selected_ritual_idx + 1) % rituals.len();
                         }
-                    }
+                    } _ => {}}}
                 } else if self.active_screen == ActiveScreen::About {
                     let content = self.about_content_lines.get();
                     let visible = self.terminal_height.saturating_sub(5);
@@ -5381,12 +5395,12 @@ impl App {
                                 self.reload_data()?;
                             }
                         }
-                    } else if let Ok(rituals) = self.db.get_rituals() {
+                    } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
                             let r_id = rituals[self.selected_ritual_idx].id.clone();
                             self.complete_ritual(&r_id)?;
                         }
-                    }
+                    } _ => {}}}
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     use crate::audio::SOUNDSCAPES;
                     let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
@@ -5570,12 +5584,12 @@ impl App {
                                 self.reload_data()?;
                             }
                         }
-                    } else if let Ok(rituals) = self.db.get_rituals() {
+                    } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
                             let r_id = rituals[self.selected_ritual_idx].id.clone();
                             self.complete_ritual(&r_id)?;
                         }
-                    }
+                    } _ => {}}}
                 } else if self.active_screen == ActiveScreen::Library {
                     self.handle_library_action()?;
                 }
@@ -7212,6 +7226,7 @@ impl App {
                             completed: false, // kept
                             priority,
                             created_at: Utc::now(),
+                            updated_at: Utc::now(),
                             owner_identity: Some(self.identity.public_key.clone()),
                             owner_username: Some(
                                 self.user
@@ -7250,6 +7265,7 @@ impl App {
                             completed: false,
                             priority,
                             created_at: Utc::now(),
+                            updated_at: Utc::now(),
                             owner_identity: Some(self.identity.public_key.clone()),
                             owner_username: Some(
                                 self.user
@@ -7406,7 +7422,7 @@ impl App {
             13 => {
                 self.about_scroll = 0;
                 use rand::Rng;
-                self.about_fact_seed = rand::thread_rng().gen();
+                self.about_fact_seed = rand::thread_rng().r#gen();
                 ActiveScreen::About
             }
             14 => {
@@ -8218,22 +8234,29 @@ impl App {
         for lvl in &[5, 15, 20, 30] {
             if user_ref.level >= *lvl {
                 let class_key = format!("class_{}_{}", base_class_key, lvl);
-                if self.db.unlock_lore_entry(&class_key)? {
-                    self.notifications.push(Notification {
-                        message: format!("New Class Lore Unlocked in Library! (Level {})", lvl),
-                        unlocked_at: std::time::Instant::now(),
-                    });
-                    self.push_great_chronicle_async(
-                        "ClassStory",
-                        &format!("unlocked a class story at Level {}.", lvl),
-                        true,
-                    );
+                let notif_key = format!("lore_notified_{}", class_key);
+                if self.db.get_setting(&notif_key)?.is_none() {
+                    if self.db.unlock_lore_entry(&class_key)? {
+                        let _ = self.db.set_setting(&notif_key, "1");
+                        self.notifications.push(Notification {
+                            message: format!("New Class Lore Unlocked in Library! (Level {})", lvl),
+                            unlocked_at: std::time::Instant::now(),
+                        });
+                        self.push_great_chronicle_async(
+                            "ClassStory",
+                            &format!("unlocked a class story at Level {}.", lvl),
+                            true,
+                        );
+                    }
                 }
             }
         }
 
         if user_ref.level >= 40 {
-            if self.db.unlock_lore_entry("class_council_orders")? {
+            if self.db.get_setting("lore_notified_class_council_orders")?.is_none()
+                && self.db.unlock_lore_entry("class_council_orders")?
+            {
+                let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
                 self.notifications.push(Notification {
                     message: "The Council of Orders Unlocked in Library!".to_string(),
                     unlocked_at: std::time::Instant::now(),
@@ -8245,16 +8268,20 @@ impl App {
             let req_level = i * 10;
             if user_ref.level >= req_level {
                 let world_key = format!("world_chapter_{}", i);
-                if self.db.unlock_lore_entry(&world_key)? {
-                    self.notifications.push(Notification {
-                        message: format!("World History Chapter {} Unlocked in Library!", i),
-                        unlocked_at: std::time::Instant::now(),
-                    });
-                    self.push_great_chronicle_async(
-                        "WorldLore",
-                        &format!("uncovered World History Chapter {}.", i),
-                        true,
-                    );
+                let notif_key = format!("lore_notified_{}", world_key);
+                if self.db.get_setting(&notif_key)?.is_none() {
+                    if self.db.unlock_lore_entry(&world_key)? {
+                        let _ = self.db.set_setting(&notif_key, "1");
+                        self.notifications.push(Notification {
+                            message: format!("World History Chapter {} Unlocked in Library!", i),
+                            unlocked_at: std::time::Instant::now(),
+                        });
+                        self.push_great_chronicle_async(
+                            "WorldLore",
+                            &format!("uncovered World History Chapter {}.", i),
+                            true,
+                        );
+                    }
                 }
             }
         }
@@ -9242,10 +9269,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.sync_in_progress = false;
                 match bg.error {
                     Some(e) => {
+                        self.sync_failure_count = self.sync_failure_count.saturating_add(1);
                         self.sync_status_msg = format!("Sync failed: {}", e);
                         self.last_sync_status_time = Some(std::time::Instant::now());
+                        let _ = self.reload_data();
                     }
                     None => {
+                        self.sync_failure_count = 0;
                         self.sync_conflicts = bg.conflicts;
                         self.last_sync_warlock_xp = 0;
                         self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
@@ -9261,17 +9291,27 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return Ok(());
         }
 
-        let debounce = std::time::Duration::from_secs(5);
-        let interval = std::time::Duration::from_secs(180);
+        let debounce = std::time::Duration::from_secs(2);
+        let interval = std::time::Duration::from_secs(30);
         let mutation_ready = self.last_mutation
             .map(|t| t.elapsed() >= debounce)
             .unwrap_or(false);
+
+        // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días
+        let last_cleanup = self.db.get_setting("last_sync_cleanup").ok().flatten()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        let cleanup_due = last_cleanup.map(|d| (chrono::Utc::now() - d).num_seconds() > 86400).unwrap_or(true);
+        if cleanup_due {
+            let _ = self.db.cleanup_old_sync_logs(30);
+            let _ = self.db.set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+        }
 
         if mutation_ready || self.last_auto_sync.elapsed() >= interval {
             self.last_mutation = None;
             self.last_auto_sync = std::time::Instant::now();
             if self.config.sync_enabled {
-                // Network sync: spawn background thread so the UI stays responsive
+                // Network sync: spawn background thread so la UI se queda responsive
                 self.start_background_sync();
             } else {
                 // Local-only sync (FileCloudProvider): fast, safe to run on main thread
@@ -9469,8 +9509,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let storage_dir = crate::storage::get_storage_dir()?;
                 let db_path = storage_dir.join("questline.db");
                 let db = crate::database::Database::new(&db_path)?;
-                // Give the sync thread up to 2 s to acquire a DB lock before giving up
-                let _ = db.conn.execute_batch("PRAGMA busy_timeout = 2000;");
+                // WAL mode ya permite concurrencia — pero damos 5s por si acaso hay contención
+                let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
 
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
                     &db, &identity, &device_id, Some(server_url.as_str()),
@@ -9673,7 +9713,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         // 15% chance, tapering to ~5% as the Swarm weakens
         let chance = 0.15 * (1.0 - progress * 0.7);
         use rand::Rng;
-        if rand::thread_rng().gen::<f64>() > chance { return; }
+        if rand::thread_rng().r#gen::<f64>() > chance { return; }
         let msg = pick_task_completion_sprite_message();
         self.notifications.push(Notification { message: msg, unlocked_at: std::time::Instant::now() });
         self.sprite_notifications_shown_this_session += 1;
@@ -9710,7 +9750,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             else if progress >= 0.25 { 0.12 }
             else { 0.20 };
         use rand::Rng;
-        if rand::thread_rng().gen::<f64>() > spawn_chance { return; }
+        if rand::thread_rng().r#gen::<f64>() > spawn_chance { return; }
 
         let msg = pick_sprite_message();
         self.notifications.push(Notification { message: msg, unlocked_at: std::time::Instant::now() });
@@ -10947,6 +10987,7 @@ mod app_tests {
             due_date: None,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             parent_task_id: None,
@@ -11211,6 +11252,7 @@ mod app_tests {
                 completed: true,
                 priority: crate::models::TaskPriority::Medium,
                 created_at: Utc::now(),
+                updated_at: Utc::now(),
                 due_date: None,
                 owner_identity: None,
                 owner_username: None,
@@ -11513,10 +11555,11 @@ mod app_tests {
         assert!(!actions.is_empty());
         assert_eq!(actions[0].name, "Open Character");
 
-        // 7. Press ? to open KeyboardHelp (since we are not in text entry)
+        // 7. Press ? to open About screen (since we are not in text entry)
         app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.modal_state, ModalType::KeyboardHelp);
+        assert_eq!(app.active_screen, ActiveScreen::About);
+        assert_eq!(app.active_tab_idx, 13);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -11527,13 +11570,13 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
         let app = App::new(db_file).unwrap();
 
-        // 1. First time Questline is opened, user is None -> shows "Questline" author and no class quote
+        // 1. First time Questline is opened, user is None -> shows a random quote with its author
         let (quote, author, class_opt) = App::choose_dynamic_quote(&None, &app.db);
-        assert_eq!(author, "Questline");
+        assert!(!author.is_empty());
         assert!(!quote.is_empty());
         assert!(class_opt.is_none());
 
-        // 2. User exists and class is selected -> shows both Questline and class quote
+        // 2. User exists and class is selected -> shows both a random quote and class quote
         let user = User {
             id: uuid::Uuid::new_v4(),
             username: "Tester".to_string(),
@@ -11544,7 +11587,7 @@ mod app_tests {
             specialization: None,
         };
         let (quote_q, author_q, class_opt_2) = App::choose_dynamic_quote(&Some(user), &app.db);
-        assert_eq!(author_q, "Questline");
+        assert!(!author_q.is_empty());
         assert!(!quote_q.is_empty());
         assert!(class_opt_2.is_some());
         let class_vals = class_opt_2.unwrap();
@@ -11688,47 +11731,50 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Character);
         assert_eq!(app.active_tab_idx, 2);
 
-        // Key '4' -> should NOT switch screens (it is removed)
+        // Key '4' -> Library
         app.handle_key_event(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::empty()))
-            .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Character);
-
-        // Key '5' -> Library
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::Library);
         assert_eq!(app.active_tab_idx, 4);
 
-        // Key '6' -> Legends
+        // Key '5' -> Soundscapes
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Soundscapes);
+        assert_eq!(app.active_tab_idx, 7);
+
+        // Key '6' -> SyncSettings
         app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Legends);
-        assert_eq!(app.active_tab_idx, 5);
+        assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
+        assert_eq!(app.active_tab_idx, 12);
 
         // Key '7' -> Fellowship
         app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::Fellowship);
+        assert_eq!(app.active_tab_idx, 8);
 
-        // Key '8' -> should NOT switch screens (it is removed)
+        // Key '8' -> GreatChronicle
         app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Legends);
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+        assert_eq!(app.active_tab_idx, 14);
 
-        // Key '9' -> should NOT switch screens (it is removed)
+        // Key '9' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Legends);
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
 
-        // Key '0' -> should NOT switch screens (it is removed)
+        // Key '0' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Legends);
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
 
-        // Key 'Y' -> should NOT switch screens (it is removed)
+        // Key 'Y' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Legends);
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
 
         // Key 'S' -> SyncSettings
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
@@ -11758,13 +11804,13 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Archive);
         assert_eq!(app.active_tab_idx, 10);
 
-        // Key 'F' on Dashboard -> should NOT switch screens
+        // Key 'F' on Dashboard -> should switch to Fellowship
         app.active_screen = ActiveScreen::Dashboard;
         app.active_tab_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
-        assert_eq!(app.active_tab_idx, 0);
+        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
+        assert_eq!(app.active_tab_idx, 8);
 
         // Key 'F' on Projects -> should switch to Focus
         app.active_screen = ActiveScreen::Projects;
