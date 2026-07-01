@@ -37,6 +37,19 @@ impl Default for Config {
 }
 
 impl Config {
+    // Rewrites the old domain to the new one in-place so existing users don't have to
+    // manually update their config after the questline.gibranlp.dev → questlinecli.com migration.
+    fn migrate_urls(&mut self, save_path: &std::path::Path) {
+        const OLD: &str = "https://questline.gibranlp.dev/api";
+        const NEW: &str = "https://questlinecli.com/api";
+        if self.server_url == OLD {
+            self.server_url = NEW.to_string();
+            if let Ok(serialized) = toml::to_string_pretty(self) {
+                let _ = std::fs::write(save_path, serialized);
+            }
+        }
+    }
+
     pub fn save(&self) -> Result<()> {
         let storage_dir = storage::get_storage_dir()?;
         let target_path = storage_dir.join("config.toml");
@@ -53,7 +66,8 @@ impl Config {
 
         if target_path.exists() {
             let content = std::fs::read_to_string(&target_path)?;
-            if let Ok(config) = toml::from_str::<Config>(&content) {
+            if let Ok(mut config) = toml::from_str::<Config>(&content) {
+                config.migrate_urls(&target_path);
                 return Ok(config);
             }
         }
@@ -62,18 +76,19 @@ impl Config {
         let local_path = PathBuf::from("config.toml");
         if local_path.exists() {
             let content = std::fs::read_to_string(&local_path)?;
-            if let Ok(config) = toml::from_str::<Config>(&content) {
+            if let Ok(mut config) = toml::from_str::<Config>(&content) {
                 // Lo copia al storage para que persista aunque corras el app desde otro lugar
                 if let Some(parent) = target_path.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                let _ = std::fs::write(&target_path, &content);
+                config.migrate_urls(&target_path);
                 return Ok(config);
             }
         }
 
         // Si no encontró nada, escribe la config por default y listo
         let default_config = Config::default();
+
         if let Some(parent) = target_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
