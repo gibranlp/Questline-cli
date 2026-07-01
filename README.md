@@ -4,9 +4,9 @@
 
 [![Latest Release](https://img.shields.io/github/v/release/gibranlp/Questline-cli?label=release&color=gold)](https://github.com/gibranlp/Questline-cli/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](https://questline.gibranlp.dev)
+[![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)](https://questlinecli.com)
 
-[Download](https://questline.gibranlp.dev) &nbsp;|&nbsp; [Website](https://questline.gibranlp.dev) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
+[Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
 ---
 
@@ -22,7 +22,7 @@ Questline does not ask you to become productive. It makes productivity the natur
 
 ## Download Questline
 
-**[questline.gibranlp.dev](https://questline.gibranlp.dev)**
+**[questlinecli.com](https://questlinecli.com)**
 
 Available for Windows, Linux, and macOS.
 All platforms are supported through native installers, AppImage, and Cargo.
@@ -208,3 +208,22 @@ Questline is released under the MIT License.
 You are free to use, modify, distribute, and build upon the project in accordance with the terms of the license.
 
 If Questline helps you on your adventures, consider starring the repository and sharing it with fellow heroes.
+
+---
+
+## Changelog
+
+### v1.0.7 — The Realm Has a Proper Address
+*Released 2026-07-01*
+
+- **Domain migration:** The sync server and website have moved from `questline.gibranlp.dev` to [`questlinecli.com`](https://questlinecli.com). The realm has outgrown its first address.
+- **Default server URL updated:** New installations now point to `https://questlinecli.com/api` automatically. Existing users with the old URL saved in their config will need to update it in the Sync screen.
+- Same server. Same database. Same hosting. The Chronicle is intact. Only the address changed.
+
+---
+
+### v1.0.6 — Sync Engine Overhaul
+- Fixed 10 synchronization bugs including WAL mode, delete tombstones, `updated_at` on Task, focus session sync, journal entry updates, device ID filtering, sequence cursor, and daily cleanup routines.
+
+### v1.0.5 and earlier
+- See [GitHub Releases](https://github.com/gibranlp/Questline-cli/releases) for full history.

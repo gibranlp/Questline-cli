@@ -3,7 +3,7 @@
 # build_release.sh — compila el release de Questline para Linux y Windows
 # ─────────────────────────────────────────────────────────────────────────────
 # Build Questline release binaries for all supported platforms and copy them
-# into server/releases/latest/ (served by questline.gibranlp.dev).
+# into server/releases/latest/ (served by questlinecli.com).
 #
 # Preferred method: `cross` (Docker-based, handles everything automatically)
 #   cargo install cross     ← install once
