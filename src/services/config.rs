@@ -27,7 +27,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            server_url: "https://questline.gibranlp.dev/api".to_string(),
+            server_url: "https://questlinecli.com/api".to_string(),
             sync_enabled: true,
             auto_sync: true,
             sync_interval_minutes: 5,

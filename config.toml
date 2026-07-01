@@ -1,5 +1,5 @@
 # Questline Cloud Chronicle Config File
-server_url = "https://questline.gibranlp.dev/api"
+server_url = "https://questlinecli.com/api"
 sync_enabled = true
 auto_sync = true
 sync_interval_minutes = 5
