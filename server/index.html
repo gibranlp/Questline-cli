@@ -396,6 +396,7 @@
     <li><a href="#manual">Manual</a></li>
     <li><a href="#identity">Identity</a></li>
     <li><a href="#download">Download</a></li>
+    <li><a href="#changelog">Changelog</a></li>
     <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" style="color:var(--accent); font-weight:bold;">Discord</a></li>
     <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
   </ul>
@@ -550,7 +551,7 @@ The Chronicle turns to the next page.</pre>
       <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Interactive Terminal Demo (Type commands here)</p>
       <div class="term" id="demo-term" style="min-height:320px; max-height:450px; overflow-y:auto; cursor:text; font-family:'JetBrains Mono', monospace; font-size:0.9rem; text-align:left;">
         <div id="term-output">
-          <span class="comment"># Questline Interactive Terminal v1.0.6</span>
+          <span class="comment"># Questline Interactive Terminal v1.0.7</span>
           <span class="comment"># Type 'help' to view commands.</span>
           <br>
         </div>
@@ -1230,6 +1231,87 @@ The Chronicle turns to the next page.</pre>
         <a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener" style="color:var(--text);letter-spacing:0.05em;text-decoration:none;border-bottom:1px solid var(--bg-border);">github.com/gibranlp/Questline-cli</a>
       </p>
     </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ CHANGELOG -->
+<section id="changelog" style="border-top:1px solid var(--bg-border); padding: 5rem 0;">
+  <div class="container">
+    <p class="section-header">// The Chronicle — Patch Notes</p>
+    <h2>The Realm <span class="accent">Expands</span></h2>
+    <hr class="divider">
+
+    <p class="intro-text">
+      The realm has always existed. It simply did not have a proper name on the world map.
+      <br><br>
+      Adventurers who survived Chapter One know the truth: the Notification Swarm was only the beginning.
+      A realm this large — with heroes across timezones completing quests, tending Zen Trees, and writing
+      scrolls at unreasonable hours — deserved an address that could be taken seriously.
+      <strong>questlinecli.com</strong> is that address. The Chronicle has been updated accordingly.
+      The backlog has not shrunk. But at least it now has a proper domain.
+    </p>
+
+    <!-- v1.0.7 -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.0.7</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Realm Has a Proper Address</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-01</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — The Naming of the Realm</span>
+
+  For a time, the realm existed at an address borrowed from the land
+  of its creator. A temporary dwelling. A camp, not a keep.
+
+  The adventurers came anyway. They completed quests.
+  They watered their trees. They wrote scrolls into the night.
+  They did not complain about the address. The backlog was already
+  doing that for them.
+
+  <span class="hi">The realm now has a name of its own: questlinecli.com</span>
+
+  The server is the same. The database is intact. The Chronicle
+  has lost nothing. The Zen Trees did not notice. The Zen Trees
+  rarely notice anything that does not involve consistency.
+
+  Existing adventurers: update your sync URL to
+  <span class="hi">https://questlinecli.com/api</span> via the Sync screen.
+  New adventurers: it is already set. You arrived at the right time.
+  You are welcome.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Domain migrated from questline.gibranlp.dev → questlinecli.com</span>
+<span class="cmd">  ✓  Default sync server URL updated in all new installations</span>
+<span class="cmd">  ✓  The Chronicle is intact. Not a single entry was lost in transit.</span>
+<span class="cmd">  –  The backlog. Still there. Doing pushups. Waiting.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.6 -->
+    <div style="margin-top:2rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1rem;font-weight:bold;color:var(--text-dim);">v1.0.6</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Sync Engine Overhaul</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:1.9;color:#666;">
+<span class="cmd">  ✓  WAL mode enabled — no more database locking under concurrent access</span>
+<span class="cmd">  ✓  Delete tombstones — deletions now propagate correctly across devices</span>
+<span class="cmd">  ✓  Task updated_at — edits sync properly; no more phantom conflicts</span>
+<span class="cmd">  ✓  Focus session sync — sessions counted on the right device</span>
+<span class="cmd">  ✓  Journal entry updates — edits no longer silently discarded</span>
+<span class="cmd">  ✓  Device ID filter — devices no longer receive their own changes back</span>
+<span class="cmd">  ✓  Sequence cursor — incremental sync now resumes from the correct position</span>
+<span class="cmd">  ✓  Daily cleanup — stale sync state no longer accumulates over time</span></pre>
+      </div>
+    </div>
+
+    <p style="margin-top:2rem;font-size:0.85rem;color:var(--text-dim);letter-spacing:0.05em;">
+      Full release history →
+      <a href="https://github.com/gibranlp/Questline-cli/releases" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none;border-bottom:1px solid var(--bg-border);">github.com/gibranlp/Questline-cli/releases</a>
+    </p>
   </div>
 </section>
 
