@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_auto_sync()?;
         app.tick_chat_poll()?;
+        app.tick_presence_update()?;
         app.tick_focus_session()?;
         app.tick_particles();
         app.tick_update_check();

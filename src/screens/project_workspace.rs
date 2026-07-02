@@ -332,19 +332,31 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             sidebar_focused,
             is_shared,
         ),
-        _ => draw_overview_tab(
-            f,
-            body_chunks[1],
-            project,
-            &tasks,
-            &notes,
-            &journals,
-            &milestones,
-            selected_item_idx,
-            &project_stats,
-            theme,
-            sidebar_focused,
-        ),
+        _ => {
+            let (overview_members, overview_activity) = if is_shared {
+                (
+                    app.db.get_project_members(&p_id.to_string()).unwrap_or_default(),
+                    app.db.get_activity_log_for_project(&p_id.to_string(), 20).unwrap_or_default(),
+                )
+            } else {
+                (vec![], vec![])
+            };
+            draw_overview_tab(
+                f,
+                body_chunks[1],
+                project,
+                &tasks,
+                &notes,
+                &journals,
+                &milestones,
+                selected_item_idx,
+                &project_stats,
+                theme,
+                sidebar_focused,
+                &overview_members,
+                &overview_activity,
+            )
+        }
     }
 
     // 3. Barra de búsqueda — solo aparece cuando el usuario presionó '/'
@@ -1349,7 +1361,8 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
             .collect();
         codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
         for (idx, note) in codex_notes {
-            flat_list.push((format!("   · {} ", note.title), Some(idx), false));
+            let lock = if note.sharing_permission == "read_only" { "[R] " } else { "" };
+            flat_list.push((format!("   · {}{} ", lock, note.title), Some(idx), false));
         }
     }
     let mut ungrouped: Vec<usize> = notes.iter().enumerate()
@@ -1361,7 +1374,8 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         flat_list.push(("  ── Ungrouped ──".to_string(), None, false)); // divider
     }
     for idx in &ungrouped {
-        flat_list.push((format!("   · {} ", notes[*idx].title), Some(*idx), false));
+        let lock = if notes[*idx].sharing_permission == "read_only" { "[R] " } else { "" };
+        flat_list.push((format!("   · {}{} ", lock, notes[*idx].title), Some(*idx), false));
     }
 
     let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {
@@ -1374,7 +1388,8 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
             } else {
                 Style::default().fg(Color::White)
             };
-            ListItem::new(format!(" {} ", n.title)).style(style)
+            let lock = if n.sharing_permission == "read_only" { "[R] " } else { "" };
+            ListItem::new(format!(" {}{} ", lock, n.title)).style(style)
         }).collect()
     } else {
         flat_list.iter().enumerate().map(|(flat_i, (text, note_idx, is_header))| {
@@ -1573,6 +1588,8 @@ fn draw_overview_tab(
     project_stats: &ProjectStats,
     theme: &Theme,
     sidebar_focused: bool,
+    members: &[(String, String, String)],
+    activity: &[(String, Option<String>, String, String, String, String, String)],
 ) {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused { theme.border } else { accent_color };
@@ -1614,14 +1631,24 @@ fn draw_overview_tab(
         format!("{} days old", diff.num_days())
     };
 
+    let constraints: Vec<Constraint> = if project.is_shared {
+        vec![
+            Constraint::Length(5),  // Project Metadata
+            Constraint::Length(4),  // Progress Bar
+            Constraint::Length(15), // Stats & Milestones (fixed so fellowship gets space)
+            Constraint::Min(8),     // Fellowship: Companions + Activity
+        ]
+    } else {
+        vec![
+            Constraint::Length(5), // Project Metadata
+            Constraint::Length(4), // Progress Bar
+            Constraint::Min(4),    // Stats & Milestones
+        ]
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(5), // Project Metadata
-            Constraint::Length(4), // Progress Bar
-            Constraint::Min(4),    // Bottom section split: Stats & Milestones
-        ])
+        .constraints(constraints)
         .split(area);
 
     // 1. Metadata Block
@@ -1819,6 +1846,48 @@ fn draw_overview_tab(
             .title(" Project Milestones — [Space] Toggle | [Delete] Slay | [m] New "),
     );
     f.render_widget(mil_list, bottom_split[1]);
+
+    // Sección de Fellowship — solo se muestra si el proyecto es compartido
+    if project.is_shared && chunks.len() > 3 {
+        let fellowship_split = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .split(chunks[3]);
+
+        let companion_items: Vec<ListItem> = if members.is_empty() {
+            vec![ListItem::new("  No companions yet.").style(Style::default().fg(theme.muted))]
+        } else {
+            members.iter().map(|(_, username, role)| {
+                ListItem::new(format!("  {} ({})", username, role))
+                    .style(Style::default().fg(theme.text))
+            }).collect()
+        };
+        let companion_list = List::new(companion_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(" Fellowship Companions "),
+        );
+        f.render_widget(companion_list, fellowship_split[0]);
+
+        let activity_items: Vec<ListItem> = if activity.is_empty() {
+            vec![ListItem::new("  No fellowship activity yet.").style(Style::default().fg(theme.muted))]
+        } else {
+            activity.iter().map(|(_, _, event_type, description, _, username, _)| {
+                ListItem::new(format!("  [{}] {} — {}", event_type, description, username))
+                    .style(Style::default().fg(theme.text))
+            }).collect()
+        };
+        let activity_list = List::new(activity_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(" Fellowship Activity "),
+        );
+        f.render_widget(activity_list, fellowship_split[1]);
+    }
 }
 
 // El modal más complejo del workspace — sirve tanto para crear como para editar tareas y sus steps
