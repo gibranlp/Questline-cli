@@ -46,6 +46,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner_identity TEXT,
     owner_username TEXT,
     parent_task_id TEXT,
+    xp_awarded INTEGER NOT NULL DEFAULT 0,
+    recurrence TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
     FOREIGN KEY(parent_task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
