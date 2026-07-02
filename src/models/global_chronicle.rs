@@ -10,6 +10,8 @@ pub struct GlobalChronicleEntry {
     pub event_type: String,
     pub description: String,
     pub timestamp: String,
+    #[serde(default)]
+    pub hero_class: Option<String>,
 }
 
 impl GlobalChronicleEntry {

@@ -305,7 +305,8 @@ CREATE TABLE IF NOT EXISTS global_chronicle (
     hero_name TEXT NOT NULL,
     event_type TEXT NOT NULL,
     description TEXT NOT NULL,
-    timestamp TEXT NOT NULL
+    timestamp TEXT NOT NULL,
+    hero_class TEXT
 );
 
 -- Contenido de lore y clases — reliquias, títulos, historia del mundo
