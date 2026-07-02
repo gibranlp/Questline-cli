@@ -23,6 +23,6 @@ pub use rpg::{
     Achievement, DailyAdventure, DailyReflection, FocusSession, Milestone, Ritual, Season,
     Statistics, Streak, ZenTree,
 };
-pub use task::{Task, TaskPriority};
+pub use task::{RecurrenceType, Task, TaskPriority};
 pub use user::{ClassType, User};
 pub use xp_event::XPEvent;

@@ -58,7 +58,7 @@ impl Config {
         Ok(())
     }
 
-    // No manches, tres lugares donde puede vivir el config: storage dir, directorio actual, o nada.
+    // Tres lugares donde puede vivir el config: storage dir, directorio actual, o nada.
     // Si no encuentra nada, escribe el default solito y ya — no hay excusa para andar sin config.
     pub fn load() -> Result<Self> {
         let storage_dir = storage::get_storage_dir()?;

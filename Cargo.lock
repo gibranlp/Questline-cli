@@ -1402,7 +1402,7 @@ dependencies = [
 
 [[package]]
 name = "questline"
-version = "1.0.6"
+version = "1.0.7"
 dependencies = [
  "anyhow",
  "base64",

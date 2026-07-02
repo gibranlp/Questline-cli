@@ -703,7 +703,7 @@ impl<'a> SyncEngine<'a> {
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
                                     let _ = self.db.conn.execute(
-                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                                         params![
                                             t.id.to_string(),
                                             t.project_id.map(|id| id.to_string()),
@@ -717,6 +717,8 @@ impl<'a> SyncEngine<'a> {
                                             t.owner_identity.clone(),
                                             t.owner_username.clone(),
                                             t.parent_task_id.map(|id| id.to_string()),
+                                            if t.xp_awarded { 1 } else { 0 },
+                                            t.recurrence.map(|r| r.name()),
                                         ],
                                     );
                                     // XP para el usuario local si está asignado y la tarea acaba de completarse
