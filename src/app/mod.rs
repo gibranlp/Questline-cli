@@ -629,6 +629,8 @@ pub struct App {
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
     pub last_chat_poll: std::time::Instant,
     pub last_chat_timestamp: std::collections::HashMap<String, String>,
+    // Presencia: heartbeat para que los compañeros sepan que estás activo en el workspace compartido
+    pub last_presence_update: std::time::Instant,
 
     // Great Chronicle — feed global de logros de la comunidad de héroes
     pub great_chronicle_entries: Vec<crate::models::GlobalChronicleEntry>,
@@ -1686,6 +1688,9 @@ impl App {
                 .checked_sub(std::time::Duration::from_secs(60))
                 .unwrap_or(std::time::Instant::now()),
             last_chat_timestamp: std::collections::HashMap::new(),
+            last_presence_update: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(120))
+                .unwrap_or(std::time::Instant::now()),
             great_chronicle_entries: Vec::new(),
             great_chronicle_scroll: 0,
             chapter_progress: None,
@@ -3927,11 +3932,25 @@ impl App {
                     self.onboarding_error = None;
                 }
                 KeyCode::Tab | KeyCode::Enter => {
-                    if self.onboarding_username.trim().is_empty() {
+                    let trimmed = self.onboarding_username.trim().to_string();
+                    if trimmed.is_empty() {
                         self.onboarding_error = Some("Name cannot be empty.".to_string());
                     } else {
-                        self.onboarding_error = None;
-                        self.onboarding_focus = OnboardingFocus::ClassSelect;
+                        let known = self.db.get_all_known_usernames().unwrap_or_default();
+                        let taken = known.iter().any(|n| n == &trimmed.to_lowercase());
+                        if taken {
+                            use rand::Rng;
+                            let suffix: u8 = rand::thread_rng().gen_range(10..=99);
+                            let suggestion = format!("{}{}", trimmed, suffix);
+                            self.onboarding_error = Some(format!(
+                                "'{}' is already taken. Try '{}'?",
+                                trimmed, suggestion
+                            ));
+                            self.onboarding_username = suggestion;
+                        } else {
+                            self.onboarding_error = None;
+                            self.onboarding_focus = OnboardingFocus::ClassSelect;
+                        }
                     }
                 }
                 _ => {}
@@ -4430,6 +4449,7 @@ impl App {
                     updated_at: Utc::now(),
                     sharing_permission: "collaborative".to_string(),
                     codex_id: None,
+                    owner_identity: None,
                 };
                 // Fetch original created_at and codex_id if exists
                 if let Ok(notes) = self.db.get_notes() {
@@ -4437,6 +4457,7 @@ impl App {
                         note.created_at = orig.created_at;
                         note.sharing_permission = orig.sharing_permission.clone();
                         note.codex_id = orig.codex_id;
+                        note.owner_identity = orig.owner_identity.clone();
                     }
                 }
                 self.db.update_note(&note)?;
@@ -4462,6 +4483,7 @@ impl App {
                     updated_at: Utc::now(),
                     sharing_permission: "collaborative".to_string(),
                     codex_id: state.codex_id,
+                    owner_identity: Some(self.identity.public_key.clone()),
                 };
                 self.db.insert_note(&note)?;
                 self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
@@ -5679,6 +5701,7 @@ impl App {
                                         event_type: e["event_type"].as_str().unwrap_or_default().to_string(),
                                         description: e["description"].as_str().unwrap_or_default().to_string(),
                                         timestamp: e["timestamp"].as_str().unwrap_or_default().to_string(),
+                                        hero_class: e["hero_class"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
                                     };
                                     if !entry.id.is_empty() {
                                         let _ = self.db.upsert_chronicle_entry(&entry);
@@ -6516,7 +6539,7 @@ impl App {
                                 } else {
                                     "completed 1 quest.".to_string()
                                 };
-                                self.push_great_chronicle_async("QuestComplete", &chronicle_desc, false);
+                                self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
                                 self.maybe_spawn_task_completion_sprite();
                                 // Tarea recurrente — genera la siguiente ocurrencia automáticamente
                                 if let Some(recurrence) = t.recurrence {
@@ -6675,6 +6698,13 @@ impl App {
                     match flat.get(self.selected_notes_flat_idx) {
                         Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                             let n = &proj_notes[*note_idx];
+                            let is_mine = n.owner_identity.as_deref()
+                                .map(|oi| oi == self.identity.public_key.as_str())
+                                .unwrap_or(true);
+                            if n.sharing_permission == "read_only" && !is_mine {
+                                self.notifications.push(Notification::warning("This scroll is sealed — you may read but not inscribe.".to_string()));
+                                return Ok(());
+                            }
                             let mut state = EditorState::new(p_id, Some(n.id), n.title.clone(), n.markdown_content.clone());
                             state.codex_id = n.codex_id;
                             self.editor_state = Some(state);
@@ -9364,6 +9394,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     None => {
                         self.sync_failure_count = 0;
                         self.sync_conflicts = bg.conflicts;
+                        if !self.sync_conflicts.is_empty() {
+                            self.notifications.push(Notification::warning(format!(
+                                "{} sync conflict(s) detected — check revision history",
+                                self.sync_conflicts.len()
+                            )));
+                        }
                         self.last_sync_warlock_xp = 0;
                         self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
                         self.last_sync_status_time = Some(std::time::Instant::now());
@@ -9379,7 +9415,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
 
         let debounce = std::time::Duration::from_secs(2);
-        let interval = std::time::Duration::from_secs(30);
+        let is_shared_workspace = self.active_screen == ActiveScreen::Workspace
+            && self.active_project_id
+                .and_then(|pid| self.projects.iter().find(|p| p.id == pid))
+                .map(|p| p.is_shared)
+                .unwrap_or(false);
+        let interval = if is_shared_workspace {
+            std::time::Duration::from_secs(15)
+        } else {
+            std::time::Duration::from_secs(30)
+        };
         let mutation_ready = self.last_mutation
             .map(|t| t.elapsed() >= debounce)
             .unwrap_or(false);
@@ -9690,10 +9735,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                                 let etype = e["event_type"].as_str().unwrap_or_default();
                                 let desc = e["description"].as_str().unwrap_or_default();
                                 let ts = e["timestamp"].as_str().unwrap_or_default();
+                                let hero_class = e["hero_class"].as_str().filter(|s| !s.is_empty());
                                 if !id.is_empty() {
                                     let _ = db.conn.execute(
-                                        "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                        rusqlite::params![id, hero, etype, desc, ts],
+                                        "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                        rusqlite::params![id, hero, etype, desc, ts, hero_class],
                                     );
                                 }
                             }
@@ -9762,6 +9808,34 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     pub fn mark_dirty(&mut self) {
         self.last_mutation = Some(std::time::Instant::now());
+    }
+
+    // Heartbeat de presencia — solo corre si estamos en un workspace compartido con sync activo
+    pub fn tick_presence_update(&mut self) -> Result<()> {
+        if self.active_screen != ActiveScreen::Workspace || !self.auto_sync {
+            return Ok(());
+        }
+        let p_id = match self.active_project_id {
+            Some(pid) => pid,
+            None => return Ok(()),
+        };
+        let is_shared = self.projects.iter()
+            .find(|p| p.id == p_id)
+            .map(|p| p.is_shared)
+            .unwrap_or(false);
+        if !is_shared {
+            return Ok(());
+        }
+        if self.last_presence_update.elapsed() < std::time::Duration::from_secs(60) {
+            return Ok(());
+        }
+        let identity_key = self.identity.public_key.clone();
+        let username = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+        let now_str = chrono::Utc::now().to_rfc3339();
+        let proj_str = p_id.to_string();
+        let _ = self.db.update_presence(&identity_key, &username, true, &now_str, Some(&proj_str), "Visible");
+        self.last_presence_update = std::time::Instant::now();
+        Ok(())
     }
 
     // ── Notification Sprite helpers ──────────────────────────────────────────
@@ -10123,13 +10197,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
         // Named events require a username; anonymous events use "The Realm" as
         // a sentinel so the server accepts the entry but the feed hides the name.
-        let hero_name = if show_name {
+        let (hero_name, hero_class) = if show_name {
             match &self.user {
-                Some(u) if !u.username.is_empty() => u.username.clone(),
+                Some(u) if !u.username.is_empty() => {
+                    (u.username.clone(), u.class.name().to_string())
+                }
                 _ => return,
             }
         } else {
-            "The Realm".to_string()
+            ("The Realm".to_string(), String::new())
         };
         let client = crate::services::api_client::ApiClient::new(
             &self.server_url,
@@ -10139,8 +10215,17 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().to_rfc3339();
         let body = format!(
-            r#"{{"id":"{id}","hero_name":"{hero_name}","event_type":"{event_type}","description":"{description}","timestamp":"{timestamp}"}}"#,
+            r#"{{"id":"{id}","hero_name":"{hero_name}","hero_class":"{hero_class}","event_type":"{event_type}","description":"{description}","timestamp":"{timestamp}"}}"#,
         );
+        // Guardamos localmente de inmediato con la clase incluida — el servidor no siempre regresa hero_class
+        let _ = self.db.upsert_chronicle_entry(&crate::models::GlobalChronicleEntry {
+            id: id.clone(),
+            hero_name: hero_name.clone(),
+            event_type: event_type.to_string(),
+            description: description.to_string(),
+            timestamp: timestamp.clone(),
+            hero_class: if hero_class.is_empty() { None } else { Some(hero_class.clone()) },
+        });
         let _ = std::thread::spawn(move || {
             let _ = client.send_request("POST", "global_chronicle", &body);
         });

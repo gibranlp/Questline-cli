@@ -233,6 +233,15 @@ impl Database {
             "CREATE INDEX IF NOT EXISTS idx_notes_codex_id ON notes(codex_id);",
         )?;
 
+        let has_note_owner_identity: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('notes') WHERE name='owner_identity'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_note_owner_identity {
+            conn.execute("ALTER TABLE notes ADD COLUMN owner_identity TEXT;", [])?;
+        }
+
         // v1.0.6: contador acumulado de riegos — necesario para calcular contribuciones al capítulo global
         let has_total_waterings: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('zen_tree') WHERE name='total_waterings'",
@@ -255,6 +264,15 @@ impl Database {
                 PRIMARY KEY (chapter_id, objective_type)
             );",
         )?;
+
+        let has_chronicle_hero_class: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('global_chronicle') WHERE name='hero_class'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_chronicle_hero_class {
+            conn.execute("ALTER TABLE global_chronicle ADD COLUMN hero_class TEXT;", [])?;
+        }
 
         // v1.0.7: xp_awarded — evita que reabrir y re-completar una tarea dé XP extra
         let has_xp_awarded: bool = conn.query_row(
@@ -1007,7 +1025,7 @@ impl Database {
     // Inserts a new note.
     pub fn insert_note(&self, note: &Note) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 note.id.to_string(),
                 note.project_id.map(|id| id.to_string()),
@@ -1016,7 +1034,8 @@ impl Database {
                 note.created_at.to_rfc3339(),
                 note.updated_at.to_rfc3339(),
                 note.sharing_permission,
-                note.codex_id.map(|id| id.to_string())
+                note.codex_id.map(|id| id.to_string()),
+                note.owner_identity.as_deref()
             ],
         )?;
         let _ = self.log_change("note", &note.id.to_string(), "create");
@@ -1028,7 +1047,7 @@ impl Database {
 
     // Lists all notes.
     pub fn get_notes(&self) -> Result<Vec<Note>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id FROM notes")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity FROM notes")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -1038,6 +1057,7 @@ impl Database {
             let updated_str: String = row.get(5)?;
             let sharing_permission: String = row.get(6)?;
             let codex_id_str: Option<String> = row.get(7)?;
+            let owner_identity: Option<String> = row.get(8)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -1066,6 +1086,7 @@ impl Database {
                 updated_at,
                 sharing_permission,
                 codex_id,
+                owner_identity,
             })
         })?;
 
@@ -1078,7 +1099,7 @@ impl Database {
 
     // Lists notes for a project.
     pub fn get_notes_for_project(&self, project_id: Uuid) -> Result<Vec<Note>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id FROM notes WHERE project_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity FROM notes WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -1088,6 +1109,7 @@ impl Database {
             let updated_str: String = row.get(5)?;
             let sharing_permission: String = row.get(6)?;
             let codex_id_str: Option<String> = row.get(7)?;
+            let owner_identity: Option<String> = row.get(8)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -1100,7 +1122,7 @@ impl Database {
                 Some(c) => Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Note { id, project_id, title, markdown_content: content, created_at, updated_at, sharing_permission, codex_id })
+            Ok(Note { id, project_id, title, markdown_content: content, created_at, updated_at, sharing_permission, codex_id, owner_identity })
         })?;
         let mut notes = Vec::new();
         for r in rows { notes.push(r?); }
@@ -2047,7 +2069,7 @@ impl Database {
     }
 
     pub fn get_note_by_id(&self, id: Uuid) -> Result<Note> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id FROM notes WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity FROM notes WHERE id = ?1")?;
         let note = stmt.query_row(params![id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -2057,6 +2079,7 @@ impl Database {
             let updated_str: String = row.get(5)?;
             let sharing_permission: String = row.get(6)?;
             let codex_id_str: Option<String> = row.get(7)?;
+            let owner_identity: Option<String> = row.get(8)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -2085,6 +2108,7 @@ impl Database {
                 updated_at,
                 sharing_permission,
                 codex_id,
+                owner_identity,
             })
         })?;
         Ok(note)
@@ -2796,6 +2820,32 @@ impl Database {
         Ok(list)
     }
 
+    pub fn get_activity_log_for_project(
+        &self,
+        project_id: &str,
+        limit: usize,
+    ) -> Result<Vec<(String, Option<String>, String, String, String, String, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, event_type, description, user_identity, user_username, timestamp FROM activity_log WHERE project_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![project_id, limit as i64], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
     pub fn create_notification(
         &self,
         notif_type: &str,
@@ -3458,14 +3508,31 @@ impl Database {
     }
 
     pub fn get_all_known_usernames(&self) -> Result<Vec<String>> {
+        // Recoge nombres de todas las fuentes conocidas: miembros de proyectos, crónica global y usuarios locales
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT user_username FROM project_members WHERE user_username IS NOT NULL AND user_username != ''",
         )?;
-        let names = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
-            .filter_map(Result::ok)
-            .collect();
-        Ok(names)
+        for row in stmt.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+            names.insert(row.to_lowercase());
+        }
+
+        let mut stmt2 = self.conn.prepare(
+            "SELECT DISTINCT hero_name FROM global_chronicle WHERE hero_name IS NOT NULL AND hero_name != ''",
+        )?;
+        for row in stmt2.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+            names.insert(row.to_lowercase());
+        }
+
+        let mut stmt3 = self.conn.prepare(
+            "SELECT DISTINCT username FROM users WHERE username IS NOT NULL AND username != ''",
+        )?;
+        for row in stmt3.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+            names.insert(row.to_lowercase());
+        }
+
+        Ok(names.into_iter().collect())
     }
 
     pub fn upsert_global_chronicle_entry(
@@ -3485,15 +3552,22 @@ impl Database {
 
     pub fn upsert_chronicle_entry(&self, e: &GlobalChronicleEntry) -> Result<()> {
         self.conn.execute(
-            "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![e.id, e.hero_name, e.event_type, e.description, e.timestamp],
+            "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![e.id, e.hero_name, e.event_type, e.description, e.timestamp, e.hero_class],
         )?;
+        // Si la fila ya existía sin hero_class, la actualizamos ahora que sí la tenemos
+        if e.hero_class.is_some() {
+            self.conn.execute(
+                "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
+                rusqlite::params![e.hero_class, e.id],
+            )?;
+        }
         Ok(())
     }
 
     pub fn get_global_chronicle_entries(&self) -> Result<Vec<GlobalChronicleEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, hero_name, event_type, description, timestamp FROM global_chronicle ORDER BY timestamp DESC LIMIT 500",
+            "SELECT id, hero_name, event_type, description, timestamp, hero_class FROM global_chronicle ORDER BY timestamp DESC LIMIT 500",
         )?;
         let entries = stmt
             .query_map([], |row| {
@@ -3503,6 +3577,7 @@ impl Database {
                     event_type: row.get(2)?,
                     description: row.get(3)?,
                     timestamp: row.get(4)?,
+                    hero_class: row.get(5)?,
                 })
             })?
             .filter_map(Result::ok)

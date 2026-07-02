@@ -17,4 +17,6 @@ pub struct Note {
     pub sharing_permission: String, // "read_only", "editable", "collaborative"
     #[serde(default)]
     pub codex_id: Option<Uuid>,
+    #[serde(default)]
+    pub owner_identity: Option<String>,
 }
