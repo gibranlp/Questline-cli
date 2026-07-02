@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::models::{
     Achievement, ClassType, Codex, DailyAdventure, DailyQuest, DailyReflection, FocusSession,
-    GlobalChronicleEntry, JournalEntry, Milestone, Note, Project, Ritual, Statistics, Streak,
-    Task, TaskPriority, User, XPEvent, ZenTree,
+    GlobalChronicleEntry, JournalEntry, Milestone, Note, Project, RecurrenceType, Ritual,
+    Statistics, Streak, Task, TaskPriority, User, XPEvent, ZenTree,
 };
 
 // Struct que envuelve la conexión — todo pasa por aquí
@@ -255,6 +255,33 @@ impl Database {
                 PRIMARY KEY (chapter_id, objective_type)
             );",
         )?;
+
+        // v1.0.7: xp_awarded — evita que reabrir y re-completar una tarea dé XP extra
+        let has_xp_awarded: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='xp_awarded'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_xp_awarded {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN xp_awarded INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )?;
+            // Las tareas ya completadas antes de esta versión ya dieron XP — se marca como cobrado
+            conn.execute(
+                "UPDATE tasks SET xp_awarded = 1 WHERE completed = 1;",
+                [],
+            )?;
+        }
+
+        // v1.0.8: recurrence — tareas que renacen solas al completarse
+        let has_recurrence: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='recurrence'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_recurrence {
+            conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT;", [])?;
+        }
 
         // Siembra los logros fijos — OR IGNORE para no pisarlos si ya existen
         for (id, name, desc) in Achievement::static_list() {
@@ -791,7 +818,7 @@ impl Database {
     // Crea una tarea nueva — también guarda revisión para historial de cambios
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 task.id.to_string(),
                 task.project_id.map(|id| id.to_string()),
@@ -804,7 +831,9 @@ impl Database {
                 task.updated_at.to_rfc3339(),
                 task.owner_identity,
                 task.owner_username,
-                task.parent_task_id.map(|id| id.to_string())
+                task.parent_task_id.map(|id| id.to_string()),
+                if task.xp_awarded { 1 } else { 0 },
+                task.recurrence.map(|r| r.name()),
             ],
         )?;
         let _ = self.log_change("task", &task.id.to_string(), "create");
@@ -816,7 +845,7 @@ impl Database {
 
     // Lists all tasks.
     pub fn get_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -830,6 +859,8 @@ impl Database {
             let owner_identity: Option<String> = row.get(9)?;
             let owner_username: Option<String> = row.get(10)?;
             let parent_task_id_str: Option<String> = row.get(11)?;
+            let xp_awarded_int: i32 = row.get(12)?;
+            let recurrence_str: Option<String> = row.get(13)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -871,6 +902,8 @@ impl Database {
                 owner_identity,
                 owner_username,
                 parent_task_id,
+                xp_awarded: xp_awarded_int != 0,
+                recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str),
             })
         })?;
 
@@ -883,7 +916,7 @@ impl Database {
 
     // Lists tasks for a project.
     pub fn get_tasks_for_project(&self, project_id: Uuid) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE project_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -897,6 +930,8 @@ impl Database {
             let owner_identity: Option<String> = row.get(9)?;
             let owner_username: Option<String> = row.get(10)?;
             let parent_task_id_str: Option<String> = row.get(11)?;
+            let xp_awarded_int: i32 = row.get(12)?;
+            let recurrence_str: Option<String> = row.get(13)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -914,7 +949,7 @@ impl Database {
                 Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Task { id, project_id, title, description, due_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id })
+            Ok(Task { id, project_id, title, description, due_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded: xp_awarded_int != 0, recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str) })
         })?;
         let mut tasks = Vec::new();
         for r in rows { tasks.push(r?); }
@@ -929,7 +964,7 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, completed = ?5, priority = ?6, updated_at = ?7, owner_identity = ?8, owner_username = ?9, parent_task_id = ?10 WHERE id = ?11",
+            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, completed = ?5, priority = ?6, updated_at = ?7, owner_identity = ?8, owner_username = ?9, parent_task_id = ?10, xp_awarded = ?11, recurrence = ?12 WHERE id = ?13",
             params![
                 task.project_id.map(|id| id.to_string()),
                 task.title,
@@ -941,6 +976,8 @@ impl Database {
                 task.owner_identity,
                 task.owner_username,
                 task.parent_task_id.map(|id| id.to_string()),
+                if task.xp_awarded { 1 } else { 0 },
+                task.recurrence.map(|r| r.name()),
                 task.id.to_string()
             ],
         )?;
@@ -1945,7 +1982,7 @@ impl Database {
     // --- STAGE 5A IDENTITY, SYNC & CLOUD REVISION HELPERS ---
 
     pub fn get_task_by_id(&self, id: Uuid) -> Result<Task> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id FROM tasks WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE id = ?1")?;
         let task = stmt.query_row(params![id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
@@ -1959,6 +1996,8 @@ impl Database {
             let owner_identity: Option<String> = row.get(9)?;
             let owner_username: Option<String> = row.get(10)?;
             let parent_task_id_str: Option<String> = row.get(11)?;
+            let xp_awarded_int: i32 = row.get(12)?;
+            let recurrence_str: Option<String> = row.get(13)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -2000,6 +2039,8 @@ impl Database {
                 owner_identity,
                 owner_username,
                 parent_task_id,
+                xp_awarded: xp_awarded_int != 0,
+                recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str),
             })
         })?;
         Ok(task)
