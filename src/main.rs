@@ -507,20 +507,28 @@ async fn main() -> Result<()> {
                 && app.active_screen != ActiveScreen::Onboarding
             {
                 if let Some(notif) = app.notifications.last() {
+                    use questline::app::NotificationKind;
                     let overlay_area = questline::screens::intro::centered_rect(50, 15, size);
                     f.render_widget(Clear, overlay_area);
                     f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
+                    // Color y título según el tipo — azul info, amarillo warning, rojo Swarm
+                    let (border_color, msg_color) = match notif.kind {
+                        NotificationKind::Info    => (Color::Rgb(56, 189, 248),  Color::Rgb(200, 230, 255)),
+                        NotificationKind::Warning => (Color::Rgb(234, 179, 8),   Color::Rgb(255, 240, 180)),
+                        NotificationKind::Swarm   => (Color::Rgb(220, 50, 50),   Color::Rgb(255, 200, 200)),
+                    };
+                    let title_text = format!("  {}  ", notif.title);
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Double)
-                        .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                        .title(Span::styled(" Quest Alert ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                        .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
+                        .title(Span::styled(title_text, Style::default().fg(border_color).add_modifier(Modifier::BOLD)));
 
                     let paragraph = Paragraph::new(format!("\n {}", notif.message))
                         .block(block)
                         .alignment(ratatui::layout::Alignment::Center)
-                        .style(Style::default().fg(Color::White));
+                        .style(Style::default().fg(msg_color));
 
                     f.render_widget(paragraph, overlay_area);
                 }
