@@ -47,11 +47,13 @@ impl DueDateType {
 pub enum SearchResultType {
     Project,
     Task,
+    Step,
     Note,
     JournalEntry,
     Achievement,
     Lore,
     ChronicleEntry,
+    Milestone,
 }
 
 impl SearchResultType {
@@ -59,11 +61,13 @@ impl SearchResultType {
         match self {
             SearchResultType::Project => "Project",
             SearchResultType::Task => "Task",
+            SearchResultType::Step => "Step",
             SearchResultType::Note => "Note",
             SearchResultType::JournalEntry => "Journal",
             SearchResultType::Achievement => "Achievement",
             SearchResultType::Lore => "Lore",
             SearchResultType::ChronicleEntry => "Chronicle",
+            SearchResultType::Milestone => "Milestone",
         }
     }
 }
@@ -542,6 +546,10 @@ pub struct App {
     pub audio_player: crate::audio::AudioPlayer,
     pub selected_soundscape_idx: usize,
     pub selected_focus_soundscape_idx: usize, // 0 = None (Silent), 1..=SOUNDSCAPES.len() = specific soundscape
+
+    // Media Player via MPRIS
+    pub mpris_now_playing: Option<crate::audio::mpris_player::NowPlaying>,
+    pub mpris_last_poll: std::time::Instant,
 
     // Stage 5A Sync & Identity Fields — cripto y sincronización con el servidor
     pub identity: crate::services::identity::Identity,
@@ -1709,6 +1717,10 @@ impl App {
             prologue_next_is_onboarding: false,
             prologue_delay_ticks: 0,
             prologue_skip_checked: false,
+
+            // Media Player via MPRIS
+            mpris_now_playing: None,
+            mpris_last_poll: std::time::Instant::now(),
         };
 
         app.reload_data()?;
@@ -2045,6 +2057,16 @@ impl App {
             return Ok(());
         }
 
+        // "/" abre Search Everywhere desde cualquier pantalla
+        if key.code == KeyCode::Char('/') && !in_text_entry {
+            self.modal_state = ModalType::SearchEverywhere {
+                query: String::new(),
+                selected_idx: 0,
+                results: Vec::new(),
+            };
+            return Ok(());
+        }
+
         // Global sync shortcut — works on any screen except the editor (which uses Ctrl+S to save notes)
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
@@ -2195,7 +2217,14 @@ impl App {
                 KeyCode::Char('p') => {
                     // Only pause audio if not on Fellowship screen (uses 'p' for companions tab)
                     if self.active_screen != ActiveScreen::Fellowship {
-                        self.audio_player.pause();
+                        use crate::audio::SOUNDSCAPES;
+                        if self.active_screen == ActiveScreen::Soundscapes
+                            && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
+                        {
+                            crate::audio::mpris_player::play_pause();
+                        } else {
+                            self.audio_player.pause();
+                        }
                         return Ok(());
                     }
                 }
@@ -2212,13 +2241,20 @@ impl App {
                     }
                 }
                 KeyCode::Char('n') => {
-                    // Only cycle soundscape if not on Dashboard, Projects, Workspace, or Fellowship
+                    use crate::audio::SOUNDSCAPES;
+                    // MPRIS next track cuando el Media Player está seleccionado
+                    if self.active_screen == ActiveScreen::Soundscapes
+                        && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
+                    {
+                        crate::audio::mpris_player::next_track();
+                        return Ok(());
+                    }
+                    // Otherwise cycle soundscape (not on screens that use 'n' for other things)
                     if self.active_screen != ActiveScreen::Dashboard
                         && self.active_screen != ActiveScreen::Projects
                         && self.active_screen != ActiveScreen::Workspace
                         && self.active_screen != ActiveScreen::Fellowship
                     {
-                        use crate::audio::SOUNDSCAPES;
                         let current = self.audio_player.get_state().current_soundscape;
                         let idx = SOUNDSCAPES
                             .iter()
@@ -2252,6 +2288,16 @@ impl App {
                         let sugs = App::path_suggestions(&current_val);
                         self.modal_state = ModalType::LocalMusicFolder { input: current_val, suggestions: sugs, selected: 0 };
                         return Ok(());
+                    }
+                }
+                KeyCode::Char('b') => {
+                    // pista anterior en MPRIS
+                    if self.active_screen == ActiveScreen::Soundscapes && self.modal_state == ModalType::None {
+                        use crate::audio::SOUNDSCAPES;
+                        if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
+                            crate::audio::mpris_player::prev_track();
+                            return Ok(());
+                        }
                     }
                 }
                 _ => {}
@@ -4828,7 +4874,7 @@ impl App {
                 self.active_screen = ActiveScreen::Character;
                 self.active_tab_idx = 2;
             }
-            KeyCode::Char('F') if self.active_screen == ActiveScreen::Projects => {
+            KeyCode::Char('f') | KeyCode::Char('F') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Focus;
                 self.active_tab_idx = 6;
             }
@@ -5410,6 +5456,10 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     use crate::audio::SOUNDSCAPES;
                     let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
+                    if s_name == "Media Player" {
+                        crate::audio::mpris_player::play_pause();
+                        return Ok(());
+                    }
                     if s_name == "Local Folder" {
                         let folder = self.db.get_setting("local_music_folder").unwrap_or_default().unwrap_or_default();
                         if folder.trim().is_empty() {
@@ -8491,147 +8541,166 @@ impl App {
             return Vec::new();
         }
         let q = query.to_lowercase();
-        let mut results = Vec::new();
+        let mut scored: Vec<(u8, SearchResult)> = Vec::new();
 
-        // 1. Search Projects
-        if let Ok(projects) = self.db.get_projects() {
-            for p in projects {
-                if p.name.to_lowercase().contains(&q)
-                    || p.description
-                        .as_ref()
-                        .map(|d| d.to_lowercase().contains(&q))
-                        .unwrap_or(false)
-                {
-                    results.push(SearchResult {
-                        result_type: SearchResultType::Project,
-                        title: p.name.clone(),
-                        details: p
-                            .description
-                            .clone()
-                            .unwrap_or_else(|| "No description".to_string()),
-                        project_id: Some(p.id),
-                        item_id: p.id.to_string(),
-                    });
-                }
+        // Puntaje por relevancia: coincidencia exacta > empieza con > contiene en título > contiene en cuerpo
+        let score_match = |title: &str, content: Option<&str>| -> Option<u8> {
+            let t = title.to_lowercase();
+            if t == q { return Some(100); }
+            if t.starts_with(&q) { return Some(80); }
+            if t.contains(&q) { return Some(60); }
+            if content.map(|c| c.to_lowercase().contains(&q)).unwrap_or(false) { return Some(30); }
+            None
+        };
+
+        let projects = self.db.get_projects().unwrap_or_default();
+        let project_name: std::collections::HashMap<uuid::Uuid, &str> = projects.iter()
+            .map(|p| (p.id, p.name.as_str()))
+            .collect();
+
+        // 1. Proyectos
+        for p in &projects {
+            if let Some(s) = score_match(&p.name, p.description.as_deref()) {
+                scored.push((s, SearchResult {
+                    result_type: SearchResultType::Project,
+                    title: p.name.clone(),
+                    details: p.description.clone().unwrap_or_else(|| "No description".to_string()),
+                    project_id: Some(p.id),
+                    item_id: p.id.to_string(),
+                }));
             }
         }
 
-        // 2. Search Tasks
+        // 2. Tareas y Steps (pasos)
         if let Ok(tasks) = self.db.get_tasks() {
-            for t in tasks {
-                if t.title.to_lowercase().contains(&q)
-                    || t.description
-                        .as_ref()
-                        .map(|d| d.to_lowercase().contains(&q))
-                        .unwrap_or(false)
-                {
-                    results.push(SearchResult {
-                        result_type: SearchResultType::Task,
-                        title: t.title.clone(),
-                        details: format!("Task (Priority: {})", t.priority.name()),
-                        project_id: t.project_id,
-                        item_id: t.id.to_string(),
-                    });
-                }
-            }
-        }
-
-        // 3. Search Notes
-        if let Ok(projects) = self.db.get_projects() {
-            for p in &projects {
-                if let Ok(notes) = self.db.get_notes_for_project(p.id) {
-                    for n in notes {
-                        if n.title.to_lowercase().contains(&q)
-                            || n.markdown_content.to_lowercase().contains(&q)
-                        {
-                            results.push(SearchResult {
-                                result_type: SearchResultType::Note,
-                                title: n.title.clone(),
-                                details: format!("Note in project '{}'", p.name),
-                                project_id: Some(p.id),
-                                item_id: n.id.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // 4. Search Journal Entries
-        if let Ok(projects) = self.db.get_projects() {
-            for p in &projects {
-                if let Ok(journal) = self.db.get_journal_entries_for_project(p.id) {
-                    for j in journal {
-                        if j.content.to_lowercase().contains(&q) {
-                            results.push(SearchResult {
-                                result_type: SearchResultType::JournalEntry,
-                                title: format!("Journal - {}", j.entry_date),
-                                details: j.content.chars().take(60).collect(),
-                                project_id: Some(p.id),
-                                item_id: j.id.to_string(),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        // 5. Search Achievements
-        if let Ok(achievements) = self.db.get_achievements() {
-            for a in achievements {
-                if a.name.to_lowercase().contains(&q) || a.description.to_lowercase().contains(&q) {
-                    let status = if a.unlocked_at.is_some() {
-                        "Unlocked"
+            for t in &tasks {
+                if let Some(s) = score_match(&t.title, t.description.as_deref()) {
+                    let proj = t.project_id.and_then(|id| project_name.get(&id)).copied().unwrap_or("—");
+                    if t.parent_task_id.is_none() {
+                        scored.push((s, SearchResult {
+                            result_type: SearchResultType::Task,
+                            title: t.title.clone(),
+                            details: format!("{} · {} priority", proj, t.priority.name()),
+                            project_id: t.project_id,
+                            item_id: t.id.to_string(),
+                        }));
                     } else {
-                        "Locked"
-                    };
-                    results.push(SearchResult {
+                        scored.push((s, SearchResult {
+                            result_type: SearchResultType::Step,
+                            title: t.title.clone(),
+                            details: format!("{} · subtask", proj),
+                            project_id: t.project_id,
+                            item_id: t.id.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 3. Notas / Scrolls
+        for p in &projects {
+            if let Ok(notes) = self.db.get_notes_for_project(p.id) {
+                for n in &notes {
+                    if let Some(s) = score_match(&n.title, Some(&n.markdown_content)) {
+                        let snippet: String = n.markdown_content
+                            .chars().take(50).collect::<String>().replace('\n', " ");
+                        scored.push((s, SearchResult {
+                            result_type: SearchResultType::Note,
+                            title: n.title.clone(),
+                            details: format!("{} · {}", p.name, snippet),
+                            project_id: Some(p.id),
+                            item_id: n.id.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 4. Entradas del diario
+        for p in &projects {
+            if let Ok(journals) = self.db.get_journal_entries_for_project(p.id) {
+                for j in &journals {
+                    if j.content.to_lowercase().contains(&q) {
+                        let snippet: String = j.content.chars().take(50).collect();
+                        scored.push((30, SearchResult {
+                            result_type: SearchResultType::JournalEntry,
+                            title: format!("Journal - {}", j.entry_date),
+                            details: format!("{} · {}", p.name, snippet),
+                            project_id: Some(p.id),
+                            item_id: j.id.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 5. Milestones / Hitos
+        for p in &projects {
+            if let Ok(milestones) = self.db.get_milestones_for_project(p.id) {
+                for m in &milestones {
+                    if let Some(s) = score_match(&m.name, m.description.as_deref()) {
+                        let status = if m.completed { "Completed" } else { "In Progress" };
+                        scored.push((s, SearchResult {
+                            result_type: SearchResultType::Milestone,
+                            title: m.name.clone(),
+                            details: format!("{} · {}", p.name, status),
+                            project_id: Some(p.id),
+                            item_id: m.id.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
+        // 6. Logros / Achievements
+        if let Ok(achievements) = self.db.get_achievements() {
+            for a in &achievements {
+                if let Some(s) = score_match(&a.name, Some(&a.description)) {
+                    let status = if a.unlocked_at.is_some() { "Unlocked" } else { "Locked" };
+                    scored.push((s, SearchResult {
                         result_type: SearchResultType::Achievement,
                         title: format!("Achievement: {}", a.name),
                         details: format!("{} ({})", a.description, status),
                         project_id: None,
                         item_id: a.id.clone(),
-                    });
+                    }));
                 }
             }
         }
 
-        // 6. Search Lore
+        // 7. Lore / Biblioteca
         if let Ok(lore) = self.db.get_lore_entries() {
-            for l in lore {
-                if l.2.to_lowercase().contains(&q) || l.3.to_lowercase().contains(&q) {
-                    results.push(SearchResult {
+            for l in &lore {
+                if let Some(s) = score_match(&l.2, Some(&l.3)) {
+                    scored.push((s, SearchResult {
                         result_type: SearchResultType::Lore,
                         title: format!("Lore: {}", l.2),
-                        details: format!(
-                            "Category: {} - {}",
-                            l.1,
-                            if l.4 { "Unlocked" } else { "Locked" }
-                        ),
+                        details: format!("Category: {} - {}", l.1, if l.4 { "Unlocked" } else { "Locked" }),
                         project_id: None,
                         item_id: l.0.clone(),
-                    });
+                    }));
                 }
             }
         }
 
-        // 7. Search Chronicle Entries
+        // 8. Crónica
         if let Ok(entries) = self.db.get_chronicle_entries() {
-            for e in entries {
+            for e in &entries {
                 if e.2.to_lowercase().contains(&q) {
-                    results.push(SearchResult {
+                    scored.push((30, SearchResult {
                         result_type: SearchResultType::ChronicleEntry,
                         title: format!("Chronicle Day {}", e.1),
                         details: e.2.clone(),
                         project_id: None,
                         item_id: e.0.clone(),
-                    });
+                    }));
                 }
             }
         }
 
-        results.truncate(15);
-        results
+        // Ordena por puntaje y limita a 40 resultados
+        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.into_iter().map(|(_, r)| r).take(40).collect()
     }
 
     pub fn navigate_to_search_result(&mut self, result: &SearchResult) -> Result<()> {
@@ -8649,11 +8718,90 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
-                    let tasks = self.db.get_tasks_for_project(p_id).unwrap_or_default();
+                    // Resetea filtro y modo drill-down para que la tarea sea visible
+                    self.task_filter = "All".to_string();
+                    self.viewing_step_for_task = None;
                     if let Ok(task_uuid) = uuid::Uuid::parse_str(&result.item_id) {
-                        if let Some(pos) = tasks.iter().position(|t| t.id == task_uuid) {
+                        self.reload_data()?;
+                        // Construye la lista plana idéntica al renderer para encontrar la posición correcta
+                        let tasks = self.db.get_tasks_for_project(p_id).unwrap_or_default();
+                        let mut parents: Vec<&crate::models::Task> = tasks.iter()
+                            .filter(|t| t.parent_task_id.is_none())
+                            .collect();
+                        match self.task_sort.as_str() {
+                            "DueDate" => parents.sort_by(|a, b| {
+                                a.completed.cmp(&b.completed).then_with(|| match (a.due_date, b.due_date) {
+                                    (Some(d1), Some(d2)) => d1.cmp(&d2),
+                                    (Some(_), None) => std::cmp::Ordering::Less,
+                                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                                    (None, None) => a.created_at.cmp(&b.created_at),
+                                })
+                            }),
+                            "Priority" => parents.sort_by(|a, b| {
+                                a.completed.cmp(&b.completed).then_with(|| b.priority.cmp(&a.priority))
+                            }),
+                            "Alphabetical" => parents.sort_by(|a, b| {
+                                a.completed.cmp(&b.completed)
+                                    .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                            }),
+                            _ => parents.sort_by(|a, b| {
+                                a.completed.cmp(&b.completed).then_with(|| b.created_at.cmp(&a.created_at))
+                            }),
+                        }
+                        let mut flat_ids: Vec<uuid::Uuid> = Vec::new();
+                        for parent in &parents {
+                            flat_ids.push(parent.id);
+                            if !parent.completed {
+                                let mut steps: Vec<&crate::models::Task> = tasks.iter()
+                                    .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
+                                    .collect();
+                                steps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                for step in steps {
+                                    flat_ids.push(step.id);
+                                }
+                            }
+                        }
+                        if let Some(pos) = flat_ids.iter().position(|&id| id == task_uuid) {
                             self.selected_task_idx = pos;
                         }
+                        return Ok(());
+                    }
+                }
+            }
+            SearchResultType::Step => {
+                // Navega al task padre — los steps aparecen inline en la lista de tareas
+                if let Some(p_id) = result.project_id {
+                    self.active_project_id = Some(p_id);
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 0;
+                    self.task_filter = "All".to_string();
+                    self.viewing_step_for_task = None;
+                    if let Ok(step_uuid) = uuid::Uuid::parse_str(&result.item_id) {
+                        self.reload_data()?;
+                        let tasks = self.db.get_tasks_for_project(p_id).unwrap_or_default();
+                        let mut parents: Vec<&crate::models::Task> = tasks.iter()
+                            .filter(|t| t.parent_task_id.is_none())
+                            .collect();
+                        parents.sort_by(|a, b| {
+                            a.completed.cmp(&b.completed).then_with(|| b.created_at.cmp(&a.created_at))
+                        });
+                        let mut flat_ids: Vec<uuid::Uuid> = Vec::new();
+                        for parent in &parents {
+                            flat_ids.push(parent.id);
+                            if !parent.completed {
+                                let mut steps: Vec<&crate::models::Task> = tasks.iter()
+                                    .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
+                                    .collect();
+                                steps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                                for step in steps {
+                                    flat_ids.push(step.id);
+                                }
+                            }
+                        }
+                        if let Some(pos) = flat_ids.iter().position(|&id| id == step_uuid) {
+                            self.selected_task_idx = pos;
+                        }
+                        return Ok(());
                     }
                 }
             }
@@ -8662,11 +8810,36 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 1;
-                    let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
                     if let Ok(note_uuid) = uuid::Uuid::parse_str(&result.item_id) {
-                        if let Some(pos) = notes.iter().position(|n| n.id == note_uuid) {
-                            self.selected_note_idx = pos;
+                        self.reload_data()?;
+                        let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
+                        let codices = self.db.get_codices_for_project(p_id).unwrap_or_default();
+                        // Construye la misma lista plana que draw_notes_tab: headers de codex + notas
+                        let mut flat: Vec<Option<uuid::Uuid>> = Vec::new();
+                        for codex in &codices {
+                            flat.push(None); // header de codex
+                            let mut codex_notes: Vec<&crate::models::Note> = notes.iter()
+                                .filter(|n| n.codex_id == Some(codex.id))
+                                .collect();
+                            codex_notes.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+                            for note in codex_notes {
+                                flat.push(Some(note.id));
+                            }
                         }
+                        let mut ungrouped: Vec<&crate::models::Note> = notes.iter()
+                            .filter(|n| n.codex_id.is_none() || !codices.iter().any(|c| Some(c.id) == n.codex_id))
+                            .collect();
+                        ungrouped.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+                        if !codices.is_empty() && !ungrouped.is_empty() {
+                            flat.push(None); // divisor
+                        }
+                        for note in &ungrouped {
+                            flat.push(Some(note.id));
+                        }
+                        if let Some(pos) = flat.iter().position(|id| *id == Some(note_uuid)) {
+                            self.selected_notes_flat_idx = pos;
+                        }
+                        return Ok(());
                     }
                 }
             }
@@ -8675,13 +8848,24 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 2;
-                    let journal = self
-                        .db
-                        .get_journal_entries_for_project(p_id)
-                        .unwrap_or_default();
+                    let journal = self.db.get_journal_entries_for_project(p_id).unwrap_or_default();
                     if let Ok(journal_uuid) = uuid::Uuid::parse_str(&result.item_id) {
                         if let Some(pos) = journal.iter().position(|j| j.id == journal_uuid) {
                             self.selected_journal_idx = pos;
+                        }
+                    }
+                }
+            }
+            SearchResultType::Milestone => {
+                if let Some(p_id) = result.project_id {
+                    self.active_project_id = Some(p_id);
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 3;
+                    if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
+                        if let Ok(m_uuid) = uuid::Uuid::parse_str(&result.item_id) {
+                            if let Some(pos) = milestones.iter().position(|m| m.id == m_uuid) {
+                                self.selected_milestone_idx = pos;
+                            }
                         }
                     }
                 }
@@ -8905,6 +9089,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 shortcut: "M / 5",
                 id: "open_music",
             },
+            CommandAction {
+                name: "Cycle Ambient Effect",
+                description: "Switch the ambient particle effect on the Dashboard",
+                shortcut: "e (Dashboard)",
+                id: "cycle_ambient",
+            },
         ];
 
         if filter.is_empty() {
@@ -9049,6 +9239,28 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             "open_music" => {
                 self.active_screen = ActiveScreen::Soundscapes;
                 self.active_tab_idx = 7;
+            }
+            "cycle_ambient" => {
+                self.active_screen = ActiveScreen::Dashboard;
+                self.active_tab_idx = 0;
+                self.active_ambient_effect = (self.active_ambient_effect + 1) % 6;
+                self.db.set_setting(
+                    "active_ambient_effect",
+                    &self.active_ambient_effect.to_string(),
+                )?;
+                self.trigger_ambient_particles();
+                self.notifications.push(Notification::info(format!(
+                    "Ambient Effect: {}",
+                    match self.active_ambient_effect {
+                        0 => "Off",
+                        1 => "Falling Leaves",
+                        2 => "Stars",
+                        3 => "Rain",
+                        4 => "Snow",
+                        5 => "Glowing Runes",
+                        _ => "Off",
+                    }
+                )));
             }
             _ => {}
         }
@@ -9451,6 +9663,19 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
         }
         Ok(())
+    }
+
+    // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
+    pub fn tick_mpris(&mut self) {
+        use crate::audio::SOUNDSCAPES;
+        let is_selected = self.active_screen == ActiveScreen::Soundscapes
+            && self.selected_soundscape_idx < SOUNDSCAPES.len()
+            && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player";
+
+        if is_selected && self.mpris_last_poll.elapsed().as_secs() >= 3 {
+            self.mpris_last_poll = std::time::Instant::now();
+            self.mpris_now_playing = crate::audio::mpris_player::get_now_playing();
+        }
     }
 
     pub fn tick_chat_poll(&mut self) -> Result<()> {

@@ -205,6 +205,33 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // Historial de versiones hardcodeado — pues hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v1.0.8", "Jul 6, 2026",
+            "The Focus Session Listens Now",
+            &[
+                "Music visualizer now shows real audio",
+                "Works with Spotify, VLC, mpv, and any player",
+                "Local soundscapes also show real frequencies",
+                "Bars jump up instantly, fall off smoothly",
+                "Search now navigates to the exact note or task",
+                "Results ranked by relevance (title first)",
+                "Search also covers steps and milestones",
+                "Press / anywhere to open search instantly",
+                "Ambient effects accessible from Command Palette",
+            ],
+        ),
+        (
+            "v1.0.7", "Jul 1, 2026",
+            "Music, Motion, and a New Address",
+            &[
+                "Moved to questlinecli.com",
+                "Added MPRIS media player support",
+                "Control any player: Spotify, VLC, Rhythmbox",
+                "Music visualizer added to Focus tab",
+                "Companion tree grows during focus sessions",
+                "Realm Activity feed in Great Chronicle",
+            ],
+        ),
+        (
             "v1.0.6", "Jun 26, 2026",
             "The Notification Swarm",
             &[

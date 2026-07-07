@@ -20,24 +20,28 @@ impl ZenTree {
     pub fn stage_name(&self) -> &'static str {
         match self.stage {
             1 => "Acorn",
-            2 => "Sapling",
-            3 => "Treekin",
-            4 => "Grovekeeper",
-            5 => "Ancient Warden",
-            6 => "Forest Elder",
-            _ => "World Tree",
+            2 => "Sprout",
+            3 => "Young Entling",
+            4 => "Grove Guardian",
+            5 => "Ancient Ent",
+            6 => "Evergrowth Elder",
+            _ => "Evergrowth Tree",
         }
     }
 
     pub fn ascii_art(&self) -> &'static str {
-        match self.stage {
-            1 => "      .\n     ( )\n",
-            2 => "      ,\n     /|\n      |\n",
-            3 => "     \\|/\n      |\n      |\n",
-            4 => "     /*\\\n    /***\\\\\n      |\n      |\n",
-            5 => "     .ooo.\n   .oQOOPQo.\n    OOPQOQO\n     |  |\n     |  |\n",
-            6 => "      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n     || ||\n     || ||\n",
-            _ => "      .ooo.\n    .oQOOPQo.\n   .oQOQOQOQo.\n  .oQOQOQOQOQo.\n    ||| |||\n    ||| |||\n",
+        Self::ascii_art_at_stage(self.stage)
+    }
+
+    pub fn ascii_art_at_stage(stage: i32) -> &'static str {
+        match stage {
+            1 => "    .\n   ( )\n",
+            2 => "    .\n   \\|/\n    |\n    '\n",
+            3 => "    ,\n   \\|/\n  --|--\n    |\n   / \\\n",
+            4 => "    .^.\n   /^^\\  \n  <^^^^>\n    ||\n    ||\n   /__\\\n",
+            5 => "     .-^^^-.\n   .^^^^^^^^^.\n  <^^^^^^^^^^^>\n <^^^^^^^^^^^^^>\n      ||||\n      ||||\n     /||||\\\n",
+            6 => "        .-^^^^^-.\n     .^^^^^^^^^^^^.\n   .^^^^^^^^^^^^^^^^.\n  <^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^>\n        ||||||\n        ||||||\n      __||||||__\n",
+            _ => "          .-^^^^^^^^^-.\n      .^^^^^^^^^^^^^^^^^^.\n    .^^^^^^^^^^^^^^^^^^^^^^.\n  .^^^^^^^^^^^^^^^^^^^^^^^^^^.\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n   \\^^^^^^^^^^^^^^^^^^^^^^^^/\n        ||||||||||||\n        ||||||||||||\n     ___||||||||||||___\n",
         }
     }
 }
