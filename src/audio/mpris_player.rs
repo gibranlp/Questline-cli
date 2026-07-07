@@ -2,9 +2,8 @@
 // audio/mpris_player.rs — controla reproductores de música vía MPRIS (D-Bus)
 // funciona con Spotify, VLC, Rhythmbox, y cualquier player compatible con MPRIS
 // sin OAuth, sin cuenta, sin configuración — solo abre tu reproductor favorito
+// solo disponible en Linux; macOS y Windows no tienen D-Bus
 // ─────────────────────────────────────────────────────────────────────────────
-
-use mpris::PlayerFinder;
 
 #[derive(Debug, Clone)]
 pub struct NowPlaying {
@@ -14,7 +13,9 @@ pub struct NowPlaying {
     pub is_playing: bool,
 }
 
+#[cfg(target_os = "linux")]
 pub fn get_now_playing() -> Option<NowPlaying> {
+    use mpris::PlayerFinder;
     let finder = PlayerFinder::new().ok()?;
     let player = finder.find_active().ok()?;
     let player_name = player.bus_name_trimmed().to_string();
@@ -31,7 +32,14 @@ pub fn get_now_playing() -> Option<NowPlaying> {
     Some(NowPlaying { title, artist, player: player_name, is_playing })
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn get_now_playing() -> Option<NowPlaying> {
+    None
+}
+
+#[cfg(target_os = "linux")]
 pub fn play_pause() {
+    use mpris::PlayerFinder;
     if let Ok(finder) = PlayerFinder::new() {
         if let Ok(player) = finder.find_active() {
             let _ = player.play_pause();
@@ -39,7 +47,12 @@ pub fn play_pause() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn play_pause() {}
+
+#[cfg(target_os = "linux")]
 pub fn next_track() {
+    use mpris::PlayerFinder;
     if let Ok(finder) = PlayerFinder::new() {
         if let Ok(player) = finder.find_active() {
             let _ = player.next();
@@ -47,10 +60,18 @@ pub fn next_track() {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
+pub fn next_track() {}
+
+#[cfg(target_os = "linux")]
 pub fn prev_track() {
+    use mpris::PlayerFinder;
     if let Ok(finder) = PlayerFinder::new() {
         if let Ok(player) = finder.find_active() {
             let _ = player.previous();
         }
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+pub fn prev_track() {}
