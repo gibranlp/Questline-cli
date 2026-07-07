@@ -8,7 +8,13 @@ pub struct SoundscapeInfo {
     pub bonus: &'static str,
 }
 
-pub const SOUNDSCAPES: [SoundscapeInfo; 8] = [
+pub const SOUNDSCAPES: [SoundscapeInfo; 9] = [
+    SoundscapeInfo {
+        name: "Media Player",
+        symbol: "",
+        description: "Control any MPRIS-compatible player: Spotify, VLC, Rhythmbox, and more.",
+        bonus: "+5% Focus XP — syncs with your listening mood",
+    },
     SoundscapeInfo {
         name: "Music For Programming",
         symbol: "",

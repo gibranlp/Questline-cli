@@ -4,7 +4,7 @@
 
 use crate::audio::state::{AudioState, PlaybackStatus};
 use crate::audio::streams::build_source;
-use rodio::{OutputStream, Sink};
+use rodio::{OutputStream, Sink, Source};
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_os = "windows"))]
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
@@ -15,6 +15,7 @@ pub struct AudioPlayer {
     sink: Arc<Mutex<Option<Sink>>>,
     state: Arc<Mutex<AudioState>>,
     cinematic_sink: Arc<Mutex<Option<Sink>>>,
+    spectrum: crate::audio::spectrum::SpectrumData,
 }
 
 impl Default for AudioPlayer {
@@ -68,9 +69,12 @@ impl AudioPlayer {
             sink: Arc::new(Mutex::new(sink)),
             state,
             cinematic_sink: Arc::new(Mutex::new(None)),
+            spectrum: crate::audio::spectrum::new_spectrum_data(),
         };
         #[cfg(not(target_os = "windows"))]
         player.init_mpris();
+        // captura el monitor del sistema para mostrar espectro de reproductores externos (MPRIS)
+        crate::audio::capture::start_system_capture(player.spectrum.clone());
         player
     }
 
@@ -158,7 +162,11 @@ impl AudioPlayer {
     }
 
     pub fn play(&self, soundscape_name: &str) {
-        trigger_playback(soundscape_name, &self.state, &self.sink, &self.handle);
+        trigger_playback(soundscape_name, &self.state, &self.sink, &self.handle, &self.spectrum);
+    }
+
+    pub fn get_spectrum(&self) -> [f32; crate::audio::spectrum::NUM_BARS] {
+        *self.spectrum.lock().unwrap()
     }
 
     pub fn init_soundscape(&self, soundscape_name: &str) {
@@ -191,6 +199,10 @@ impl AudioPlayer {
         if let Some(ref sk) = *sink_guard {
             sk.stop();
         }
+        // limpia el espectro — ya no hay audio fluyendo por el sink
+        let _ = self.spectrum.try_lock().map(|mut s| {
+            *s = [0.0f32; crate::audio::spectrum::NUM_BARS];
+        });
     }
 
     // actualiza volumen en tiempo real sin reiniciar el stream — clampea entre 0 y 1
@@ -229,6 +241,7 @@ impl AudioPlayer {
         let state_clone = self.state.clone();
         let sink_clone = self.sink.clone();
         let handle_clone = self.handle.clone();
+        let spectrum_clone = self.spectrum.clone();
 
         // corre en su propio thread — el loop de MPRIS no debe bloquear el UI
         std::thread::spawn(move || {
@@ -317,17 +330,17 @@ impl AudioPlayer {
                         MediaControlEvent::Next => {
                             let current = state_clone.lock().unwrap().current_soundscape.clone();
                             if current == "Local Folder" || current.starts_with("Local:") {
-                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
                             } else if current == "Music For Programming" || current.starts_with("MFP:") {
-                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
                             }
                         }
                         MediaControlEvent::Previous => {
                             let current = state_clone.lock().unwrap().current_soundscape.clone();
                             if current == "Local Folder" || current.starts_with("Local:") {
-                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
                             } else if current == "Music For Programming" || current.starts_with("MFP:") {
-                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
                             }
                         }
                         _ => {}
@@ -374,6 +387,7 @@ fn trigger_playback(
     state_clone: &Arc<Mutex<AudioState>>,
     sink_clone: &Arc<Mutex<Option<Sink>>>,
     handle_clone: &Option<rodio::OutputStreamHandle>,
+    spectrum: &crate::audio::spectrum::SpectrumData,
 ) {
     let mut state = state_clone.lock().unwrap();
     state.current_soundscape = soundscape_name.to_string();
@@ -399,20 +413,21 @@ fn trigger_playback(
         // drop explícito antes de spawn para no tener deadlock en el otro thread
         drop(sink_guard);
         drop(state);
-        trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+        trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum.clone());
         return;
     }
 
     if soundscape_name == "Local Folder" {
         drop(sink_guard);
         drop(state);
-        trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone());
+        trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum.clone());
         return;
     }
 
     if let Some(src) = build_source(soundscape_name) {
         if let Some(ref sk) = *sink_guard {
-            sk.append(src);
+            // envuelve la fuente en SpectrumTap para capturar muestras en tiempo real
+            sk.append(crate::audio::spectrum::SpectrumSource::new(src, spectrum.clone()));
             sk.play();
         }
     }
@@ -423,6 +438,7 @@ fn trigger_music_for_programming(
     state_clone: Arc<Mutex<AudioState>>,
     sink_clone: Arc<Mutex<Option<Sink>>>,
     handle_clone: Option<rodio::OutputStreamHandle>,
+    spectrum: crate::audio::spectrum::SpectrumData,
 ) {
     std::thread::spawn(move || {
         // todo esto corre en background — el UI no espera, la descarga puede tardar
@@ -524,7 +540,11 @@ fn trigger_music_for_programming(
             let volume = state_clone.lock().unwrap().volume;
             sink.set_volume(volume);
             sink.pause();
-            sink.append(source);
+            // convierte i16→f32 para poder envolver con SpectrumSource
+            sink.append(crate::audio::spectrum::SpectrumSource::new(
+                Box::new(source.convert_samples::<f32>()),
+                spectrum,
+            ));
             sink.play();
 
             {
@@ -543,6 +563,7 @@ fn trigger_local_folder(
     state_clone: Arc<Mutex<AudioState>>,
     sink_clone: Arc<Mutex<Option<Sink>>>,
     handle_clone: Option<rodio::OutputStreamHandle>,
+    spectrum: crate::audio::spectrum::SpectrumData,
 ) {
     // lee el path desde el state — nunca tocamos la DB desde el thread de audio
     let folder_path = {
@@ -646,7 +667,11 @@ fn trigger_local_folder(
                         .to_string();
                 }
 
-                sink.append(source);
+                // convierte i16→f32 antes del SpectrumSource — cada archivo comparte el mismo Arc
+                sink.append(crate::audio::spectrum::SpectrumSource::new(
+                    Box::new(source.convert_samples::<f32>()),
+                    spectrum.clone(),
+                ));
                 play_count += 1;
             }
 

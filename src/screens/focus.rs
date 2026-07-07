@@ -86,7 +86,8 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         .constraints([
             Constraint::Length(3), // Header
             Constraint::Length(8), // Big Timer Box
-            Constraint::Min(5),    // Zen Tree & Motivation
+            Constraint::Length(5), // Visualizador de música
+            Constraint::Min(5),    // Zen Tree & Motivación
             Constraint::Length(3), // Footer
         ])
         .split(size);
@@ -183,42 +184,63 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         .alignment(Alignment::Center);
     f.render_widget(timer_box, chunks[1]);
 
-    // 3. Middle Section: árbol zen a la izquierda, quote motivacional a la derecha
+    // 3. Visualizador de música — misma lógica que en el config screen
+    draw_visualizer(f, app, theme, chunks[2]);
+
+    // 4. Middle Section: árbol zen a la izquierda, quote motivacional a la derecha
     let mid_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(40), // Tree Companion
             Constraint::Percentage(60), // Motivating scroll
         ])
-        .split(chunks[2]);
+        .split(chunks[3]);
 
-    // Left: el árbol zen — crece con cada sesión completada, chido sistema
+    // animación del árbol: crece de etapa 1 hasta la etapa actual, luego se queda
+    // 20 ticks/stage = 1 segundo por etapa; HOLD_TICKS = 3 segundos en la etapa final antes de reiniciar
     let zen_tree = app.db.get_zen_tree().unwrap();
-    let tree_text = vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            zen_tree.ascii_art(),
+    let current_stage = zen_tree.stage.max(1) as usize;
+    const TICKS_PER_STAGE: usize = 20;
+    const HOLD_TICKS: usize = 60;
+    let cycle_len = current_stage * TICKS_PER_STAGE + HOLD_TICKS;
+    let cycle_pos = app.music_scroll_ticks % cycle_len;
+    let animated_stage = if cycle_pos >= current_stage * TICKS_PER_STAGE {
+        current_stage
+    } else {
+        (cycle_pos / TICKS_PER_STAGE + 1).min(current_stage)
+    } as i32;
+
+    let tree_color = if animated_stage == zen_tree.stage {
+        theme.success
+    } else {
+        Color::Rgb(34, 120, 60) // verde más oscuro mientras crece
+    };
+
+    let art_str = crate::models::ZenTree::ascii_art_at_stage(animated_stage);
+    let mut tree_lines: Vec<Line> = vec![Line::from("")];
+    for art_line in art_str.lines() {
+        tree_lines.push(Line::from(Span::styled(
+            art_line.to_string(),
+            Style::default().fg(tree_color).add_modifier(Modifier::BOLD),
+        )));
+    }
+    tree_lines.push(Line::from(""));
+    tree_lines.push(Line::from(vec![
+        Span::styled("Companion Tree: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            zen_tree.stage_name(),
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    tree_lines.push(Line::from(vec![
+        Span::styled("Growth: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format!("{} pts", zen_tree.growth),
             Style::default().fg(theme.success),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("Companion Tree: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                zen_tree.stage_name(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Growth: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("{} pts", zen_tree.growth),
-                Style::default().fg(theme.success),
-            ),
-        ]),
-    ];
-    let tree_box = Paragraph::new(tree_text)
+        ),
+    ]));
+
+    let tree_box = Paragraph::new(tree_lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -267,7 +289,8 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         .constraints([
             Constraint::Length(3), // Header
             Constraint::Length(7), // Pickers Layout
-            Constraint::Min(4),    // Information / Selected details
+            Constraint::Length(5), // Visualizador de música
+            Constraint::Min(4),    // Session Forecast
             Constraint::Length(3), // Help instructions footer
         ])
         .split(size);
@@ -589,7 +612,11 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             .border_style(Style::default().fg(theme.border))
             .title(" Session Forecast "),
     );
-    f.render_widget(details, chunks[2]);
+
+    // renderiza el visualizador entre los pickers y el Session Forecast
+    draw_visualizer(f, app, theme, chunks[2]);
+
+    f.render_widget(details, chunks[3]);
 
     // Footer instructions
     let footer_text = vec![
@@ -622,5 +649,94 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         ]),
     ];
     let footer = Paragraph::new(footer_text).alignment(Alignment::Center);
-    f.render_widget(footer, chunks[3]);
+    f.render_widget(footer, chunks[4]);
+}
+
+// barras de espectro FFT en tiempo real — datos reales del audio local, animación sutil si no hay
+fn draw_visualizer(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+    use crate::audio::PlaybackStatus;
+    use crate::audio::spectrum::NUM_BARS;
+
+    let status = app.audio_player.get_state().status;
+    let spectrum = app.audio_player.get_spectrum();
+    let t = app.music_scroll_ticks as f32;
+
+    // caracteres de bloque Unicode de menor a mayor altura
+    const BAR_CHARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+    // si hay señal real (local FFT o captura del sistema), úsala — si no, animación de idle
+    let has_signal = spectrum.iter().any(|&v| v > 0.015);
+
+    let bar_spans: Vec<Span> = (0..NUM_BARS)
+        .map(|i| {
+            let height = if has_signal {
+                // datos reales: soundscape local vía SpectrumSource o MPRIS vía captura del monitor
+                match status {
+                    PlaybackStatus::Paused => spectrum[i].max(0.04),
+                    _ => spectrum[i],
+                }
+            } else {
+                // animación de idle cuando no hay señal de audio en el sistema
+                match status {
+                    PlaybackStatus::Playing => {
+                        let h = 0.5
+                            + 0.30 * f32::sin(t * 0.07 + i as f32 * 0.31)
+                            + 0.20 * f32::sin(t * 0.11 + i as f32 * 0.53)
+                            + 0.10 * f32::sin(t * 0.19 + i as f32 * 0.17);
+                        h.clamp(0.0, 1.0)
+                    }
+                    PlaybackStatus::Paused => 0.38,
+                    PlaybackStatus::Stopped => {
+                        let h = 0.10
+                            + 0.05 * f32::sin(t * 0.03 + i as f32 * 0.31)
+                            + 0.03 * f32::sin(t * 0.05 + i as f32 * 0.53);
+                        h.clamp(0.0, 1.0)
+                    }
+                }
+            };
+
+            let char_idx = ((height * 7.99) as usize).min(7);
+            let bar_char = BAR_CHARS[char_idx];
+
+            // gradiente de color según la altura: bajo→muted, medio→primary, alto→warning
+            let color = if height < 0.35 {
+                theme.muted
+            } else if height < 0.72 {
+                theme.primary
+            } else {
+                theme.warning
+            };
+
+            Span::styled(
+                format!("{} ", bar_char),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect();
+
+    let title_str = match status {
+        PlaybackStatus::Playing => " ♪ Soundscape Visualizer ",
+        PlaybackStatus::Paused => " ⏸ Soundscape Visualizer ",
+        PlaybackStatus::Stopped => " ○ Soundscape Visualizer ",
+    };
+    let title_color = match status {
+        PlaybackStatus::Playing => theme.primary,
+        PlaybackStatus::Paused => theme.warning,
+        PlaybackStatus::Stopped => theme.muted,
+    };
+
+    let vis_text = vec![Line::from(""), Line::from(bar_spans)];
+    let vis = Paragraph::new(vis_text)
+        .alignment(Alignment::Center)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(title_color))
+                .title(Span::styled(
+                    title_str,
+                    Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+                )),
+        );
+    f.render_widget(vis, area);
 }

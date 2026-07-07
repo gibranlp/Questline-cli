@@ -215,6 +215,7 @@ async fn main() -> Result<()> {
         app.tick_chat_poll()?;
         app.tick_presence_update()?;
         app.tick_focus_session()?;
+        app.tick_mpris();
         app.tick_particles();
         app.tick_update_check();
         app.tick_chapter_progress();
@@ -389,16 +390,14 @@ async fn main() -> Result<()> {
                     }
 
                     // Render Footer Help Info
-                    let tabs_str = "[1]D [2]P [3]H [4]L [5]M [6]S [7]F [8]G ?";
-
                     let footer_block = Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(Color::DarkGray));
-                    
+
                     let footer_area = footer_block.inner(chunks[1]);
                     f.render_widget(footer_block, chunks[1]);
-                    
+
                     let footer_cols = Layout::default()
                         .direction(Direction::Horizontal)
                         .constraints([
@@ -408,19 +407,58 @@ async fn main() -> Result<()> {
                         ])
                         .split(footer_area);
 
-                    let footer_text = vec![
-                        Line::from(vec![
-                            Span::styled(" Keys: ", Style::default().fg(Color::Rgb(140, 140, 140))),
-                            Span::styled(tabs_str, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-                            Span::styled(" | ", Style::default().fg(Color::Rgb(140, 140, 140))),
-                            Span::styled("Tab/Shift+Tab", Style::default().fg(theme.primary)),
-                            Span::styled(" cycle | ", Style::default().fg(Color::Rgb(140, 140, 140))),
-                            Span::styled("Ctrl+P", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
-                            Span::styled(" palette | ", Style::default().fg(Color::Rgb(140, 140, 140))),
-                            Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-                            Span::styled(" quit", Style::default().fg(Color::Rgb(140, 140, 140))),
-                        ])
+                    // Tabs de navegación: activo muestra nombre completo con color de clase
+                    let nav_tabs: &[(&str, ActiveScreen)] = &[
+                        ("Dashboard",  ActiveScreen::Dashboard),
+                        ("Projects",   ActiveScreen::Projects),
+                        ("Hero",       ActiveScreen::Character),
+                        ("Library",    ActiveScreen::Library),
+                        ("Music",      ActiveScreen::Soundscapes),
+                        ("Sync",       ActiveScreen::SyncSettings),
+                        ("Fellowship", ActiveScreen::Fellowship),
+                        ("Chronicle",  ActiveScreen::GreatChronicle),
                     ];
+
+                    let muted = Color::Rgb(90, 90, 90);
+                    let mut tab_spans: Vec<Span> = vec![Span::styled(" ", Style::default())];
+                    for (i, (name, screen)) in nav_tabs.iter().enumerate() {
+                        let num = i + 1;
+                        if app.active_screen == *screen {
+                            tab_spans.push(Span::styled(
+                                format!("[{}]{}", num, name),
+                                Style::default()
+                                    .fg(Color::Black)
+                                    .bg(theme.primary)
+                                    .add_modifier(Modifier::BOLD),
+                            ));
+                        } else {
+                            tab_spans.push(Span::styled(
+                                format!("{}", num),
+                                Style::default().fg(muted),
+                            ));
+                        }
+                        tab_spans.push(Span::styled(" ", Style::default()));
+                    }
+                    // Tab de About — activa con [?]About
+                    if app.active_screen == ActiveScreen::About {
+                        tab_spans.push(Span::styled(
+                            "[?]About",
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(theme.primary)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    } else {
+                        tab_spans.push(Span::styled("?", Style::default().fg(muted)));
+                    }
+                    tab_spans.push(Span::styled(" ", Style::default()));
+                    tab_spans.push(Span::styled("| ", Style::default().fg(muted)));
+                    tab_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+                    tab_spans.push(Span::styled(" palette  ", Style::default().fg(muted)));
+                    tab_spans.push(Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
+                    tab_spans.push(Span::styled(" quit", Style::default().fg(muted)));
+
+                    let footer_text = vec![Line::from(tab_spans)];
 
                     // Sync status: 10s transient para éxito/fallo — permanente si hay 3+ fallos consecutivos
                     let sync_line = if app.sync_failure_count >= 3 {
