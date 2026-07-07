@@ -203,7 +203,7 @@
 
     /* ── ZEN TREE ── */
     .tree-section { display:grid; grid-template-columns:auto 1fr; gap:3rem; align-items:center; margin-top:2rem; }
-    .tree-ascii { font-size:1.25rem; line-height:1.5; white-space:pre; color:var(--sage); text-shadow:0 0 12px var(--sage); }
+    .tree-ascii { font-size:1.25rem; line-height:1.5; white-space:pre; color:var(--sage); text-shadow:0 0 12px var(--sage); transition:opacity 0.35s ease; }
     .tree-stages { list-style:none; display:flex; flex-direction:column; gap:0.5rem; }
     .tree-stage { display:flex; align-items:center; gap:0.75rem; font-size:0.97rem; }
     .tree-stage .stage-dot { width:8px;height:8px;border-radius:50%;background:var(--text-dimmer);flex-shrink:0; }
@@ -551,7 +551,7 @@ The Chronicle turns to the next page.</pre>
       <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Interactive Terminal Demo (Type commands here)</p>
       <div class="term" id="demo-term" style="min-height:320px; max-height:450px; overflow-y:auto; cursor:text; font-family:'JetBrains Mono', monospace; font-size:0.9rem; text-align:left;">
         <div id="term-output">
-          <span class="comment"># Questline Interactive Terminal v1.0.7</span>
+          <span class="comment"># Questline Interactive Terminal v1.0.8</span>
           <span class="comment"># Type 'help' to view commands.</span>
           <br>
         </div>
@@ -800,7 +800,7 @@ The Chronicle turns to the next page.</pre>
         <div class="feature-icon" style="color:var(--accent); font-weight:bold;">&gt;</div>
         <div>
           <div class="feature-title">The Zen Tree</div>
-          <div class="feature-desc">A companion that grows from consistency, not intensity. Water it daily. Complete focus sessions. It progresses from Acorn to World Tree over time. It does not respond to motivational speeches. It has heard them before.</div>
+          <div class="feature-desc">A companion that grows from consistency, not intensity. Water it daily. Complete focus sessions. It progresses from Acorn to Evergrowth Tree over time. It does not respond to motivational speeches. It has heard them before.</div>
         </div>
       </div>
       <div class="feature-row">
@@ -855,22 +855,27 @@ The Chronicle turns to the next page.</pre>
     </div>
 
     <div class="tree-section" style="margin-top:3rem;">
-      <div class="tree-ascii">      .ooo.
-    .oQOOPQo.
-   .oQOQOQOQo.
-  .oQOQOQOQOQo.
-    ||| |||
-    ||| |||</div>
+      <div class="tree-ascii" id="zen-tree-display">          .-^^^^^^^^-.
+      .^^^^^^^^^^^^^^^^^^.
+    .^^^^^^^^^^^^^^^^^^^^^^.
+  .^^^^^^^^^^^^^^^^^^^^^^^^^^.
+ &lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
+&lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
+ &lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
+   \^^^^^^^^^^^^^^^^^^^^^^^^/
+        ||||||||||||
+        ||||||||||||
+     ___||||||||||||___</div>
       <div>
         <p class="section-header" style="margin-bottom:1rem;">// Zen Tree Growth Stages</p>
         <ul class="tree-stages">
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 1 — Acorn &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;  Your tree exists. Barely.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 2 — Sapling &nbsp;&nbsp;&nbsp;&nbsp; Signs of life. Encouragingly.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 3 — Treekin &nbsp;&nbsp;&nbsp;&nbsp; Something is growing here.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 4 — Grovekeeper &nbsp; Consistency is paying off.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 5 — Ancient Warden  Long-term commitment, confirmed.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 6 — Forest Elder &nbsp; The long game. Respected.</span></li>
-          <li class="tree-stage active"><span class="stage-dot"></span><span class="stage-name">Stage 7 — World Tree &nbsp;&nbsp; Either exceptional or alarming.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 1 — Acorn &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Your tree exists. Barely.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 2 — Sprout &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Signs of life. Encouragingly.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 3 — Young Entling &nbsp;&nbsp; Something is growing here.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 4 — Grove Guardian &nbsp; Consistency is paying off.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 5 — Ancient Ent &nbsp;&nbsp;&nbsp; Long-term commitment, confirmed.</span></li>
+          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 6 — Evergrowth Elder  The long game. Respected.</span></li>
+          <li class="tree-stage active"><span class="stage-dot"></span><span class="stage-name">Stage 7 — Evergrowth Tree &nbsp; Either exceptional or alarming.</span></li>
         </ul>
       </div>
     </div>
@@ -907,14 +912,17 @@ The Chronicle turns to the next page.</pre>
       <div class="manual-section">
         <h3>Global Navigation</h3>
         <ul class="keybind-list">
-          <li class="keybind-row"><kbd>1</kbd><kbd>D</kbd><span class="keybind-label">Dashboard — overview, stats, daily quests</span></li>
-          <li class="keybind-row"><kbd>2</kbd><kbd>P</kbd><span class="keybind-label">Projects — your quest board</span></li>
-          <li class="keybind-row"><kbd>3</kbd><kbd>H</kbd><span class="keybind-label">Character — level, XP, class, achievements</span></li>
-          <li class="keybind-row"><kbd>4</kbd><kbd>L</kbd><span class="keybind-label">Library — lore, memory fragments, bestiary</span></li>
-          <li class="keybind-row"><kbd>5</kbd><kbd>M</kbd><span class="keybind-label">Soundscapes — ambient audio</span></li>
-          <li class="keybind-row"><kbd>6</kbd><kbd>S</kbd><span class="keybind-label">Sync — identity, devices, cloud settings</span></li>
-          <li class="keybind-row"><kbd>7</kbd><kbd>F</kbd><span class="keybind-label">Fellowship — companions, shared projects</span></li>
-          <li class="keybind-row"><kbd>8</kbd><kbd>G</kbd><span class="keybind-label">The Great Chronicle — realm activity, chapter objectives</span></li>
+          <li class="keybind-row"><kbd>1</kbd><span class="keybind-label">Dashboard — overview, stats, daily quests</span></li>
+          <li class="keybind-row"><kbd>2</kbd><span class="keybind-label">Projects — your quest board</span></li>
+          <li class="keybind-row"><kbd>3</kbd><span class="keybind-label">Hero — level, XP, class, achievements</span></li>
+          <li class="keybind-row"><kbd>4</kbd><span class="keybind-label">Library — lore, memory fragments, bestiary</span></li>
+          <li class="keybind-row"><kbd>5</kbd><span class="keybind-label">Music — ambient soundscapes</span></li>
+          <li class="keybind-row"><kbd>6</kbd><span class="keybind-label">Sync — identity, devices, cloud settings</span></li>
+          <li class="keybind-row"><kbd>7</kbd><span class="keybind-label">Fellowship — companions, shared projects</span></li>
+          <li class="keybind-row"><kbd>8</kbd><span class="keybind-label">Chronicle — realm activity, chapter objectives</span></li>
+          <li class="keybind-row"><kbd>?</kbd><span class="keybind-label">About — version history, credits, feedback</span></li>
+          <li class="keybind-row"><kbd>/</kbd><span class="keybind-label">Search — find any task, note, milestone, or entry</span></li>
+          <li class="keybind-row"><kbd>Ctrl+P</kbd><span class="keybind-label">Command palette — all actions in one place</span></li>
           <li class="keybind-row"><kbd>Q</kbd><span class="keybind-label">Quit — the Chronicle saves automatically</span></li>
         </ul>
       </div>
@@ -1251,15 +1259,67 @@ The Chronicle turns to the next page.</pre>
       The backlog has not shrunk. But at least it now has a proper domain.
     </p>
 
-    <!-- v1.0.7 -->
+    <!-- v1.0.8 -->
     <div style="margin-top:2.5rem;">
       <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
-        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.0.7</span>
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.0.8</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Focus Session Listens Now</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-06</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — The Realm Begins to Hear</span>
+
+  For a long time the Focus tab showed bars that moved.
+  They were pleasant. They were animated. They were lying.
+
+  No sound was being measured. No frequency was being tracked.
+  The bars simply waved, like a soldier who knows nothing of the battle
+  but has been told to look confident.
+
+  <span class="hi">The bars now show the actual audio.</span>
+
+  Every beat. Every frequency spike. Every moment of silence where
+  the music used to pretend it was doing something.
+  It is not pretending anymore.
+
+  The spectrum reads from whatever your system is playing —
+  Spotify, VLC, mpv, a browser tab at 2am, anything.
+  No setup. No login. No SDK. The realm simply listens.
+
+  The search system has also been rebuilt from the foundation.
+  It used to find what you were looking for, then drop you
+  at the project door and expect you to remember which room it was in.
+
+  <span class="hi">It now takes you to the exact item.</span>
+
+  The note. The task. The milestone. The step.
+  The cursor lands on it. The realm does not make you search twice.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Music visualizer now shows real audio frequencies</span>
+<span class="cmd">  ✓  Works with any system audio player — Spotify, VLC, mpv, anything</span>
+<span class="cmd">  ✓  Local soundscapes (Lo-Fi, Rain, Forest…) also show real spectrum</span>
+<span class="cmd">  ✓  Bars respond instantly; fall off gradually (VU meter behavior)</span>
+<span class="cmd">  ✓  Search navigates to the exact note, task, step, or milestone</span>
+<span class="cmd">  ✓  Results ranked by relevance — title match beats content match</span>
+<span class="cmd">  ✓  Search now covers steps and milestones</span>
+<span class="cmd">  ✓  Press / from anywhere to open search instantly</span>
+<span class="cmd">  ✓  Footer nav shows the active screen name with class color highlight</span>
+<span class="cmd">  ✓  Ambient effects now accessible from the Command Palette (Ctrl+P)</span>
+<span class="cmd">  –  The bars still cannot play the music. This is a feature, not a limitation.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.7 -->
+    <div style="margin-top:2rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1rem;font-weight:bold;color:var(--text-dim);">v1.0.7</span>
         <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Realm Has a Proper Address</span>
         <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-01</span>
       </div>
       <div class="term">
-        <pre style="margin-top:0.5rem;line-height:2;">
+        <pre style="margin-top:0.5rem;line-height:1.9;color:#666;">
 <span class="comment"># Chronicle Entry — The Naming of the Realm</span>
 
   For a time, the realm existed at an address borrowed from the land
@@ -1487,16 +1547,50 @@ The Chronicle turns to the next page.</pre>
     if (e.key === 'ArrowRight')  lbNav(1);
   });
 
-  // ── Zen Tree dot ambience — cycle through class colors
+  // ── Zen Tree: cicla entre los 7 estadios — dot, highlight y ASCII art sincronizados
   const dots = document.querySelectorAll('.tree-stage .stage-dot');
+  const stageRows = document.querySelectorAll('.tree-stage');
+  const treeDisplay = document.getElementById('zen-tree-display');
   const colors = ['rgb(168,85,247)','rgb(255,105,180)','rgb(6,182,212)','rgb(59,130,246)','rgb(249,115,22)','rgb(245,158,11)','rgb(6,182,212)'];
-  let cur = 0;
-  setInterval(() => {
+  const treeArt = [
+    // Stage 1 — Acorn
+    `    .\n   ( )`,
+    // Stage 2 — Sprout
+    `    .\n   \\|/\n    |\n    '`,
+    // Stage 3 — Young Entling
+    `    ,\n   \\|/\n  --|--\n    |\n   / \\`,
+    // Stage 4 — Grove Guardian
+    `    .^.\n   /^^\\\n  <^^^^>\n    ||\n    ||\n   /__\\`,
+    // Stage 5 — Ancient Ent
+    `     .-^^^-.\n   .^^^^^^^^^.\n  <^^^^^^^^^^^>\n <^^^^^^^^^^^^^>\n      ||||\n      ||||\n     /||||\\`,
+    // Stage 6 — Evergrowth Elder
+    `        .-^^^^^-.\n     .^^^^^^^^^^^^.\n   .^^^^^^^^^^^^^^^^.\n  <^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^>\n        ||||||\n        ||||||\n      __||||||__`,
+    // Stage 7 — Evergrowth Tree
+    `          .-^^^^^^^^^-.\n      .^^^^^^^^^^^^^^^^^^.\n    .^^^^^^^^^^^^^^^^^^^^^^.\n  .^^^^^^^^^^^^^^^^^^^^^^^^^^.\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n   \\^^^^^^^^^^^^^^^^^^^^^^^^/\n        ||||||||||||\n        ||||||||||||\n     ___||||||||||||___`,
+  ];
+  let cur = 6; // arranca en World Tree (índice 6)
+  const applyStage = (idx) => {
+    // Dot highlights
     dots.forEach(d => { d.style.background = ''; d.style.boxShadow = ''; });
-    dots[cur].style.background = colors[cur];
-    dots[cur].style.boxShadow = '0 0 8px ' + colors[cur];
+    dots[idx].style.background = colors[idx];
+    dots[idx].style.boxShadow = '0 0 8px ' + colors[idx];
+    // Active row
+    stageRows.forEach(r => r.classList.remove('active'));
+    stageRows[idx].classList.add('active');
+    // Tree art: fade out → swap → fade in
+    if (treeDisplay) {
+      treeDisplay.style.opacity = '0';
+      setTimeout(() => {
+        treeDisplay.textContent = treeArt[idx];
+        treeDisplay.style.opacity = '1';
+      }, 350);
+    }
+  };
+  applyStage(cur);
+  setInterval(() => {
     cur = (cur + 1) % dots.length;
-  }, 900);
+    applyStage(cur);
+  }, 1800);
 
   // ── Copy to Clipboard Helper ────────────────────────────────────────
   window.copyToClipboard = function(id, btn) {
