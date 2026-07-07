@@ -213,12 +213,28 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
-### v1.0.7 — The Realm Has a Proper Address
+### v1.0.8 — The Focus Session Listens Now
+*Released 2026-07-06*
+
+- **Real music visualizer:** The spectrum bars in the Focus tab now show the actual sound playing — not an animation. Every beat, drop, and frequency comes through as it happens.
+- **Works with any music player:** If you use Spotify, VLC, mpv, or anything else on your system, the visualizer picks it up automatically. It reads what your speakers are outputting, so no special setup is needed.
+- **Local soundscapes also visualized:** White Noise, Lo-Fi, Rain, Forest — all local soundscapes show their real frequency content in the bars.
+- **Smooth response:** Bars jump up instantly when the music hits and fall off gradually, the same way a real VU meter behaves.
+- **Search goes to the exact item:** Searching for a note now takes you to that note, not just its project. Same for tasks, steps, and milestones — the cursor lands on the right row.
+- **Results ranked by relevance:** Exact title matches appear first, followed by partial matches, then content matches.
+- **Search covers more:** Steps (subtasks) and milestones are now included in search results.
+- **Press / to search:** Hitting `/` from any screen opens Search Everywhere instantly.
+
+---
+
+### v1.0.7 — Music, Motion, and a New Address
 *Released 2026-07-01*
 
-- **Domain migration:** The sync server and website have moved from `questline.gibranlp.dev` to [`questlinecli.com`](https://questlinecli.com). The realm has outgrown its first address.
-- **Default server URL updated:** New installations now point to `https://questlinecli.com/api` automatically. Existing users with the old URL saved in their config will need to update it in the Sync screen.
-- Same server. Same database. Same hosting. The Chronicle is intact. Only the address changed.
+- **New home:** The sync server and website moved from `questline.gibranlp.dev` to [`questlinecli.com`](https://questlinecli.com). Existing users with the old URL saved will need to update it in the Sync screen.
+- **Media Player tab:** Added MPRIS support — works with any player on your system. Open Spotify, VLC, Rhythmbox, or mpv and control it directly from the Music tab. No login, no setup.
+- **Music visualizer in Focus:** A spectrum bar display now lives between the session options and the forecast panel. It animates while your soundscape plays and stays visible during the session.
+- **Companion tree animation:** The Zen Tree in the active focus session now grows step by step from its first stage up to its current one, then holds at full growth for a moment before repeating.
+- **Realm Activity feed:** Live feed of hero activity across the realm, visible from the Great Chronicle screen.
 
 ---
 

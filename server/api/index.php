@@ -104,6 +104,14 @@ try {
             INDEX idx_gc_timestamp (timestamp)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    // Tabla temporal para los códigos OAuth de Spotify — se autolimpian a los 5 minutos
+    $pdo->exec("
+        CREATE TABLE IF NOT EXISTS spotify_auth_codes (
+            state VARCHAR(128) PRIMARY KEY,
+            code VARCHAR(512) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ");
     // Migraciones: agregar columnas de stats y tabla de webhooks
     $cols = [
         'username' => 'VARCHAR(255) NULL',
@@ -205,6 +213,126 @@ if ($route === 'public/webhook/test') {
         exit;
     }
     echo json_encode(["status" => "success", "message" => "Webhook test successful"]);
+    exit;
+}
+
+// ── Spotify config pública — la app jala el client_id del servidor, no del usuario ──
+if ($route === 'spotify/config') {
+    $client_id = getenv('SPOTIFY_CLIENT_ID') ?: '';
+    if (empty($client_id)) {
+        http_response_code(503);
+        echo json_encode(["error" => "Spotify not configured on this server"]);
+        exit;
+    }
+    $redirect_uri = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off' ? 'https' : 'http')
+        . '://' . ($_SERVER['HTTP_HOST'] ?? 'questlinecli.com')
+        . '/api/spotify/callback';
+    echo json_encode(["client_id" => $client_id, "redirect_uri" => $redirect_uri]);
+    exit;
+}
+
+// ── Spotify OAuth callback — Spotify redirige al navegador aquí con el código ──
+// No requiere auth de Questline; la seguridad viene del parámetro `state` único por sesión
+if ($route === 'spotify/callback') {
+    $code  = trim($_GET['code']  ?? '');
+    $state = trim($_GET['state'] ?? '');
+    $error = trim($_GET['error'] ?? '');
+
+    // Spotify mandó error (e.g. acceso denegado por el usuario)
+    if (!empty($error)) {
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!doctype html><html><head><meta charset="UTF-8"><title>Spotify — Questline</title>'
+           . '<style>body{font-family:system-ui,sans-serif;background:#0d1117;color:#e6edf3;display:flex;'
+           . 'flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0}'
+           . 'h2{color:#f85149}p{color:#8b949e}</style></head><body>'
+           . '<h2>Authorization cancelled</h2>'
+           . '<p>You denied access. You can close this tab and try again in Questline.</p>'
+           . '</body></html>';
+        exit;
+    }
+
+    if (empty($code) || empty($state)) {
+        http_response_code(400);
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!doctype html><html><body>Bad request — missing code or state.</body></html>';
+        exit;
+    }
+
+    // Sanitización básica — state y code solo llevan caracteres URL-safe
+    if (!preg_match('/^[A-Za-z0-9\-_]{4,128}$/', $state) ||
+        !preg_match('/^[A-Za-z0-9\-_\.]{10,512}$/', $code)) {
+        http_response_code(400);
+        header('Content-Type: text/html; charset=UTF-8');
+        echo '<!doctype html><html><body>Invalid parameters.</body></html>';
+        exit;
+    }
+
+    // Limpia códigos expirados (>5 min) antes de insertar
+    $pdo->exec("DELETE FROM spotify_auth_codes WHERE created_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)");
+
+    $stmt = $pdo->prepare(
+        "INSERT INTO spotify_auth_codes (state, code) VALUES (?, ?)
+         ON DUPLICATE KEY UPDATE code = VALUES(code), created_at = CURRENT_TIMESTAMP"
+    );
+    $stmt->execute([$state, $code]);
+
+    header('Content-Type: text/html; charset=UTF-8');
+    echo '<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Spotify Connected — Questline</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#e6edf3;
+         display:flex;flex-direction:column;align-items:center;justify-content:center;
+         min-height:100vh;gap:1.5rem;padding:2rem;text-align:center}
+    .icon{font-size:3rem}
+    h1{font-size:1.5rem;font-weight:700;color:#1db954}
+    p{color:#8b949e;max-width:380px;line-height:1.6}
+    .badge{background:#161b22;border:1px solid #30363d;border-radius:8px;
+           padding:.6rem 1.2rem;font-size:.85rem;color:#58a6ff}
+  </style>
+</head>
+<body>
+  <div class="icon">⚔️</div>
+  <h1>Spotify Connected!</h1>
+  <p>Questline is now linked to your Spotify account. You can close this tab and return to the terminal.</p>
+  <div class="badge">Returning you to the Realm...</div>
+  <script>setTimeout(()=>window.close(),3000)</script>
+</body>
+</html>';
+    exit;
+}
+
+// ── Spotify token poll — la app consulta esto cada segundo hasta recibir el código ──
+if ($route === 'spotify/token') {
+    $state = trim($_GET['state'] ?? '');
+
+    if (empty($state) || !preg_match('/^[A-Za-z0-9\-_]{4,128}$/', $state)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Invalid state parameter"]);
+        exit;
+    }
+
+    // Limpia expirados de paso
+    $pdo->exec("DELETE FROM spotify_auth_codes WHERE created_at < DATE_SUB(NOW(), INTERVAL 5 MINUTE)");
+
+    $stmt = $pdo->prepare("SELECT code FROM spotify_auth_codes WHERE state = ?");
+    $stmt->execute([$state]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        http_response_code(404);
+        echo json_encode(["status" => "pending"]);
+        exit;
+    }
+
+    // Una sola entrega — borra el código inmediatamente para que no se reutilice
+    $pdo->prepare("DELETE FROM spotify_auth_codes WHERE state = ?")->execute([$state]);
+
+    echo json_encode(["status" => "ok", "code" => $row['code']]);
     exit;
 }
 
