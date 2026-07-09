@@ -551,6 +551,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             ),
         ]),
     ];
+    // Divide the right column: Cloud Chronicle on top, Support card on bottom
+    let right_col_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(4)])
+        .split(row3_layout[2]);
+
     let chronicle_p = Paragraph::new(chronicle_text).block(
         Block::default()
             .borders(Borders::ALL)
@@ -558,7 +564,30 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             .border_style(Style::default().fg(accent_color))
             .title(" Cloud Chronicle "),
     );
-    f.render_widget(chronicle_p, row3_layout[2]);
+    f.render_widget(chronicle_p, right_col_layout[0]);
+
+    // Small "Support the Realm" card — compact, easy to ignore, one builder made this
+    let support_text = vec![Line::from(vec![
+        Span::styled("  Keep the Realm Alive. ", Style::default().fg(theme.muted)),
+        Span::styled(
+            "ko-fi.com/Y4H021XN7F",
+            Style::default()
+                .fg(Color::Rgb(218, 165, 32))
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        Span::styled("  [p]", Style::default().fg(theme.muted)),
+    ])];
+    let support_p = Paragraph::new(support_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Rgb(80, 70, 40)))
+            .title(Span::styled(
+                " Support the Realm ",
+                Style::default().fg(Color::Rgb(218, 165, 32)),
+            )),
+    );
+    f.render_widget(support_p, right_col_layout[1]);
 
     // ── ROW 4: Tasks activas, proyectos compartidos y actividad del gremio ──
     let bottom_layout = Layout::default()
