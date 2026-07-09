@@ -96,6 +96,8 @@ pub enum ModalType {
     None,
     // Modal de capítulo completado — aparece cuando el capítulo cooperativo llega al 100%
     ChapterComplete,
+    // Una sola vez tras la primera victoria — anima al héroe a apoyar el Realm en Ko-fi
+    SupportRealm,
     NewProject {
         name: String,
         desc: String,
@@ -669,6 +671,28 @@ pub struct App {
 
 pub fn extract_url(content: &str) -> Option<&str> {
     content.split_whitespace().find(|w| w.starts_with("http://") || w.starts_with("https://"))
+}
+
+pub fn open_url(url: &str) {
+    use std::process::Stdio;
+    #[cfg(target_os = "linux")]
+    let _ = std::process::Command::new("xdg-open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("open")
+        .arg(url)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    #[cfg(target_os = "windows")]
+    let _ = std::process::Command::new("cmd")
+        .args(["/c", "start", "", url])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
 
 // Arma la lista plana para el panel de tareas del dashboard — padres ordenados por fecha, cada uno seguido de sus pasos
@@ -2215,8 +2239,12 @@ impl App {
                     }
                 }
                 KeyCode::Char('p') => {
-                    // Only pause audio if not on Fellowship screen (uses 'p' for companions tab)
-                    if self.active_screen != ActiveScreen::Fellowship {
+                    // Dashboard: open Ko-fi link. Fellowship/Dashboard excluded from audio pause.
+                    if self.active_screen == ActiveScreen::Dashboard {
+                        open_url("https://ko-fi.com/Y4H021XN7F");
+                        self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
+                        return Ok(());
+                    } else if self.active_screen != ActiveScreen::Fellowship {
                         use crate::audio::SOUNDSCAPES;
                         if self.active_screen == ActiveScreen::Soundscapes
                             && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
@@ -3786,6 +3814,18 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::SupportRealm => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('P') => {
+                        open_url("https://ko-fi.com/Y4H021XN7F");
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::SearchEverywhere {
                 ref query,
                 selected_idx,
@@ -4865,6 +4905,9 @@ impl App {
                     let _ = self.config.save();
                 } else if self.active_screen == ActiveScreen::Fellowship {
                     self.selected_fellowship_tab = 2;
+                } else if self.active_screen == ActiveScreen::Dashboard {
+                    open_url("https://ko-fi.com/Y4H021XN7F");
+                    self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
                 } else {
                     self.active_screen = ActiveScreen::Projects;
                     self.active_tab_idx = 1;
@@ -5697,6 +5740,8 @@ impl App {
                                             self.selected_dashboard_task_idx = new_flat.len() - 1;
                                         }
                                         self.reload_data()?;
+                                        // One-time support prompt after the first quest victory
+                                        self.maybe_show_support_realm_prompt()?;
                                     }
                                 }
                             }
@@ -10495,6 +10540,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
+    fn maybe_show_support_realm_prompt(&mut self) -> Result<()> {
+        if self.db.get_setting("support_realm_shown")?.is_none()
+            && self.modal_state == ModalType::None
+        {
+            let _ = self.db.set_setting("support_realm_shown", "1");
+            self.modal_state = ModalType::SupportRealm;
+        }
+        Ok(())
+    }
+
     pub fn tick_focus_session(&mut self) -> Result<()> {
         if let Some(ref active) = self.active_focus_session {
             let total_seconds = (active.duration_mins * 60) as i64;
@@ -10594,6 +10649,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.complete_productive_action()?;
                 self.check_traits()?;
                 self.reload_data()?;
+
+                // One-time support prompt after the first meaningful focus session
+                if stats.sessions_completed == 1 {
+                    self.maybe_show_support_realm_prompt()?;
+                }
             }
         }
         Ok(())
