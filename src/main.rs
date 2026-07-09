@@ -786,6 +786,62 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
+            // Modal de Support the Realm — aparece una sola vez tras la primera victoria del héroe
+            if app.modal_state == questline::app::ModalType::SupportRealm {
+                let overlay_area = centered_rect_fixed_height(58, 14, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+
+                let gold = Color::Rgb(218, 165, 32);
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(gold))
+                    .title(Span::styled(
+                        " Support the Realm ",
+                        Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                    ));
+
+                let content = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "The Chronicle has recorded your first victory.",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "If Questline helped you take one real step against the Great Backlog,",
+                        Style::default().fg(Color::Rgb(210, 210, 210)),
+                    )),
+                    Line::from(Span::styled(
+                        "consider supporting the Realm on Ko-fi. Every offering helps keep",
+                        Style::default().fg(Color::Rgb(210, 210, 210)),
+                    )),
+                    Line::from(Span::styled(
+                        "servers running, chapters written, and Scope Dragons contained.",
+                        Style::default().fg(Color::Rgb(210, 210, 210)),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "https://ko-fi.com/Y4H021XN7F",
+                        Style::default()
+                            .fg(gold)
+                            .add_modifier(Modifier::BOLD)
+                            .add_modifier(Modifier::UNDERLINED),
+                    )),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("[p] open link", Style::default().fg(Color::Rgb(160, 140, 80))),
+                        Span::styled("   ·   ", Style::default().fg(Color::Rgb(80, 80, 80))),
+                        Span::styled("[Enter] / [Space] / [Esc]  continue", Style::default().fg(Color::Rgb(120, 120, 120))),
+                    ]),
+                ];
+                let p = Paragraph::new(content)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Center);
+                f.render_widget(p, overlay_area);
+            }
+
             // Modal de Chapter Complete — el más elaborado del juego, usa bordes manuales con spans
             if app.modal_state == questline::app::ModalType::ChapterComplete {
                 // Overlay de tamaño fijo — la caja es 60 chars de ancho, 31 líneas de contenido
