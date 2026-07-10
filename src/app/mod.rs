@@ -2695,6 +2695,33 @@ impl App {
                                     let _ = std::fs::write(&key_path, json_str);
                                 }
                                 self.identity = new_identity;
+                                // Fetch the full cloud backup snapshot first for instant restoration,
+                                // then sync() will pull any incremental events on top of it
+                                if self.config.sync_enabled {
+                                    self.sync_status_msg = "Fetching cloud backup...".to_string();
+                                    let client = crate::services::api_client::ApiClient::new(
+                                        &self.server_url,
+                                        self.identity.clone(),
+                                        &self.device_id,
+                                    );
+                                    if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
+                                        if !json.trim().is_empty() {
+                                            use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                            let decoded = STANDARD.decode(json.trim())
+                                                .ok()
+                                                .and_then(|b| String::from_utf8(b).ok())
+                                                .unwrap_or(json);
+                                            if self.db.import_from_json(&decoded).is_ok() {
+                                                self.notifications.push(Notification::info(
+                                                    "Data restored from cloud backup!".to_string()
+                                                ));
+                                            }
+                                        }
+                                    }
+                                }
+                                // Reset the pull cursor — PC-B's old seq belongs to a different
+                                // identity's account; without this we'd miss all of PC-A's history
+                                let _ = self.db.set_setting("last_pull_seq", "0");
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored! Syncing now...".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
@@ -4785,7 +4812,22 @@ impl App {
                                 })
                                 .collect();
                             let transfer_code = STANDARD.encode(&secret_bytes);
-                            self.sync_status_msg = format!("Profile exported! Backup saved to {}", backup_path.display());
+                            // Also upload to cloud so 'r' on PC-B works right after identity transfer
+                            if self.config.sync_enabled {
+                                if let Ok(json) = self.db.export_to_json() {
+                                    let client = crate::services::api_client::ApiClient::new(
+                                        &self.server_url,
+                                        self.identity.clone(),
+                                        &self.device_id,
+                                    );
+                                    self.sync_status_msg = match client.send_request("POST", "recovery", &json) {
+                                        Ok(_) => format!("Profile exported & cloud backup saved! Local: {}", backup_path.display()),
+                                        Err(e) => format!("Profile exported to {} (cloud backup failed: {})", backup_path.display(), e),
+                                    };
+                                }
+                            } else {
+                                self.sync_status_msg = format!("Profile exported! Backup saved to {}", backup_path.display());
+                            }
                             self.modal_state = ModalType::ExportProfile { transfer_code };
                         }
                         Err(e) => {
@@ -7890,6 +7932,7 @@ impl App {
             1
         };
         tree.water_today += 1;
+        tree.total_waterings += 1;
         tree.growth += amount;
         tree.last_watered = Some(now_local.with_timezone(&Utc));
 
@@ -7899,7 +7942,6 @@ impl App {
             )));
 
         self.db.update_zen_tree(&tree)?;
-        let _ = self.db.increment_tree_waterings();
         self.push_great_chronicle_async("TreeWatering", "watered the Zen Tree.", true);
 
         self.update_daily_adventure_progress("water_tree", 1)?;
