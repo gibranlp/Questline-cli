@@ -2327,6 +2327,60 @@ impl Database {
         Ok(deleted)
     }
 
+    // Cuántas tareas completadas tienen más de `days` días — para mostrarle al usuario antes de podar
+    pub fn count_prunable_tasks(&self, days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND (
+                (updated_at != '' AND updated_at < ?1) OR
+                (updated_at = '' AND created_at < ?1)
+            )",
+            params![cutoff],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    // Borra tareas completadas más viejas que `days` días — registra tombstones para que sync no las reviva
+    pub fn prune_completed_tasks(&self, days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+
+        // Log tombstones before deletion so other devices know these records are gone
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM tasks WHERE completed = 1 AND (
+                (updated_at != '' AND updated_at < ?1) OR
+                (updated_at = '' AND created_at < ?1)
+            )",
+        )?;
+        let ids: Vec<String> = stmt
+            .query_map(params![cutoff], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        let count = ids.len();
+        for id in &ids {
+            let _ = self.log_change("task", id, "delete");
+        }
+
+        // Delete top-level tasks (CASCADE removes their subtasks automatically)
+        self.conn.execute(
+            "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NULL AND (
+                (updated_at != '' AND updated_at < ?1) OR
+                (updated_at = '' AND created_at < ?1)
+            )",
+            params![cutoff],
+        )?;
+        // Delete any completed subtasks whose parents survived the prune
+        self.conn.execute(
+            "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL AND (
+                (updated_at != '' AND updated_at < ?1) OR
+                (updated_at = '' AND created_at < ?1)
+            )",
+            params![cutoff],
+        )?;
+
+        Ok(count)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn

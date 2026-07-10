@@ -105,7 +105,10 @@ impl ApiClient {
             .set("X-Signature", &signature)
             .send_string(&body_to_send)?;
 
-        Ok(response.into_string()?)
+        let mut body = String::new();
+        use std::io::Read;
+        response.into_reader().read_to_string(&mut body)?;
+        Ok(body)
     }
 
     pub fn lookup_username(&self, public_key_hex: &str) -> Option<String> {

@@ -265,6 +265,10 @@ pub enum ModalType {
         codex_id: Uuid,
         codex_name: String,
     },
+    ConfirmPruneTasks {
+        days: i64,
+        count: usize,
+    },
     RefileScroll {
         note_id: Uuid,
         selected_idx: usize,
@@ -2239,12 +2243,12 @@ impl App {
                     }
                 }
                 KeyCode::Char('p') => {
-                    // Dashboard: open Ko-fi link. Fellowship/Dashboard excluded from audio pause.
+                    // Dashboard: open Ko-fi link. Fellowship/Dashboard/SyncSettings excluded from audio pause.
                     if self.active_screen == ActiveScreen::Dashboard {
                         open_url("https://ko-fi.com/Y4H021XN7F");
                         self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
                         return Ok(());
-                    } else if self.active_screen != ActiveScreen::Fellowship {
+                    } else if self.active_screen != ActiveScreen::Fellowship && self.active_screen != ActiveScreen::SyncSettings {
                         use crate::audio::SOUNDSCAPES;
                         if self.active_screen == ActiveScreen::Soundscapes
                             && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
@@ -2531,6 +2535,31 @@ impl App {
                         self.selected_notes_flat_idx = 0;
                         self.selected_note_idx = 0;
                         self.reload_data()?;
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::ConfirmPruneTasks { days, .. } => {
+                let d = days;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        match self.db.prune_completed_tasks(d) {
+                            Ok(pruned) => {
+                                self.sync_status_msg = format!("Pruned {} completed task(s) older than {} days.", pruned, d);
+                                self.notifications.push(Notification::info(
+                                    format!("{} old completed tasks pruned from the Chronicle.", pruned)
+                                ));
+                                self.reload_data()?;
+                            }
+                            Err(e) => {
+                                self.sync_status_msg = format!("Prune failed: {}", e);
+                            }
+                        }
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
@@ -4838,6 +4867,12 @@ impl App {
                 }
                 KeyCode::Char('i') => {
                     self.modal_state = ModalType::RestoreIdentity { input: String::new() };
+                    return Ok(());
+                }
+                KeyCode::Char('p') => {
+                    const PRUNE_DAYS: i64 = 30;
+                    let count = self.db.count_prunable_tasks(PRUNE_DAYS).unwrap_or(0);
+                    self.modal_state = ModalType::ConfirmPruneTasks { days: PRUNE_DAYS, count };
                     return Ok(());
                 }
                 _ => {}

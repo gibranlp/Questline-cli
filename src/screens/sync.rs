@@ -142,7 +142,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [b] Backup | [r] Restore | [c] Copy Share Key | [e] Export Profile | [i] Restore Identity",
+            "   [b] Backup | [r] Restore | [c] Copy Share Key | [e] Export Profile",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            "   [i] Restore Identity | [p] Prune Old Tasks",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
