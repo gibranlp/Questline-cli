@@ -425,6 +425,7 @@ impl<'a> SyncEngine<'a> {
                     })
                     .ok()
                 }
+                "zen_tree" => self.db.get_zen_tree().ok().and_then(|t| serde_json::to_string(&t).ok()),
                 _ => None,
             };
 
@@ -659,6 +660,16 @@ impl<'a> SyncEngine<'a> {
                             params![log.entity_id],
                             |row| row.get::<_, i32>(0),
                         ).unwrap_or(1) == 0
+                    }
+                }
+                // Árbol zen: latest-watered timestamp wins — es una sola fila global por usuario
+                "zen_tree" => {
+                    let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
+                        .map(|d| d.with_timezone(&Utc))
+                        .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+                    match self.db.get_zen_tree() {
+                        Ok(lt) => lt.last_watered.map(|lw| incoming_time > lw).unwrap_or(true),
+                        Err(_) => true,
                     }
                 }
                 _ => false,
@@ -980,6 +991,28 @@ impl<'a> SyncEngine<'a> {
                                 let _ = self.db.conn.execute(
                                     "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                                     params![id, project_id, sender_id, sender_name, msg_content, msg_type, timestamp],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Árbol zen: aplicamos directamente sin pasar por update_zen_tree() para no
+                        // disparar log_change() de nuevo y crear un loop de sync
+                        "zen_tree" => {
+                            if let Ok(t) = serde_json::from_str::<crate::models::ZenTree>(content) {
+                                let local_water_today = self.db.get_zen_tree()
+                                    .map(|lt| lt.water_today)
+                                    .unwrap_or(0);
+                                let _ = self.db.conn.execute(
+                                    "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
+                                    params![
+                                        t.growth,
+                                        t.health,
+                                        t.stage,
+                                        t.last_watered.map(|dt| dt.to_rfc3339()),
+                                        t.water_today.max(local_water_today),
+                                        t.total_waterings,
+                                        t.id.to_string(),
+                                    ],
                                 );
                                 pulled_count += 1;
                             }

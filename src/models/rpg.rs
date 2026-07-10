@@ -14,6 +14,7 @@ pub struct ZenTree {
     pub stage: i32,
     pub last_watered: Option<DateTime<Utc>>,
     pub water_today: i32,
+    pub total_waterings: i32,
 }
 
 impl ZenTree {

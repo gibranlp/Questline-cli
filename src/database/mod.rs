@@ -1273,7 +1273,7 @@ impl Database {
     // Trae el estado actual del árbol zen — stage, salud, growth y cuándo fue regado por última vez
     pub fn get_zen_tree(&self) -> Result<ZenTree> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, growth, health, stage, last_watered, water_today FROM zen_tree LIMIT 1",
+            "SELECT id, growth, health, stage, last_watered, water_today, COALESCE(total_waterings, 0) FROM zen_tree LIMIT 1",
         )?;
         let tree = stmt.query_row([], |row| {
             let id_str: String = row.get(0)?;
@@ -1282,6 +1282,7 @@ impl Database {
             let stage: i32 = row.get(3)?;
             let last_watered_str: Option<String> = row.get(4)?;
             let water_today: i32 = row.get(5)?;
+            let total_waterings: i32 = row.get(6)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let last_watered = last_watered_str.and_then(|s| {
@@ -1297,6 +1298,7 @@ impl Database {
                 stage,
                 last_watered,
                 water_today,
+                total_waterings,
             })
         })?;
         Ok(tree)
@@ -1304,16 +1306,18 @@ impl Database {
 
     pub fn update_zen_tree(&self, tree: &ZenTree) -> Result<()> {
         self.conn.execute(
-            "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5 WHERE id = ?6",
+            "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
             params![
                 tree.growth,
                 tree.health,
                 tree.stage,
                 tree.last_watered.map(|dt| dt.to_rfc3339()),
                 tree.water_today,
+                tree.total_waterings,
                 tree.id.to_string(),
             ],
         )?;
+        let _ = self.log_change("zen_tree", &tree.id.to_string(), "update");
         Ok(())
     }
 
@@ -1492,6 +1496,7 @@ impl Database {
             stage: 1,
             last_watered: None,
             water_today: 0,
+            total_waterings: 0,
         });
 
         let achievements_unlocked: i32 = self.conn.query_row(
@@ -3673,12 +3678,4 @@ impl Database {
         Ok(())
     }
 
-    // Incrementa el contador global de riegos — se llama junto con update_zen_tree al regar
-    pub fn increment_tree_waterings(&self) -> Result<()> {
-        self.conn.execute(
-            "UPDATE zen_tree SET total_waterings = total_waterings + 1",
-            [],
-        )?;
-        Ok(())
-    }
 }
