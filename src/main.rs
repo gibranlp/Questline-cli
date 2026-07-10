@@ -1324,6 +1324,46 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
+            // Confirmación para podar tareas completadas viejas — reduce el tamaño del backup
+            if let questline::app::ModalType::ConfirmPruneTasks { days, count } = app.modal_state {
+                let overlay_area = centered_rect_fixed_height(55, 10, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(
+                        " Prune Old Completed Tasks ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+
+                let task_noun = if count == 1 { "task" } else { "tasks" };
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(format!("  {} completed {}", count, task_noun), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" older than {} days will be deleted.", days), Style::default().fg(Color::Rgb(200, 200, 200))),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  This frees up backup space. Action cannot be undone.",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Prune completed tasks?  [Y] Yes   [N] No / Esc",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                ];
+
+                let p = Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(p, overlay_area);
+            }
+
             // Avisa que hay una versión nueva disponible — Y para instalar directo desde el app
             if let questline::app::ModalType::UpdateAvailable { ref latest_version } = app.modal_state {
                 let overlay_area = centered_rect_fixed_height(62, 12, size);
