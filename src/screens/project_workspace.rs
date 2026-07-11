@@ -322,7 +322,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             viewing_step_for_task,
             parent_quest_title.as_deref(),
         ),
-        1 => draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices),
+        1 => {
+            draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices);
+        }
         2 => draw_journal_tab(
             f,
             body_chunks[1],
@@ -406,7 +408,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             txt(" Scrolls  "),
             key("n"), txt(" New"),
             sep(),
-            key("Enter"), txt(" Edit"),
+            key("Enter"), txt(" Open"),
+            sep(),
+            key("e"), txt(" Rename"),
+            sep(),
+            key("r"), txt(" Move"),
             sep(),
             key("d"), txt(" Codex"),
             sep(),
@@ -541,7 +547,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         ModalType::JournalVisibility { visibility_idx, .. } => {
             draw_journal_visibility_modal(f, *visibility_idx, theme);
         }
-        ModalType::NewCodex { name } => {
+        ModalType::NewCodex { name, .. } => {
             draw_new_codex_modal(f, name, theme);
         }
         ModalType::RenameCodex { name, .. } => {
@@ -549,6 +555,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         }
         ModalType::RefileScroll { selected_idx, .. } => {
             draw_refile_scroll_modal(f, &app.codices, *selected_idx, theme);
+        }
+        ModalType::RefileCodex { codex_id, selected_idx } => {
+            let targets = app.refile_codex_targets(*codex_id);
+            let codex_name = app.codices.iter().find(|c| c.id == *codex_id).map(|c| c.name.as_str()).unwrap_or("");
+            draw_refile_codex_modal(f, &app.codices, &targets, *selected_idx, codex_name, theme);
         }
         _ => {}
     }
@@ -784,17 +795,90 @@ fn draw_refile_scroll_modal(f: &mut Frame, codices: &[crate::models::Codex], sel
         Style::default().fg(theme.muted)
     };
     items.push(ListItem::new("  ── Ungrouped ──").style(ungrouped_style));
-    // Options 1..=n: each codex
+    // Options 1..=n: each codex, indented if it has a parent
     for (i, codex) in codices.iter().enumerate() {
         let style = if selected_idx == i + 1 {
             Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        items.push(ListItem::new(format!("  ◆ {}", codex.name)).style(style));
+        let indent = if codex.parent_codex_id.is_some() { "    " } else { "  " };
+        let parent_hint = if let Some(pid) = codex.parent_codex_id {
+            codices.iter().find(|c| c.id == pid)
+                .map(|p| format!(" ↳ {}", p.name))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        items.push(ListItem::new(format!("{}◆ {}{}", indent, codex.name, parent_hint)).style(style));
     }
 
     let hint = Paragraph::new("↑↓ navigate · Enter confirm · Esc cancel")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    f.render_widget(List::new(items), chunks[0]);
+    f.render_widget(hint, chunks[1]);
+}
+
+// Modal para mover un codex a otro padre — muestra Root + codices elegibles (no descendientes)
+fn draw_refile_codex_modal(f: &mut Frame, all_codices: &[crate::models::Codex], targets: &[uuid::Uuid], selected_idx: usize, codex_name: &str, theme: &Theme) {
+    let size = f.size();
+    let item_count = (targets.len() + 1) as u16; // +1 for Root
+    let height = (item_count + 4).min(size.height.saturating_sub(4));
+    let width = (size.width / 3).max(40).min(56);
+    let area = ratatui::layout::Rect {
+        x: (size.width.saturating_sub(width)) / 2,
+        y: (size.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+    let title = format!(" Move Codex: {} ", codex_name);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(title);
+    f.render_widget(block, area);
+
+    use ratatui::layout::Margin;
+    let inner = area.inner(&Margin { vertical: 1, horizontal: 1 });
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let root_style = if selected_idx == 0 {
+        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.muted)
+    };
+    items.push(ListItem::new("  ── Root (Top Level) ──").style(root_style));
+
+    for (i, &target_id) in targets.iter().enumerate() {
+        let style = if selected_idx == i + 1 {
+            Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        if let Some(codex) = all_codices.iter().find(|c| c.id == target_id) {
+            let indent = if codex.parent_codex_id.is_some() { "    " } else { "  " };
+            let parent_hint = if let Some(pid) = codex.parent_codex_id {
+                all_codices.iter().find(|c| c.id == pid)
+                    .map(|p| format!(" ↳ {}", p.name))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            items.push(ListItem::new(format!("{}◆ {}{}", indent, codex.name, parent_hint)).style(style));
+        }
+    }
+
+    let hint = Paragraph::new("↑↓ navigate · Enter move · Esc cancel")
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center);
 
@@ -1338,7 +1422,36 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
     Line::from(spans)
 }
 
-// Tab de notas — lista de scrolls a la izquierda (agrupados por codex), preview con markdown a la derecha
+// Append one level of the DFS tree into flat_list (text, note_idx, is_header)
+fn append_display_subtree(
+    flat_list: &mut Vec<(String, Option<usize>, bool)>,
+    notes: &[&Note],
+    codices: &[crate::models::Codex],
+    parent: Option<uuid::Uuid>,
+    depth: usize,
+) {
+    let indent = "  ".repeat(depth);
+    let note_indent = "  ".repeat(depth + 1);
+    let children: Vec<&crate::models::Codex> = codices.iter()
+        .filter(|c| c.parent_codex_id == parent)
+        .collect();
+    for codex in children {
+        flat_list.push((format!("{}◆ {} ", indent, codex.name), None, true));
+        // Recurse into sub-codices first
+        append_display_subtree(flat_list, notes, codices, Some(codex.id), depth + 1);
+        // Then direct notes in this codex
+        let mut codex_notes: Vec<(usize, &&Note)> = notes.iter().enumerate()
+            .filter(|(_, n)| n.codex_id == Some(codex.id))
+            .collect();
+        codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+        for (idx, note) in codex_notes {
+            let lock = if note.sharing_permission == "read_only" { "[R] " } else { "" };
+            flat_list.push((format!("{}· {}{} ", note_indent, lock, note.title), Some(idx), false));
+        }
+    }
+}
+
+// Tab de notas — lista de scrolls a la izquierda (árbol expandido con indentación), preview a la derecha
 fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx: usize, theme: &Theme, sidebar_focused: bool, codices: &[crate::models::Codex]) {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused { theme.border } else { accent_color };
@@ -1351,31 +1464,22 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         ])
         .split(area);
 
-    // Lista plana: headers de codex + sus notas ordenadas, luego las notas sin grupo al final
-    // Cada ítem: (texto, Option<note_idx>, es_header) — el índice plano es lo que usamos para selección
+    // Full DFS tree — all codices always expanded with depth-based indentation
     let mut flat_list: Vec<(String, Option<usize>, bool)> = Vec::new();
-    for codex in codices {
-        flat_list.push((format!(" ◆ {} ", codex.name), None, true));
-        let mut codex_notes: Vec<(usize, &&Note)> = notes.iter().enumerate()
-            .filter(|(_, n)| n.codex_id == Some(codex.id))
-            .collect();
-        codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        for (idx, note) in codex_notes {
-            let lock = if note.sharing_permission == "read_only" { "[R] " } else { "" };
-            flat_list.push((format!("   · {}{} ", lock, note.title), Some(idx), false));
-        }
-    }
+    append_display_subtree(&mut flat_list, notes, codices, None, 0);
+
+    // Ungrouped notes (no codex or codex from a different project)
     let mut ungrouped: Vec<usize> = notes.iter().enumerate()
         .filter(|(_, n)| n.codex_id.is_none() || !codices.iter().any(|c| Some(c.id) == n.codex_id))
         .map(|(i, _)| i)
         .collect();
     ungrouped.sort_by(|&a, &b| notes[a].title.to_lowercase().cmp(&notes[b].title.to_lowercase()));
     if !codices.is_empty() && !ungrouped.is_empty() {
-        flat_list.push(("  ── Ungrouped ──".to_string(), None, false)); // divider
+        flat_list.push(("  ── Ungrouped ──".to_string(), None, false));
     }
     for idx in &ungrouped {
         let lock = if notes[*idx].sharing_permission == "read_only" { "[R] " } else { "" };
-        flat_list.push((format!("   · {}{} ", lock, notes[*idx].title), Some(*idx), false));
+        flat_list.push((format!("· {}{} ", lock, notes[*idx].title), Some(*idx), false));
     }
 
     let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {

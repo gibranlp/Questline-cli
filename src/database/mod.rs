@@ -16,13 +16,11 @@ use crate::models::{
     Statistics, Streak, Task, TaskPriority, User, XPEvent, ZenTree,
 };
 
-// Struct que envuelve la conexión — todo pasa por aquí
 pub struct Database {
     pub conn: Connection,
 }
 
 impl Database {
-    // Aquí nace la base de datos — abre la conexión, corre migraciones y siembra datos por defecto
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
 
@@ -32,7 +30,6 @@ impl Database {
         conn.execute("PRAGMA foreign_keys = ON;", [])?;
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
-        // Crea todas las tablas si no existen — el schema base
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
 
         // Migraciones por columna — ALTER TABLE si el campo no existe todavía (upgrades de versiones viejas)
@@ -107,6 +104,15 @@ impl Database {
             )?;
         }
 
+        let has_focus_owner_col: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('focus_sessions') WHERE name='owner_identity'",
+            [],
+            |row| { let cnt: i32 = row.get(0)?; Ok(cnt > 0) },
+        )?;
+        if !has_focus_owner_col {
+            conn.execute("ALTER TABLE focus_sessions ADD COLUMN owner_identity TEXT;", [])?;
+        }
+
         // Migraciones del modo colaborativo (Stage 5B) — dueño e identidad por entidad
         let has_project_owner_identity: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('projects') WHERE name='owner_identity'",
@@ -168,7 +174,6 @@ impl Database {
             conn.execute("ALTER TABLE milestones ADD COLUMN created_at TEXT NOT NULL DEFAULT '2000-01-01T00:00:00+00:00';", [])?;
         }
 
-        // Add tier column to milestones
         let has_tier: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('milestones') WHERE name='tier'",
             [],
@@ -181,7 +186,6 @@ impl Database {
             )?;
         }
 
-        // Add template_id column to milestones
         let has_template_id: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('milestones') WHERE name='template_id'",
             [],
@@ -203,12 +207,11 @@ impl Database {
         if !has_parent_task_id {
             conn.execute("ALTER TABLE tasks ADD COLUMN parent_task_id TEXT;", [])?;
         }
-        // Index must be created after the column exists
+        // CUIDADO: el índice debe crearse después de que la columna ya exista — no mover antes del bloque de migración
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_tasks_parent_task_id ON tasks(parent_task_id);",
         )?;
 
-        // v1.0.5: Create codices table
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS codices (
                 id TEXT PRIMARY KEY,
@@ -220,7 +223,6 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_codices_project_id ON codices(project_id);",
         )?;
 
-        // v1.0.5: Add codex_id to notes
         let has_codex_id: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('notes') WHERE name='codex_id'",
             [],
@@ -301,7 +303,15 @@ impl Database {
             conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT;", [])?;
         }
 
-        // Siembra los logros fijos — OR IGNORE para no pisarlos si ya existen
+        // v1.0.9: nested codices — un codex puede vivir dentro de otro
+        let has_parent_codex: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('codices') WHERE name='parent_codex_id'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_parent_codex {
+            conn.execute("ALTER TABLE codices ADD COLUMN parent_codex_id TEXT;", [])?;
+        }
+
         for (id, name, desc) in Achievement::static_list() {
             conn.execute(
                 "INSERT OR IGNORE INTO achievements (id, name, description, unlocked_at) VALUES (?1, ?2, ?3, NULL)",
@@ -309,7 +319,6 @@ impl Database {
             )?;
         }
 
-        // Rituales por defecto — sólo se insertan si la tabla está vacía (primer arranque)
         let count_rituals: i32 =
             conn.query_row("SELECT count(*) FROM rituals", [], |row| row.get(0))?;
         if count_rituals == 0 {
@@ -358,7 +367,6 @@ impl Database {
             }
         }
 
-        // El árbol zen siempre debe existir — si no hay registro, nace con salud 100
         let count_tree: i32 =
             conn.query_row("SELECT count(*) FROM zen_tree", [], |row| row.get(0))?;
         if count_tree == 0 {
@@ -369,7 +377,6 @@ impl Database {
             )?;
         }
 
-        // Check/initialize streaks
         let count_streaks: i32 =
             conn.query_row("SELECT count(*) FROM streaks", [], |row| row.get(0))?;
         if count_streaks == 0 {
@@ -379,7 +386,6 @@ impl Database {
             )?;
         }
 
-        // Títulos legendarios — el flex máximo del héroe, se inicializan todos bloqueados
         let count_titles: i32 =
             conn.query_row("SELECT count(*) FROM legendary_titles", [], |row| {
                 row.get(0)
@@ -425,7 +431,6 @@ impl Database {
             }
         }
 
-        // Initialize relics
         let count_relics: i32 =
             conn.query_row("SELECT count(*) FROM relics", [], |row| row.get(0))?;
         if count_relics == 0 {
@@ -444,47 +449,40 @@ impl Database {
             }
         }
 
-        // Misiones de clase — 5 por cada una de las 6 clases, qué rollo la cantidad de datos
         let count_quests: i32 =
             conn.query_row("SELECT count(*) FROM class_quests", [], |row| row.get(0))?;
         if count_quests == 0 {
             let quests = vec![
-                // Code Warlock
                 ("Code Warlock", 10, "The Forgotten Compiler", "Complete 5 tasks to align the compiler parameters and purge syntax anomalies.", "Locked", 0, 5, "Unlocks the lore of the Compiler Wizards."),
                 ("Code Warlock", 25, "The Broken Daemon", "Dedicate 60 minutes of deep focus to debug and stabilize the rogue background daemon.", "Locked", 0, 60, "Unlocks the lore of the Background Daemons."),
                 ("Code Warlock", 50, "The Library of Infinite Scripts", "Water your Zen Tree 3 times to grow script-bearing leaves containing ancient functions.", "Locked", 0, 3, "Unlocks the lore of the Leaf Scripts."),
                 ("Code Warlock", 75, "The Stack Overflow Sigil", "Complete a project to craft the ultimate code architecture of the Keep.", "Locked", 0, 1, "Unlocks the lore of the Architecture Sigils."),
                 ("Code Warlock", 100, "The Simulation Core", "Maintain a 7-day streak to boot up the final cosmic simulation engine.", "Locked", 0, 7, "Unlocks the ultimate lore of the Simulation Core."),
 
-                // Task Paladin
                 ("Task Paladin", 10, "The Mountain of Unfinished Things", "Complete 5 tasks to clear the pass of procrastination monsters.", "Locked", 0, 5, "Unlocks the lore of the Mountain Pass."),
                 ("Task Paladin", 25, "The Keeper of Deadlines", "Dedicate 60 minutes of deep focus to reinforce the fortress deadlines.", "Locked", 0, 60, "Unlocks the lore of the Deadline Keep."),
                 ("Task Paladin", 50, "The Final Checklist", "Water your Zen Tree 3 times to bless the roots of completion.", "Locked", 0, 3, "Unlocks the lore of the Checklist Tree."),
                 ("Task Paladin", 75, "The Shield of Discipline", "Complete a project to forge the legendary shield of absolute momentum.", "Locked", 0, 1, "Unlocks the lore of the Shield of discipline."),
                 ("Task Paladin", 100, "The Citadel of Completion", "Maintain a 7-day streak to defend the Citadel of Completion against decay.", "Locked", 0, 7, "Unlocks the lore of the Eternal Citadel."),
 
-                // Mind Sage
                 ("Mind Sage", 10, "The Silent Archive", "Complete 5 tasks to index the scrolls in the quiet archive.", "Locked", 0, 5, "Unlocks the lore of the Silent Archive."),
                 ("Mind Sage", 25, "The Crystal of Reflection", "Dedicate 60 minutes of deep focus to charge the crystal of inner sight.", "Locked", 0, 60, "Unlocks the lore of the Reflection Crystal."),
                 ("Mind Sage", 50, "The Hall of Thoughts", "Water your Zen Tree 3 times to nourish the branches of knowledge.", "Locked", 0, 3, "Unlocks the lore of the Hall of Thoughts."),
                 ("Mind Sage", 75, "The Cognitive Cartography", "Complete a project to map the mental node layout of the world.", "Locked", 0, 1, "Unlocks the lore of the Cognitive Map."),
                 ("Mind Sage", 100, "The Singularity of Mind", "Maintain a 7-day streak to achieve total neural alignment.", "Locked", 0, 7, "Unlocks the lore of the Mind Singularity."),
 
-                // Systems Architect
                 ("Systems Architect", 10, "The Blueprint of Babel", "Complete 5 tasks to lay down the base schema of construction.", "Locked", 0, 5, "Unlocks the lore of the Schema Blueprints."),
                 ("Systems Architect", 25, "The Pillars of Order", "Dedicate 60 minutes of deep focus to reinforce the support pillars.", "Locked", 0, 60, "Unlocks the lore of the Pillars of Order."),
                 ("Systems Architect", 50, "The Grand Engine", "Water your Zen Tree 3 times to feed the engine cooling system.", "Locked", 0, 3, "Unlocks the lore of the Grand Engine."),
                 ("Systems Architect", 75, "The Modular Framework", "Complete a project to connect all components of the system.", "Locked", 0, 1, "Unlocks the lore of the Modular Framework."),
                 ("Systems Architect", 100, "The Unified Schema", "Maintain a 7-day streak to compile the universe's ultimate structure.", "Locked", 0, 7, "Unlocks the lore of the Cosmic Schema."),
 
-                // Time Chronomancer
                 ("Time Chronomancer", 10, "The Broken Hourglass", "Complete 5 tasks to collect the scattered sands of time.", "Locked", 0, 5, "Unlocks the lore of the Hourglass Sands."),
                 ("Time Chronomancer", 25, "The Sands of Yesterday", "Dedicate 60 minutes of deep focus to spin the threads of memory.", "Locked", 0, 60, "Unlocks the lore of the Threads of Memory."),
                 ("Time Chronomancer", 50, "The Infinite Loop", "Water your Zen Tree 3 times to grow the temporal leaves.", "Locked", 0, 3, "Unlocks the lore of the Temporal Leaves."),
                 ("Time Chronomancer", 75, "The Temporal Shield", "Complete a project to deflect the agents of distraction.", "Locked", 0, 1, "Unlocks the lore of the Temporal Shield."),
                 ("Time Chronomancer", 100, "The Eternal Timeline", "Maintain a 7-day streak to lock the timeline in a state of flow.", "Locked", 0, 7, "Unlocks the lore of the Eternal Timeline."),
 
-                // Arch Accountant
                 ("Arch Accountant", 10, "The Ledger of Fate", "Complete 5 tasks to reconcile the local ledger entries.", "Locked", 0, 5, "Unlocks the lore of the Local Ledgers."),
                 ("Arch Accountant", 25, "The Golden Ratio", "Dedicate 60 minutes of deep focus to calculate the perfect balance.", "Locked", 0, 60, "Unlocks the lore of the Perfect Balance."),
                 ("Arch Accountant", 50, "The Final Balance", "Water your Zen Tree 3 times to secure the growth dividend.", "Locked", 0, 3, "Unlocks the lore of the Growth Dividend."),
@@ -501,7 +499,6 @@ impl Database {
             }
         }
 
-        // Initialize lore library
         let default_lore: Vec<(&str, &str, &str, &str, i32, Option<String>)> = vec![
             ("class_six_orders", "Class", "The Six Great Orders", "Though all followers of Questline seek progress, few agree on how it should be achieved.\n\nOver the centuries, six distinct philosophies emerged.\n\nEach became an Order.\n\nEach mastered a different aspect of productivity.\n\nEach insists they are obviously correct.\n\nThe resulting arguments have lasted for generations.", 1, Some(Utc::now().to_rfc3339())),
             ("world_chapter_1", "World", "Before the First Cursor", "Before there were projects, before there were tasks, before there were notes and chronicles, there was only the Void.\n\nThe Void was not empty.\n\nIt was filled with unfinished intentions.\n\nIdeas that would someday be started.\n\nPlans that would someday be organized.\n\nGoals that would someday be pursued.\n\nYet none of them ever moved beyond possibility.\n\nNothing was recorded.\n\nNothing was completed.\n\nNothing endured.\n\nThis forgotten era became known as The Age of Intention.", 0, None),
@@ -511,46 +508,38 @@ impl Database {
             ("world_chapter_5", "World", "The Founding of Questline", "In the years that followed, the surviving peoples gathered around the teachings of the First Cursor.\n\nThey learned that progress was not achieved through motivation.\n\nProgress was achieved through repetition.\n\nThrough systems.\n\nThrough consistency.\n\nThrough showing up again tomorrow.\n\nThese teachings became known as the Questline.\n\nNot because the path was easy.\n\nBut because every meaningful achievement was composed of smaller quests completed one after another.", 0, None),
             ("world_chapter_6", "World", "The Six Great Orders", "As Questline spread across the realm, different groups interpreted its teachings in different ways.\n\nSome pursued structure.\n\nOthers sought discipline.\n\nSome mastered knowledge.\n\nOthers mastered time itself.\n\nFrom these philosophies emerged the Six Great Orders.\n\nThe Arch Accountants.\n\nThe Code Warlocks.\n\nThe Mind Sages.\n\nThe Task Paladins.\n\nThe Systems Architects.\n\nThe Time Chronomancers.\n\nThough their methods differed, all sought the same goal:\n\nTo bring order to chaos and purpose to effort.", 0, None),
             ("world_chapter_7", "World", "The Era of Productivity", "For the first time in history, progress became measurable.\n\nProjects were completed.\n\nGoals were achieved.\n\nKnowledge was preserved.\n\nEntire cities prospered under the guidance of the Orders.\n\nYet success created new challenges.\n\nScope Dragons multiplied.\n\nMeeting Mimics infiltrated institutions.\n\nDeadline Wraiths appeared in increasing numbers.\n\nThe struggle against chaos had entered a new age.", 0, None),
-            ("world_chapter_8", "World", "The Growth of the Zen Tree", "During this period, a mysterious sapling appeared near the center of the realm.\n\nNo one knows who planted it.\n\nNo one knows where it came from.\n\nAttempts to accelerate its growth failed.\n\nAttempts to manipulate it failed.\n\nAttempts to place it in a productivity framework generated seventeen conflicting methodologies and three conference talks.\n\nThe Tree ignored them all.\n\nIt grew only through consistent effort.\n\nA little each day.\n\nNever quickly.\n\nNever dramatically.\n\nYet never stopping.", 0, None),
+            ("world_chapter_8", "World", "The Growth of The Evergrowth", "During this period, a mysterious sapling appeared near the center of the realm.\n\nNo one knows who planted it.\n\nNo one knows where it came from.\n\nAttempts to accelerate its growth failed.\n\nAttempts to manipulate it failed.\n\nAttempts to place it in a productivity framework generated seventeen conflicting methodologies and three conference talks.\n\nThe Tree ignored them all.\n\nIt grew only through consistent effort.\n\nA little each day.\n\nNever quickly.\n\nNever dramatically.\n\nYet never stopping.", 0, None),
             ("world_chapter_9", "World", "The Age of Chronicles", "The greatest weakness of mortals had always been memory.\n\nVictories were forgotten.\n\nProgress went unnoticed.\n\nGrowth became invisible.\n\nTo solve this, the Orders created the Chronicle.\n\nA living record of journeys, achievements, failures, discoveries, and lessons learned.\n\nThe Chronicle does not celebrate perfection.\n\nIt celebrates persistence.\n\nEvery completed task.\n\nEvery finished project.\n\nEvery return after a difficult day.\n\nAll are recorded.", 0, None),
             ("world_chapter_10", "World", "The Present Age", "The realm now stands in an era unlike any before it.\n\nThe Great Backlog remains beyond the horizon.\n\nDeadline Wraiths continue to roam.\n\nScope Dragons still tempt adventurers with promises of \"just one more feature.\"\n\nYet the people endure.\n\nEvery day new travelers begin their journey.\n\nEvery day new quests are completed.\n\nEvery day another page is added to the Chronicle.\n\nThe story of Questline remains unfinished.\n\nAs all good stories should.", 0, None),
-            // Chapter One reward — unlocked when the Notification Swarm chapter is completed
             ("world_chapter_11", "World", "The Fate of the Notification Sprites", "When the Swarm finally broke, no great battle was recorded.\n\nNo armies marched.\n\nNo ancient relic was activated.\n\nNo chosen hero stood atop a mountain and delivered a dramatic speech.\n\nThe Sprites simply began to vanish.\n\nOne by one.\n\nThen hundreds at a time.\n\nThen thousands.\n\nAcross the Realm, unfinished quests were completed.\n\nScrolls were written.\n\nReflections were recorded.\n\nFocus sessions were honored.\n\nThe Swarm had always fed upon hesitation.\n\nEvery ignored task.\n\nEvery postponed intention.\n\nEvery promise made to \"start tomorrow.\"\n\nThe Notification Sprites themselves were never evil.\n\nMerely hungry.\n\nFor years they had consumed abandoned attention and multiplied beyond control.\n\nBut once the Realm began moving forward again, the food supply disappeared.\n\nThe Sprites weakened.\n\nTheir numbers collapsed.\n\nMany returned to their natural role as harmless messengers.\n\nOthers scattered into forgotten corners of the Realm.\n\nYet as the final Swarm dissolved, the Mind Sages noticed something troubling.\n\nThe Sprites had never created the problem.\n\nThey had only benefited from it.\n\nSomething else had nurtured the conditions that allowed the Swarm to grow.\n\nSomething patient.\n\nSomething ancient.\n\nSomething that preferred heroes distracted.\n\nAt the edge of recorded history, the Chronicle found references to a force long believed dormant.\n\nA force known only as:\n\nThe Great Backlog.\n\nThe horizon darkened.\n\nThe Realm celebrated its victory.\n\nBut the Chronicle quietly turned to the next page.", 0, None),
 
-            // Class Stories: The Council of Orders (unlocked at Level 40, shared)
             ("class_council_orders", "Class", "The Council of Orders", "Though the Orders often disagree, they meet each year at the Hall of Progress.\n\nRepresentatives gather to discuss threats facing the realm.\n\nThe Great Backlog.\n\nScope Dragons.\n\nDeadline Wraiths.\n\nMeeting Mimics.\n\nNotification Sprites.\n\nAnd other horrors.\n\nThe meetings usually begin with noble intentions.\n\nThey usually end with action items.\n\nThe action items are recorded.\n\nAssigned.\n\nPrioritized.\n\nScheduled.\n\nCategorized.\n\nLinked to supporting documentation.\n\nAnd occasionally completed.", 0, None),
 
-            // Arch Accountant Lore
             ("class_accountant_5", "Class", "The Order of the Ledger", "The Arch Accountants\n\n\"If it is not recorded, it did not happen.\"\n\nThe Arch Accountants were among the first followers of the Questline.\n\nWhere others sought glory, they sought balance.\n\nWhere others chased inspiration, they chased documentation.\n\nWhere others asked \"Can we afford this?\"\n\nThe Arch Accountants replied:\n\n\"We could have answered that three months ago if someone had updated the spreadsheet.\"", 0, None),
             ("class_accountant_15", "Class", "Business Purposes", "Their temples are vast halls of ledgers, records, receipts, reports, and financial histories stretching back centuries.\n\nEvery transaction is preserved.\n\nEvery expense is categorized.\n\nEvery discrepancy is investigated.\n\nEspecially the suspicious charge labeled:\n\n\"Business Purposes.\"\n\nNo one has ever successfully explained a Business Purposes expense to an Arch Accountant.", 0, None),
             ("class_accountant_20", "Class", "Traditions", "New initiates must perform the Rite of Reconciliation.\n\nA sacred ceremony in which a financial statement refuses to balance by exactly $0.03.\n\nThe ritual continues until the discrepancy is found.\n\nSome initiates emerge wiser.\n\nOthers emerge with eye twitches.", 0, None),
             ("class_accountant_30", "Class", "Rivalries", "Arch Accountants maintain a long-standing rivalry with Code Warlocks.\n\nThe Accountants claim developers spend money recklessly.\n\nThe Warlocks claim budgets are imaginary.\n\nBoth sides are technically correct.", 0, None),
 
-            // Code Warlock Lore
             ("class_warlock_5", "Class", "The Terminal Covenant", "The Code Warlocks\n\n\"It worked on my machine.\"\n\nNo one knows exactly how the Code Warlocks began.\n\nTheir own records are incomplete.\n\nMostly because they forgot to back them up.\n\nAccording to legend, the first Code Warlock discovered an ancient terminal hidden beneath the ruins of a forgotten data center.\n\nWithin it were the Sacred Commands.\n\nMany were dangerous.\n\nSeveral were undocumented.\n\nOne simply read:\n\nsudo trust_me\n\nHistory records that this was a mistake.", 0, None),
             ("class_warlock_15", "Class", "The Great Forking", "The most famous event in Warlock history was The Great Forking.\n\nA disagreement regarding indentation escalated into a civil war.\n\nEntire repositories split apart.\n\nFriendships ended.\n\nThree documentation teams disappeared.\n\nTo this day no one remembers the original argument.\n\nOnly that it was important.", 0, None),
             ("class_warlock_20", "Class", "Traditions", "Code Warlocks consume sacred caffeinated beverages before performing major rituals.\n\nThe stronger the coffee, the more powerful the magic.\n\nThis belief remains scientifically unchallenged.", 0, None),
             ("class_warlock_30", "Class", "Rivalries", "Code Warlocks and Systems Architects have argued for centuries.\n\nWarlocks believe systems should emerge naturally.\n\nArchitects believe systems should be designed beforehand.\n\nThe resulting meetings are responsible for approximately 14% of all productivity losses in recorded history.", 0, None),
 
-            // Mind Sage Lore
             ("class_sage_5", "Class", "The Silent Archive", "The Mind Sages\n\n\"That reminds me of a note I took six years ago.\"\n\nThe Mind Sages dedicate themselves to preserving knowledge.\n\nNothing is too small to record.\n\nNothing is too obscure to catalog.\n\nNothing is too ridiculous to link to three related concepts.\n\nTheir archives contain billions of interconnected ideas.\n\nMany visitors become permanently lost.\n\nFortunately, the Sages have detailed maps explaining how to escape.\n\nUnfortunately, those maps require reading seventeen prerequisite notes.", 0, None),
             ("class_sage_15", "Class", "The Great Linking", "A legendary Sage once connected every note in the Archive to every other note.\n\nThe resulting structure became so complex that it achieved sentience.\n\nThe Archive still occasionally recommends books no one remembers writing.", 0, None),
             ("class_sage_20", "Class", "Traditions", "Initiates are given a single blank page.\n\nTheir task is simple:\n\nWrite something worth remembering.\n\nMost spend years preparing.\n\nSome never begin.\n\nA few immediately write:\n\n\"Don't overthink this.\"\n\nThese individuals are usually promoted.", 0, None),
             ("class_sage_30", "Class", "Rivalries", "Mind Sages secretly believe everyone else's systems would improve if they simply took better notes.\n\nEveryone else secretly fears they may be right.", 0, None),
 
-            // Task Paladin Lore
             ("class_paladin_5", "Class", "The Sacred Checklist", "The Task Paladins\n\n\"Finish what you start.\"\n\nThe Task Paladins are the defenders of execution.\n\nWhile others debate.\n\nWhile others plan.\n\nWhile others research.\n\nTask Paladins complete things.\n\nThey maintain that motivation is unreliable.\n\nDiscipline is dependable.\n\nAnd checking a box feels incredible.", 0, None),
             ("class_paladin_15", "Class", "The Endless List", "At the center of their Order lies a stone tablet known as The Endless List.\n\nEvery unfinished task in existence is said to appear upon its surface.\n\nFortunately, the tablet is several kilometers tall.\n\nOtherwise morale would suffer considerably.", 0, None),
             ("class_paladin_20", "Class", "Traditions", "Young Paladins swear the Oath of Completion.\n\nThe oath is simple:\n\n\"I will stop creating new projects before finishing old ones.\"\n\nVery few survive their first year.", 0, None),
             ("class_paladin_30", "Class", "Rivalries", "Task Paladins view Scope Dragons as their natural enemies.\n\nUnfortunately, Scope Dragons often disguise themselves as exciting opportunities.\n\nThis has resulted in numerous tragic incidents.", 0, None),
 
-            // Systems Architect Lore
             ("class_architect_5", "Class", "The Builders of Order", "The Systems Architects\n\n\"Let's step back and look at the bigger picture.\"\n\nNo phrase has ever inspired more hope and fear simultaneously.\n\nSystems Architects see patterns where others see chaos.\n\nProcesses where others see confusion.\n\nStructure where others see piles of unrelated documents.\n\nThey possess an almost supernatural ability to create organization.\n\nMany are capable of producing folder hierarchies before understanding the project itself.", 0, None),
             ("class_architect_15", "Class", "The Great Refactoring", "One Architect famously reorganized an entire kingdom.\n\nRoads were rerouted.\n\nGuilds were restructured.\n\nDepartments were merged.\n\nEverything became dramatically more efficient.\n\nNo one could find anything for six months.", 0, None),
             ("class_architect_20", "Class", "Traditions", "Architects spend years studying the Sacred Frameworks.\n\nEvery generation eventually invents a new framework.\n\nEvery generation claims it solves all previous problems.\n\nHistory suggests otherwise.", 0, None),
             ("class_architect_30", "Class", "Rivalries", "Architects often clash with Task Paladins.\n\nPaladins want action.\n\nArchitects want planning.\n\nTogether they accidentally create functional organizations.", 0, None),
 
-            // Time Chronomancer Lore
             ("class_chronomancer_5", "Class", "The Keepers of Hours", "The Time Chronomancers\n\n\"That meeting could have been an email.\"\n\nThe Time Chronomancers study the most precious resource in existence:\n\nTime.\n\nUnlike gold, time cannot be earned.\n\nUnlike knowledge, time cannot be stored.\n\nUnlike tasks, time refuses to wait.\n\nChronomancers dedicate their lives to understanding where it goes.\n\nMost discoveries are deeply unsettling.", 0, None),
             ("class_chronomancer_15", "Class", "The Lost Afternoon", "Among their greatest mysteries is The Lost Afternoon.\n\nA temporal anomaly affecting productivity across the realm.\n\nVictims sit down for five minutes.\n\nThree hours vanish.\n\nNo explanation has ever been found.\n\nResearchers suspect social media.", 0, None),
             ("class_chronomancer_20", "Class", "Traditions", "Chronomancer apprentices carry hourglasses at all times.\n\nNot because they are useful.\n\nBecause it looks extremely impressive.", 0, None),
@@ -597,14 +586,13 @@ impl Database {
             ("memory_077", "Fragment #077 \u{2014} The Sixth Chronicle [Rare]",
              "Recovered from a forbidden archive\n\n\"The Great Backlog can never be destroyed.\n\nOnly managed.\"\n\n\u{2014} The Sixth Chronicle\n\n[ Rare Fragment ]"),
             ("memory_112", "Fragment #112 \u{2014} Rootkeeper Sol [Rare]",
-             "Recovered from the roots of the Zen Tree\n\n\"Heroes ask how long the tree takes to grow.\n\nThe tree asks how long they plan to remain.\"\n\n\u{2014} Rootkeeper Sol\n\n[ Rare Fragment ]"),
+             "Recovered from the roots of The Evergrowth\n\n\"Heroes ask how long the tree takes to grow.\n\nThe tree asks how long they plan to remain.\"\n\n\u{2014} Rootkeeper Sol\n\n[ Rare Fragment ]"),
             ("memory_144", "Fragment #144 \u{2014} Future You [Rare]",
              "Recovered from the Future\n\n\"Everything worked out.\n\nNow stop worrying and finish the task.\"\n\n\u{2014} Future You\n\n[ Rare Fragment ]"),
             ("memory_188", "Fragment #188 \u{2014} Chronomancer Voss [Rare]",
              "Recovered from a corrupted timeline\n\n\"I finally reached Inbox Zero.\n\nNobody was there to witness it.\"\n\n\u{2014} Chronomancer Voss\n\nStatus: Scholars debate authenticity.\n\n[ Rare Fragment ]"),
             ("memory_999", "Fragment #999 \u{2014} Unknown [Legendary]",
              "Recovered from the deepest vault beneath the Chronicle\n\n\"There was never a chosen one.\n\nThere were only people who continued showing up.\n\nAgain.\n\nAnd again.\n\nAnd again.\"\n\n\u{2014} Unknown\n\nThe remainder of the fragment has been lost.\n\n[ Legendary Fragment ]"),
-            // Chapter One reward fragment — unlocked when the Notification Swarm chapter is completed
             ("memory_ch1_001", "Fragment #CH1-001 \u{2014} The Last Quiet Morning [Chapter Reward]",
              "Recovered from the Early Chronicle\n\n\"I remember the morning after the Swarm vanished.\n\nNo pings.\n\nNo banners.\n\nNo red circles demanding attention.\n\nFor the first time in years, the Realm was silent.\n\nThe silence was unsettling.\n\nMany heroes believed something was wrong.\n\nSeveral Task Paladins spent hours refreshing things that no longer needed refreshing.\n\nOne Code Warlock claimed the silence was suspicious and restarted three perfectly functioning systems.\n\nThe Mind Sages simply smiled.\n\nIt took several days before the Realm remembered what silence felt like.\n\nMost agreed it was pleasant.\n\nA few admitted they missed the chaos.\n\nThe Chronicle records both opinions.\"\n\n\u{2014} Unknown Hero\n\n[ Chapter One Reward Fragment ]"),
         ];
@@ -615,7 +603,6 @@ impl Database {
             )?;
         }
 
-        // Lore de logros — se desbloquea junto con el milestone correspondiente, narrativa chida
         let achievement_lore: &[(&str, &str, &str)] = &[
             (
                 "milestone_first_quest",
@@ -673,7 +660,6 @@ impl Database {
         Ok(Self { conn })
     }
 
-    // Trae el perfil del héroe — sólo hay uno, pues, no es un juego multijugador local
     pub fn get_user(&self) -> Result<Option<User>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, username, class, level, xp, created_at, specialization FROM users LIMIT 1",
@@ -710,7 +696,6 @@ impl Database {
         Ok(user_opt)
     }
 
-    // Primer uso del juego — crea al héroe y loguea el evento de creación
     pub fn insert_user(&self, user: &User) -> Result<()> {
         self.conn.execute(
             "INSERT INTO users (id, username, class, level, xp, created_at, specialization) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -728,7 +713,6 @@ impl Database {
         Ok(())
     }
 
-    // Guarda nivel, XP y clase — se llama cada que el héroe sube de nivel o cambia algo
     pub fn update_user(&self, user: &User) -> Result<()> {
         self.conn.execute(
             "UPDATE users SET username = ?1, class = ?2, level = ?3, xp = ?4, specialization = ?5 WHERE id = ?6",
@@ -745,7 +729,6 @@ impl Database {
         Ok(())
     }
 
-    // Inserts a new project.
     pub fn insert_project(&self, project: &Project) -> Result<()> {
         self.conn.execute(
             "INSERT INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -765,7 +748,6 @@ impl Database {
         Ok(())
     }
 
-    // Lists all stored projects.
     pub fn get_projects(&self) -> Result<Vec<Project>> {
         let mut stmt = self.conn.prepare("SELECT id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared FROM projects")?;
         let rows = stmt.query_map([], |row| {
@@ -804,7 +786,6 @@ impl Database {
         Ok(projects)
     }
 
-    // Updates an existing project.
     pub fn update_project(&self, project: &Project) -> Result<()> {
         self.conn.execute(
             "UPDATE projects SET name = ?1, description = ?2, archived = ?3, completed = ?4, owner_identity = ?5, owner_username = ?6, is_shared = ?7 WHERE id = ?8",
@@ -822,7 +803,6 @@ impl Database {
         Ok(())
     }
 
-    // Deletes an archived project permanently.
     pub fn delete_project_permanently(&self, id: Uuid) -> Result<()> {
         // Tombstone antes de borrar — los otros dispositivos necesitan saber que este proyecto ya no existe
         let _ = self.log_change("project", &id.to_string(), "delete");
@@ -833,7 +813,6 @@ impl Database {
         Ok(())
     }
 
-    // Crea una tarea nueva — también guarda revisión para historial de cambios
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
             "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
@@ -861,7 +840,6 @@ impl Database {
         Ok(())
     }
 
-    // Lists all tasks.
     pub fn get_tasks(&self) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks")?;
         let rows = stmt.query_map([], |row| {
@@ -932,7 +910,6 @@ impl Database {
         Ok(tasks)
     }
 
-    // Lists tasks for a project.
     pub fn get_tasks_for_project(&self, project_id: Uuid) -> Result<Vec<Task>> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
@@ -975,7 +952,6 @@ impl Database {
     }
 
 
-    // Actualiza una tarea — detecta si se acaba de completar para loguear "complete" en vez de "update"
     pub fn update_task(&self, task: &Task) -> Result<()> {
         let old_task = self.get_task_by_id(task.id).ok();
         let was_completed = old_task.map(|t| t.completed).unwrap_or(false);
@@ -1000,7 +976,7 @@ impl Database {
             ],
         )?;
 
-        // Órale — si pasó de incompleta a completa, el log va como "complete" no "update"
+        // si pasó de incompleta a completa, el log va como "complete" — el sync server distingue ambos eventos
         let op = if task.completed && !was_completed {
             "complete"
         } else {
@@ -1013,7 +989,6 @@ impl Database {
         Ok(())
     }
 
-    // Deletes a task.
     pub fn delete_task(&self, id: Uuid) -> Result<()> {
         // Tombstone — sin esto la tarea resucita en el próximo pull desde otro dispositivo
         let _ = self.log_change("task", &id.to_string(), "delete");
@@ -1022,7 +997,6 @@ impl Database {
         Ok(())
     }
 
-    // Inserts a new note.
     pub fn insert_note(&self, note: &Note) -> Result<()> {
         self.conn.execute(
             "INSERT INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1045,7 +1019,6 @@ impl Database {
         Ok(())
     }
 
-    // Lists all notes.
     pub fn get_notes(&self) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity FROM notes")?;
         let rows = stmt.query_map([], |row| {
@@ -1097,7 +1070,6 @@ impl Database {
         Ok(notes)
     }
 
-    // Lists notes for a project.
     pub fn get_notes_for_project(&self, project_id: Uuid) -> Result<Vec<Note>> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity FROM notes WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
@@ -1129,7 +1101,6 @@ impl Database {
         Ok(notes)
     }
 
-    // Updates an existing note.
     pub fn update_note(&self, note: &Note) -> Result<()> {
         self.conn.execute(
             "UPDATE notes SET project_id = ?1, title = ?2, markdown_content = ?3, updated_at = ?4, sharing_permission = ?5, codex_id = ?6 WHERE id = ?7",
@@ -1150,14 +1121,12 @@ impl Database {
         Ok(())
     }
 
-    // Deletes a note.
     pub fn delete_note(&self, id: Uuid) -> Result<()> {
         self.conn
             .execute("DELETE FROM notes WHERE id = ?1", params![id.to_string()])?;
         Ok(())
     }
 
-    // Lists daily quests for a given date.
     pub fn get_daily_quests_for_date(&self, date: NaiveDate) -> Result<Vec<DailyQuest>> {
         let mut stmt = self.conn.prepare("SELECT id, title, description, completed, due_date FROM daily_quests WHERE due_date = ?1")?;
         let rows = stmt.query_map([date.to_string()], |row| {
@@ -1187,7 +1156,6 @@ impl Database {
         Ok(quests)
     }
 
-    // Registra un evento de XP — cada acción del juego que da puntos termina aquí
     pub fn insert_xp_event(&self, event: &XPEvent) -> Result<()> {
         self.conn.execute(
             "INSERT INTO xp_events (id, event_type, xp_gained, timestamp) VALUES (?1, ?2, ?3, ?4)",
@@ -1201,7 +1169,6 @@ impl Database {
         Ok(())
     }
 
-    // Inserts a journal entry.
     pub fn insert_journal_entry(&self, entry: &JournalEntry) -> Result<()> {
         self.conn.execute(
             "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, visibility, author_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -1219,7 +1186,6 @@ impl Database {
         Ok(())
     }
 
-    // Lists all journal entries.
     pub fn get_journal_entries(&self) -> Result<Vec<JournalEntry>> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, entry_date, content, created_at, visibility, author_username FROM journal_entries ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |row| {
@@ -1258,7 +1224,6 @@ impl Database {
         Ok(entries)
     }
 
-    // Lists journal entries for a project.
     pub fn get_journal_entries_for_project(&self, project_id: Uuid) -> Result<Vec<JournalEntry>> {
         let entries = self.get_journal_entries()?;
         let filtered = entries
@@ -1268,9 +1233,6 @@ impl Database {
         Ok(filtered)
     }
 
-    // RPG Progression System helpers
-
-    // Trae el estado actual del árbol zen — stage, salud, growth y cuándo fue regado por última vez
     pub fn get_zen_tree(&self) -> Result<ZenTree> {
         let mut stmt = self.conn.prepare(
             "SELECT id, growth, health, stage, last_watered, water_today, COALESCE(total_waterings, 0) FROM zen_tree LIMIT 1",
@@ -1388,7 +1350,6 @@ impl Database {
         Ok(achievements)
     }
 
-    // Desbloquea un logro — sólo si no está desbloqueado ya, chido el AND unlocked_at IS NULL
     pub fn unlock_achievement(&self, id: &str) -> Result<()> {
         let now_str = Utc::now().to_rfc3339();
         self.conn.execute(
@@ -1465,7 +1426,6 @@ impl Database {
         Ok(())
     }
 
-    // Agrega todas las métricas del juego en un solo struct — muchas queries, pero necesarias
     pub fn get_statistics(&self) -> Result<Statistics> {
         let tasks_completed: i32 = self.conn.query_row(
             "SELECT count(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL",
@@ -1510,7 +1470,6 @@ impl Database {
             |row| row.get(0),
         )?;
 
-        // Métricas del modo focus y rituales — se suman a las básicas de arriba
         let focus_hours: f64 = self.conn.query_row(
             "SELECT COALESCE(SUM(duration_mins), 0) / 60.0 FROM focus_sessions",
             [],
@@ -1601,11 +1560,9 @@ impl Database {
         })
     }
 
-    // Focus Session CRUD
-    // Guarda una sesión de enfoque completada con su soundscape y XP ganado
     pub fn insert_focus_session(&self, sess: &FocusSession) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sess.id.to_string(),
                 sess.project_id.map(|u| u.to_string()),
@@ -1614,15 +1571,15 @@ impl Database {
                 sess.xp_gained,
                 sess.completed_at.to_rfc3339(),
                 sess.soundscape,
+                sess.owner_identity,
             ],
         )?;
-        // Registrar sesión de focus — el XP ganado debe replicarse entre dispositivos
         let _ = self.log_change("focus_session", &sess.id.to_string(), "insert");
         Ok(())
     }
 
     pub fn get_focus_sessions(&self) -> Result<Vec<FocusSession>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape FROM focus_sessions")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity FROM focus_sessions")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let proj_str: Option<String> = row.get(1)?;
@@ -1631,6 +1588,7 @@ impl Database {
             let xp_gained: i32 = row.get(4)?;
             let completed_str: String = row.get(5)?;
             let soundscape: String = row.get(6)?;
+            let owner_identity: Option<String> = row.get(7)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = proj_str.and_then(|s| Uuid::parse_str(&s).ok());
@@ -1647,6 +1605,7 @@ impl Database {
                 xp_gained,
                 completed_at,
                 soundscape,
+                owner_identity,
             })
         })?;
         let mut list = Vec::new();
@@ -1711,7 +1670,6 @@ impl Database {
         Ok(count)
     }
 
-    // Rituals CRUD
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
         self.conn.execute(
             "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1760,8 +1718,6 @@ impl Database {
         Ok(())
     }
 
-    // Ritual History CRUD
-    // Marca un ritual como completado para el día — OR IGNORE para que no se duplique
     pub fn complete_ritual(&self, ritual_id: &str, date: NaiveDate) -> Result<()> {
         self.conn.execute(
             "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date) VALUES (?1, ?2)",
@@ -1783,7 +1739,6 @@ impl Database {
         Ok(list)
     }
 
-    // Milestone CRUD
     pub fn insert_milestone(&self, m: &Milestone) -> Result<()> {
         self.conn.execute(
             "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, tier, template_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -1867,7 +1822,6 @@ impl Database {
         Ok(())
     }
 
-    /// Count distinct dates where activity (tasks created or journal entries) occurred in a project.
     pub fn get_active_days_for_project(&self, project_id: Uuid) -> Result<i64> {
         let count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM (
@@ -1881,7 +1835,6 @@ impl Database {
         Ok(count)
     }
 
-    /// Count how many daily adventures have been completed (based on XP event descriptions).
     pub fn get_daily_adventures_completed_count(&self) -> Result<i64> {
         let count: i64 = self.conn.query_row(
             "SELECT count(*) FROM xp_events WHERE description LIKE 'Daily Quest:%'",
@@ -1891,7 +1844,6 @@ impl Database {
         Ok(count)
     }
 
-    // Traits CRUD
     pub fn get_unlocked_traits(&self) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare("SELECT id FROM traits")?;
         let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
@@ -1910,7 +1862,6 @@ impl Database {
         Ok(())
     }
 
-    // Reflections CRUD
     pub fn insert_reflection(&self, ref_obj: &DailyReflection) -> Result<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO reflections (created_date, what_went_well, what_can_improve) VALUES (?1, ?2, ?3)",
@@ -1977,7 +1928,6 @@ impl Database {
         Ok(name_opt.unwrap_or_else(|| "None yet".to_string()))
     }
 
-    // Historial de XP reciente — sólo los últimos 5, para mostrar en el dashboard
     pub fn get_xp_history(&self) -> Result<Vec<XPEvent>> {
         let mut stmt = self.conn.prepare("SELECT id, event_type, xp_gained, timestamp FROM xp_events ORDER BY timestamp DESC LIMIT 5")?;
         let rows = stmt.query_map([], |row| {
@@ -2005,8 +1955,6 @@ impl Database {
         }
         Ok(events)
     }
-
-    // --- STAGE 5A IDENTITY, SYNC & CLOUD REVISION HELPERS ---
 
     pub fn get_task_by_id(&self, id: Uuid) -> Result<Task> {
         let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE id = ?1")?;
@@ -2119,15 +2067,15 @@ impl Database {
         Ok(note)
     }
 
-    // Codex CRUD
     pub fn insert_codex(&self, codex: &Codex) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO codices (id, project_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 codex.id.to_string(),
                 codex.project_id.to_string(),
                 codex.name,
-                codex.created_at.to_rfc3339()
+                codex.created_at.to_rfc3339(),
+                codex.parent_codex_id.map(|id| id.to_string()),
             ],
         )?;
         let _ = self.log_change("codex", &codex.id.to_string(), "create");
@@ -2139,19 +2087,24 @@ impl Database {
 
     pub fn get_codices_for_project(&self, project_id: Uuid) -> Result<Vec<Codex>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
+            "SELECT id, project_id, name, created_at, parent_codex_id FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
         )?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let pid_str: String = row.get(1)?;
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
+            let parent_str: Option<String> = row.get(4)?;
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            Ok(Codex { id, project_id: pid, name, created_at })
+            let parent_codex_id = match parent_str {
+                Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                None => None,
+            };
+            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id })
         })?;
         let mut list = Vec::new();
         for r in rows { list.push(r?); }
@@ -2160,19 +2113,24 @@ impl Database {
 
     pub fn get_codex_by_id(&self, id: &str) -> Result<Codex> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at FROM codices WHERE id = ?1"
+            "SELECT id, project_id, name, created_at, parent_codex_id FROM codices WHERE id = ?1"
         )?;
         let codex = stmt.query_row(params![id], |row| {
             let id_str: String = row.get(0)?;
             let pid_str: String = row.get(1)?;
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
+            let parent_str: Option<String> = row.get(4)?;
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            Ok(Codex { id, project_id: pid, name, created_at })
+            let parent_codex_id = match parent_str {
+                Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                None => None,
+            };
+            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id })
         })?;
         Ok(codex)
     }
@@ -2186,8 +2144,22 @@ impl Database {
         Ok(())
     }
 
+    pub fn update_codex_parent(&self, id: Uuid, parent_codex_id: Option<Uuid>) -> Result<()> {
+        self.conn.execute(
+            "UPDATE codices SET parent_codex_id = ?1 WHERE id = ?2",
+            params![parent_codex_id.map(|p| p.to_string()), id.to_string()],
+        )?;
+        let _ = self.log_change("codex", &id.to_string(), "update");
+        Ok(())
+    }
+
     pub fn delete_codex(&self, id: Uuid) -> Result<()> {
-        // ON DELETE SET NULL on notes.codex_id ungroups scrolls automatically
+        // los sub-codices huérfanos suben a raíz en vez de borrarse — el usuario no pierde jerarquía de golpe
+        self.conn.execute(
+            "UPDATE codices SET parent_codex_id = NULL WHERE parent_codex_id = ?1",
+            params![id.to_string()],
+        )?;
+        // el ON DELETE SET NULL del schema ya desagrupa las notas — no hace falta UPDATE manual aquí
         self.conn.execute(
             "DELETE FROM codices WHERE id = ?1",
             params![id.to_string()],
@@ -2205,7 +2177,7 @@ impl Database {
         Ok(count)
     }
 
-    // Registra cada mutación en el sync_log — la columna synced=0 marca lo pendiente de subir
+    // synced=0 al insertar — el motor de sync sólo toma los pendientes; no tocar este default
     pub fn log_change(&self, entity_type: &str, entity_id: &str, operation: &str) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339();
@@ -2216,7 +2188,7 @@ impl Database {
         Ok(())
     }
 
-    // Snapshots versionados de cada entidad — el número de revisión se auto-incrementa por entidad
+    // el número de revisión se calcula como MAX+1 por entidad, no global — dos entidades distintas pueden tener rev 1
     pub fn create_revision(&self, entity_type: &str, entity_id: &str, content: &str) -> Result<()> {
         let next_rev: i32 = self.conn.query_row(
             "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM revisions WHERE entity_type = ?1 AND entity_id = ?2",
@@ -2287,7 +2259,6 @@ impl Database {
         Ok(())
     }
 
-    // Trae todos los cambios sin sincronizar — el motor de sync los procesa y luego los marca
     pub fn get_pending_sync_logs(&self) -> Result<Vec<(String, String, String, String, String)>> {
         let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0")?;
         let rows = stmt.query_map([], |row| {
@@ -2305,7 +2276,7 @@ impl Database {
         Ok(logs)
     }
 
-    // Marca un batch de logs como ya sincronizados — el IN dinámico es necesario por rusqlite
+    // el IN dinámico con placeholders numerados es necesario porque rusqlite no acepta slices directamente en execute
     pub fn mark_sync_logs_synced(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
@@ -2327,7 +2298,6 @@ impl Database {
         Ok(deleted)
     }
 
-    // Cuántas tareas completadas tienen más de `days` días — para mostrarle al usuario antes de podar
     pub fn count_prunable_tasks(&self, days: i64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         let count: i64 = self.conn.query_row(
@@ -2341,11 +2311,10 @@ impl Database {
         Ok(count as usize)
     }
 
-    // Borra tareas completadas más viejas que `days` días — registra tombstones para que sync no las reviva
     pub fn prune_completed_tasks(&self, days: i64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
-        // Log tombstones before deletion so other devices know these records are gone
+        // CUIDADO: los tombstones van antes del DELETE — si se hace al revés, otros dispositivos resucitan la tarea en el siguiente pull
         let mut stmt = self.conn.prepare(
             "SELECT id FROM tasks WHERE completed = 1 AND (
                 (updated_at != '' AND updated_at < ?1) OR
@@ -2361,7 +2330,7 @@ impl Database {
             let _ = self.log_change("task", id, "delete");
         }
 
-        // Delete top-level tasks (CASCADE removes their subtasks automatically)
+        // el CASCADE del schema borra las subtareas automáticamente al borrar la tarea raíz
         self.conn.execute(
             "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NULL AND (
                 (updated_at != '' AND updated_at < ?1) OR
@@ -2369,7 +2338,7 @@ impl Database {
             )",
             params![cutoff],
         )?;
-        // Delete any completed subtasks whose parents survived the prune
+        // subtareas completadas cuyo padre sobrevivió la poda — hay que borrarlas por separado
         self.conn.execute(
             "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL AND (
                 (updated_at != '' AND updated_at < ?1) OR
@@ -2399,11 +2368,8 @@ impl Database {
         Ok(())
     }
 
-    // Exporta toda la base de datos a JSON — para que el usuario pueda llevarse sus datos o hacer backup
     pub fn export_to_json(&self) -> Result<String> {
         let mut map = serde_json::Map::new();
-
-        // Add human-readable metadata
         let mut metadata = serde_json::Map::new();
         metadata.insert(
             "app_name".to_string(),
@@ -2487,7 +2453,6 @@ impl Database {
                             serde_json::Value::String(s)
                         }
                         rusqlite::types::ValueRef::Blob(b) => {
-                            // Convert bytes to hex
                             let hex_str: String = b.iter().map(|x| format!("{:02x}", x)).collect();
                             serde_json::Value::String(hex_str)
                         }
@@ -2504,7 +2469,6 @@ impl Database {
         ))?)
     }
 
-    // Importa un JSON de export — desactiva foreign keys temporalmente para poder insertar en cualquier orden
     pub fn import_from_json(&self, json_str: &str) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(json_str)?;
         let map = value
@@ -2517,13 +2481,12 @@ impl Database {
         let res = (|| -> Result<()> {
             for (table_name, rows_val) in map {
                 if table_name.starts_with('_') {
-                    continue; // Las claves de metadata van con _ al inicio, se ignoran
+                    continue;
                 }
                 if !table_name.chars().all(|c| c.is_alphanumeric() || c == '_') {
                     return Err(anyhow::anyhow!("Invalid table name: {}", table_name));
                 }
 
-                // Clear table
                 self.conn
                     .execute(&format!("DELETE FROM {}", table_name), [])?;
 
@@ -2605,9 +2568,6 @@ impl Database {
         Ok(revs)
     }
 
-    // --- STAGE 5B FELLOWSHIP & COLLABORATION HELPERS ---
-
-    // Agrega o actualiza un miembro del proyecto — OR REPLACE para cambiar su rol sin duplicar
     pub fn add_project_member(
         &self,
         project_id: &str,
@@ -2619,7 +2579,6 @@ impl Database {
             "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
             params![project_id, identity, username, role],
         )?;
-        // Registrar membresía — los demás miembros del proyecto necesitan saber que alguien se unió
         let compound_id = format!("{}__{}", project_id, identity);
         let _ = self.log_change("project_member", &compound_id, "add");
         Ok(())
@@ -2724,7 +2683,6 @@ impl Database {
         Ok(())
     }
 
-    // Guarda un mensaje en el chronicle del proyecto — feed de actividad colaborativa
     pub fn add_chronicle_message(
         &self,
         project_id: &str,
@@ -2739,7 +2697,6 @@ impl Database {
             "INSERT INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, project_id, sender_identity, sender_username, content, msg_type, ts],
         )?;
-        // Registrar mensaje — sin esto los compañeros del proyecto no verán este mensaje
         let _ = self.log_change("chronicle_message", &id, "create");
         Ok(id)
     }
@@ -2975,7 +2932,6 @@ impl Database {
             "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
             params![task_id, user_identity, user_username],
         )?;
-        // Registrar asignación — sin esto el colaborador nunca sabe que tiene esta tarea
         let compound_id = format!("{}__{}", task_id, user_identity);
         let _ = self.log_change("task_assignment", &compound_id, "assign");
         Ok(())
@@ -3155,7 +3111,6 @@ impl Database {
         Ok(list)
     }
 
-    // Desbloquea un título legendario sólo si no estaba ya — retorna true si fue nuevo
     pub fn unlock_legendary_title(&self, title_id: &str) -> Result<bool> {
         let already_unlocked: Option<i32> = self
             .conn
@@ -3274,7 +3229,6 @@ impl Database {
         Ok(list)
     }
 
-    // Trae todo el lore y lo ordena por categoría y número — la lógica de sorting es medio peluda
     pub fn get_lore_entries(
         &self,
     ) -> Result<Vec<(String, String, String, String, bool, Option<String>)>> {
@@ -3295,7 +3249,7 @@ impl Database {
             list.push(r?);
         }
 
-        // Ordenamiento custom: primero por categoría, luego World/Class por número, el resto alfabético
+        // orden custom: por categoría primero; World/Class se ordenan por número del ID, no por título — cambiarlo rompe la narrativa
         list.sort_by(|a, b| {
             if a.1 != b.1 {
                 a.1.cmp(&b.1)
@@ -3331,9 +3285,8 @@ impl Database {
         Ok(list)
     }
 
-    // Desbloquea lore por ID — atómico: solo retorna true si realmente cambió de 0 a 1
     pub fn unlock_lore_entry(&self, id: &str) -> Result<bool> {
-        // UPDATE condicional elimina la carrera SELECT→UPDATE: si unlocked ya es 1 o la fila no existe, changed=0
+        // el WHERE unlocked = 0 hace esto atómico — elimina la carrera SELECT→UPDATE y retorna 0 si ya estaba desbloqueado
         let changed = self.conn.execute(
             "UPDATE lore_library SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1 AND unlocked = 0",
             params![id, Utc::now().to_rfc3339()],
@@ -3393,7 +3346,6 @@ impl Database {
         Ok(())
     }
 
-    // Sistema de drops de fragmentos de lore — probabilidad por rareza y trigger, muy RPG esto
     pub fn discover_memory_fragment(&self, trigger: &str, chance_multiplier: f64) -> Result<Option<(String, String)>> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
@@ -3411,7 +3363,7 @@ impl Database {
         let rare_chance = (0.01 * chance_multiplier).min(1.0);
         let legendary_chance = (0.001 * chance_multiplier).min(1.0);
 
-        // Se tira de mayor a menor rareza para no solapar — sólo un fragmento por evento
+        // se evalúa de mayor a menor rareza para que legendary no quede eclipsado por common al mismo tiempo
         let rarity = if rng.gen_bool(legendary_chance) {
             "legendary"
         } else if rng.gen_bool(rare_chance) {
@@ -3461,11 +3413,10 @@ impl Database {
         Ok(Some((id, title)))
     }
 
-    // Verifica referencias huérfanas y entidades faltantes — mejor prevenir que lamentar datos corruptos
     pub fn verify_data_integrity(&self) -> Result<Vec<String>> {
         let mut reports = Vec::new();
 
-        // Tareas huérfanas: su proyecto ya no existe — las desconectamos en vez de borrarlas
+        // las tareas huérfanas se desconectan (project_id = NULL) en vez de borrarse — el usuario no pierde el trabajo
         let orphaned_tasks: i32 = self.conn.query_row(
             "SELECT count(*) FROM tasks WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects)",
             [],
@@ -3482,7 +3433,6 @@ impl Database {
             ));
         }
 
-        // 2. Clean notes with invalid project_id references (set project_id = NULL)
         let orphaned_notes: i32 = self.conn.query_row(
             "SELECT count(*) FROM notes WHERE project_id IS NOT NULL AND project_id NOT IN (SELECT id FROM projects)",
             [],
@@ -3499,7 +3449,7 @@ impl Database {
             ));
         }
 
-        // Milestones sin proyecto sí se borran — no tiene sentido conservarlos sueltos
+        // los milestones huérfanos sí se borran (a diferencia de tareas/notas) — sin proyecto no tienen contexto y el schema lo requiere
         let orphaned_milestones: i32 = self.conn.query_row(
             "SELECT count(*) FROM milestones WHERE project_id NOT IN (SELECT id FROM projects)",
             [],
@@ -3516,7 +3466,6 @@ impl Database {
             ));
         }
 
-        // 4. Validate streaks presence
         let count_streaks: i32 =
             self.conn
                 .query_row("SELECT count(*) FROM streaks", [], |row| row.get(0))?;
@@ -3528,7 +3477,6 @@ impl Database {
             reports.push("Initialized missing streak records.".to_string());
         }
 
-        // 5. Validate Zen Tree presence
         let count_tree: i32 = self
             .conn
             .query_row("SELECT count(*) FROM zen_tree", [], |row| row.get(0))?;
@@ -3544,7 +3492,6 @@ impl Database {
         Ok(reports)
     }
 
-    // Abre el backup y corre integrity_check + foreign_key_check — si algo falla, el backup está jodido
     pub fn verify_db_backup(backup_path: &Path) -> Result<bool> {
         let conn = Connection::open(backup_path)?;
         let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
@@ -3567,7 +3514,6 @@ impl Database {
     }
 
     pub fn get_all_known_usernames(&self) -> Result<Vec<String>> {
-        // Recoge nombres de todas las fuentes conocidas: miembros de proyectos, crónica global y usuarios locales
         let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         let mut stmt = self.conn.prepare(
@@ -3614,7 +3560,7 @@ impl Database {
             "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             rusqlite::params![e.id, e.hero_name, e.event_type, e.description, e.timestamp, e.hero_class],
         )?;
-        // Si la fila ya existía sin hero_class, la actualizamos ahora que sí la tenemos
+        // si la fila llegó primero desde otro dispositivo sin hero_class, la completamos aquí — no sobreescribimos datos ya presentes
         if e.hero_class.is_some() {
             self.conn.execute(
                 "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
@@ -3644,13 +3590,12 @@ impl Database {
         Ok(entries)
     }
 
-    // Snapshot de todas las métricas de contribución del usuario al capítulo global —
-    // el owner_identity filtra tasks para que los pulls de proyectos compartidos no inflen el delta
+    // el owner_identity filtra las tareas para que los pulls de proyectos compartidos no inflen el delta del capítulo
     pub fn get_contribution_snapshot(&self, owner_identity: &str) -> Result<std::collections::HashMap<String, u64>> {
         let mut map = std::collections::HashMap::new();
 
         let tasks: u64 = self.conn.query_row(
-            // Sólo tareas raíz del propio usuario — subtareas y tareas de otros no cuentan
+            // sólo tareas raíz propias — las subtareas y las de otros colaboradores no cuentan para el capítulo
             "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL
              AND (owner_identity IS NULL OR owner_identity = ?1)",
             params![owner_identity],
@@ -3667,8 +3612,8 @@ impl Database {
         map.insert("subtasks_completed".to_string(), subtasks);
 
         let focus: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM focus_sessions",
-            [],
+            "SELECT COUNT(*) FROM focus_sessions WHERE owner_identity = ?1 OR owner_identity IS NULL",
+            params![owner_identity],
             |row| row.get::<_, i64>(0),
         ).unwrap_or(0) as u64;
         map.insert("focus_sessions".to_string(), focus);
@@ -3704,7 +3649,7 @@ impl Database {
         Ok(map)
     }
 
-    // Trae los totales que mandamos en el sync anterior — sin esto calcularíamos siempre desde cero
+    // sin este log estaríamos mandando el total acumulado en cada sync en vez del delta — doble-conteo en el servidor
     pub fn get_last_sent_contributions(&self, chapter_id: &str) -> Result<std::collections::HashMap<String, u64>> {
         let mut stmt = self.conn.prepare(
             "SELECT objective_type, last_sent_total FROM chapter_contribution_log WHERE chapter_id = ?1",
@@ -3717,12 +3662,11 @@ impl Database {
         Ok(entries)
     }
 
-    // Persiste los totales recién mandados — el INSERT OR REPLACE es más seguro que ON CONFLICT en rusqlite viejo
     pub fn save_sent_contributions(&self, chapter_id: &str, totals: &std::collections::HashMap<String, u64>) -> Result<()> {
         for (obj_type, &total) in totals {
-            // INSERT OR REPLACE is broadly compatible; the equivalent UPSERT syntax
-            // (ON CONFLICT DO UPDATE) requires SQLite ≥ 3.24 and can fail silently
-            // in some rusqlite builds, which would cause the delta to be re-sent every sync.
+            // INSERT OR REPLACE en vez de ON CONFLICT DO UPDATE — este último requiere SQLite ≥ 3.24
+            // y en algunas builds de rusqlite falla silenciosamente, lo que causaría que el delta
+            // se re-mandara en cada sync e inflara los contadores del capítulo
             self.conn.execute(
                 "INSERT OR REPLACE INTO chapter_contribution_log (chapter_id, objective_type, last_sent_total)
                  VALUES (?1, ?2, ?3)",

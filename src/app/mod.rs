@@ -122,10 +122,15 @@ pub enum ModalType {
     },
     NewCodex {
         name: String,
+        parent_codex_id: Option<Uuid>,
     },
     RenameCodex {
         codex_id: Uuid,
         name: String,
+    },
+    RefileCodex {
+        codex_id: Uuid,
+        selected_idx: usize,
     },
     EditTask {
         id: Uuid,
@@ -144,7 +149,6 @@ pub enum ModalType {
     NewJournalEntry {
         content: String,
     },
-    // Stage 4 Modal Additions
     CustomFocusDuration {
         input: String,
     },
@@ -489,10 +493,8 @@ pub struct App {
     pub onboarding_classes: Vec<ClassType>,
     pub onboarding_error: Option<String>,
 
-    // Services
     pub theme_service: ThemeService,
 
-    // Navigation and database states
     pub active_tab_idx: usize,
     // Quote del dashboard — se selecciona al iniciar y queda fija durante la sesión
     pub quote: String,
@@ -505,7 +507,6 @@ pub struct App {
     pub projects: Vec<Project>,
     pub should_quit: bool,
 
-    // Stage 2 Core Workspace variables
     pub selected_project_idx: usize,
     pub active_project_id: Option<Uuid>,
     pub workspace_tab_idx: usize,
@@ -524,21 +525,17 @@ pub struct App {
     pub overlay_modal: ModalType,
     pub editor_state: Option<EditorState>,
 
-    // Dashboard quest panel navigation
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
 
-    // Local Search and Filters
     pub searching: bool,
     pub search_query: String,
     pub task_filter: String,
     pub task_sort: String,
 
-    // Notifications overlay
     pub notifications: Vec<Notification>,
     pub fragment_notification: Option<FragmentAlert>,
 
-    // Stage 4 Configuration variables
     pub active_focus_session: Option<ActiveFocusSession>,
     pub selected_focus_duration_idx: usize,
     pub selected_focus_project_idx: usize,
@@ -548,12 +545,10 @@ pub struct App {
     pub selected_ritual_idx: usize,
     pub selected_milestone_idx: usize,
 
-    // Soundscapes fields
     pub audio_player: crate::audio::AudioPlayer,
     pub selected_soundscape_idx: usize,
     pub selected_focus_soundscape_idx: usize, // 0 = None (Silent), 1..=SOUNDSCAPES.len() = specific soundscape
 
-    // Media Player via MPRIS
     pub mpris_now_playing: Option<crate::audio::mpris_player::NowPlaying>,
     pub mpris_last_poll: std::time::Instant,
 
@@ -574,7 +569,6 @@ pub struct App {
     pub last_mutation: Option<std::time::Instant>,
     pub last_sync_warlock_xp: i32,
 
-    // Stage 5B Fellowship & Collaboration Fields
     pub selected_fellowship_project_idx: usize,
 
     pub fellowship_search_query: String,
@@ -602,7 +596,6 @@ pub struct App {
         String,
     )>,
 
-    // Stage 6 Living World Fields
     pub selected_chronicle_idx: usize,
     pub selected_library_cat_idx: usize,
     pub selected_library_item_idx: usize,
@@ -623,10 +616,8 @@ pub struct App {
     pub update_check_done: bool,
     pub run_installer_on_exit: bool,
 
-    // v1.0.5 Steps & Codices
     pub codices: Vec<crate::models::Codex>,
     pub viewing_step_for_task: Option<Uuid>,
-    // Flat selection index for notes tab (navigates headers + notes)
     pub selected_notes_flat_idx: usize,
 
     // Cachés de performance — se llenan en reload_data() para no golpear la DB en cada frame
@@ -638,7 +629,6 @@ pub struct App {
     pub sync_in_progress: bool,
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
 
-    // Chat polling state — fast poll active only when fellowship chat tab is visible
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
     pub last_chat_poll: std::time::Instant,
@@ -646,11 +636,9 @@ pub struct App {
     // Presencia: heartbeat para que los compañeros sepan que estás activo en el workspace compartido
     pub last_presence_update: std::time::Instant,
 
-    // Great Chronicle — feed global de logros de la comunidad de héroes
     pub great_chronicle_entries: Vec<crate::models::GlobalChronicleEntry>,
     pub great_chronicle_scroll: usize,
 
-    // Living Chapters — sistema cooperativo global, todos contribuyen al mismo capítulo
     pub chapter_progress: Option<crate::models::chapter::ChapterProgressData>,
     pub chapter_panel_scroll: usize,
     pub chapter_tab: usize,           // 0 = Active Chapter, 1 = Chapter History
@@ -659,7 +647,6 @@ pub struct App {
     pub chapter_completion_seen: bool,
     pub chapter_progress_refreshed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
-    // Notification Sprites — los personajes satiricos del Capítulo Uno
     pub sprite_notifications_shown_this_session: u32,
     pub last_sprite_notification_time: Option<std::time::Instant>,
     pub last_sprite_check_time: Option<std::time::Instant>,
@@ -1101,7 +1088,7 @@ impl App {
             ),
             (
                 "The roots grow. The tasks remain.",
-                "The Zen Tree",
+                "The Evergrowth",
             ),
             (
                 "I support your goals, but your calendar concerns me.",
@@ -1157,7 +1144,7 @@ impl App {
             ),
             (
                 "You are one completed task away from feeling slightly better.",
-                "The Zen Tree",
+                "The Evergrowth",
             ),
             (
                 "Progress is simply stubbornness with a better public image.",
@@ -1261,7 +1248,7 @@ impl App {
             ),
             (
                 "You seek wisdom. The task seeks completion.",
-                "The Zen Tree",
+                "The Evergrowth",
             ),
             (
                 "Another day, another opportunity to stop making excuses.",
@@ -1620,7 +1607,6 @@ impl App {
             projects: Vec::new(),
             should_quit: false,
 
-            // Stage 2 setup
             selected_project_idx: 0,
             active_project_id: None,
             workspace_tab_idx: 0,
@@ -1646,7 +1632,6 @@ impl App {
             notifications: Vec::new(),
             fragment_notification: None,
 
-            // Stage 4 setup
             active_focus_session: None,
             selected_focus_duration_idx: 0,
             selected_focus_project_idx: 0,
@@ -1655,7 +1640,6 @@ impl App {
             selected_ritual_idx: 0,
             selected_milestone_idx: 0,
 
-            // Soundscape setup
             audio_player: crate::audio::AudioPlayer::new(),
             selected_soundscape_idx: 0,
             selected_focus_soundscape_idx: 0,
@@ -1674,7 +1658,6 @@ impl App {
             last_mutation: None,
             last_sync_warlock_xp: 0,
 
-            // Stage 5B Fellowship & Collaboration Fields
             selected_fellowship_project_idx: 0,
 
             fellowship_search_query: String::new(),
@@ -1692,7 +1675,6 @@ impl App {
             about_fact_seed: 0,
             bug_report_modal: None,
 
-            // Stage 6 initializations
             selected_chronicle_idx: 0,
             selected_library_cat_idx: 0,
             selected_library_item_idx: 0,
@@ -1746,7 +1728,6 @@ impl App {
             prologue_delay_ticks: 0,
             prologue_skip_checked: false,
 
-            // Media Player via MPRIS
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
         };
@@ -1827,7 +1808,6 @@ impl App {
             .map(|u| u.username.clone())
             .unwrap_or_else(|| "Gibranlp".to_string());
 
-        // 1. Update presence
         self.db.update_presence(
             "alex_key",
             "Alex",
@@ -1847,7 +1827,6 @@ impl App {
         self.db
             .update_presence("diana_key", "Diana", false, "2 hours ago", None, "Offline")?;
 
-        // 2. Generate simulated invitation if none exists
         let invites = self.db.get_invitations()?;
         if invites.is_empty() {
             let sim_proj_id = "fellowship_adv_proj_id";
@@ -1867,7 +1846,6 @@ impl App {
             )?;
         }
 
-        // 3. Populate project data if accepted
         let projects = self.db.get_projects()?;
         if let Some(proj) = projects
             .iter()
@@ -1905,7 +1883,6 @@ impl App {
                 )?;
             }
 
-            // Alex reaction / reply simulation
             let user_msg_count = msgs.iter().filter(|m| m.2 == my_identity).count();
             let alex_reply_count = msgs
                 .iter()
@@ -1925,7 +1902,6 @@ impl App {
                 }
             }
 
-            // Tasks seed
             let tasks = self.db.get_tasks()?;
             let proj_tasks: Vec<_> = tasks
                 .into_iter()
@@ -1982,7 +1958,6 @@ impl App {
         Ok(())
     }
 
-    // Reloads all states from the SQLite database.
     pub fn reload_data(&mut self) -> Result<()> {
         if self.user.is_some() {
             self.user = self.db.get_user()?;
@@ -1990,7 +1965,6 @@ impl App {
                 self.theme_service.set_class(u.class);
             }
 
-            // Load theme choice
             if let Some(theme_choice_str) = self.db.get_setting("equipped_theme")? {
                 let choice = match theme_choice_str.as_str() {
                     "Forest" => ThemeChoice::Forest,
@@ -2025,10 +1999,8 @@ impl App {
             let today = Utc::now().date_naive();
             self.tasks_due_today = self.all_tasks.iter().filter(|t| !t.completed).cloned().collect();
 
-            // Load daily quests for today
             self.daily_quests = self.db.get_daily_quests_for_date(today)?;
 
-            // Load codices for active project
             if let Some(pid) = self.active_project_id {
                 self.codices = self.db.get_codices_for_project(pid).unwrap_or_default();
             } else {
@@ -2038,7 +2010,6 @@ impl App {
         Ok(())
     }
 
-    // Main entry router for key events.
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
@@ -2050,12 +2021,10 @@ impl App {
             return Ok(());
         }
 
-        // Bug report modal intercepts all keys when open
         if self.bug_report_modal.is_some() {
             return self.handle_bug_report_key(key);
         }
 
-        // Fellowship chronicle chat intercept — handles input/browse before general keys
         if self.active_screen == ActiveScreen::Fellowship
             && self.selected_fellowship_tab == 0
             && self.modal_state == ModalType::None
@@ -2070,7 +2039,6 @@ impl App {
             || self.active_screen == ActiveScreen::Editor
             || self.active_screen == ActiveScreen::Onboarding;
 
-        // Global Modals Triggers
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
             || key.code == KeyCode::F(1)
@@ -2095,7 +2063,7 @@ impl App {
             return Ok(());
         }
 
-        // Global sync shortcut — works on any screen except the editor (which uses Ctrl+S to save notes)
+        // Ctrl+S sincroniza en cualquier pantalla excepto el editor (ahí guarda la nota)
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
             && self.active_screen != ActiveScreen::Editor
@@ -2108,7 +2076,6 @@ impl App {
             return Ok(());
         }
 
-        // Global quick-create shortcuts — open project picker then task/note form
         if !in_text_entry && key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('t') => {
@@ -2164,7 +2131,6 @@ impl App {
             }
         }
 
-        // Global Audio Hotkeys: only active when not in text-entry modes
         let in_text_entry = self.searching
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
@@ -2231,8 +2197,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
-                    // Only switch to Soundscapes if not on Workspace milestones tab (uses 'm' for New Milestone)
-                    // and not on Fellowship screen (uses 'm' for New Message)
+                    // 'm' en Workspace milestones y Fellowship ya está tomado — no cambiar pantalla
                     if !(self.active_screen == ActiveScreen::Workspace
                         && self.workspace_tab_idx == 3)
                         && self.active_screen != ActiveScreen::Fellowship
@@ -2243,7 +2208,6 @@ impl App {
                     }
                 }
                 KeyCode::Char('p') => {
-                    // Dashboard: open Ko-fi link. Fellowship/Dashboard/SyncSettings excluded from audio pause.
                     if self.active_screen == ActiveScreen::Dashboard {
                         open_url("https://ko-fi.com/Y4H021XN7F");
                         self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
@@ -2261,8 +2225,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('s') => {
-                    // Only stop audio if not on Character screen (specialization select)
-                    // and not on Workspace tasks tab (sort tasks)
+                    // 's' en Character y en Workspace tareas ya está tomado — no detener audio
                     let is_character_spec = self.active_screen == ActiveScreen::Character;
                     let is_task_sort = self.active_screen == ActiveScreen::Workspace
                         && self.workspace_tab_idx == 0;
@@ -2274,14 +2237,13 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     use crate::audio::SOUNDSCAPES;
-                    // MPRIS next track cuando el Media Player está seleccionado
                     if self.active_screen == ActiveScreen::Soundscapes
                         && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
                     {
                         crate::audio::mpris_player::next_track();
                         return Ok(());
                     }
-                    // Otherwise cycle soundscape (not on screens that use 'n' for other things)
+                    // 'n' en Dashboard/Projects/Workspace/Fellowship ya está tomado para otras acciones
                     if self.active_screen != ActiveScreen::Dashboard
                         && self.active_screen != ActiveScreen::Projects
                         && self.active_screen != ActiveScreen::Workspace
@@ -2323,7 +2285,6 @@ impl App {
                     }
                 }
                 KeyCode::Char('b') => {
-                    // pista anterior en MPRIS
                     if self.active_screen == ActiveScreen::Soundscapes && self.modal_state == ModalType::None {
                         use crate::audio::SOUNDSCAPES;
                         if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
@@ -2336,7 +2297,6 @@ impl App {
             }
         }
 
-        // If focus session is active, lock input to focus screen
         if self.active_focus_session.is_some() {
             self.handle_focus_screen_key(key)?;
             return Ok(());
@@ -2398,14 +2358,11 @@ impl App {
                     return Ok(());
                 }
 
-                // During typing or between pages: any key cancels delay and skips/advances.
                 self.prologue_delay_ticks = 0;
                 if self.prologue_line_idx < total {
-                    // Skip — jump to end of this page immediately
                     self.prologue_line_idx = total;
                     self.prologue_char_in_line = 0;
                 } else if self.prologue_page == 0 {
-                    // Advance to Chapter One page
                     self.prologue_page = 1;
                     self.prologue_line_idx = 0;
                     self.prologue_char_in_line = 0;
@@ -2432,7 +2389,7 @@ impl App {
     }
 
     fn handle_rpg_modal_key(&mut self, key: KeyEvent) -> Result<bool> {
-        // Overlay modal (step creation on top of EditTask) takes priority over the base modal.
+        // El overlay modal (crear paso encima de EditTask) tiene prioridad sobre el modal base
         if self.overlay_modal != ModalType::None {
             if let Some(project_id) = self.active_project_id {
                 if let ModalType::NewTask {
@@ -2440,14 +2397,12 @@ impl App {
                     ref due_date_val, focus_idx, parent_task_id, recurrence,
                 } = self.overlay_modal.clone()
                 {
-                    // Swap: modal_state ← overlay, overlay ← base EditTask
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                     self.handle_task_modal_key(
                         key, project_id, None,
                         title.clone(), desc.clone(), desc_cursor, priority, due_date_type,
                         due_date_val.clone(), focus_idx, parent_task_id, 0, true, recurrence,
                     )?;
-                    // Swap back: modal_state restored to EditTask, overlay = new/None
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                 }
             }
@@ -2488,7 +2443,6 @@ impl App {
                 let pid = project_id;
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        // Perform the archive
                         if let Some(pos) = self.projects.iter().position(|p| p.id == pid) {
                             let mut p = self.projects[pos].clone();
                             p.archived = true;
@@ -2604,6 +2558,39 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::RefileCodex { codex_id, selected_idx } => {
+                let cid = codex_id;
+                let mut sel = selected_idx;
+                let targets = self.refile_codex_targets(cid);
+                let total = targets.len() + 1; // 0 = Root
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = if sel > 0 { sel - 1 } else { total - 1 };
+                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx: sel };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1) % total;
+                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx: sel };
+                    }
+                    KeyCode::Enter => {
+                        let new_parent = if sel == 0 {
+                            None
+                        } else {
+                            targets.get(sel - 1).copied()
+                        };
+                        self.db.update_codex_parent(cid, new_parent)?;
+                        self.mark_dirty();
+                        self.selected_notes_flat_idx = 0;
+                        self.reload_data()?;
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::CustomFocusDuration { ref input } => {
                 let mut val = input.clone();
                 match key.code {
@@ -2623,11 +2610,8 @@ impl App {
                     KeyCode::Enter => {
                         if let Ok(mins) = val.parse::<i32>() {
                             if mins > 0 {
-                                // Start focus session configuration with custom minutes
                                 self.modal_state = ModalType::None;
                                 self.active_screen = ActiveScreen::Focus;
-                                // Automatically choose the project/task dial or custom
-                                // Start custom focus
                                 self.start_focus_session(mins, None, None)?;
                             }
                         }
@@ -2933,7 +2917,6 @@ impl App {
                             u.specialization = Some(selected_spec.clone());
                             self.db.update_user(u)?;
 
-                            // Write chronicle entry for specialization choice
                             let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
                             self.db.add_chronicle_entry(
                                 day_number,
@@ -2943,7 +2926,6 @@ impl App {
                                 ),
                             )?;
 
-                            // Unlock custom lore entry for subclass
                             let spec_desc = u
                                 .class
                                 .specializations()
@@ -4059,7 +4041,6 @@ impl App {
         }
     }
 
-    // Onboarding Key handling.
     fn handle_onboarding_key(&mut self, key: KeyEvent) -> Result<()> {
         match self.onboarding_focus {
             OnboardingFocus::NameInput => match key.code {
@@ -4124,7 +4105,6 @@ impl App {
         Ok(())
     }
 
-    // Complete onboarding identity generation.
     fn complete_onboarding(&mut self) -> Result<()> {
         let username = self.onboarding_username.trim().to_string();
 
@@ -4166,7 +4146,6 @@ impl App {
         self.user = Some(new_user);
         self.theme_service.set_class(selected_class);
 
-        // Grant starting XP
         let xp_service = XPService::new(&self.db);
         if let Some(ref mut u) = self.user {
             xp_service.grant_xp(u, "Onboarding Completed", 50)?;
@@ -4179,7 +4158,6 @@ impl App {
         Ok(())
     }
 
-    // Trigger sync service execution.
     pub fn trigger_sync(&mut self) -> Result<()> {
         self.sync_status_msg = "Syncing...".to_string();
 
@@ -4214,7 +4192,6 @@ impl App {
                         &self.device_id,
                     );
 
-                    // 1. Pull pending invitations from server
                     if let Ok(resp_str) = client.send_request("GET", "pending", "") {
                         if let Ok(server_invites) =
                             serde_json::from_str::<serde_json::Value>(&resp_str)
@@ -4261,7 +4238,6 @@ impl App {
                         }
                     }
 
-                    // 2. Fetch chronicle messages for each shared project
                     if let Ok(projs) = self.db.get_projects() {
                         let shared_projs: Vec<_> =
                             projs.into_iter().filter(|p| p.is_shared).collect();
@@ -4312,13 +4288,8 @@ impl App {
                             }
                         }
                     }
-                    // 3. Fetch companion presence from shared projects
                     let _ = self.refresh_companions(&client);
-
-                    // 4. Submit chapter contribution increments
                     self.submit_chapter_contribution(&client);
-
-                    // 5. Refresh active chapter progress
                     self.refresh_chapter_progress_sync(&client);
                 } else {
                     let _ = self.simulate_fellowship_sync();
@@ -4408,11 +4379,9 @@ impl App {
         Ok(())
     }
 
-    // Returns true if the key was fully handled (caller should return early).
     fn handle_fellowship_chat_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // Left panel focused: Enter/→ switches to right panel, everything else falls through
         if self.fellowship_focus_left {
             match key.code {
                 KeyCode::Enter | KeyCode::Right => {
@@ -4425,7 +4394,6 @@ impl App {
 
         let browsing = self.fellowship_selected_msg_idx != usize::MAX;
 
-        // Browse mode: arrow navigation + react/copy — always active regardless of compose state
         match key.code {
             KeyCode::Up => {
                 let msgs = self.fellowship_current_messages();
@@ -4547,7 +4515,7 @@ impl App {
                             None,
                             if is_online { "Visible" } else { "Offline" },
                         );
-                        // Also fix stale username in local project_members
+                                        // Corregir el username en project_members — puede quedar como 'Accepted Companion' si el sync llegó antes del perfil
                         let _ = self.db.conn.execute(
                             "UPDATE project_members SET user_username = ?1 WHERE user_identity = ?2 AND user_username = 'Accepted Companion'",
                             rusqlite::params![username, identity],
@@ -4559,8 +4527,9 @@ impl App {
         Ok(())
     }
 
-    // Markdown Editor Key handling.
     fn handle_editor_key(&mut self, key: KeyEvent) -> Result<()> {
+        use crate::screens::editor::EditorMode;
+
         let state = if let Some(ref mut s) = self.editor_state {
             s
         } else {
@@ -4568,7 +4537,19 @@ impl App {
             return Ok(());
         };
 
-        // Save command: Ctrl+S
+        if key.code == KeyCode::Char('?') && !state.editing_title {
+            if let EditorMode::Normal = state.mode {
+                state.show_help = !state.show_help;
+                state.pending_cmd.clear();
+                return Ok(());
+            }
+        }
+
+        if state.show_help {
+            state.show_help = false;
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             let note_title = if state.title.trim().is_empty() {
                 "Untitled Scroll".to_string()
@@ -4581,19 +4562,17 @@ impl App {
             let is_new_note = state.note_id.is_none();
             let xp_service = XPService::new(&self.db);
             if let Some(note_id) = state.note_id {
-                // Editing note
                 let mut note = Note {
                     id: note_id,
                     project_id: Some(state.project_id),
                     title: note_title,
                     markdown_content: content,
-                    created_at: Utc::now(), // will keep original below
+                    created_at: Utc::now(),
                     updated_at: Utc::now(),
                     sharing_permission: "collaborative".to_string(),
                     codex_id: None,
                     owner_identity: None,
                 };
-                // Fetch original created_at and codex_id if exists
                 if let Ok(notes) = self.db.get_notes() {
                     if let Some(orig) = notes.iter().find(|n| n.id == note_id) {
                         note.created_at = orig.created_at;
@@ -4603,19 +4582,15 @@ impl App {
                     }
                 }
                 self.db.update_note(&note)?;
-
                 if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 2; // Edit Note = +2 XP
-                    if word_count > 500 {
-                        xp_gain += 10; // Large Note bonus = +10 XP
-                    }
+                    let mut xp_gain = 2;
+                    if word_count > 500 { xp_gain += 10; }
                     let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
                     if leveled_up {
                         self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
                     }
                 }
             } else {
-                // New note
                 let note = Note {
                     id: Uuid::new_v4(),
                     project_id: Some(state.project_id),
@@ -4629,63 +4604,190 @@ impl App {
                 };
                 self.db.insert_note(&note)?;
                 self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
-
                 if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 5; // Create Note = +5 XP
-                    if word_count > 500 {
-                        xp_gain += 10; // Large Note bonus = +10 XP
-                    }
+                    let mut xp_gain = 5;
+                    if word_count > 500 { xp_gain += 10; }
                     let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
                     if leveled_up {
                         self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
                     }
                 }
-
-                // Stage 3 Integration:
                 self.complete_productive_action()?;
                 self.update_daily_adventure_progress("write_note", 1)?;
                 self.check_action_achievements()?;
             }
-
             self.mark_dirty();
             let note_trigger = if is_new_note { "note_create" } else { "note_edit" };
             self.apply_class_passive(note_trigger, word_count)?;
-
             self.reload_data()?;
             self.editor_state = None;
             self.active_screen = ActiveScreen::Workspace;
-            self.workspace_tab_idx = 1; // Return to Notes Tab
+            self.workspace_tab_idx = 1;
             return Ok(());
         }
 
-        // Cancel command: ESC
+        if state.editing_title {
+            match key.code {
+                KeyCode::Esc => {
+                    self.editor_state = None;
+                    self.active_screen = ActiveScreen::Workspace;
+                }
+                KeyCode::Enter | KeyCode::Tab | KeyCode::Down => {
+                    state.editing_title = false;
+                    state.cursor_y = 0;
+                    state.cursor_x = 0;
+                    state.mode = EditorMode::Insert;
+                }
+                KeyCode::Backspace => { state.title.pop(); }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if state.title.len() < 50 { state.title.push(c); }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
         if key.code == KeyCode::Esc {
-            self.editor_state = None;
-            self.active_screen = ActiveScreen::Workspace;
+            match state.mode {
+                EditorMode::Insert => {
+                    state.push_undo();
+                    state.leave_insert();
+                    state.pending_cmd.clear();
+                }
+                EditorMode::Visual { .. } => {
+                    state.mode = EditorMode::Normal;
+                    state.pending_cmd.clear();
+                }
+                EditorMode::Normal => {
+                    if !state.pending_cmd.is_empty() {
+                        state.pending_cmd.clear();
+                    } else {
+                        self.editor_state = None;
+                        self.active_screen = ActiveScreen::Workspace;
+                    }
+                }
+            }
             return Ok(());
         }
 
-        // Typing and navigation in editor
+        if state.mode == EditorMode::Insert {
+            match key.code {
+                KeyCode::Up        => state.move_up(),
+                KeyCode::Down      => state.move_down(),
+                KeyCode::Left      => state.move_left(),
+                KeyCode::Right     => state.move_right(),
+                KeyCode::Backspace => state.handle_backspace(),
+                KeyCode::Delete    => state.handle_delete(),
+                KeyCode::Enter     => state.handle_enter(),
+                KeyCode::Tab       => state.handle_tab(),
+                KeyCode::BackTab   => { state.editing_title = true; }
+                KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => state.insert_char(c),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if let EditorMode::Visual { .. } = state.mode.clone() {
+            match key.code {
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    match c {
+                        'h' => state.normal_h(),
+                        'l' => state.normal_l(),
+                        'j' => state.normal_j(),
+                        'k' => state.normal_k(),
+                        'w' => state.word_forward(),
+                        'b' => state.word_backward(),
+                        'e' => state.word_end(),
+                        '0' => state.goto_line_start(),
+                        '$' => state.goto_line_end(),
+                        'G' => state.goto_file_end(),
+                        'y' => state.yank_visual(),
+                        'd' | 'x' => { state.push_undo(); state.delete_visual(); }
+                        'c' => { state.push_undo(); state.change_visual(); }
+                        'v' | 'V' => {
+                            if let EditorMode::Visual { anchor_y, anchor_x, line_mode } = state.mode {
+                                state.mode = EditorMode::Visual { anchor_y, anchor_x, line_mode: !line_mode };
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Up    => state.normal_k(),
+                KeyCode::Down  => state.normal_j(),
+                KeyCode::Left  => state.normal_h(),
+                KeyCode::Right => state.normal_l(),
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        let pending = state.pending_cmd.clone();
+        state.pending_cmd.clear(); // optimistic clear; re-set below for multi-key sequences
+
         match key.code {
-            KeyCode::Up => state.move_up(),
-            KeyCode::Down => state.move_down(),
-            KeyCode::Left => state.move_left(),
-            KeyCode::Right => state.move_right(),
-            KeyCode::BackTab => state.editing_title = !state.editing_title,
-            KeyCode::Char(c) => state.insert_char(c),
-            KeyCode::Backspace => state.handle_backspace(),
-            KeyCode::Delete => state.handle_delete(),
-            KeyCode::Enter => state.handle_enter(),
-            KeyCode::Tab => state.handle_tab(),
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
+
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                match (pending.as_str(), c) {
+                    ("g", 'g')  => state.goto_file_start(),
+                    ("d", 'd')  => { state.push_undo(); state.delete_line(); }
+                    ("d", 'w')  => { state.push_undo(); state.delete_word(); }
+                    ("d", '$')  => { state.push_undo(); state.delete_to_end(); }
+                    ("d", 'i')  => { state.pending_cmd = "di".to_string(); }
+                    ("di", 'w') => { state.push_undo(); state.delete_inner_word(); }
+                    ("c", 'c')  => { state.push_undo(); state.change_line(); }
+                    ("c", 'w')  => { state.push_undo(); state.change_word(); }
+                    ("c", '$')  => { state.push_undo(); state.change_to_end(); }
+                    ("c", 'i')  => { state.pending_cmd = "ci".to_string(); }
+                    ("ci", 'w') => { state.push_undo(); state.change_inner_word(); }
+                    ("y", 'y')  => state.yank_line(),
+                    ("r", _)    => { state.push_undo(); state.replace_char(c); }
+
+                    (_, 'h') => state.normal_h(),
+                    (_, 'l') => state.normal_l(),
+                    (_, 'j') => state.normal_j(),
+                    (_, 'k') => state.normal_k(),
+                    (_, 'w') => state.word_forward(),
+                    (_, 'b') => state.word_backward(),
+                    (_, 'e') => state.word_end(),
+                    (_, '0') => state.goto_line_start(),
+                    (_, '$') => state.goto_line_end(),
+                    (_, 'G') => state.goto_file_end(),
+                    (_, 'i') => { state.push_undo(); state.enter_insert(); }
+                    (_, 'a') => { state.push_undo(); state.enter_insert_after(); }
+                    (_, 'I') => { state.push_undo(); state.enter_insert_line_start(); }
+                    (_, 'A') => { state.push_undo(); state.enter_insert_line_end(); }
+                    (_, 'o') => { state.push_undo(); state.open_line_below(); }
+                    (_, 'O') => { state.push_undo(); state.open_line_above(); }
+                    (_, 'x') => { state.push_undo(); state.delete_char(); }
+                    (_, 'X') => { state.push_undo(); state.delete_char_before(); }
+                    (_, 'D') => { state.push_undo(); state.delete_to_end(); }
+                    (_, 'C') => { state.push_undo(); state.change_to_end(); }
+                    (_, 'p') => { state.push_undo(); state.paste_after(); }
+                    (_, 'P') => { state.push_undo(); state.paste_before(); }
+                    (_, 'u') => state.undo(),
+                    (_, 'v') => state.enter_visual_char(),
+                    (_, 'V') => state.enter_visual_line(),
+                    (_, 'g') => { state.pending_cmd = "g".to_string(); }
+                    (_, 'd') => { state.pending_cmd = "d".to_string(); }
+                    (_, 'c') => { state.pending_cmd = "c".to_string(); }
+                    (_, 'y') => { state.pending_cmd = "y".to_string(); }
+                    (_, 'r') => { state.pending_cmd = "r".to_string(); }
+                    _ => {} // unknown key — pending already cleared
+                }
+            }
+            KeyCode::Up    => state.normal_k(),
+            KeyCode::Down  => state.normal_j(),
+            KeyCode::Left  => state.normal_h(),
+            KeyCode::Right => state.normal_l(),
             _ => {}
         }
 
         Ok(())
     }
 
-    // Top Level Screens Key handling.
     fn handle_top_screen_key(&mut self, key: KeyEvent) -> Result<()> {
-        // GreatChronicle: Esc unfocuses right panel (or falls through to Dashboard navigation)
         if self.active_screen == ActiveScreen::GreatChronicle
             && key.code == KeyCode::Esc
             && self.chapter_panel_focused
@@ -4694,7 +4796,6 @@ impl App {
             return Ok(());
         }
 
-        // GreatChronicle: Left arrow returns focus to the left panel
         if self.active_screen == ActiveScreen::GreatChronicle
             && key.code == KeyCode::Left
             && self.chapter_panel_focused
@@ -4703,7 +4804,6 @@ impl App {
             return Ok(());
         }
 
-        // GreatChronicle: Right arrow focuses the right chapter panel
         if self.active_screen == ActiveScreen::GreatChronicle
             && key.code == KeyCode::Right
             && !self.chapter_panel_focused
@@ -4879,15 +4979,13 @@ impl App {
             }
         }
 
-        // If modal dialog is active on Projects screen
         if self.active_screen == ActiveScreen::Projects && self.modal_state != ModalType::None {
             self.handle_project_modal_key(key)?;
             return Ok(());
         }
 
         match key.code {
-            // Numeric tab shortcuts (only outside Workspace so they don't clash
-            // with the workspace's own 1-4 sub-tab keys)
+            // Los atajos 1-8 solo aplican fuera del Workspace — ahí el 1-4 son sub-tabs
             KeyCode::Char('1') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
@@ -5539,12 +5637,10 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
-                        // Navigate to the selected dashboard task (or its parent if a step) in its project workspace
                         let tasks = self.db.get_tasks().unwrap_or_default();
                         let flat = dashboard_flat_items(&tasks);
                         let sel = self.selected_dashboard_task_idx.min(flat.len().saturating_sub(1));
                         if let Some((is_step, parent_id, task)) = flat.get(sel).cloned() {
-                            // If on a step, navigate to the parent task instead
                             let nav_task_id = if is_step { parent_id } else { task.id };
                             let nav_project_id = if is_step {
                                 tasks.iter().find(|t| t.id == parent_id).and_then(|t| t.project_id)
@@ -5591,7 +5687,6 @@ impl App {
                     self.audio_player.play(s_name);
                 } else if self.active_screen == ActiveScreen::Fellowship {
                     if self.selected_fellowship_tab == 1 {
-                        // Accept invitation
                         let invites = self.db.get_invitations().unwrap_or_default();
                         if !invites.is_empty() && self.selected_invitation_idx < invites.len() {
                             let invite = &invites[self.selected_invitation_idx];
@@ -5613,8 +5708,6 @@ impl App {
                                         let _ = client.send_request("POST", "accept", &body);
                                     });
                                 }
-                                // Insert the project locally
-
                                 if let Ok(proj_uuid) = Uuid::parse_str(&invite.1) {
                                     let new_proj = Project {
                                         id: proj_uuid,
@@ -5629,11 +5722,9 @@ impl App {
                                     };
                                     let _ = self.db.insert_project(&new_proj);
 
-                                    // Add inviter as a member too
                                     let _ = self.db.add_project_member(
                                         &invite.1, &invite.3, &invite.4, "Owner",
                                     );
-                                    // Add myself as member
                                     let _ = self.db.add_project_member(
                                         &invite.1,
                                         &self.identity.public_key,
@@ -5642,12 +5733,10 @@ impl App {
                                     );
                                 }
 
-                                // Unlock "First Companion" achievement
                                 let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
 
                                 self.notifications.push(Notification::info(format!("Accepted invitation to '{}'", invite.2)));
 
-                                // Check "Alliance Builder" achievement progress
                                 let shared_projs_count =
                                     self.projects.iter().filter(|p| p.is_shared).count() + 1;
                                 if shared_projs_count >= 25 {
@@ -5682,7 +5771,7 @@ impl App {
                         if let Some((is_step, _parent_id, task)) = flat.get(sel).cloned() {
                             if is_step {
                                 if task.completed {
-                                    // Reabrir paso — XP ya cobrado
+                                    // Reabrir paso — el XP ya fue cobrado, no se devuelve
                                     let mut t = task;
                                     t.completed = false;
                                     self.db.update_task(&t)?;
@@ -5717,7 +5806,6 @@ impl App {
                                 }
                             } else {
                                 if task.completed {
-                                    // Reabrir quest — los pasos también se reabren
                                     let steps: Vec<Task> = all_tasks.iter()
                                         .filter(|t| t.parent_task_id == Some(task.id))
                                         .cloned()
@@ -5745,7 +5833,6 @@ impl App {
                                         .cloned()
                                         .collect();
                                     if !incomplete_steps.is_empty() {
-                                        // Bloquear hasta que todos los pasos estén cerrados
                                         let n = incomplete_steps.len();
                                         let msg = if n == 1 {
                                             "One trial remains unsealed. Face it before this quest can be closed.".to_string()
@@ -5791,7 +5878,6 @@ impl App {
                                         };
                                         self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
                                         self.maybe_spawn_task_completion_sprite();
-                                        // Tarea recurrente — genera la siguiente ocurrencia automáticamente
                                         if let Some(recurrence) = t.recurrence {
                                             let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
                                             let next_task = Task {
@@ -5817,7 +5903,6 @@ impl App {
                                             self.selected_dashboard_task_idx = new_flat.len() - 1;
                                         }
                                         self.reload_data()?;
-                                        // One-time support prompt after the first quest victory
                                         self.maybe_show_support_realm_prompt()?;
                                     }
                                 }
@@ -5856,7 +5941,6 @@ impl App {
             {
                 self.great_chronicle_scroll = 0;
                 self.chapter_panel_scroll = 0;
-                // Synchronous pull: fetch from server and store before reloading the list
                 if self.config.sync_enabled {
                     let client = crate::services::api_client::ApiClient::new(
                         &self.server_url,
@@ -5901,7 +5985,6 @@ impl App {
                     let _ = self.refresh_companions(&client);
                     self.notifications.push(Notification::info("Companion presence refreshed.".to_string()));
                 } else if self.active_screen == ActiveScreen::Dashboard {
-                    // Guard: only allow one reflection per day
                     let today = chrono::Local::now().date_naive();
                     let already_reflected = self
                         .db
@@ -6006,8 +6089,6 @@ impl App {
                 }
             }
             KeyCode::Char('m') => {
-                // Fellowship tab 0 'm' is handled by handle_fellowship_chat_key (inline input).
-                // Nothing to do here for that case.
             }
             KeyCode::Char('v') => {
                 if self.active_screen == ActiveScreen::Fellowship
@@ -6055,7 +6136,6 @@ impl App {
 
             KeyCode::Delete => {
                 if self.active_screen == ActiveScreen::Archive {
-                    // Permanently Slay Project — show confirmation first
                     let archived: Vec<&Project> =
                         self.projects.iter().filter(|p| p.archived).collect();
                     if !archived.is_empty() && self.selected_archive_idx < archived.len() {
@@ -6066,7 +6146,6 @@ impl App {
                         };
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
-                    // Delete selected ritual
                     if let Ok(rituals) = self.db.get_rituals() {
                         if rituals.len() <= 1 {
                             self.notifications.push(Notification::warning("You must maintain at least one active sidequest!"));
@@ -6083,7 +6162,6 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                // Exit to Dashboard
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
             }
@@ -6092,7 +6170,6 @@ impl App {
         Ok(())
     }
 
-    // Handles Project edit/new modals.
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let (mut name, mut desc, mut focus_idx, is_edit, p_id) = match self.modal_state {
             ModalType::NewProject {
@@ -6235,38 +6312,25 @@ impl App {
         Ok(())
     }
 
-    // Builds a flat navigation list for the notes tab.
-    // Each item: (codex_id Option<Uuid>, note_index Option<usize>)
-    // (Some, None) = codex header  |  (_, Some) = note  |  (None, None) = divider
+    // Lista plana para el tab de notas: (Some, None)=encabezado codex | (_, Some)=nota | (None, None)=divisor
+    // Árbol DFS completo — todos los codices y sus hijos a cualquier profundidad, siempre expandidos
     fn build_notes_flat(notes: &[Note], codices: &[crate::models::Codex], project_id: Uuid) -> Vec<(Option<Uuid>, Option<usize>)> {
         let mut flat: Vec<(Option<Uuid>, Option<usize>)> = Vec::new();
         let proj_notes: Vec<(usize, &Note)> = notes.iter().enumerate()
             .filter(|(_, n)| n.project_id == Some(project_id))
             .collect();
 
-        // codices already arrive sorted by name (DB ORDER BY LOWER(name))
-        for codex in codices {
-            flat.push((Some(codex.id), None));
-            let mut codex_notes: Vec<(usize, &Note)> = proj_notes.iter()
-                .filter(|(_, n)| n.codex_id == Some(codex.id))
-                .map(|(i, n)| (*i, *n))
-                .collect();
-            codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-            for (idx, _) in codex_notes {
-                flat.push((Some(codex.id), Some(idx)));
-            }
-        }
+        Self::append_codex_subtree(&mut flat, &proj_notes, codices, None);
 
-        let grouped_note_indices: std::collections::HashSet<usize> = proj_notes.iter()
+        let grouped: std::collections::HashSet<usize> = proj_notes.iter()
             .filter(|(_, n)| n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id))
             .map(|(i, _)| *i)
             .collect();
         let mut ungrouped: Vec<(usize, &Note)> = proj_notes.iter()
-            .filter(|(i, _)| !grouped_note_indices.contains(i))
+            .filter(|(i, _)| !grouped.contains(i))
             .map(|(i, n)| (*i, *n))
             .collect();
         ungrouped.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-
         if !codices.is_empty() && !ungrouped.is_empty() {
             flat.push((None, None)); // divider
         }
@@ -6276,7 +6340,46 @@ impl App {
         flat
     }
 
-    // Handles active Project Workspace key events.
+    fn append_codex_subtree(flat: &mut Vec<(Option<Uuid>, Option<usize>)>, proj_notes: &[(usize, &Note)], codices: &[crate::models::Codex], parent: Option<Uuid>) {
+        let children: Vec<&crate::models::Codex> = codices.iter()
+            .filter(|c| c.parent_codex_id == parent)
+            .collect(); // ordenados por nombre vía DB ORDER BY LOWER(name)
+        for codex in children {
+            flat.push((Some(codex.id), None));
+            Self::append_codex_subtree(flat, proj_notes, codices, Some(codex.id));
+            let mut notes: Vec<(usize, &Note)> = proj_notes.iter()
+                .filter(|(_, n)| n.codex_id == Some(codex.id))
+                .map(|(i, n)| (*i, *n))
+                .collect();
+            notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+            for (idx, _) in notes {
+                flat.push((Some(codex.id), Some(idx)));
+            }
+        }
+    }
+
+    // Colecta todos los IDs descendientes de un codex para prevenir ciclos al rearchivarlo
+    fn codex_descendants(&self, codex_id: Uuid) -> std::collections::HashSet<Uuid> {
+        let mut result = std::collections::HashSet::new();
+        let mut queue = vec![codex_id];
+        while let Some(id) = queue.pop() {
+            for c in self.codices.iter().filter(|c| c.parent_codex_id == Some(id)) {
+                if result.insert(c.id) {
+                    queue.push(c.id);
+                }
+            }
+        }
+        result
+    }
+
+    pub fn refile_codex_targets(&self, codex_id: Uuid) -> Vec<Uuid> {
+        let descendants = self.codex_descendants(codex_id);
+        self.codices.iter()
+            .filter(|c| c.id != codex_id && !descendants.contains(&c.id))
+            .map(|c| c.id)
+            .collect()
+    }
+
     fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
         let p_id = if let Some(id) = self.active_project_id {
             id
@@ -6314,22 +6417,19 @@ impl App {
             return Ok(());
         }
 
-        // If a task or journal modal is active
         if self.modal_state != ModalType::None {
             self.handle_workspace_modal_key(key, p_id)?;
             return Ok(());
         }
 
         let all_tasks = self.all_tasks.clone();
-        // When viewing steps (→ drill-down), proj_tasks = steps of that task only.
-        // In the main view, proj_tasks is a flat list: sorted parents + their incomplete steps inline.
+        // Drill-down activo: proj_tasks son solo los pasos de esa tarea; de lo contrario lista plana con pasos inline
         let proj_tasks: Vec<Task> = if let Some(parent_id) = self.viewing_step_for_task {
             let mut steps: Vec<Task> = all_tasks
                 .iter()
                 .filter(|t| t.parent_task_id == Some(parent_id))
                 .cloned()
                 .collect();
-            // Open steps first, then by the same sort the user chose for parent tasks
             steps.sort_by(|a, b| {
                 a.completed.cmp(&b.completed).then_with(|| match self.task_sort.as_str() {
                     "DueDate" => match (a.due_date, b.due_date) {
@@ -6345,7 +6445,6 @@ impl App {
             });
             steps
         } else {
-            // Collect and sort parent tasks: open first, then by the chosen sort key
             let mut parents: Vec<Task> = all_tasks
                 .iter()
                 .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
@@ -6389,7 +6488,6 @@ impl App {
                 }),
             }
 
-            // Build flat list: each parent followed by its incomplete steps
             let mut flat = Vec::new();
             for parent in parents {
                 flat.push(parent.clone());
@@ -6454,11 +6552,9 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 if self.viewing_step_for_task.is_some() {
-                    // Exit step view back to quest list
                     self.viewing_step_for_task = None;
                     self.selected_task_idx = 0;
                 } else {
-                    // Exit workspace to Projects
                     self.active_project_id = None;
                     self.active_screen = ActiveScreen::Projects;
                     self.workspace_sidebar_focused = false;
@@ -6478,7 +6574,6 @@ impl App {
                 self.workspace_tab_idx = if self.workspace_tab_idx > 0 { self.workspace_tab_idx - 1 } else { 3 };
                 self.workspace_sidebar_focused = false;
             }
-            // Left: in step view → go back; in content → focus sidebar
             KeyCode::Left if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_some() && self.workspace_tab_idx == 0 => {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
@@ -6486,11 +6581,10 @@ impl App {
             KeyCode::Left if !self.workspace_sidebar_focused => {
                 self.workspace_sidebar_focused = true;
             }
-            // Right: in quests tab → drill into steps (parent tasks only); in sidebar → return to content
+            // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_none() && self.workspace_tab_idx == 0 => {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = &proj_tasks[self.selected_task_idx];
-                    // Only enter step view for parent tasks, not for inline step items
                     if task.parent_task_id.is_none() {
                         let task_id = task.id;
                         self.viewing_step_for_task = Some(task_id);
@@ -6501,14 +6595,12 @@ impl App {
             KeyCode::Right if self.workspace_sidebar_focused => {
                 self.workspace_sidebar_focused = false;
             }
-            // Up/Down: switch tabs in sidebar mode, navigate items in content mode
             KeyCode::Up if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = if self.workspace_tab_idx > 0 { self.workspace_tab_idx - 1 } else { 3 };
             }
             KeyCode::Down if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
             }
-            // Navigation inside Workspace active lists
             KeyCode::Up => match self.workspace_tab_idx {
                 0 => {
                     if !proj_tasks.is_empty() {
@@ -6528,7 +6620,7 @@ impl App {
                         } else {
                             len - 1
                         };
-                        // skip dividers (None, None)
+                        // Los divisores (None, None) no son navegables — saltarlos
                         while flat[idx] == (None, None) {
                             idx = if idx > 0 { idx - 1 } else { len - 1 };
                         }
@@ -6603,7 +6695,6 @@ impl App {
                 }
                 _ => {}
             },
-            // Space: Complete / Reopen Tasks & Steps, Toggle Milestones
             KeyCode::Char(' ') => {
                 if self.workspace_tab_idx == 0
                     && !proj_tasks.is_empty()
@@ -6668,7 +6759,6 @@ impl App {
                                 .cloned()
                                 .collect();
                             if !incomplete_steps.is_empty() {
-                                // Bloquear hasta que todos los pasos estén cerrados
                                 let n = incomplete_steps.len();
                                 let msg = if n == 1 {
                                     "One trial remains unsealed. Face it before this quest can be closed.".to_string()
@@ -6750,31 +6840,53 @@ impl App {
                     }
                 }
             }
-            // d: New Codex in Notes tab
             KeyCode::Char('d') if self.workspace_tab_idx == 1 => {
-                self.modal_state = ModalType::NewCodex { name: String::new() };
+                let parent_codex_id = if let Some(p_id) = self.active_project_id {
+                    let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                    match flat.get(self.selected_notes_flat_idx) {
+                        Some((Some(codex_id), None)) => Some(*codex_id),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+                self.modal_state = ModalType::NewCodex {
+                    name: String::new(),
+                    parent_codex_id,
+                };
             }
-            // r: Refile selected scroll to a different codex
             KeyCode::Char('r') if self.workspace_tab_idx == 1 => {
                 let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                if let Some((_, Some(note_idx))) = flat.get(self.selected_notes_flat_idx) {
-                    if *note_idx < proj_notes.len() {
+                match flat.get(self.selected_notes_flat_idx) {
+                    Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                         let note_id = proj_notes[*note_idx].id;
                         let current_codex_id = proj_notes[*note_idx].codex_id;
-                        // Pre-select the current codex in the picker (0 = Ungrouped, 1..=n = codices)
                         let selected_idx = current_codex_id
                             .and_then(|cid| self.codices.iter().position(|c| c.id == cid))
                             .map(|pos| pos + 1)
                             .unwrap_or(0);
                         self.modal_state = ModalType::RefileScroll { note_id, selected_idx };
                     }
+                    Some((Some(codex_id), None)) => {
+                        let cid = *codex_id;
+                        let descendants = self.codex_descendants(cid);
+                        let current_parent = self.codices.iter().find(|c| c.id == cid).and_then(|c| c.parent_codex_id);
+                        let eligible: Vec<Uuid> = self.codices.iter()
+                            .filter(|c| c.id != cid && !descendants.contains(&c.id))
+                            .map(|c| c.id)
+                            .collect();
+                        let selected_idx = current_parent
+                            .and_then(|pid| eligible.iter().position(|&id| id == pid))
+                            .map(|pos| pos + 1)
+                            .unwrap_or(0);
+                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx };
+                    }
+                    _ => {}
                 }
             }
-            // +: Add Step to selected quest (from quest list, no need to enter step view)
             KeyCode::Char('+') if self.workspace_tab_idx == 0 && self.viewing_step_for_task.is_none() => {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = &proj_tasks[self.selected_task_idx];
-                    // If on an inline step, add to its parent; otherwise add to the selected parent
                     let parent_id = task.parent_task_id.unwrap_or(task.id);
                     self.modal_state = ModalType::NewTask {
                         title: String::new(),
@@ -6789,10 +6901,8 @@ impl App {
                     };
                 }
             }
-            // n/m: New Note / Task / Milestone / Journal
             KeyCode::Char('n') | KeyCode::Char('m') => {
                 if self.workspace_tab_idx == 0 && key.code == KeyCode::Char('n') {
-                    // When in step view, create a step under the viewed task
                     let parent_id = self.viewing_step_for_task;
                     self.modal_state = ModalType::NewTask {
                         title: String::new(),
@@ -6806,7 +6916,6 @@ impl App {
                         recurrence: None,
                     };
                 } else if self.workspace_tab_idx == 1 && key.code == KeyCode::Char('n') {
-                    // If selected flat item is a codex header, create note inside that codex
                     let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
                     let codex_id = flat.get(self.selected_notes_flat_idx)
                         .and_then(|(cid, _)| *cid);
@@ -6825,7 +6934,6 @@ impl App {
                     };
                 }
             }
-            // Enter or e: Edit Note / Task
             KeyCode::Enter | KeyCode::Char('e') => {
                 if self.workspace_tab_idx == 0
                     && !proj_tasks.is_empty()
@@ -6884,14 +6992,17 @@ impl App {
                         }
                         Some((Some(codex_id), None)) => {
                             let cid = *codex_id;
-                            let current_name = self.codices.iter()
-                                .find(|c| c.id == cid)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_default();
-                            self.modal_state = ModalType::RenameCodex {
-                                codex_id: cid,
-                                name: current_name,
-                            };
+                            // 'e' renames the codex; Enter is a no-op (tree is always expanded)
+                            if key.code == KeyCode::Char('e') {
+                                let current_name = self.codices.iter()
+                                    .find(|c| c.id == cid)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_default();
+                                self.modal_state = ModalType::RenameCodex {
+                                    codex_id: cid,
+                                    name: current_name,
+                                };
+                            }
                         }
                         _ => {}
                     }
@@ -7226,8 +7337,9 @@ impl App {
             ModalType::NewJournalEntry { ref content } => {
                 self.handle_journal_modal_key(key, project_id, content.clone())?;
             }
-            ModalType::NewCodex { ref name } => {
+            ModalType::NewCodex { ref name, parent_codex_id } => {
                 let name = name.clone();
+                let pcid = parent_codex_id;
                 match key.code {
                     KeyCode::Esc => {
                         self.modal_state = ModalType::None;
@@ -7239,6 +7351,7 @@ impl App {
                             project_id,
                             name: name.trim().to_string(),
                             created_at: Utc::now(),
+                            parent_codex_id: pcid,
                         };
                         self.modal_state = ModalType::None;
                         self.db.insert_codex(&codex)?;
@@ -7249,13 +7362,13 @@ impl App {
                     KeyCode::Backspace => {
                         let mut n = name.clone();
                         n.pop();
-                        self.modal_state = ModalType::NewCodex { name: n };
+                        self.modal_state = ModalType::NewCodex { name: n, parent_codex_id: pcid };
                     }
                     KeyCode::Char(c) => {
                         if name.len() < 40 {
                             let mut n = name.clone();
                             n.push(c);
-                            self.modal_state = ModalType::NewCodex { name: n };
+                            self.modal_state = ModalType::NewCodex { name: n, parent_codex_id: pcid };
                         }
                     }
                     _ => {}
@@ -7476,6 +7589,28 @@ impl App {
                     );
                 }
                 // For other fields: Down does nothing
+            }
+            KeyCode::Home => {
+                if focus_idx == 1 {
+                    // Jump to start of current line
+                    desc_cursor = desc[..desc_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                    self.update_task_modal_state(
+                        task_id, title, desc, desc_cursor, priority, due_date_type,
+                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    );
+                }
+            }
+            KeyCode::End => {
+                if focus_idx == 1 {
+                    // Jump to end of current line
+                    desc_cursor = desc[desc_cursor..].find('\n')
+                        .map(|i| desc_cursor + i)
+                        .unwrap_or(desc.len());
+                    self.update_task_modal_state(
+                        task_id, title, desc, desc_cursor, priority, due_date_type,
+                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    );
+                }
             }
             KeyCode::Char(c) => {
                 match focus_idx {
@@ -7908,6 +8043,12 @@ impl App {
                     }
                     streak.current_streak = 0;
                     self.db.update_streak(&streak)?;
+                } else if today - last_day == chrono::Duration::days(1) && tree.health < 100 {
+                    // Consecutive login: the tree recovers slightly from your return
+                    tree.health = (tree.health + 1).min(100);
+                    self.notifications.push(Notification::info(format!(
+                        "You returned. Tree health +1 ({}%)", tree.health
+                    )));
                 }
             }
             self.db.update_zen_tree(&tree)?;
@@ -7971,13 +8112,17 @@ impl App {
         tree.growth += amount;
         tree.last_watered = Some(now_local.with_timezone(&Utc));
 
+        let hp_gain = if tree.health < 100 { (2_i32).min(100 - tree.health) } else { 0 };
+        tree.health = (tree.health + hp_gain).min(100);
+        let hp_note = if hp_gain > 0 { format!(", Health +{}", hp_gain) } else { String::new() };
+
         self.notifications.push(Notification::info(format!(
-                "Tree Watered! Growth +{} (Today: {}/2)",
-                amount, tree.water_today
+                "Tree Watered! Growth +{}{} (Today: {}/2)",
+                amount, hp_note, tree.water_today
             )));
 
         self.db.update_zen_tree(&tree)?;
-        self.push_great_chronicle_async("TreeWatering", "watered the Zen Tree.", true);
+        self.push_great_chronicle_async("TreeWatering", "watered The Evergrowth.", true);
 
         self.update_daily_adventure_progress("water_tree", 1)?;
 
@@ -8936,29 +9081,12 @@ impl App {
                         self.reload_data()?;
                         let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
                         let codices = self.db.get_codices_for_project(p_id).unwrap_or_default();
-                        // Construye la misma lista plana que draw_notes_tab: headers de codex + notas
-                        let mut flat: Vec<Option<uuid::Uuid>> = Vec::new();
-                        for codex in &codices {
-                            flat.push(None); // header de codex
-                            let mut codex_notes: Vec<&crate::models::Note> = notes.iter()
-                                .filter(|n| n.codex_id == Some(codex.id))
-                                .collect();
-                            codex_notes.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-                            for note in codex_notes {
-                                flat.push(Some(note.id));
-                            }
-                        }
-                        let mut ungrouped: Vec<&crate::models::Note> = notes.iter()
-                            .filter(|n| n.codex_id.is_none() || !codices.iter().any(|c| Some(c.id) == n.codex_id))
-                            .collect();
-                        ungrouped.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-                        if !codices.is_empty() && !ungrouped.is_empty() {
-                            flat.push(None); // divisor
-                        }
-                        for note in &ungrouped {
-                            flat.push(Some(note.id));
-                        }
-                        if let Some(pos) = flat.iter().position(|id| *id == Some(note_uuid)) {
+                        // Full tree is always visible — just find the note's position
+                        let flat = Self::build_notes_flat(&notes, &codices, p_id);
+                        let flat_note_ids: Vec<Option<uuid::Uuid>> = flat.iter().map(|(_, ni)| {
+                            ni.and_then(|i| notes.get(i)).map(|n| n.id)
+                        }).collect();
+                        if let Some(pos) = flat_note_ids.iter().position(|id| *id == Some(note_uuid)) {
                             self.selected_notes_flat_idx = pos;
                         }
                         return Ok(());
@@ -10674,6 +10802,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     xp_gained: xp,
                     completed_at: Utc::now(),
                     soundscape: active_soundscape.clone(),
+                    owner_identity: Some(self.identity.public_key.clone()),
                 };
                 self.db.insert_focus_session(&sess)?;
                 self.mark_dirty();
@@ -10684,6 +10813,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 );
 
                 self.notifications.push(Notification::info(format!("Focus Completed! Gained +{} XP", xp)));
+
+                // Every completed focus session restores a point of tree health
+                {
+                    let mut tree = self.db.get_zen_tree()?;
+                    if tree.health < 100 {
+                        tree.health = (tree.health + 1).min(100);
+                        self.db.update_zen_tree(&tree)?;
+                        self.notifications.push(Notification::info(format!("Focus honored. Tree health +1 ({}%)", tree.health)));
+                    }
+                }
 
                 // Apply active soundscape bonuses
                 if active_soundscape == "Forest Sounds" {
@@ -10981,6 +11120,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     true,
                 );
                 self.notifications.push(Notification::info(format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)));
+            }
+
+            let mut tree = self.db.get_zen_tree()?;
+            if tree.health < 100 {
+                tree.health = (tree.health + 1).min(100);
+                self.db.update_zen_tree(&tree)?;
+                self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
             }
 
             self.complete_productive_action()?;

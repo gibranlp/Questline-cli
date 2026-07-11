@@ -1,7 +1,3 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// models/rpg.rs — structs del sistema RPG: árbol zen, logros, estadísticas y rituales
-// ─────────────────────────────────────────────────────────────────────────────
-
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -51,7 +47,7 @@ impl ZenTree {
 pub struct DailyAdventure {
     pub id: Uuid,
     pub title: String,
-    pub quest_type: String, // "complete_tasks", "write_note", "write_journal", "water_tree", "complete_high_priority_task"
+    pub quest_type: String, // valores posibles: "complete_tasks", "write_note", "write_journal", "water_tree", "complete_high_priority_task"
     pub target_count: i32,
     pub current_count: i32,
     pub completed: bool,
@@ -59,7 +55,6 @@ pub struct DailyAdventure {
 }
 
 impl DailyAdventure {
-    // Genera 3 quests aleatorias del pool — se barajan y se toman las primeras 3, chido y simple
     pub fn generate_daily_quests(today: NaiveDate) -> Vec<Self> {
         use rand::seq::SliceRandom;
         let mut rng = rand::thread_rng();
@@ -92,7 +87,7 @@ impl DailyAdventure {
     }
 }
 
-// Todas las estadísticas del héroe en un solo struct — fue creciendo por etapas, qué rollo
+// Este struct fue creciendo por etapas del roadmap — los campos de Stage 4 y 5A se agregaron después, no son legacy
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Statistics {
     pub tasks_completed: i32,
@@ -104,7 +99,6 @@ pub struct Statistics {
     pub tree_growth: i32,
     pub achievements_unlocked: i32,
     pub total_xp_earned: i32,
-    // Stage 4 Additions
     pub focus_hours: f64,
     pub sessions_completed: i32,
     pub rituals_completed: i32,
@@ -114,7 +108,6 @@ pub struct Statistics {
     pub avg_tasks_per_day: f64,
     pub avg_xp_per_day: f64,
 
-    // Stage 5A Additions
     pub sync_count: i32,
     pub backup_count: i32,
     pub devices_connected: i32,
@@ -139,7 +132,6 @@ pub struct Achievement {
 }
 
 impl Achievement {
-    // La lista completa de logros del juego — incluye desde básicos hasta los milestone épicos con lore
     pub fn static_list() -> Vec<(&'static str, &'static str, &'static str)> {
         vec![
             ("first_quest", "First Quest", "Complete first task."),
@@ -156,7 +148,6 @@ impl Achievement {
                 "Hundred Day Journey",
                 "Reach 100-day streak.",
             ),
-            // Stage 4 achievements
             (
                 "first_focus",
                 "First Focus",
@@ -173,7 +164,6 @@ impl Achievement {
                 "90 Minute Sage",
                 "Complete a 90-minute session.",
             ),
-            // Focus Soundscapes achievements
             (
                 "silent_monk",
                 "Silent Monk",
@@ -194,7 +184,6 @@ impl Achievement {
                 "Master of Atmosphere",
                 "Complete focus sessions with all 8 soundscapes.",
             ),
-            // Stage 5B Fellowship achievements
             (
                 "first_companion",
                 "First Companion",
@@ -216,7 +205,6 @@ impl Achievement {
                 "Alliance Builder",
                 "Participate in 25 shared projects.",
             ),
-            // Milestone Lore achievements
             (
                 "milestone_first_quest",
                 "Reluctant Hero",
@@ -262,7 +250,6 @@ impl Achievement {
                 "The Myth. The Legend. The Problem.",
                 "One hundred tasks. Twenty-five daily adventures. A thirty-day streak. This is either exceptional discipline or a warning sign. Either way, the backlog has stopped trying to intimidate you. It now simply respects you from a cautious distance.",
             ),
-            // Codex (note folder) achievements
             (
                 "archivist",
                 "Archivist",
@@ -286,6 +273,7 @@ pub struct FocusSession {
     pub xp_gained: i32,
     pub completed_at: DateTime<Utc>,
     pub soundscape: String,
+    pub owner_identity: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -307,9 +295,9 @@ pub struct Milestone {
     pub completed: bool,
     pub xp_reward: i32,
     pub created_at: DateTime<Utc>,
-    // Tier del milestone: 0 = legacy/custom, 1/2/3 = Initiate/Veteran/Legendary
+    // 0 = legacy/custom, 1 = Initiate, 2 = Veteran, 3 = Legendary — no hay un enum porque se serializa directo a SQLite
     pub tier: u8,
-    // ID del template usado para crear este milestone — vacío si es legacy o custom
+    // vacío ("") cuando el milestone es legacy o fue creado a mano, no desde un template
     pub template_id: String,
 }
 

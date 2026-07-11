@@ -1,11 +1,5 @@
-// ─────────────────────────────────────────────────────────────────────────────
-// database/schema.rs — el esquema completo de la base de datos SQLite, todas las tablas
-// ─────────────────────────────────────────────────────────────────────────────
-
-// Aquí viven todas las CREATE TABLE del juego — si algo no existe aquí, no existe en ningún lado
 pub const CREATE_TABLES_SQL: &str = "
 
--- Tablas del héroe: usuario, configuración y proyectos
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     username TEXT NOT NULL,
@@ -32,7 +26,6 @@ CREATE TABLE IF NOT EXISTS projects (
     is_shared INTEGER NOT NULL DEFAULT 0
 );
 
--- Tareas y subtareas — el corazón de todo el rollo de productividad
 CREATE TABLE IF NOT EXISTS tasks (
     id TEXT PRIMARY KEY,
     project_id TEXT,
@@ -52,13 +45,14 @@ CREATE TABLE IF NOT EXISTS tasks (
     FOREIGN KEY(parent_task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
--- Codices y notas — el sistema de conocimiento del héroe
 CREATE TABLE IF NOT EXISTS codices (
     id TEXT PRIMARY KEY,
     project_id TEXT NOT NULL,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL,
-    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+    parent_codex_id TEXT,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(parent_codex_id) REFERENCES codices(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS notes (
@@ -74,7 +68,6 @@ CREATE TABLE IF NOT EXISTS notes (
     FOREIGN KEY(codex_id) REFERENCES codices(id) ON DELETE SET NULL
 );
 
--- Misiones diarias, XP y progresión del personaje
 CREATE TABLE IF NOT EXISTS daily_quests (
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
@@ -100,7 +93,7 @@ CREATE TABLE IF NOT EXISTS journal_entries (
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
--- El árbol zen — ojo, solo hay uno por usuario, no se crean varios
+-- singleton por usuario — si intentas insertar más de uno, el juego se rompe
 CREATE TABLE IF NOT EXISTS zen_tree (
     id TEXT PRIMARY KEY,
     growth INTEGER NOT NULL DEFAULT 0,
@@ -135,7 +128,6 @@ CREATE TABLE IF NOT EXISTS achievements (
     unlocked_at TEXT
 );
 
--- Sesiones de enfoque y rituales — la parte de hábitos del juego
 CREATE TABLE IF NOT EXISTS focus_sessions (
     id TEXT PRIMARY KEY,
     project_id TEXT,
@@ -144,6 +136,7 @@ CREATE TABLE IF NOT EXISTS focus_sessions (
     xp_gained INTEGER NOT NULL,
     completed_at TEXT NOT NULL,
     soundscape TEXT NOT NULL DEFAULT 'Silent',
+    owner_identity TEXT,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE SET NULL
 );
@@ -164,7 +157,6 @@ CREATE TABLE IF NOT EXISTS ritual_history (
     FOREIGN KEY(ritual_id) REFERENCES rituals(id) ON DELETE CASCADE
 );
 
--- Rasgos, hitos y reflexiones — el meta-RPG sobre el meta-RPG
 CREATE TABLE IF NOT EXISTS traits (
     id TEXT PRIMARY KEY,
     unlocked_at TEXT NOT NULL
@@ -186,7 +178,6 @@ CREATE TABLE IF NOT EXISTS reflections (
     what_can_improve TEXT NOT NULL
 );
 
--- Tablas de sync — rastrea qué se mandó al servidor y qué no
 CREATE TABLE IF NOT EXISTS sync_log (
     id TEXT PRIMARY KEY,
     entity_type TEXT NOT NULL,
@@ -214,7 +205,6 @@ CREATE TABLE IF NOT EXISTS devices (
     last_sync TEXT
 );
 
--- Tablas colaborativas — para cuando el juego se pone multijugador
 CREATE TABLE IF NOT EXISTS project_members (
     project_id TEXT,
     user_identity TEXT,
@@ -292,7 +282,6 @@ CREATE TABLE IF NOT EXISTS presence (
     privacy_status TEXT NOT NULL DEFAULT 'Visible'
 );
 
--- Crónicas — la historia del héroe y los eventos globales del realm
 CREATE TABLE IF NOT EXISTS great_chronicle (
     id TEXT PRIMARY KEY,
     day_number INTEGER NOT NULL,
@@ -309,7 +298,6 @@ CREATE TABLE IF NOT EXISTS global_chronicle (
     hero_class TEXT
 );
 
--- Contenido de lore y clases — reliquias, títulos, historia del mundo
 CREATE TABLE IF NOT EXISTS class_quests (
     class_name TEXT NOT NULL,
     unlock_level INTEGER NOT NULL,
@@ -353,7 +341,7 @@ CREATE TABLE IF NOT EXISTS lore_library (
     unlocked_at TEXT
 );
 
--- Living Chapter tracking — cuánto ha aportado cada héroe al capítulo global
+-- guarda el último total enviado al servidor por capítulo/objetivo, para mandar solo el delta en el siguiente sync
 CREATE TABLE IF NOT EXISTS chapter_contribution_log (
     chapter_id TEXT NOT NULL,
     objective_type TEXT NOT NULL,
@@ -361,7 +349,6 @@ CREATE TABLE IF NOT EXISTS chapter_contribution_log (
     PRIMARY KEY (chapter_id, objective_type)
 );
 
--- Índices — sin estos las queries se ven bonitas pero tardan un chingo
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_notes_project_id ON notes(project_id);
