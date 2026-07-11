@@ -754,7 +754,7 @@ VALUES
     ('$CHRON1', 1, 'MerlinBytes began the Questline. The terminal was opened. The cursor blinked. History was waiting.', '2026-01-15T09:00:00+00:00'),
     ('$CHRON2', 38, 'Operation: Inbox Zero was launched. 4,742 emails stood between MerlinBytes and peace. The sorting began.', '2026-02-21T08:30:00+00:00'),
     ('$CHRON3', 102, 'The borrow checker was defeated in battle. A Rust CLI tool was compiled successfully on the first try. The second time had also been the first try in a different timeline.', '2026-04-26T15:00:00+00:00'),
-    ('$CHRON4', 155, 'A 12-day streak was achieved. The Zen Tree reached Stage 3. coffee.js reached 47 weekly downloads. Progress was undeniable.', '2026-06-19T09:00:00+00:00'),
+    ('$CHRON4', 155, 'A 12-day streak was achieved. The Evergrowth reached Stage 3. coffee.js reached 47 weekly downloads. Progress was undeniable.', '2026-06-19T09:00:00+00:00'),
     ('gc000005-0000-4000-8000-000000000005', 160, 'Chapter One: The Notification Swarm is active. The Realm has been called to action. MerlinBytes answered.', '2026-06-25T08:00:00+00:00');
 
 -- ── Class Quests (Code Warlock) ───────────────────────────────────────────────
@@ -978,7 +978,7 @@ Deadline Wraiths appeared in increasing numbers.
 The struggle against chaos had entered a new age.',
      1, '2026-04-01T10:00:00+00:00'),
 
-    ('world_chapter_8', 'World', 'The Growth of the Zen Tree',
+    ('world_chapter_8', 'World', 'The Growth of The Evergrowth',
      'During this period, a mysterious sapling appeared near the center of the realm.
 
 No one knows who planted it.
@@ -1245,7 +1245,7 @@ Only managed."
      0, NULL),
 
     ('memory_112', 'Memory', 'Fragment #112 — Rootkeeper Sol [Rare]',
-     'Recovered from the roots of the Zen Tree
+     'Recovered from the roots of The Evergrowth
 
 "Heroes ask how long the tree takes to grow.
 
@@ -1346,21 +1346,21 @@ VALUES
     ('$GC01', 'Valdris',      'QuestComplete',     'Valdris completed "Debug the production daemon" and pushed the Swarm back.', '2026-06-25T06:14:00+00:00'),
     ('$GC02', 'Kessa',        'FocusSession',       'Kessa completed a 50-minute focus session. The Swarm flinched.', '2026-06-25T07:02:00+00:00'),
     ('$GC03', 'Thornbite',    'ScrollCreated',      'Thornbite wrote a new scroll: "On the Nature of Infinite Notifications".', '2026-06-25T08:30:00+00:00'),
-    ('$GC04', 'Aelwyn',       'TreeWatering',       'Aelwyn watered the Zen Tree. Growth continued undisturbed.', '2026-06-25T09:15:00+00:00'),
+    ('$GC04', 'Aelwyn',       'TreeWatering',       'Aelwyn watered The Evergrowth. Growth continued undisturbed.', '2026-06-25T09:15:00+00:00'),
     ('$GC05', 'Pip',          'SidequestComplete',  'Pip completed the Morning Ritual sidequest. Consistency noted.', '2026-06-25T10:00:00+00:00'),
     ('$GC06', 'The Realm',    'QuestComplete',      'The realm crossed 100 quests completed. The Swarm''s numbers are falling.', '2026-06-25T11:45:00+00:00'),
     ('$GC07', 'Valdris',      'ReflectionWritten',  'Valdris recorded a reflection. What went well: everything. What to improve: the definition of everything.', '2026-06-25T13:20:00+00:00'),
     ('$GC08', 'Sera',         'LevelUp',            'Sera reached Level 12. The Code Warlock''s power grows.', '2026-06-25T14:55:00+00:00'),
     ('$GC09', 'Orin',         'FocusSession',       'Orin ran a 90-minute deep work session. Soundscape: Rain. The Swarm lost ground.', '2026-06-25T16:30:00+00:00'),
     ('$GC10', 'Kessa',        'QuestComplete',      'Kessa finished "Migrate the old API endpoints." Three days ahead of schedule.', '2026-06-26T07:10:00+00:00'),
-    ('$GC11', 'Thornbite',    'TreeWatering',       'Thornbite watered the Zen Tree for the 30th consecutive day.', '2026-06-26T08:00:00+00:00'),
+    ('$GC11', 'Thornbite',    'TreeWatering',       'Thornbite watered The Evergrowth for the 30th consecutive day.', '2026-06-26T08:00:00+00:00'),
     ('$GC12', 'Mira',         'ScrollCreated',      'Mira created a scroll: "System Design for People Who Hate Meetings".', '2026-06-26T09:45:00+00:00'),
     ('$GC13', 'The Realm',    'QuestComplete',      'The realm crossed 250 quests completed. Chapter One objectives are advancing.', '2026-06-26T11:00:00+00:00'),
     ('$GC14', 'Aelwyn',       'SidequestComplete',  'Aelwyn completed the Weekly Backlog Triage ritual.', '2026-06-26T13:30:00+00:00'),
     ('$GC15', 'Pip',          'ReflectionWritten',  'Pip wrote a reflection. Day 22 of the habit. The streak holds.', '2026-06-26T15:00:00+00:00'),
     ('$GC16', 'Sera',         'FocusSession',       'Sera completed a 25-minute focus session. Lo-Fi Radio. Back to back with another.', '2026-06-26T16:40:00+00:00'),
     ('$GC17', 'Orin',         'QuestComplete',      'Orin completed "Write the architecture document nobody asked for." It was necessary.', '2026-06-27T07:55:00+00:00'),
-    ('$GC18', 'Mira',         'TreeWatering',       'Mira watered the Zen Tree. Stage 4. The canopy is forming.', '2026-06-27T09:00:00+00:00'),
+    ('$GC18', 'Mira',         'TreeWatering',       'Mira watered The Evergrowth. Stage 4. The canopy is forming.', '2026-06-27T09:00:00+00:00'),
     ('$GC19', 'The Realm',    'QuestComplete',      'The realm crossed 400 quests completed. The Notification Swarm is retreating.', '2026-06-27T10:30:00+00:00'),
     ('$GC20', 'Valdris',      'Milestone',          'Valdris completed the "Ship It" milestone. The project is live. The realm notes this.', '2026-06-27T11:15:00+00:00');
 

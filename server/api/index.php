@@ -1323,7 +1323,7 @@ try {
                         $noun = $amount === 1 ? $singular : $plural;
                         $desc = "completed {$amount} {$noun}.";
                         if ($obj_type === 'tree_waterings') {
-                            $desc = $amount === 1 ? "watered the Zen Tree." : "watered the Zen Tree {$amount} times.";
+                            $desc = $amount === 1 ? "watered The Evergrowth." : "watered The Evergrowth {$amount} times.";
                         } elseif ($obj_type === 'focus_sessions') {
                             $desc = $amount === 1 ? "honored a focus session." : "honored {$amount} focus sessions.";
                         } elseif ($obj_type === 'reflections_written') {
@@ -1646,7 +1646,7 @@ function trigger_webhooks($pdo, $userId, $eventType, $operation, $payload) {
                     $sCount = is_array($contentObj) ? ($contentObj['streak_count'] ?? '0') : $contentObj;
                     $event_msg = "{$user_name} has maintained a streak of {$sCount} days.";
                 } elseif ($eventType === 'zen_tree') {
-                    $event_msg = "{$user_name} has nurtured the Zen Tree.";
+                    $event_msg = "{$user_name} has nurtured The Evergrowth.";
                 } elseif ($eventType === 'task') {
                     $tName = is_array($contentObj) ? ($contentObj['title'] ?? 'Task') : 'Task';
                     $event_msg = "{$user_name} has completed: {$tName}.";
@@ -1660,7 +1660,7 @@ function trigger_webhooks($pdo, $userId, $eventType, $operation, $payload) {
                 $ironic_quotes = [
                     "The Realm grows stronger. Or at least, slightly less disorganized.",
                     "A monumental achievement that will be forgotten by tomorrow.",
-                    "The Chronicle is impressed. The Zen Tree remains completely indifferent.",
+                    "The Chronicle is impressed. The Evergrowth remains completely indifferent.",
                     "The Notification Swarm retreated, if only out of sheer embarrassment.",
                     "Proof that sufficient database entries can simulate actual productivity.",
                     "Somewhere, a manager is wondering why you aren't doing actual work instead of leveling up.",
@@ -1716,7 +1716,7 @@ function trigger_global_webhook($hero, $eventType, $description) {
         } elseif ($eventType === 'Streak') {
             $event_msg = "{$hero} has maintained a streak of " . preg_replace('/[^0-9]/', '', $description) . " days.";
         } elseif ($eventType === 'TreeWatering' || $eventType === 'ZenTree') {
-            $event_msg = "{$hero} has nurtured the Zen Tree.";
+            $event_msg = "{$hero} has nurtured The Evergrowth.";
         } elseif ($eventType === 'Milestone') {
             $event_msg = "{$hero} has completed a milestone: {$description}.";
         } elseif ($eventType === 'QuestComplete' || $eventType === 'task') {
@@ -1728,7 +1728,7 @@ function trigger_global_webhook($hero, $eventType, $description) {
         $ironic_quotes = [
             "The Realm grows stronger. Or at least, slightly less disorganized.",
             "A monumental achievement that will be forgotten by tomorrow.",
-            "The Chronicle is impressed. The Zen Tree remains completely indifferent.",
+            "The Chronicle is impressed. The Evergrowth remains completely indifferent.",
             "The Notification Swarm retreated, if only out of sheer embarrassment.",
             "Proof that sufficient database entries can simulate actual productivity.",
             "Somewhere, a manager is wondering why you aren't doing actual work instead of leveling up.",

@@ -19,7 +19,7 @@ pub struct SyncLogEntry {
     pub entity_id: String,
     pub operation: String,
     pub timestamp: String,
-    pub content: Option<String>, // JSON serialized state of the entity
+    pub content: Option<String>,
     #[serde(default)]
     pub device_id: String,
     // seq — cursor incremental del servidor para no descargar toda la historia en cada sync
@@ -27,14 +27,13 @@ pub struct SyncLogEntry {
     pub seq: i64,
 }
 
-// Pues aquí está el trait que aguanta tanto el modo archivo local como el HTTPS real
 pub trait CloudProvider {
     fn name(&self) -> &str;
     fn push(&self, public_key: &str, signature: &str, payload: &str) -> Result<()>;
     fn pull(&self, public_key: &str, signature: &str, since_seq: i64) -> Result<String>;
 }
 
-// Modo sin internet: simula el servidor en disco, chido para desarrollo y uso offline
+// Simula el servidor en disco — para desarrollo y para que el sync funcione sin internet
 pub struct FileCloudProvider {
     pub base_dir: PathBuf,
 }
@@ -50,7 +49,7 @@ impl FileCloudProvider {
     }
 
     fn user_log_file(&self, public_key: &str) -> PathBuf {
-        // Hex public key is safe for file names
+        // La llave pública en hex no tiene caracteres raros — sirve de nombre de archivo directo
         self.base_dir.join(format!("{}_logs.json", public_key))
     }
 }
@@ -60,9 +59,8 @@ impl CloudProvider for FileCloudProvider {
         "Cloud Chronicle (File-Simulated)"
     }
 
-    // Verifica firma antes de escribir cualquier cosa — nada entra sin estar firmado
+    // Nada se escribe sin firma criptográfica válida — el servidor de archivos también la exige
     fn push(&self, public_key: &str, signature: &str, payload: &str) -> Result<()> {
-        // Firma criptográfica obligatoria, sin esto no pasa nada
         let verified = Identity::verify(payload.as_bytes(), public_key, signature)?;
         if !verified {
             return Err(anyhow!(
@@ -80,7 +78,7 @@ impl CloudProvider for FileCloudProvider {
             Vec::new()
         };
 
-        // Dedup por id — el mismo evento no se guarda dos veces, órale
+        // Dedup por id — el mismo evento no se guarda dos veces
         for entry in new_entries {
             if !existing_entries.iter().any(|e| e.id == entry.id) {
                 existing_entries.push(entry);
@@ -131,7 +129,6 @@ pub struct SyncEngine<'a> {
 }
 
 impl<'a> SyncEngine<'a> {
-    // Elige el proveedor según si hay URL de servidor — HTTP en prod, archivo en local
     pub fn new(
         db: &'a Database,
         identity: &'a Identity,
@@ -152,14 +149,12 @@ impl<'a> SyncEngine<'a> {
         })
     }
 
-    // El mero mero: sincronización bidireccional completa — push → pull → resolve
-    // CRÍTICO: el orden push-antes-pull no es negociable, así los cambios locales no se pisan
+    // CRÍTICO: el orden push-antes-pull no es negociable — así los cambios locales no se pisan con lo remoto
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
         let mut pulled_count = 0;
 
-        // Paso 1: recopilar todo lo que no se ha subido todavía de esta máquina
         let pending = self.db.get_pending_sync_logs()?;
         let mut local_payload = Vec::new();
 
@@ -402,7 +397,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 "focus_session" => {
                     let mut stmt = self.db.conn.prepare(
-                        "SELECT id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape FROM focus_sessions WHERE id = ?1",
+                        "SELECT id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity FROM focus_sessions WHERE id = ?1",
                     )?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
@@ -412,6 +407,7 @@ impl<'a> SyncEngine<'a> {
                         let xp: i32 = row.get(4)?;
                         let completed_at: String = row.get(5)?;
                         let soundscape: String = row.get(6)?;
+                        let owner_identity: Option<String> = row.get(7)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "project_id": proj,
@@ -420,6 +416,7 @@ impl<'a> SyncEngine<'a> {
                             "xp_gained": xp,
                             "completed_at": completed_at,
                             "soundscape": soundscape,
+                            "owner_identity": owner_identity,
                         })
                         .to_string())
                     })
@@ -437,11 +434,11 @@ impl<'a> SyncEngine<'a> {
                 timestamp,
                 content,
                 device_id: self.device_id.to_string(),
-                seq: 0, // el servidor asigna el seq real al insertar
+                seq: 0, // el servidor sobreescribe esto con el seq real al insertar
             });
         }
 
-        // Paso 2: subir cambios locales PRIMERO — si falla el push, no jalamos nada
+        // Si falla el push, no jalamos nada — así no pisamos cambios que aún no subimos
         let pushed_ids: Vec<String> = if !local_payload.is_empty() {
             let serialized = serde_json::to_string(&local_payload)?;
             let signature = self.identity.sign(serialized.as_bytes())?;
@@ -453,7 +450,7 @@ impl<'a> SyncEngine<'a> {
             Vec::new()
         };
 
-        // Paso 3: jalar solo eventos nuevos — el cursor evita descargar toda la historia cada vez
+        // El cursor `since_seq` evita descargar toda la historia en cada sync
         let since_seq: i64 = self.db
             .get_setting("last_pull_seq")
             .ok()
@@ -463,37 +460,35 @@ impl<'a> SyncEngine<'a> {
         let pulled_data = self.provider.pull(&self.identity.public_key, "", since_seq)?;
         let remote_logs: Vec<SyncLogEntry> = serde_json::from_str(&pulled_data)?;
 
-        // Paso 4: resolver conflictos — Latest Edit Wins, con revisiones guardadas por si acaso
+        // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
         for log in remote_logs {
-            // Guardamos el seq más alto para el cursor del próximo pull
             if log.seq > max_seq { max_seq = log.seq; }
-            // Ignorar eventos que generamos nosotros mismos, ya los tenemos localmente
+            // Ignorar eventos que generamos nosotros mismos — ya los tenemos localmente
             if log.device_id == self.device_id {
                 continue;
             }
 
             let ent_uuid = Uuid::parse_str(&log.entity_id).unwrap_or_default();
             let is_newer = match log.entity_type.as_str() {
-                // Usuario remoto solo si no existe localmente — restauración en dispositivo nuevo
+                // Solo aceptamos usuario remoto si no existe localmente — restauración en dispositivo nuevo
                 "user" => self.db.get_user().map(|u| u.is_none()).unwrap_or(true),
                 "task" => {
-                    // Deletes siempre se aplican — un tombstone no tiene conflicto posible
+                    // Los deletes (tombstones) siempre se aplican — no tienen conflicto posible
                     if log.operation == "delete" { true } else
                     { match self.db.get_task_by_id(ent_uuid) { Ok(local_task) => {
-                        // Comparamos timestamps — el más reciente gana, no hay democracia aquí
+                        // El más reciente gana — sin democracia
                         let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                             .map(|d| d.with_timezone(&Utc))
                             .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
 
                         if incoming_time > local_task.updated_at {
-                            // If local task has different title/description, save revision
                             if let Some(ref content) = log.content {
                                 if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
                                     if remote_task.title != local_task.title
                                         || remote_task.completed != local_task.completed
                                     {
-                                        // No manches, conflicto real — guardamos la versión local antes de pisarla
+                                        // Conflicto real — guardamos la versión local antes de pisarla
                                         if let Ok(local_json) = serde_json::to_string(&local_task) {
                                             let _ = self.db.create_revision(
                                                 "task",
@@ -513,7 +508,6 @@ impl<'a> SyncEngine<'a> {
                             false
                         }
                     } _ => {
-                        // Task doesn't exist here yet — take it no questions asked
                         true
                     }}}
                 }
@@ -553,15 +547,14 @@ impl<'a> SyncEngine<'a> {
                         true
                     }}
                 }
-                // Proyectos: solo actualizamos is_shared — el nombre/descripción local manda
+                // Proyectos: si ya existe localmente, solo tocamos is_shared — el nombre/descripción local manda
                 "project" => {
                     if log.operation == "delete" { true } else {
                     let local_projects = self.db.get_projects().unwrap_or_default();
                     let local_proj = local_projects.iter().find(|p| p.id == ent_uuid);
                     match local_proj {
-                        None => true, // Proyecto nuevo, lo creamos sin preguntar
+                        None => true,
                         Some(lp) => {
-                            // Si ya existe: solo actualizamos is_shared, no tocamos datos locales
                             if lp.is_shared { false } else {
                                 log.content.as_ref()
                                     .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
@@ -600,7 +593,6 @@ impl<'a> SyncEngine<'a> {
                         false
                     }
                 }
-                // Codex: aceptamos siempre si es delete, o si no existe localmente
                 "codex" => {
                     if log.operation == "delete" {
                         true
@@ -608,7 +600,7 @@ impl<'a> SyncEngine<'a> {
                         self.db.get_codex_by_id(&log.entity_id).is_err()
                     }
                 }
-                // Sesiones de focus: solo insertamos si no existe — son inmutables una vez completadas
+                // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
                     self.db.conn.query_row(
                         "SELECT count(*) FROM focus_sessions WHERE id = ?1",
@@ -616,7 +608,6 @@ impl<'a> SyncEngine<'a> {
                         |row| row.get::<_, i32>(0),
                     ).unwrap_or(0) == 0
                 }
-                // Asignaciones de tareas: INSERT OR IGNORE — no hay conflicto posible
                 "task_assignment" => {
                     let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                     if parts.len() == 2 {
@@ -627,7 +618,6 @@ impl<'a> SyncEngine<'a> {
                         ).unwrap_or(0) == 0
                     } else { false }
                 }
-                // Miembros de proyecto: INSERT OR IGNORE — la membresía no tiene conflictos
                 "project_member" => {
                     let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                     if parts.len() == 2 {
@@ -638,7 +628,7 @@ impl<'a> SyncEngine<'a> {
                         ).unwrap_or(0) == 0
                     } else { false }
                 }
-                // Mensajes de la crónica: siempre aceptamos — son inmutables, nunca se editan
+                // Los mensajes de la crónica son inmutables — nunca se editan, solo se insertan
                 "chronicle_message" => {
                     self.db.conn.query_row(
                         "SELECT count(*) FROM chronicle_messages WHERE id = ?1",
@@ -646,7 +636,7 @@ impl<'a> SyncEngine<'a> {
                         |row| row.get::<_, i32>(0),
                     ).unwrap_or(0) == 0
                 }
-                // Lore: solo aplicamos si el evento dice desbloqueado y la entrada local aún no lo está
+                // Lore: los desbloqueos no se revierten — solo aplicamos si el remoto dice desbloqueado y el local aún no
                 "lore_unlock" => {
                     let remote_unlocked = log.content.as_ref()
                         .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
@@ -709,7 +699,6 @@ impl<'a> SyncEngine<'a> {
                                     .unwrap_or(false);
                                 let was_incomplete_locally = !local_completed;
                                 if local_completed && !t.completed {
-                                    // La tarea ya está completa aquí — ignorar el "incompleto" remoto
                                     pulled_count += 1;
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
@@ -766,7 +755,6 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
-                        // Proyectos son especiales: si ya existe solo tocamos is_shared, no el resto
                         "project" => {
                             if log.operation == "delete" {
                                 let _ = self.db.conn.execute(
@@ -788,7 +776,7 @@ impl<'a> SyncEngine<'a> {
                                         "UPDATE projects SET is_shared = ?1 WHERE id = ?2",
                                         params![if is_shared { 1 } else { 0 }, id],
                                     );
-                                    // Si es compartido, aseguramos que el owner esté en la tabla de miembros
+                                    // Al marcar como compartido hay que garantizar que el owner aparezca en project_members
                                     if is_shared {
                                         let owner_id = p["owner_identity"].as_str().unwrap_or_default();
                                         let owner_name = p["owner_username"].as_str().unwrap_or_default();
@@ -798,7 +786,7 @@ impl<'a> SyncEngine<'a> {
                                                 params![id, owner_id, owner_name],
                                             );
                                         }
-                                        // También nos agregamos nosotros como miembro del proyecto
+                                        // También auto-agregamos al dispositivo receptor como miembro
                                         let _ = self.db.conn.execute(
                                             "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, 'Member', 'Member')",
                                             params![id, self.identity.public_key],
@@ -923,18 +911,18 @@ impl<'a> SyncEngine<'a> {
                                 );
                             } else if let Ok(c) = serde_json::from_str::<crate::models::Codex>(content) {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at) VALUES (?1, ?2, ?3, ?4)",
+                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at, parent_codex_id) VALUES (?1, ?2, ?3, ?4, ?5)",
                                     params![
                                         c.id.to_string(),
                                         c.project_id.to_string(),
                                         c.name,
                                         c.created_at.to_rfc3339(),
+                                        c.parent_codex_id.map(|id| id.to_string()),
                                     ],
                                 );
                             }
                             pulled_count += 1;
                         }
-                        // Sesiones de focus: INSERT OR IGNORE — son inmutables, nunca se actualizan
                         "focus_session" => {
                             if let Ok(fs) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = fs["id"].as_str().unwrap_or_default();
@@ -944,14 +932,14 @@ impl<'a> SyncEngine<'a> {
                                 let xp = fs["xp_gained"].as_i64().unwrap_or(0) as i32;
                                 let completed_at = fs["completed_at"].as_str().unwrap_or_default();
                                 let soundscape = fs["soundscape"].as_str().unwrap_or("Silent");
+                                let owner_identity = fs["owner_identity"].as_str();
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                    params![id, proj, task, duration, xp, completed_at, soundscape],
+                                    "INSERT OR IGNORE INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    params![id, proj, task, duration, xp, completed_at, soundscape, owner_identity],
                                 );
                                 pulled_count += 1;
                             }
                         }
-                        // Asignaciones de tareas: INSERT OR IGNORE — idempotente y sin conflictos
                         "task_assignment" => {
                             if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
                                 let task_id = ta["task_id"].as_str().unwrap_or_default();
@@ -964,7 +952,6 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
-                        // Miembros de proyecto: INSERT OR IGNORE — la membresía es aditiva
                         "project_member" => {
                             if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
                                 let project_id = pm["project_id"].as_str().unwrap_or_default();
@@ -978,7 +965,6 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
-                        // Mensajes de la crónica: INSERT OR IGNORE — los mensajes son inmutables
                         "chronicle_message" => {
                             if let Ok(cm) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = cm["id"].as_str().unwrap_or_default();
@@ -1033,7 +1019,6 @@ impl<'a> SyncEngine<'a> {
             self.db.mark_sync_logs_synced(&pushed_ids)?;
         }
 
-        // Actualizamos el timestamp del dispositivo para que otros sepan cuándo sincronizamos por última vez
         self.db.update_device_sync_time(self.device_id)?;
 
         Ok((pushed_count, pulled_count, conflicts))
@@ -1099,7 +1084,6 @@ mod tests {
 
         let db = Database::new(&temp_db_path).expect("Failed to create test DB");
 
-        // Check task change tracking
         let task_id = Uuid::new_v4();
         let task = Task {
             id: task_id,
@@ -1118,7 +1102,6 @@ mod tests {
 
         db.insert_task(&task).expect("Failed to insert task");
 
-        // Retrieve sync log
         let pending_logs = db
             .get_pending_sync_logs()
             .expect("Failed to get pending sync logs");
@@ -1134,7 +1117,6 @@ mod tests {
         );
         assert_eq!(pending_logs[0].3, "create", "Sync log operation mismatch");
 
-        // Check note revision creation
         let note_id = Uuid::new_v4();
         let note = Note {
             id: note_id,
@@ -1158,7 +1140,6 @@ mod tests {
             "Database did not archive note version 1 snapshot"
         );
 
-        // Update note and check version increment
         let mut updated_note = note.clone();
         updated_note.markdown_content = "Content version 2".to_string();
         db.update_note(&updated_note)
@@ -1177,7 +1158,6 @@ mod tests {
             "Revision number increment failed"
         );
 
-        // Clean up
         let _ = std::fs::remove_file(&temp_db_path);
     }
 
