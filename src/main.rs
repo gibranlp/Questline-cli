@@ -275,7 +275,7 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveScreen::Editor => {
-                    if let Some(ref s) = app.editor_state {
+                    if let Some(ref mut s) = app.editor_state {
                         screens::editor::draw(f, s, &theme);
                     }
                 }
@@ -547,11 +547,24 @@ async fn main() -> Result<()> {
             {
                 if let Some(notif) = app.notifications.last() {
                     use questline::app::NotificationKind;
-                    let overlay_area = questline::screens::intro::centered_rect(50, 15, size);
+                    use ratatui::layout::Alignment;
+                    use ratatui::widgets::Wrap;
+
+                    // Width: 60% de la terminal
+                    let popup_w = (size.width * 60 / 100).max(30);
+                    let inner_w = popup_w.saturating_sub(4).max(1); // subtract borders + padding
+                    let msg_lines = (notif.message.chars().count() as u16).div_ceil(inner_w) + 1;
+                    let popup_h = (msg_lines + 4).clamp(6, size.height.saturating_sub(4));
+                    let overlay_area = ratatui::layout::Rect {
+                        x: size.x + (size.width.saturating_sub(popup_w)) / 2,
+                        y: size.y + (size.height.saturating_sub(popup_h)) / 2,
+                        width: popup_w.min(size.width),
+                        height: popup_h.min(size.height),
+                    };
+
                     f.render_widget(Clear, overlay_area);
                     f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
-                    // Color y título según el tipo — azul info, amarillo warning, rojo Swarm
                     let (border_color, msg_color) = match notif.kind {
                         NotificationKind::Info    => (Color::Rgb(56, 189, 248),  Color::Rgb(200, 230, 255)),
                         NotificationKind::Warning => (Color::Rgb(234, 179, 8),   Color::Rgb(255, 240, 180)),
@@ -564,9 +577,10 @@ async fn main() -> Result<()> {
                         .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
                         .title(Span::styled(title_text, Style::default().fg(border_color).add_modifier(Modifier::BOLD)));
 
-                    let paragraph = Paragraph::new(format!("\n {}", notif.message))
+                    let paragraph = Paragraph::new(format!(" {}", notif.message))
                         .block(block)
-                        .alignment(ratatui::layout::Alignment::Center)
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
                         .style(Style::default().fg(msg_color));
 
                     f.render_widget(paragraph, overlay_area);
@@ -1443,7 +1457,7 @@ async fn main() -> Result<()> {
 
                 match app.active_screen {
                     ActiveScreen::Dashboard => {
-                        lines.push(Line::from("  w            Water the Zen Tree (Growth & XP)"));
+                        lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
                         lines.push(Line::from("  f            Quick start Focus Session"));
                         lines.push(Line::from("  m            Go to Music Screen"));
                     }
@@ -1465,9 +1479,14 @@ async fn main() -> Result<()> {
                                 lines.push(Line::from("  f            Toggle Tasks filter (All -> Incomplete -> Completed)"));
                             }
                             1 => {
-                                lines.push(Line::from("  n            Create New Note"));
-                                lines.push(Line::from("  e            Edit/Open selected Note in Editor"));
-                                lines.push(Line::from("  d            Delete selected Note"));
+                                lines.push(Line::from("  n            Create New Note (in current codex if one is selected)"));
+                                lines.push(Line::from("  Enter        Open selected Note in Editor / Drill into Codex"));
+                                lines.push(Line::from("  e            Rename selected Codex"));
+                                lines.push(Line::from("  r            Move Note or Codex to a different Codex"));
+                                lines.push(Line::from("  d            Create new Codex (sub-codex if inside one)"));
+                                lines.push(Line::from("  →            Drill into selected Codex"));
+                                lines.push(Line::from("  ←  / Esc    Go back up one Codex level"));
+                                lines.push(Line::from("  Del          Remove selected Note or Codex"));
                                 lines.push(Line::from("  s            Open Note Sharing modal (Multi-device Sync)"));
                             }
                             2 => {
