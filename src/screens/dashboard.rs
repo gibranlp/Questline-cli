@@ -318,9 +318,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     let row3_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Percentage(35),
             Constraint::Percentage(40),
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
+            Constraint::Percentage(25),
         ])
         .split(chunks[2]);
 
