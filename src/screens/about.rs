@@ -11,7 +11,6 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
-// Banco de datos curiosos del Questline lore — se elige uno random por sesión
 const FACTS: &[&[&str]] = &[
     &[
         "• The Great Backlog grows stronger when ignored.",
@@ -20,7 +19,7 @@ const FACTS: &[&[&str]] = &[
         "• Scope Dragons feed on \"just one more feature.\"",
     ],
     &[
-        "• The Zen Tree has witnessed every excuse ever recorded.",
+        "• The Evergrowth has witnessed every excuse ever recorded.",
     ],
     &[
         "• Future You has filed several complaints.",
@@ -47,12 +46,12 @@ const FACTS: &[&[&str]] = &[
         "• Every archaeological discovery was once an unread note.",
     ],
     &[
-        "• The Zen Tree grows from consistency, not intensity.",
-        "• The Zen Tree does not care about your motivational speeches.",
-        "• The Zen Tree prefers action.",
-        "• The Zen Tree has heard \"I'll do it tomorrow\"",
+        "• The Evergrowth grows from consistency, not intensity.",
+        "• The Evergrowth does not care about your motivational speeches.",
+        "• The Evergrowth prefers action.",
+        "• The Evergrowth has heard \"I'll do it tomorrow\"",
         "  approximately 8.4 million times.",
-        "• The Zen Tree remains unconvinced.",
+        "• The Evergrowth remains unconvinced.",
     ],
     &[
         "• Future You remembers every promise.",
@@ -200,10 +199,23 @@ fn cl_div() -> Line<'static> {
     ))
 }
 
-// Arma todas las líneas del changelog — cada versión con su codename y lista de cambios
 fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
-    // Historial de versiones hardcodeado — pues hay que actualizar esto con cada release
+    // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "v1.0.9", "Jul 11, 2026",
+            "The Scrollkeeper Awakens",
+            &[
+                "Vim-like editor for notes: Normal, Insert, Visual modes",
+                "Undo / redo history (up to 100 snapshots)",
+                "Yank, paste, delete word, line ops — press ? for full help",
+                "Codices now display as an expanded tree (no more drill-down)",
+                "Codices can be moved with their full contents to any parent",
+                "Notification popups now wrap long messages cleanly",
+                "Home / End keys in task and step description fields",
+                "Focus sessions now tracked per-hero — no more double-counting",
+            ],
+        ),
         (
             "v1.0.8", "Jul 6, 2026",
             "The Focus Session Listens Now",
@@ -332,7 +344,6 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
         cl_div(),
     ];
 
-    // Itera versiones y agrega separador entre ellas — el último no lleva divider
     for (i, (ver, date, codename, changes)) in VERSIONS.iter().enumerate() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -363,14 +374,12 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     lines
 }
 
-// Pantalla principal about — dos columnas: info/lore a la izq, changelog a la der
-// Ambas comparten el mismo scroll_offset, qué rollo si los contenidos tienen largo diferente
+// ambas columnas comparten el mismo scroll_offset — si los contenidos tienen largo diferente una se queda corta
 pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
     let accent = theme.primary;
-    // La versión viene del Cargo.toml en tiempo de compilación — no hay que hardcodearla
+    // versión inyectada en build time desde Cargo.toml — nunca hardcodear aquí
     let version = env!("CARGO_PKG_VERSION");
 
-    // Elige el grupo de facts con el seed aleatorio guardado en app state
     let fact_group = FACTS[app.about_fact_seed as usize % FACTS.len()];
 
     let mut lines: Vec<Line> = vec![
@@ -430,7 +439,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         "Project Chronicles and Persistent Chat",
         "RPG Progression and Character Classes",
         "Daily Adventures and Streak Tracking",
-        "The Zen Tree Growth System",
+        "The Evergrowth Growth System",
         "Focus Sessions and Ambient Soundscapes",
         "Local-First Architecture with Cloud Synchronization",
         "A Ridiculous Amount of Lore",
@@ -577,7 +586,6 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
             Span::styled(*value, Style::default().fg(Color::White)),
         ]));
     }
-    // La versión se inyecta en build time — siempre está actualizada, órale
     lines.push(Line::from(vec![
         Span::styled("  Version    : ", Style::default().fg(theme.muted)),
         Span::styled(
@@ -613,7 +621,6 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
     ]);
 
-    // Agrega las líneas del fact group seleccionado — puede ser uno o varios
     for fact_line in fact_group {
         lines.push(Line::from(Span::styled(
             format!("  {fact_line}"),
@@ -627,12 +634,11 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
     ]);
 
-    // Guarda el total de líneas para que el app pueda calcular el scroll máximo
+    // Cell::set() — se guarda aquí para que el caller pueda calcular el scroll máximo sin re-contar
     app.about_content_lines.set(lines.len() as u16);
 
     let cl_lines = changelog_lines(theme, accent);
 
-    // Layout de dos columnas — 55% about, 45% changelog
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
@@ -659,7 +665,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         );
     f.render_widget(left, cols[0]);
 
-    // El changelog usa el mismo scroll que el about — ambos se mueven juntos
+    // mismo scroll que el panel izquierdo — se mueven juntos a propósito
     let right = Paragraph::new(cl_lines)
         .wrap(Wrap { trim: false })
         .scroll((app.about_scroll, 0))

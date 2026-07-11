@@ -11,4 +11,5 @@ pub struct Codex {
     pub project_id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    pub parent_codex_id: Option<Uuid>,
 }

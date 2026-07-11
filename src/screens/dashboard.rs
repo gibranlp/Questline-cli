@@ -36,17 +36,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     // Layout adaptivo — si la terminal es chica apretamos filas, si es grande damos más espacio
     let constraints = if size.height < 42 {
         vec![
-            Constraint::Length(4),      // Row 1: Profile + XP Gauge
-            Constraint::Percentage(35), // Row 2: Tree + Adventures + Streak & Trophies
-            Constraint::Length(7),      // Row 3: Rituals + Focus stats & reflection box
-            Constraint::Min(4),         // Row 4: Tasks + Summary
+            Constraint::Length(4),
+            Constraint::Percentage(35),
+            Constraint::Length(7),
+            Constraint::Min(4),
         ]
     } else {
         vec![
-            Constraint::Length(5),      // Row 1: Profile + XP Gauge
-            Constraint::Percentage(42), // Row 2: Tree + Adventures + Streak & Trophies
-            Constraint::Length(9),      // Row 3: Rituals + Focus stats & reflection box
-            Constraint::Min(6),         // Row 4: Tasks + Summary
+            Constraint::Length(5),
+            Constraint::Percentage(42),
+            Constraint::Length(9),
+            Constraint::Min(6),
         ]
     };
     let chunks = Layout::default()
@@ -54,7 +54,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .constraints(constraints)
         .split(size);
 
-    // ── ROW 1: Perfil del aventurero y su barra de XP ──
     let profile_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -84,7 +83,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             Span::styled(user.title(), Style::default().fg(theme.warning)),
         ]),
     ];
-    // Órale — si hay backups corruptos le avisamos al usuario bien visible
     if !app.corrupted_backups_found.is_empty() {
         profile_text.push(Line::from(vec![Span::styled(
             "[!] Corrupted Backup!",
@@ -108,7 +106,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     let ratio = if next_level_xp > 0 {
         (current_xp as f64 / next_level_xp as f64).clamp(0.0, 1.0)
     } else {
-        1.0 // ya llegó al tope, qué chido
+        1.0
     };
 
     let gauge = Gauge::default()
@@ -129,17 +127,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .ratio(ratio);
     f.render_widget(gauge, profile_layout[1]);
 
-    // ── ROW 2: El árbol zen, las quests del día y las rachas del héroe ──
     let hub_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
+            Constraint::Percentage(45),
+            Constraint::Percentage(28),
+            Constraint::Percentage(27),
         ])
         .split(chunks[1]);
 
-    // 2a. El arbolito zen — refleja el progreso acumulado del usuario, cuídalo!
     let zen_tree = app.db.get_zen_tree().unwrap();
     let tree_block = Block::default()
         .borders(Borders::ALL)
@@ -151,7 +147,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
 
     let tree_sub = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(tree_inner);
 
     let tree_ascii = Paragraph::new(zen_tree.ascii_art())
@@ -228,7 +224,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     let tree_status_p = Paragraph::new(tree_status);
     f.render_widget(tree_status_p, tree_sub[1]);
 
-    // 2b. Las quests del día — el engine las genera automáticamente cada mañana
+    // el engine genera las daily adventures automáticamente cada mañana — no son persistentes entre días
     let daily_adventures = app.db.get_daily_adventures().unwrap_or_default();
     let comp_count = daily_adventures.iter().filter(|a| a.completed).count();
     let adv_items: Vec<ListItem> = if daily_adventures.is_empty() {
@@ -254,7 +250,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(adv_list, hub_layout[1]);
 
-    // 2c. Rachas y trofeos — solo mostramos los primeros 4 achievements para no saturar
+    // solo se muestran 4 achievements — mostrar todos satura el panel
     let streak_obj = app.db.get_streak().unwrap();
     let achievements = app.db.get_achievements().unwrap_or_default();
     let achievements_unlocked = achievements
@@ -319,17 +315,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(ach_list, right_sub[1]);
 
-    // ── ROW 3: Sidequests diarias, stats de deep work y sincronía en la nube ──
     let row3_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
+            Constraint::Percentage(35),
             Constraint::Percentage(40),
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
+            Constraint::Percentage(25),
         ])
         .split(chunks[2]);
 
-    // 3a. Lista de sidequests (hábitos) — el historial es por fecha, no por ID global
+    // el historial de sidequests se consulta por fecha, no por ID global
     let rituals = app.db.get_rituals().unwrap_or_default();
     let completed_rituals = app
         .db
@@ -389,7 +384,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     }
     f.render_stateful_widget(rituals_list, row3_layout[0], &mut rituals_state);
 
-    // 3b. Resumen de focus sessions y el recordatorio de reflexión diaria
     let stats = app.db.get_statistics().unwrap();
     let reflected_today = app
         .db
@@ -400,12 +394,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     let focus_and_ref_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // Focus summary metrics (expanded for soundscapes)
-            Constraint::Length(4), // Reflection status box
+            Constraint::Length(4),
+            Constraint::Length(4),
         ])
         .split(row3_layout[1]);
 
-    // Tres queries para soundscapes: último usado, favorito y más productivo
     let last_soundscape = app
         .db
         .get_last_soundscape_used()
@@ -457,7 +450,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(focus_summary_p, focus_and_ref_layout[0]);
 
-    // El box cambia de color y mensaje dependiendo si ya reflejó hoy o no
     let (ref_text, ref_block_style) = if reflected_today {
         (
             vec![
@@ -492,13 +484,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(ref_p, focus_and_ref_layout[1]);
 
-    // 3c. Estado de la sincronía con el servidor — parsea el RFC3339 y lo convierte a tiempo relativo
+    // el timestamp viene en RFC3339 crudo — se parsea y convierte a tiempo relativo ("5 mins ago", etc.)
     let last_sync_raw = app
         .db
         .get_setting("last_sync")
         .unwrap_or(None)
         .unwrap_or_else(|| "Never".to_string());
-    // Convierte timestamp crudo a string legible: "Just now", "5 mins ago", etc.
     let last_sync_formatted = if last_sync_raw == "Never" {
         "Never".to_string()
     } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&last_sync_raw) {
@@ -516,7 +507,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         last_sync_raw
     };
 
-    // pending_changes en amarillo si hay algo por sincronizar, verde si todo está al día
     let dev_count = app.db.get_devices().unwrap_or_default().len();
     let pending_changes = app.db.get_pending_sync_logs().map(|l| l.len()).unwrap_or(0);
 
@@ -551,7 +541,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             ),
         ]),
     ];
-    // Divide the right column: Cloud Chronicle on top, Support card on bottom
     let right_col_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Min(5), Constraint::Length(4)])
@@ -566,7 +555,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(chronicle_p, right_col_layout[0]);
 
-    // Small "Support the Realm" card — compact, easy to ignore, one builder made this
     let support_text = vec![Line::from(vec![
         Span::styled("  Keep the Realm Alive. ", Style::default().fg(theme.muted)),
         Span::styled(
@@ -589,22 +577,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(support_p, right_col_layout[1]);
 
-    // ── ROW 4: Tasks activas, proyectos compartidos y actividad del gremio ──
     let bottom_layout = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(35), // Left: Active & Assigned Quests
-            Constraint::Percentage(30), // Middle: Shared Projects & Invites
-            Constraint::Percentage(35), // Right: Activity & Mentions
+            Constraint::Percentage(35),
+            Constraint::Percentage(30),
+            Constraint::Percentage(35),
         ])
         .split(chunks[3]);
 
-    // 4a. Lista jerárquica de tasks — padres primero, luego sus steps incompletos
-    // No manches, el sort por due_date con None al final requiere ese match tan verbose
+    // el sort por due_date con None al final requiere ese match tan verbose — no hay forma más corta
     let all_tasks = &app.all_tasks;
     let today = Utc::now().date_naive();
 
-    // Construye lista plana: parent task seguida de sus steps, ordenada por fecha límite
     let mut parents: Vec<&Task> = all_tasks
         .iter()
         .filter(|t| !t.completed && t.parent_task_id.is_none())
@@ -657,7 +642,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                 ]))
             } else {
                 let proj_name = get_project_name(t.project_id, &app.projects);
-                // La etiqueta de fecha: rojo si ya venció, neutral si es hoy o futuro
                 let due_label = match t.due_date {
                     Some(d) => {
                         let d_naive = d.date_naive();
@@ -731,7 +715,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .highlight_style(Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD));
     f.render_stateful_widget(left_list, bottom_layout[0], &mut left_state);
 
-    // 4b. Proyectos compartidos e invitaciones — el campo i.7 es el status, ojo con el índice
+    // i.7 es el campo status de la invitación — las invitaciones son tuplas sin nombre de campos
     let mut middle_lines = vec![Line::from("")];
     let shared_projects: Vec<_> = app.projects.iter().filter(|p| p.is_shared).collect();
     middle_lines.push(Line::from(vec![
@@ -787,7 +771,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     );
     f.render_widget(middle_p, bottom_layout[1]);
 
-    // 4c. Feed del gremio — menciones sin leer y actividad reciente de compañeros
     let mut right_lines = vec![Line::from("")];
     let unread_mentions: Vec<_> = app
         .db
@@ -848,7 +831,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
 
     // ── Modals flotantes — se renderizan encima de todo lo demás ──
     match &app.modal_state {
-        // Modal de reflexión diaria — dos campos de texto con Tab para cambiar entre ellos
+        // Tab cambia el focus entre los dos campos — no hay cursor visible, solo el borde activo cambia de color
         ModalType::DailyReflection {
             what_went_well,
             what_can_improve,
@@ -888,10 +871,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             let content_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(4), // What went well
-                    Constraint::Length(4), // What can improve
-                    Constraint::Min(2),    // Instruction footer
+                    Constraint::Length(1),
+                    Constraint::Length(4),
+                    Constraint::Length(4),
+                    Constraint::Min(2),
                 ])
                 .split(block.inner(area));
 
@@ -920,7 +903,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             let help_p = Paragraph::new(help_text).alignment(Alignment::Center);
             f.render_widget(help_p, content_layout[3]);
         }
-        // Modal para crear un nuevo sidequest — 4 campos, el de frecuencia es un selector con flechas
+        // el campo frecuencia no es texto libre — es un selector cíclico con flechas izq/der
         ModalType::NewRitual {
             name,
             desc,
@@ -968,19 +951,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                 Style::default().fg(theme.muted)
             };
 
-            // El selector de frecuencia — flechas izq/der o Space para ciclar entre opciones
             let freqs = ["Daily", "Weekdays", "Weekly", "Monthly", "Custom"];
             let freq_str = format!("<  {}  >", freqs[*frequency_idx]);
 
             let content_layout = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1), // Spacer
-                    Constraint::Length(3), // Name
-                    Constraint::Length(3), // Desc
-                    Constraint::Length(3), // Freq
-                    Constraint::Length(3), // XP
-                    Constraint::Min(2),    // Instruction footer
+                    Constraint::Length(1),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Length(3),
+                    Constraint::Min(2),
                 ])
                 .split(block.inner(area));
 

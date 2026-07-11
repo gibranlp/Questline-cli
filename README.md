@@ -213,6 +213,18 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v1.0.9 — The Scrollkeeper Awakens
+*Released 2026-07-11*
+
+- **Vim-like note editor:** Notes now open in a full modal editor with Normal, Insert, and Visual modes. Navigate with hjkl, yank lines, delete words, undo and redo up to 100 steps. Press `?` inside any note for the full keybind reference.
+- **Nested codex tree view:** Codices that contain other codices now display as an always-expanded tree. The full hierarchy is visible at a glance — no more drilling in and pressing Back to see what is inside.
+- **Move codices:** A codex and everything inside it can now be relocated to any other parent codex, or moved back to the root, using the same refile flow as notes.
+- **Notification wrapping:** Long notification messages now wrap cleanly inside the popup instead of being cut off.
+- **Home / End in descriptions:** The Home and End keys now work in the task and step description field, jumping to the start or end of the current line.
+- **Focus session attribution:** Each focus session is now stamped with the hero who completed it. The Chapter One contribution counter no longer double-counts sessions that sync across multiple devices.
+
+---
+
 ### v1.0.8 — The Focus Session Listens Now
 *Released 2026-07-06*
 
@@ -233,7 +245,7 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **New home:** The sync server and website moved from `questline.gibranlp.dev` to [`questlinecli.com`](https://questlinecli.com). Existing users with the old URL saved will need to update it in the Sync screen.
 - **Media Player tab:** Added MPRIS support — works with any player on your system. Open Spotify, VLC, Rhythmbox, or mpv and control it directly from the Music tab. No login, no setup.
 - **Music visualizer in Focus:** A spectrum bar display now lives between the session options and the forecast panel. It animates while your soundscape plays and stays visible during the session.
-- **Companion tree animation:** The Zen Tree in the active focus session now grows step by step from its first stage up to its current one, then holds at full growth for a moment before repeating.
+- **Companion tree animation:** The Evergrowth in the active focus session now grows step by step from its first stage up to its current one, then holds at full growth for a moment before repeating.
 - **Realm Activity feed:** Live feed of hero activity across the realm, visible from the Great Chronicle screen.
 
 ---
