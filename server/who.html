@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Who Is This For — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #who-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/who.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #who .section-header,
+    #who h2,
+    #who .intro-text {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div id="who-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ WHO FOR -->
+<section id="who" class="page-top">
+  <div class="container">
+    <p class="section-header">// Target Profile Assessment</p>
+    <h2>Who Is This <span class="accent">For</span></h2>
+    <hr class="divider">
+
+    <p class="intro-text">
+      Questline is for people who have tried plain to-do lists and found them motivationally inert.
+      It is not exclusively for developers. It is for anyone who does <strong>knowledge work</strong>,
+      manages their own time, and responds better to systems with some personality than to
+      systems that look like a spreadsheet that has given up.
+      <br><br>
+      If you have ever opened a productivity app, added three tasks, and closed it without ever
+      opening it again — Questline was built with you specifically in mind. Not to fix the problem.
+      To make it significantly more embarrassing to repeat.
+    </p>
+
+    <div class="three-col" style="margin-top:2rem;">
+
+      <div class="class-card" style="--class-color:rgb(6,182,212);">
+        <div class="class-name">The Solo Worker</div>
+        <div class="class-order">Freelancers · Contractors · Consultants</div>
+        <div class="class-motto">"I am my own project manager, which is exactly as terrifying as it sounds."</div>
+        <div class="class-desc">
+          You manage your own time, your own deadlines, and your own motivation —
+          with no one to hold you accountable except the invoice you haven't sent yet.
+          Questline provides structure without overhead: projects, tasks, streaks,
+          and a daily rhythm that keeps work moving even when no one is watching.
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(168,85,247);">
+        <div class="class-name">The Developer</div>
+        <div class="class-order">Engineers · Programmers · Architects</div>
+        <div class="class-motto">"I have seventeen terminal windows open. One more is fine."</div>
+        <div class="class-desc">
+          You live in the terminal. A mouse-driven productivity app is a context switch
+          you did not ask for. Questline runs entirely in the CLI, integrates naturally
+          into your existing workflow, and does not require you to learn a new UI paradigm.
+          You already know how a keyboard works.
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(245,158,11);">
+        <div class="class-name">The Knowledge Worker</div>
+        <div class="class-order">Writers · Researchers · Analysts</div>
+        <div class="class-motto">"My work is invisible until it suddenly isn't."</div>
+        <div class="class-desc">
+          Your output is ideas, documents, and decisions — not code commits or shipped features.
+          Progress is hard to see and harder to measure. The journal, daily reflections,
+          streak tracking, and milestone system exist precisely to make invisible progress
+          visible. You did the work. The Chronicle agrees.
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(255,105,180);">
+        <div class="class-name">The Student</div>
+        <div class="class-order">Coursework · Research · Long Projects</div>
+        <div class="class-motto">"The deadline has been aware of me for weeks. I am only now becoming aware of it."</div>
+        <div class="class-desc">
+          Long projects with distant deadlines are Questline's natural habitat.
+          Daily adventures, streak tracking, and focus sessions are designed for sustained
+          effort over weeks and months — not last-minute sprints. The Evergrowth does not
+          care about your exam date. It cares whether you showed up today.
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(59,130,246);">
+        <div class="class-name">The Small Team</div>
+        <div class="class-order">Collaborators · Co-founders · Pairs</div>
+        <div class="class-motto">"We are highly aligned on the vision. Less so on who is doing what by when."</div>
+        <div class="class-desc">
+          Shared projects via Fellowship let small teams coordinate tasks, notes,
+          and a running Project Chronicle without a subscription to a project management
+          platform that is technically designed for teams of fifty.
+          Two people with a shared goal and a shared project board. That is enough.
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(249,115,22);">
+        <div class="class-name">The Chronic Starter</div>
+        <div class="class-order">Everyone Else · The Honest Category</div>
+        <div class="class-motto">"I have seventeen unfinished projects and eight productivity apps installed."</div>
+        <div class="class-desc">
+          You start things. You have always started things. The finishing is where
+          it gets complicated. Questline does not solve this — no app does.
+          But milestones require proof of sustained effort, streaks punish gaps,
+          and the Chronicle records everything. The social contract is with the system.
+          The system does not accept excuses gracefully.
+        </div>
+      </div>
+
+    </div>
+
+    <!-- NOT FOR -->
+    <p class="section-header" style="margin-top:3.5rem;">// Out of Scope</p>
+    <div class="term" style="margin-top:1rem;">
+      <pre>
+<span class="comment"># Questline is probably not the right tool if you:</span>
+
+  ✗  Need Gantt charts, resource allocation, or sprint planning boards
+  ✗  Require a mobile app  (terminal runs on desktop only)
+  ✗  Prefer clicking things  (keyboard-only interface, intentionally)
+  ✗  Want a team of 20+ people on the same workspace
+  ✗  Need integrations with Jira, Slack, or other enterprise platforms
+  ✗  Are looking for something that will finish your tasks for you
+
+<span class="comment"># No tool does the last one. We checked.</span></pre>
+    </div>
+
+  </div>
+</section>
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  // ── Parallax: image moves at 15% of scroll speed ─────────────────────
+  const whoBg = document.getElementById('who-bg');
+  let whoRaf = null;
+  window.addEventListener('scroll', () => {
+    if (whoRaf) cancelAnimationFrame(whoRaf);
+    whoRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.15;
+      whoBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>

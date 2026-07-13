@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>The Six Orders — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #orders-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/orders.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #classes .section-header,
+    #classes h2,
+    #classes .intro-text {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+
+    /* ── Vertical roster layout ── */
+    .orders-list {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      margin-top: 2rem;
+    }
+
+    .orders-list .class-card {
+      display: grid;
+      grid-template-columns: 270px 1fr;
+      align-items: stretch;
+      padding: 0;
+    }
+
+    /* Override horizontal top bar → vertical left bar */
+    .orders-list .class-card::before {
+      top: 0;
+      left: 0;
+      right: auto;
+      bottom: 0;
+      width: 3px;
+      height: 100%;
+    }
+
+    .class-card-left {
+      padding: 1.5rem 1.75rem;
+      border-right: 1px solid rgba(255,255,255,0.05);
+    }
+
+    .class-card-right {
+      padding: 1.5rem 1.75rem;
+      display: flex;
+      align-items: center;
+    }
+
+    .orders-list .class-desc {
+      font-size: 1rem;
+      color: var(--text-dim);
+      line-height: 1.8;
+    }
+
+    @media (max-width: 720px) {
+      .orders-list .class-card {
+        grid-template-columns: 1fr;
+      }
+      .class-card-left {
+        border-right: none;
+        border-bottom: 1px solid rgba(255,255,255,0.05);
+        padding-bottom: 1rem;
+      }
+      .orders-list .class-card::before {
+        right: 0;
+        bottom: auto;
+        width: 100%;
+        height: 3px;
+      }
+    }
+  </style>
+</head>
+<body>
+
+<div id="orders-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ CLASSES -->
+<section id="classes" class="page-top">
+  <div class="container">
+    <p class="section-header">// The Six Great Orders</p>
+    <h2>Choose Your <span class="accent">Calling</span></h2>
+    <hr class="divider">
+
+    <p class="intro-text" style="margin-bottom:2rem;">
+      Your class is not cosmetic. It determines your color palette, your starting powers, your Order lore,
+      and the specific flavor of productivity guilt you will carry. Choose with care. Choose with honesty.
+      You can change at Level 10 via Specialization, but the Chronicle will remember your original shame.
+    </p>
+
+    <div class="orders-list">
+
+      <div class="class-card" style="--class-color:rgb(168,85,247);">
+        <div class="class-card-left">
+          <div class="class-name">Code Warlock</div>
+          <div class="class-order">The Terminal Covenant</div>
+          <div class="class-motto">"Caffeine in. Code out. The loop must continue."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">No one knows exactly how the Code Warlocks began. Their own records are incomplete. Mostly because they forgot to back them up.</div>
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(255,105,180);">
+        <div class="class-card-left">
+          <div class="class-name">Task Paladin</div>
+          <div class="class-order">The Sacred Checklist</div>
+          <div class="class-motto">"The to-do list shall be purified."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">While others debate, while others plan, while others research — Task Paladins complete things. The checkbox is their cathedral.</div>
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(6,182,212);">
+        <div class="class-card-left">
+          <div class="class-name">Mind Sage</div>
+          <div class="class-order">The Silent Archive</div>
+          <div class="class-motto">"Every idea is a node. Every node is power."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">The Mind Sages dedicate themselves to preserving knowledge. Nothing is too small to record. Some of their archives are even relevant.</div>
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(59,130,246);">
+        <div class="class-card-left">
+          <div class="class-name">Systems Architect</div>
+          <div class="class-order">The Builders of Order</div>
+          <div class="class-motto">"Give me enough folders and I will organize the universe."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">Systems Architects see patterns where others see chaos. Many are capable of producing folder hierarchies before understanding the project itself. The Downloads folder remains exempt.</div>
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(249,115,22);">
+        <div class="class-card-left">
+          <div class="class-name">Time Chronomancer</div>
+          <div class="class-order">The Keepers of Hours</div>
+          <div class="class-motto">"Time is not money. Time is everything."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">Unlike gold, time cannot be earned. Unlike knowledge, it cannot be stored. Chronomancers know exactly where every hour goes. They are rarely happy about it.</div>
+        </div>
+      </div>
+
+      <div class="class-card" style="--class-color:rgb(245,158,11);">
+        <div class="class-card-left">
+          <div class="class-name">Arch Accountant</div>
+          <div class="class-order">The Order of the Ledger</div>
+          <div class="class-motto">"Numbers do not lie. But accountants can make them confess."</div>
+        </div>
+        <div class="class-card-right">
+          <div class="class-desc">Where others sought glory, the Arch Accountants sought balance. They can account for every coin. They cannot account for where the weekend went. No one can.</div>
+        </div>
+      </div>
+
+    </div>
+
+    <div style="margin-top:2.5rem;text-align:center;">
+      <a href="download.html" class="badge" style="text-decoration:none;animation:cycleColor 9s linear infinite;border-color:currentColor;">Download Questline</a>
+    </div>
+  </div>
+</section>
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  // ── Parallax: image moves at 12% of scroll speed ─────────────────────
+  const ordersBg = document.getElementById('orders-bg');
+  let ordersRaf = null;
+  window.addEventListener('scroll', () => {
+    if (ordersRaf) cancelAnimationFrame(ordersRaf);
+    ordersRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.12;
+      ordersBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+
+  // ── Class Selector Accent Customization ──────────────────────────────
+  document.querySelectorAll('.class-card').forEach(card => {
+    card.addEventListener('click', () => {
+      const isSelected = card.classList.contains('selected');
+      document.querySelectorAll('.class-card').forEach(c => c.classList.remove('selected'));
+
+      if (isSelected) {
+        document.body.classList.remove('class-theme-active');
+      } else {
+        card.classList.add('selected');
+        const color = card.style.getPropertyValue('--class-color');
+        document.documentElement.style.setProperty('--accent', color);
+        document.body.classList.add('class-theme-active');
+      }
+    });
+  });
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>
