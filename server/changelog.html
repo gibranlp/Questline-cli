@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Changelog — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #changelog-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/changelog.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #changelog .section-header,
+    #changelog h2 {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div id="changelog-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ CHANGELOG -->
+<section id="changelog" class="page-top" style="padding-bottom: 0;">
+  <div class="container">
+    <p class="section-header">// The Chronicle — Patch Notes</p>
+    <h2>The Realm <span class="accent">Expands</span></h2>
+    <hr class="divider">
+
+    <p class="intro-text">
+      The realm has always existed. It simply did not have a proper name on the world map.
+      <br><br>
+      Adventurers who survived Chapter One know the truth: the Notification Swarm was only the beginning.
+      A realm this large — with heroes across timezones completing quests, tending Zen Trees, and writing
+      scrolls at unreasonable hours — deserved an address that could be taken seriously.
+      <strong>questlinecli.com</strong> is that address. The Chronicle has been updated accordingly.
+      The backlog has not shrunk. But at least it now has a proper domain.
+    </p>
+
+    <!-- SITE UPDATE -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">site update</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Realm Gets a Face</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-13</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — The Map Was Always There</span>
+
+  The realm existed before the website.
+
+  Adventurers found it through word of mouth, through a GitHub link,
+  through a friend who typed <span class="hi">questline</span> into a terminal
+  and did not explain what it was.
+  The site existed too. It worked.
+  It was a single page that scrolled.
+
+  That was enough, for a while.
+
+  Then the realm grew.
+  More orders. More systems. More lore.
+  The Chapter began. The Swarm descended.
+  The scroll became a document pretending to be a world.
+
+  <span class="hi">The world now has its own rooms.</span>
+
+  Every section of the Chronicle lives on its own page.
+  Chapter I is a chapter, not a paragraph buried four scrolls down.
+  The Six Orders are a hall, not a grid you pass on the way to something else.
+  The Manual has space to breathe.
+  The Changelog has room to remember.
+
+  Each page has its own scene.
+  The dungeon where the Swarm nests.
+  The guild hall where the Orders stand watch.
+  The balcony above the realm at dusk.
+  The archive. The armory. The gate.
+  Pixel art painted by a realm that takes its own fiction seriously.
+
+  They move when you scroll.
+  Slowly. Not enough to distract. Enough to remind you
+  that there is a world behind the text.
+
+  The logo no longer pretends to be characters in a font.
+  It is what it always was — a mark.
+  It breathes now, softly, in the colors of the Six Orders.
+
+  The Chronicle will keep expanding.
+  The site will keep up.
+
+<span class="comment">// Changes in this update</span>
+<span class="cmd">  ✓  Site rebuilt from a single scroll into 11 dedicated pages</span>
+<span class="cmd">  ✓  Parallax pixel art backgrounds — one scene per page</span>
+<span class="cmd">  ✓  Logo replaced with official mark — cycling class color glow</span>
+<span class="cmd">  ✓  The Six Orders displayed as a full roster, not a grid</span>
+<span class="cmd">  ✓  Support pill on every page — present, quiet, never in the way</span>
+<span class="cmd">  –  The backlog did not shrink during the redesign. The Chronicle noted it.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.9 -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.0.9</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Scrollkeeper Awakens</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-11</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — The Craft Beneath the Scroll</span>
+
+  For a long time, writing a note in the realm meant typing in a box.
+  The cursor moved. Text appeared. The scroll was saved.
+
+  No one asked what the cursor was touching.
+  No one asked whether you meant to delete that word or that line.
+  No one offered to hold your last twenty actions in memory
+  so you could change your mind.
+
+  The box accepted everything and remembered nothing.
+
+  <span class="hi">The Scrollkeeper has awakened.</span>
+
+  Notes now open in a proper workshop.
+  Normal mode. Insert mode. Visual mode.
+  The cursor knows the difference between moving and writing.
+  You can yank a line, paste it three paragraphs down,
+  delete a word without touching the ones beside it,
+  and undo the last hundred decisions if you need to.
+
+  Press ? inside any note to see the full arsenal.
+  It is longer than you might expect.
+
+  The codices have also revealed their true shape.
+
+  For a time, a codex that held other codices showed only an arrow.
+  A suggestion. A door. You had to go through it to see what was inside.
+  Then come back. Then go through another.
+  The structure existed. It simply refused to show itself.
+
+  <span class="hi">The tree is now visible.</span>
+
+  Every codex unfolds in place.
+  Every nested scroll sits beneath its parent, indented, present, accounted for.
+  The hierarchy does not hide behind navigation anymore.
+  It is simply there when you arrive.
+
+  And the Chronicle was lying about the focus sessions.
+
+  Not with malice. It simply did not know whose work it was counting.
+  When a session synced from one hero's device to another,
+  the second device counted it as its own.
+  Then a third device counted it again.
+  The contribution numbers climbed. The actual sessions had not.
+
+  <span class="hi">Each session now carries the name of its hero.</span>
+
+  The Chronicle knows who did the work.
+  It will not give the credit to someone who was not there.
+  It will not take it away from someone who was.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Vim-like editor: Normal, Insert, and Visual modes in every note</span>
+<span class="cmd">  ✓  Undo / redo history — up to 100 snapshots per editing session</span>
+<span class="cmd">  ✓  Yank, paste, delete word, delete line, go-to-line, and more</span>
+<span class="cmd">  ✓  Press ? inside any note for the full keybind reference</span>
+<span class="cmd">  ✓  Codices display as an always-expanded tree — full depth visible</span>
+<span class="cmd">  ✓  Codices can be moved with all contents to any parent or to root</span>
+<span class="cmd">  ✓  Notification popups wrap long messages instead of cutting them off</span>
+<span class="cmd">  ✓  Home / End keys work in task and step description fields</span>
+<span class="cmd">  ✓  Focus sessions stamped per-hero — contribution counts are now correct</span>
+<span class="cmd">  –  The Scrollkeeper still cannot write your notes for you. This is intentional.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.8 -->
+    <div style="margin-top:2rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1rem;font-weight:bold;color:var(--text-dim);">v1.0.8</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Focus Session Listens Now</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-06</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:1.9;color:#666;">
+<span class="comment"># Chronicle Entry — The Realm Begins to Hear</span>
+
+  For a long time the Focus tab showed bars that moved.
+  They were pleasant. They were animated. They were lying.
+
+  No sound was being measured. No frequency was being tracked.
+  The bars simply waved, like a soldier who knows nothing of the battle
+  but has been told to look confident.
+
+  <span class="hi">The bars now show the actual audio.</span>
+
+  Every beat. Every frequency spike. Every moment of silence where
+  the music used to pretend it was doing something.
+  It is not pretending anymore.
+
+  The spectrum reads from whatever your system is playing —
+  Spotify, VLC, mpv, a browser tab at 2am, anything.
+  No setup. No login. No SDK. The realm simply listens.
+
+  The search system has also been rebuilt from the foundation.
+  It used to find what you were looking for, then drop you
+  at the project door and expect you to remember which room it was in.
+
+  <span class="hi">It now takes you to the exact item.</span>
+
+  The note. The task. The milestone. The step.
+  The cursor lands on it. The realm does not make you search twice.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Music visualizer now shows real audio frequencies</span>
+<span class="cmd">  ✓  Works with any system audio player — Spotify, VLC, mpv, anything</span>
+<span class="cmd">  ✓  Local soundscapes (Lo-Fi, Rain, Forest…) also show real spectrum</span>
+<span class="cmd">  ✓  Bars respond instantly; fall off gradually (VU meter behavior)</span>
+<span class="cmd">  ✓  Search navigates to the exact note, task, step, or milestone</span>
+<span class="cmd">  ✓  Results ranked by relevance — title match beats content match</span>
+<span class="cmd">  ✓  Search now covers steps and milestones</span>
+<span class="cmd">  ✓  Press / from anywhere to open search instantly</span>
+<span class="cmd">  ✓  Footer nav shows the active screen name with class color highlight</span>
+<span class="cmd">  ✓  Ambient effects now accessible from the Command Palette (Ctrl+P)</span>
+<span class="cmd">  –  The bars still cannot play the music. This is a feature, not a limitation.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.7 -->
+    <div style="margin-top:2rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1rem;font-weight:bold;color:var(--text-dim);">v1.0.7</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Realm Has a Proper Address</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-01</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:1.9;color:#666;">
+<span class="comment"># Chronicle Entry — The Naming of the Realm</span>
+
+  For a time, the realm existed at an address borrowed from the land
+  of its creator. A temporary dwelling. A camp, not a keep.
+
+  The adventurers came anyway. They completed quests.
+  They watered their trees. They wrote scrolls into the night.
+  They did not complain about the address. The backlog was already
+  doing that for them.
+
+  <span class="hi">The realm now has a name of its own: questlinecli.com</span>
+
+  The server is the same. The database is intact. The Chronicle
+  has lost nothing. The Evergrowths did not notice. The Evergrowths
+  rarely notice anything that does not involve consistency.
+
+  Existing adventurers: update your sync URL to
+  <span class="hi">https://questlinecli.com/api</span> via the Sync screen.
+  New adventurers: it is already set. You arrived at the right time.
+  You are welcome.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Domain migrated from questline.gibranlp.dev → questlinecli.com</span>
+<span class="cmd">  ✓  Default sync server URL updated in all new installations</span>
+<span class="cmd">  ✓  The Chronicle is intact. Not a single entry was lost in transit.</span>
+<span class="cmd">  –  The backlog. Still there. Doing pushups. Waiting.</span></pre>
+      </div>
+    </div>
+
+    <!-- v1.0.6 -->
+    <div style="margin-top:2rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1rem;font-weight:bold;color:var(--text-dim);">v1.0.6</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Sync Engine Overhaul</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:1.9;color:#666;">
+<span class="cmd">  ✓  WAL mode enabled — no more database locking under concurrent access</span>
+<span class="cmd">  ✓  Delete tombstones — deletions now propagate correctly across devices</span>
+<span class="cmd">  ✓  Task updated_at — edits sync properly; no more phantom conflicts</span>
+<span class="cmd">  ✓  Focus session sync — sessions counted on the right device</span>
+<span class="cmd">  ✓  Journal entry updates — edits no longer silently discarded</span>
+<span class="cmd">  ✓  Device ID filter — devices no longer receive their own changes back</span>
+<span class="cmd">  ✓  Sequence cursor — incremental sync now resumes from the correct position</span>
+<span class="cmd">  ✓  Daily cleanup — stale sync state no longer accumulates over time</span></pre>
+      </div>
+    </div>
+
+    <p style="margin-top:2rem;font-size:0.85rem;color:var(--text-dim);letter-spacing:0.05em;">
+      Full release history →
+      <a href="https://github.com/gibranlp/Questline-cli/releases" target="_blank" rel="noopener" style="color:var(--text);text-decoration:none;border-bottom:1px solid var(--bg-border);">github.com/gibranlp/Questline-cli/releases</a>
+    </p>
+  </div>
+</section>
+
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  const changelogBg = document.getElementById('changelog-bg');
+  let changelogRaf = null;
+  window.addEventListener('scroll', () => {
+    if (changelogRaf) cancelAnimationFrame(changelogRaf);
+    changelogRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.12;
+      changelogBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>
