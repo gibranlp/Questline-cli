@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>What Is Questline — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #what-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/what.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #what .section-header,
+    #what h2 {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div id="what-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ WHAT IS -->
+<section id="what" class="page-top">
+  <div class="container">
+    <p class="section-header">// The Chronicle — Entry 001</p>
+    <h2><span class="accent">What</span> Is Questline</h2>
+    <hr class="divider">
+
+    <p class="intro-text">
+      Questline is a <strong>terminal-first productivity application</strong> built in Rust that turns your
+      task list into an RPG. You pick a class, you level up, you grow a tree that silently judges your
+      consistency, and you do your actual work — which was the main point all along.
+      <br><br>
+      It runs entirely in your terminal. Your data lives locally in SQLite. There is optional cloud sync
+      if you want your productivity guilt to follow you across devices. The interface looks like it was
+      built by someone who loved both spreadsheets and dungeons, because it was.
+    </p>
+
+    <!-- INTERACTIVE TERMINAL SIMULATOR -->
+    <div class="interactive-terminal-container" style="margin-top:2.5rem; margin-bottom:2.5rem;">
+      <p style="font-size:0.78rem;letter-spacing:0.3em;text-transform:uppercase;color:var(--text-dim);margin-bottom:0.6rem;">// Interactive Terminal Demo (Type commands here)</p>
+      <div class="term" id="demo-term" style="min-height:320px; max-height:450px; overflow-y:auto; cursor:text; font-family:'JetBrains Mono', monospace; font-size:0.9rem; text-align:left;">
+        <div id="term-output">
+          <span class="comment"># Questline Interactive Terminal v1.0.9</span>
+          <span class="comment"># Type 'help' to view commands.</span>
+          <br>
+        </div>
+        <div class="term-input-line" style="display:flex; align-items:center; margin-top:0.5rem;">
+          <span class="cmd" style="color:var(--accent); font-weight:bold; margin-right:0.5rem;">$</span>
+          <input type="text" id="term-input" style="background:none; border:none; color:var(--text); outline:none; font-family:inherit; font-size:inherit; flex:1; width:100%;" autocomplete="off" spellcheck="false" placeholder="type 'help' and press Enter...">
+        </div>
+      </div>
+    </div>
+
+    <div class="two-col">
+      <div class="card">
+        <h3>Built on Honesty</h3>
+        <p>Questline cannot complete your tasks. It can, however, make ignoring them significantly
+        more embarrassing. Every skipped day is a gap in the Chronicle. The Evergrowth notices.
+        The Evergrowth does not forgive.</p>
+      </div>
+      <div class="card">
+        <h3>Local-First Architecture</h3>
+        <p>Your data stays on your machine. No subscription required to access your own to-do list.
+        Optional sync is available for multi-device adventurers and those who enjoy watching databases
+        replicate across timezones.</p>
+      </div>
+      <div class="card">
+        <h3>RPG Progression That Matters</h3>
+        <p>XP is earned by completing tasks, writing journal entries, maintaining streaks, and finishing
+        focus sessions — not by clicking buttons or watching progress bars. There is no shortcut.
+        The system has been tested.</p>
+      </div>
+      <div class="card">
+        <h3>Collaborative Realms</h3>
+        <p>Share projects with other users via Fellowship. Members contribute to shared tasks, write to
+        a Project Chronicle, and silently compete for who can maintain a longer streak.
+        Collaboration, technically.</p>
+      </div>
+    </div>
+
+    <div class="term" style="margin-top:2rem;">
+      <pre>
+<span class="comment"># The elevator pitch, terminal edition</span>
+
+<span class="cmd">$ questline --describe-self</span>
+
+  "The world's most elaborate reminder to finish your tasks."
+
+  Status .......... Running
+  Motivation ...... Overrated
+  Discipline ....... The actual plan
+  Backlog ......... Doing pushups while you read this
+  Your Zen Tree ... Waiting</pre>
+    </div>
+  </div>
+</section>
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  const whatBg = document.getElementById('what-bg');
+  let whatRaf = null;
+  window.addEventListener('scroll', () => {
+    if (whatRaf) cancelAnimationFrame(whatRaf);
+    whatRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.12;
+      whatBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+
+  // ── Interactive Terminal Simulator ──────────────────────────────────
+  const termInput = document.getElementById('term-input');
+  const termOutput = document.getElementById('term-output');
+  const demoTerm = document.getElementById('demo-term');
+
+  if (demoTerm) {
+    demoTerm.addEventListener('click', () => termInput.focus());
+  }
+
+  const commands = {
+    help: () => `Available commands:
+  <span style="color:var(--accent);">quests</span>   - View active tasks and objectives
+  <span style="color:var(--accent);">status</span>   - View simulated hero attributes &amp; progress
+  <span style="color:var(--accent);">tree</span>     - Query The Evergrowth growth status
+  <span style="color:var(--accent);">about</span>    - Display info about Questline
+  <span style="color:var(--accent);">clear</span>    - Clear the terminal screen`,
+
+    quests: () => `<span style="color:var(--accent); font-weight:bold;">Active Quests:</span>
+  [ ] Complete 3 Tasks (0/3)
+  [ ] Water Your Zen Tree (0/1)
+  [ ] Write 1 Scroll/Note (0/1)
+
+  Type <span style="color:var(--accent);">status</span> to inspect details.`,
+
+    status: () => `<span style="color:var(--accent); font-weight:bold;">Adventurer Stats:</span>
+  Name ........ Traveler
+  Level ....... 1
+  XP .......... 0 / 220
+  Class ....... Onlooker (Pick one on the <a href="orders.html" style="color:var(--text); text-decoration:underline;">Orders</a> page!)`,
+
+    tree: () => `      <span style="color:var(--sage);">.   ,
+     (\\./)
+     .---.
+    /     \\
+   |   O   |
+    \\     /
+     '---'</span>
+  Zen Tree Status: Sapling
+  Growth ........ 0
+  Water Today ... 0/2`,
+
+    about: () => `Questline is a local-first, terminal-first productivity game.
+Your tasks are quests, and you level up by completing them.
+Check the <a href="download.html" style="color:var(--text); text-decoration:underline;">Download</a> page to install the real app!`
+  };
+
+  if (termInput) {
+    termInput.addEventListener('keydown', e => {
+      if (e.key === 'Enter') {
+        const inputVal = termInput.value.trim().toLowerCase();
+        termInput.value = '';
+
+        if (!inputVal) return;
+
+        const cmdLine = document.createElement('div');
+        cmdLine.innerHTML = `<span style="color:var(--accent); font-weight:bold; margin-right:0.5rem;">$</span> <span style="color:var(--text);">${inputVal}</span>`;
+        termOutput.appendChild(cmdLine);
+
+        const outputLine = document.createElement('div');
+        outputLine.style.marginTop = '0.25rem';
+        outputLine.style.marginBottom = '0.5rem';
+
+        if (inputVal === 'clear') {
+          termOutput.innerHTML = '';
+        } else if (commands[inputVal]) {
+          outputLine.innerHTML = commands[inputVal]().replace(/\\n/g, '<br>');
+          termOutput.appendChild(outputLine);
+        } else {
+          outputLine.innerHTML = `Command not found: '${inputVal}'. Type <span style="color:var(--accent);">help</span> for a list of commands.`;
+          termOutput.appendChild(outputLine);
+        }
+
+        if (demoTerm) {
+          demoTerm.scrollTop = demoTerm.scrollHeight;
+        }
+      }
+    });
+  }
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>
