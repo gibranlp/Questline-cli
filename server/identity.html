@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Identity — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #identity-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/identity.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #identity .section-header,
+    #identity h2 {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div id="identity-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ IDENTITY -->
+<section id="identity" class="page-top">
+  <div class="container">
+    <p class="section-header">// Cryptographic Identity System</p>
+    <h2>Your <span class="accent">Identity Key</span></h2>
+    <hr class="divider">
+
+    <p class="intro-text">
+      Questline does not use passwords. It does not use accounts. It does not send you a welcome email
+      with a temporary link that expires in 24 hours. Instead, it generates a unique
+      <strong>Ed25519 cryptographic keypair</strong> on first launch and uses it to sign every request
+      to the sync server. Your private key never leaves your machine. Your public key is your identity
+      in the realm.
+      <br><br>
+      This is not an SSH key — although Ed25519 is the same algorithm SSH uses, because the field
+      has had decades to agree on the right answer. It is Questline's own identity system, stored
+      independently of your SSH configuration, and it requires nothing from you except launching the app.
+      The key is generated automatically. There is no command to run. There is no setup wizard.
+      There is no confirmation email. It simply happens.
+    </p>
+
+    <div class="term" style="margin-top:2rem;">
+      <pre>
+<span class="comment"># What Questline generates on first launch</span>
+
+  Algorithm .... Ed25519
+  Private key .. Linux   : <span class="hi">~/.config/questline/identity.key</span>
+               macOS   : <span class="hi">~/Library/Application Support/questline/identity.key</span>
+               Windows : <span class="hi">%APPDATA%\questline\identity.key</span>
+  Public key ... displayed in the Sync screen  ← this is your identity in the realm
+
+  Key format ... hex-encoded, 64 characters (32 bytes)
+  Generated .... automatically on first launch
+  Required action from you: <span class="hi">none</span></pre>
+    </div>
+
+    <!-- SCENARIOS -->
+    <div class="two-col" style="margin-top:2rem;">
+
+      <div class="card">
+        <h3>I Have Never Launched Questline</h3>
+        <p>
+          Launch the app. That is it. Questline detects the absence of an identity file and
+          generates a fresh Ed25519 keypair automatically. By the time you finish the
+          onboarding screen, your identity exists, your public key is ready, and you have
+          technically performed cryptography without trying.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>I Have Already Launched Questline</h3>
+        <p>
+          Your identity was created on first launch and saved to:
+          <br><br>
+          <code>Linux &nbsp;&nbsp;: ~/.config/questline/identity.key</code><br>
+          <code>macOS &nbsp;&nbsp;: ~/Library/Application Support/questline/identity.key</code><br>
+          <code>Windows: %APPDATA%\questline\identity.key</code>
+          <br><br>
+          Open the Sync screen inside the app (<kbd>S</kbd> from the main menu or via the
+          sidebar) to view and copy your public key — it is the 64-character hex string
+          listed under <em>Identity</em>.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Sharing Your Public Key</h3>
+        <p>
+          Your public key is what other users need to invite you to a shared project.
+          In the Sync screen, your public key is displayed and can be copied to clipboard.
+          Share the 64-character hex string with your companion.
+          It is safe to share. That is the entire point of a public key.
+          The private half stays local and is never transmitted anywhere.
+        </p>
+      </div>
+
+      <div class="card">
+        <h3>Inviting Someone to Fellowship</h3>
+        <p>
+          Ask your companion for their public key — they find it in their Sync screen.
+          Open the Fellowship screen in Questline, press <kbd>I</kbd> to invite,
+          paste their 64-character public key, select the project and role, and confirm.
+          They accept on their device. The project syncs between both identities
+          via the server from that point forward.
+        </p>
+      </div>
+
+      <div class="card" style="grid-column:span 2;">
+        <h3>Working Across Devices</h3>
+        <p>
+          Questline is designed to follow you. The same character, the same Chronicle, the same projects —
+          on Linux, macOS, and Windows, at the same time if needed. The sync engine pushes your tasks,
+          notes, projects, journal entries, and character profile to the server automatically every few
+          minutes. Your identity is tied to a cryptographic keypair — whoever holds that key is you to the server.
+          <br><br>
+          Moving to a new machine is now built into the app. On your old device press <kbd>E</kbd> on the
+          Sync screen to export a Transfer Code. On the new device press <kbd>I</kbd> and paste it.
+          The app backs up your database automatically at both ends, restores your identity, and pulls
+          your full Chronicle from the server. No file managers, no terminal, no paths to remember.
+          <br><br>
+          Sync keeps things current day-to-day. The cloud backup (<kbd>B</kbd> on the Sync screen) is a full
+          snapshot you push deliberately — useful before wiping a machine or as an extra safety net.
+          Do both. They serve different purposes and cost almost nothing.
+        </p>
+      </div>
+
+    </div>
+
+    <!-- SETUP STEPS -->
+    <p class="section-header" style="margin-top:3rem;">// First-Time Sync Setup</p>
+    <p style="font-size:0.85rem;color:var(--text-dim);margin:0.5rem 0 1.5rem;">
+      If you want cloud sync and backup across devices, follow these steps after installing.
+    </p>
+
+    <div class="manual-grid">
+      <div class="manual-section">
+        <h3>Enabling Cloud Sync</h3>
+        <ul class="steps">
+          <li class="step"><span class="step-num">1</span><span>Launch Questline. Complete the onboarding (choose your class, set your name). Your identity keypair is generated silently in the background.</span></li>
+          <li class="step"><span class="step-num">2</span><span>Open the Sync screen. Your User ID and public key are displayed. No further action is needed to generate them — they already exist.</span></li>
+          <li class="step"><span class="step-num">3</span><span>Enter the sync server URL and enable sync. Questline registers your public key with the server automatically on the next sync operation.</span></li>
+          <li class="step"><span class="step-num">4</span><span>Press <kbd>B</kbd> in the Sync screen to push your first backup to the cloud. From now on, sync runs when you press <kbd>S</kbd> on the Dashboard.</span></li>
+        </ul>
+      </div>
+
+      <div class="manual-section">
+        <h3>Moving to a New Machine</h3>
+        <ul class="steps">
+          <li class="step"><span class="step-num">1</span><span><strong>Old machine:</strong> Open the Sync screen. Press <kbd>S</kbd> to push the latest sync data, then <kbd>B</kbd> to push a full cloud backup. This ensures nothing is missing on the server.</span></li>
+          <li class="step"><span class="step-num">2</span><span><strong>Old machine:</strong> Press <kbd>E</kbd> on the Sync screen — <em>Export Profile</em>. Questline creates a timestamped local database backup and displays a Transfer Code. Press <kbd>C</kbd> inside the modal to copy it to your clipboard.</span></li>
+          <li class="step"><span class="step-num">3</span><span><strong>New machine:</strong> Install Questline and complete onboarding. Then open the Sync screen, set the server URL, and press <kbd>I</kbd> — <em>Restore Identity</em>. Paste the Transfer Code and press <kbd>Enter</kbd>. Your current database is backed up first, then your identity is replaced and a full sync starts automatically.</span></li>
+          <li class="step"><span class="step-num">4</span><span>Questline pulls your Chronicle, character, tasks, notes, and shared projects from the server. Your identity on both machines is now identical — the server sees them as the same user.</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="term" style="margin-top:2rem;">
+      <pre>
+<span class="comment"># Transferring your identity to a new machine — built into the Sync screen</span>
+
+<span class="comment"># ── Old machine ────────────────────────────────────────────────────────────</span>
+<span class="cmd">  [S]  Sync screen → push latest data to server</span>
+<span class="cmd">  [B]  Push a full cloud backup</span>
+<span class="cmd">  [E]  Export Profile → Questline backs up your local DB and shows a Transfer Code</span>
+<span class="cmd">  [C]  Copy Transfer Code to clipboard (inside the Export modal)</span>
+
+<span class="comment"># ── New machine ────────────────────────────────────────────────────────────</span>
+<span class="cmd">  Install Questline and complete onboarding</span>
+<span class="cmd">  Open Sync screen → set server URL → [S] to register</span>
+<span class="cmd">  [I]  Restore Identity → paste Transfer Code → [Enter]</span>
+
+<span class="comment"># Questline backs up the current DB, writes the new identity.key,</span>
+<span class="comment"># triggers a full sync, and reloads your Chronicle automatically.</span>
+<span class="comment"># Works across any OS combination — Linux, macOS, Windows.</span></pre>
+    </div>
+
+    <!-- LOST KEY -->
+    <p class="section-header" style="margin-top:3rem;">// If Your Identity File Is Lost or Deleted</p>
+    <div class="term">
+      <pre>
+<span class="comment"># If identity.key was deleted or the config directory was wiped:</span>
+
+  Questline will generate a NEW keypair on the next launch.
+  Your local database (tasks, notes, journal) remains intact.
+
+  However:
+    ✗  Your new public key will NOT match your previous identity
+    ✗  Fellowship invitations tied to the old key must be re-sent
+    ✗  Cloud sync registration is lost — you must re-register
+    ✗  Companions must invite the new identity to shared projects
+
+<span class="comment"># Prevention: back up the file. It is 300 bytes.</span>
+<span class="comment"># There is no excuse. The Chronicle is unforgiving on this matter.</span></pre>
+    </div>
+
+    <div class="warning-card">
+      <h3>Back Up Your Identity</h3>
+      <p>
+        Your cryptographic identity is the only thing that cannot be regenerated from your data.
+        Your tasks, notes, journal entries, and Chronicle can all be restored from a cloud backup.
+        Your signing key cannot be recovered if lost — the sync server has never heard of you by any other name.
+        <br><br>
+        The easiest way to back it up is <kbd>E</kbd> on the Sync screen. Questline generates a
+        Transfer Code you can store in a password manager or note. That code is all you need to
+        restore your identity on any machine at any time. Keep it somewhere deliberate — before
+        you need it, not after. The backlog will still be there when you return. Your identity may not be.
+      </p>
+    </div>
+
+  </div>
+</section>
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  const identityBg = document.getElementById('identity-bg');
+  let identityRaf = null;
+  window.addEventListener('scroll', () => {
+    if (identityRaf) cancelAnimationFrame(identityRaf);
+    identityRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.12;
+      identityBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>

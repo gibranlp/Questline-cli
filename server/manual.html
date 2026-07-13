@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Manual — QUESTLINE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="styles.css">
+  <style>
+    #manual-bg {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      background-image:
+        linear-gradient(rgba(4,4,4,0.44), rgba(4,4,4,0.44)),
+        url('assets/images/manual.webp');
+      background-size: 100% 100%, cover;
+      background-position: 0 0, center 50%;
+      background-repeat: no-repeat;
+    }
+
+    #manual .section-header,
+    #manual h2 {
+      text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
+    }
+  </style>
+</head>
+<body>
+
+<div id="manual-bg"></div>
+
+<nav>
+  <a href="index.html" class="nav-brand">QUESTLINE</a>
+  <ul>
+    <li><a href="chapter.html">Chapter I</a></li>
+    <li><a href="what.html">What</a></li>
+    <li><a href="who.html">Who</a></li>
+    <li><a href="orders.html">Orders</a></li>
+    <li><a href="features.html">Features</a></li>
+    <li><a href="screenshots.html">Screenshots</a></li>
+    <li><a href="manual.html">Manual</a></li>
+    <li><a href="identity.html">Identity</a></li>
+    <li><a href="download.html">Download</a></li>
+    <li><a href="changelog.html">Changelog</a></li>
+    <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
+    <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
+  </ul>
+</nav>
+
+<!-- ══════════════════════════════════════════════════════ MANUAL -->
+<section id="manual" class="page-top">
+  <div class="container">
+    <p class="section-header">// Adventurer's Field Guide</p>
+    <h2>Tips &amp; <span class="accent">Manual</span></h2>
+    <hr class="divider">
+
+    <div class="term">
+      <pre>
+<span class="comment"># Questline is a TUI — it runs entirely in your terminal.</span>
+<span class="comment"># You navigate with the keyboard. There is no mouse support.</span>
+<span class="comment"># This is a feature, not an oversight. The mouse breeds dependency.</span>
+
+<span class="cmd">$ questline</span>     <span class="comment"># launch the application</span></pre>
+    </div>
+
+    <div class="manual-grid">
+      <div class="manual-section">
+        <h3>Global Navigation</h3>
+        <ul class="keybind-list">
+          <li class="keybind-row"><kbd>1</kbd><span class="keybind-label">Dashboard — overview, stats, daily quests</span></li>
+          <li class="keybind-row"><kbd>2</kbd><span class="keybind-label">Projects — your quest board</span></li>
+          <li class="keybind-row"><kbd>3</kbd><span class="keybind-label">Hero — level, XP, class, achievements</span></li>
+          <li class="keybind-row"><kbd>4</kbd><span class="keybind-label">Library — lore, memory fragments, bestiary</span></li>
+          <li class="keybind-row"><kbd>5</kbd><span class="keybind-label">Music — ambient soundscapes</span></li>
+          <li class="keybind-row"><kbd>6</kbd><span class="keybind-label">Sync — identity, devices, cloud settings</span></li>
+          <li class="keybind-row"><kbd>7</kbd><span class="keybind-label">Fellowship — companions, shared projects</span></li>
+          <li class="keybind-row"><kbd>8</kbd><span class="keybind-label">Chronicle — realm activity, chapter objectives</span></li>
+          <li class="keybind-row"><kbd>?</kbd><span class="keybind-label">About — version history, credits, feedback</span></li>
+          <li class="keybind-row"><kbd>/</kbd><span class="keybind-label">Search — find any task, note, milestone, or entry</span></li>
+          <li class="keybind-row"><kbd>Ctrl+P</kbd><span class="keybind-label">Command palette — all actions in one place</span></li>
+          <li class="keybind-row"><kbd>Q</kbd><span class="keybind-label">Quit — the Chronicle saves automatically</span></li>
+        </ul>
+      </div>
+
+      <div class="manual-section">
+        <h3>Project Workspace</h3>
+        <ul class="keybind-list">
+          <li class="keybind-row"><kbd>Enter</kbd><span class="keybind-label">Open selected project</span></li>
+          <li class="keybind-row"><kbd>← →</kbd><span class="keybind-label">Toggle sidebar / content focus</span></li>
+          <li class="keybind-row"><kbd>↑ ↓</kbd><span class="keybind-label">Navigate sidebar tabs when focused</span></li>
+          <li class="keybind-row"><kbd>1</kbd><span class="keybind-label">Tasks tab</span></li>
+          <li class="keybind-row"><kbd>2</kbd><span class="keybind-label">Notes tab</span></li>
+          <li class="keybind-row"><kbd>3</kbd><span class="keybind-label">Journal tab</span></li>
+          <li class="keybind-row"><kbd>4</kbd><span class="keybind-label">Overview &amp; Milestones tab</span></li>
+          <li class="keybind-row"><kbd>N</kbd><span class="keybind-label">New item (task / note / entry / milestone)</span></li>
+          <li class="keybind-row"><kbd>Space</kbd><span class="keybind-label">Toggle task completion</span></li>
+          <li class="keybind-row"><kbd>Esc</kbd><span class="keybind-label">Back to project list</span></li>
+        </ul>
+      </div>
+
+      <div class="manual-section">
+        <h3>Focus Sessions</h3>
+        <ul class="keybind-list">
+          <li class="keybind-row"><kbd>Enter</kbd><span class="keybind-label">Start / pause session</span></li>
+          <li class="keybind-row"><kbd>S</kbd><span class="keybind-label">Stop session early</span></li>
+          <li class="keybind-row"><kbd>↑ ↓</kbd><span class="keybind-label">Select duration (15/25/45/60/90/Custom)</span></li>
+          <li class="keybind-row"><kbd>M</kbd><span class="keybind-label">Switch soundscape mid-session</span></li>
+          <li class="keybind-row" style="margin-top:0.5rem;">
+            <span class="keybind-label" style="font-size:0.75rem;opacity:.5;">Sessions grant XP, water The Evergrowth, and track towards Daily Adventures. Abandoning mid-session grants partial XP.</span>
+          </li>
+        </ul>
+      </div>
+
+      <div class="manual-section">
+        <h3>Tips from the Field</h3>
+        <ul class="tips-list">
+          <li class="tip-item">Complete Daily Adventures every day — they are small on purpose and their cumulative effect is not.</li>
+          <li class="tip-item">The streak counter tracks calendar days. Midnight is the cutoff. The Deadline Wraith is punctual even when you are not.</li>
+          <li class="tip-item">Journal entries in shared projects display your username. Write accordingly. The Chronicle is public to your fellowship.</li>
+          <li class="tip-item">Rituals are reusable tasks. Use them for recurring work — they grant XP every time and keep the system from becoming a monument to past productivity.</li>
+          <li class="tip-item">Milestone templates require minimum project age and activity. Creating and immediately completing them does not work. The system was tested.</li>
+          <li class="tip-item">Back up your data from the Sync screen. The Chronicle records everything — losing it is permanent and unironic.</li>
+          <li class="tip-item">The Lore Library unlocks content as you progress. Locked entries say "RECORD LOCKED." They mean it.</li>
+        </ul>
+      </div>
+    </div>
+
+    <p class="section-header" style="margin-top:3rem;">// Project Milestone Tiers</p>
+    <div class="two-col" style="margin-top:1.25rem;">
+      <div class="card">
+        <h3 style="color:rgb(6,182,212);">Tier I — Initiate (250 XP)</h3>
+        <p>Entry-level milestones: a few completed tasks, one or two journal entries, minimum project age, and a couple of focus sessions. For those who showed up and did the work. The bar exists. You found it.</p>
+      </div>
+      <div class="card">
+        <h3 style="color:rgb(168,85,247);">Tier II — Veteran (500 XP)</h3>
+        <p>Mid-tier milestones requiring sustained effort: double-digit task counts, active days across multiple sessions, maintained streaks. For those who returned the next day, and treated it as a habit rather than an event.</p>
+      </div>
+      <div class="card" style="grid-column:span 2;">
+        <h3 style="color:rgb(245,158,11);">Tier III — Legendary (1000 XP)</h3>
+        <p>Long-form achievement requiring hundreds of tasks, months of active work, significant journal commitment, and streaks that outlast most personal projects. For those who are either genuinely exceptional or have confused discipline for identity. Both groups qualify.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+  const _page = location.pathname.split('/').pop() || 'index.html';
+  document.querySelectorAll('nav a[href]').forEach(a => {
+    if (a.getAttribute('href') === _page) a.classList.add('active');
+  });
+
+  const manualBg = document.getElementById('manual-bg');
+  let manualRaf = null;
+  window.addEventListener('scroll', () => {
+    if (manualRaf) cancelAnimationFrame(manualRaf);
+    manualRaf = requestAnimationFrame(() => {
+      const shift = window.scrollY * 0.12;
+      manualBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+    });
+  }, { passive: true });
+</script>
+
+<div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
+</body>
+</html>
