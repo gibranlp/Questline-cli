@@ -2,6 +2,7 @@
 name = "questline"
 version = "1.0.9"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 ratatui = "0.26.1"

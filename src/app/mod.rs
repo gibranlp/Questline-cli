@@ -666,6 +666,14 @@ pub struct App {
     pub prologue_next_is_onboarding: bool, // where to go when prologue finishes
     pub prologue_delay_ticks: usize, // ticks to wait before typewriter starts (audio warm-up)
     pub prologue_skip_checked: bool, // "don't show again" checkbox state
+
+    // Gateway — pantalla de selección inicial para nuevos aventureros sin usuario registrado
+    pub gateway_selected_idx: usize,
+    // Restore — pantalla de restauración de identidad desde código de transferencia
+    pub restore_input: String,
+    pub restore_error: Option<String>,
+    // bandera para saber si el onboarding vino del Gateway — define qué pantalla sigue al terminar
+    pub onboarding_from_gateway: bool,
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
@@ -1724,6 +1732,11 @@ impl App {
             prologue_delay_ticks: 0,
             prologue_skip_checked: false,
 
+            gateway_selected_idx: 0,
+            restore_input: String::new(),
+            restore_error: None,
+            onboarding_from_gateway: false,
+
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
         };
@@ -2034,7 +2047,9 @@ impl App {
         let in_text_entry = self.searching
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding;
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore;
 
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
@@ -2131,7 +2146,9 @@ impl App {
         let in_text_entry = self.searching
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding;
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore;
 
         if !in_text_entry {
             match key.code {
@@ -2301,26 +2318,29 @@ impl App {
 
         match self.active_screen {
             ActiveScreen::Intro => {
-                let skip = self.db.get_setting("prologue_skip")
-                    .ok().flatten()
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                self.prologue_next_is_onboarding = self.user.is_none();
-                if skip {
-                    if self.prologue_next_is_onboarding {
-                        self.active_screen = ActiveScreen::Onboarding;
-                    } else {
+                if self.user.is_none() {
+                    // Primer arranque — manda al aventurero a elegir su destino en el Gateway
+                    self.gateway_selected_idx = 0;
+                    self.active_screen = ActiveScreen::Gateway;
+                } else {
+                    // Usuario existente — respeta la preferencia de skip del prólogo
+                    let skip = self.db.get_setting("prologue_skip")
+                        .ok().flatten()
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    if skip {
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
+                    } else {
+                        self.prologue_page = 0;
+                        self.prologue_line_idx = 0;
+                        self.prologue_char_in_line = 0;
+                        self.prologue_delay_ticks = 20;
+                        self.prologue_skip_checked = false;
+                        self.prologue_next_is_onboarding = false;
+                        self.audio_player.play_cinematic();
+                        self.active_screen = ActiveScreen::Prologue;
                     }
-                } else {
-                    self.prologue_page = 0;
-                    self.prologue_line_idx = 0;
-                    self.prologue_char_in_line = 0;
-                    self.prologue_delay_ticks = 20;
-                    self.prologue_skip_checked = false;
-                    self.audio_player.play_cinematic();
-                    self.active_screen = ActiveScreen::Prologue;
                 }
             }
             ActiveScreen::Prologue => {
@@ -2364,6 +2384,12 @@ impl App {
                     self.prologue_line_idx = 0;
                     self.prologue_char_in_line = 0;
                 }
+            }
+            ActiveScreen::Gateway => {
+                self.handle_gateway_key(key)?;
+            }
+            ActiveScreen::Restore => {
+                self.handle_restore_key(key)?;
             }
             ActiveScreen::Onboarding => {
                 self.handle_onboarding_key(key)?;
@@ -4092,6 +4118,149 @@ impl App {
         }
     }
 
+    /// Maneja las teclas de la pantalla de selección inicial — navega entre las dos opciones y confirma.
+    fn handle_gateway_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.gateway_selected_idx > 0 {
+                    self.gateway_selected_idx -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.gateway_selected_idx < 1 {
+                    self.gateway_selected_idx += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.gateway_selected_idx == 0 {
+                    // Nuevo aventurero → pantalla de selección de clase
+                    self.onboarding_from_gateway = true;
+                    self.onboarding_username = String::new();
+                    self.onboarding_class_idx = 0;
+                    self.onboarding_focus = OnboardingFocus::NameInput;
+                    self.onboarding_error = None;
+                    self.active_screen = ActiveScreen::Onboarding;
+                } else {
+                    // Exiliado con código → portal de restauración de identidad
+                    self.restore_input = String::new();
+                    self.restore_error = None;
+                    self.active_screen = ActiveScreen::Restore;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Maneja las teclas del portal de restauración — procesa el código de transferencia al presionar Enter.
+    fn handle_restore_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.restore_error = None;
+                self.active_screen = ActiveScreen::Gateway;
+            }
+            KeyCode::Char(c) => {
+                self.restore_input.push(c);
+                self.restore_error = None;
+            }
+            KeyCode::Backspace => {
+                self.restore_input.pop();
+                self.restore_error = None;
+            }
+            KeyCode::Enter => {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let trimmed = self.restore_input.trim().to_string();
+                match STANDARD.decode(&trimmed) {
+                    Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
+                        use ed25519_dalek::{SigningKey, VerifyingKey};
+
+                        let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
+                            let mut uuid_bytes = [0u8; 16];
+                            uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
+                            let user_uuid = Uuid::from_bytes(uuid_bytes);
+                            let mut secret_bytes = [0u8; 32];
+                            secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
+                            (user_uuid, secret_bytes)
+                        } else {
+                            let mut secret_bytes = [0u8; 32];
+                            secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
+                            (self.identity.user_uuid, secret_bytes)
+                        };
+
+                        let signing_key   = SigningKey::from_bytes(&secret_arr);
+                        let verifying_key: VerifyingKey = signing_key.verifying_key();
+                        let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
+                        let public_hex: String = verifying_key.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+
+                        let storage_dir = crate::storage::get_storage_dir()?;
+                        let db_path     = storage_dir.join("questline.db");
+                        let ts          = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+                        let backup_path = storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
+                        let _ = std::fs::copy(&db_path, &backup_path);
+
+                        let new_identity = crate::services::identity::Identity {
+                            user_uuid,
+                            public_key: public_hex,
+                            secret_key: secret_hex,
+                            created_at: self.identity.created_at.clone(),
+                        };
+                        let key_path = storage_dir.join("identity.key");
+                        if let Ok(json_str) = serde_json::to_string_pretty(&new_identity) {
+                            let _ = std::fs::write(&key_path, json_str);
+                        }
+                        self.identity = new_identity;
+
+                        if self.config.sync_enabled {
+                            let client = crate::services::api_client::ApiClient::new(
+                                &self.server_url,
+                                self.identity.clone(),
+                                &self.device_id,
+                            );
+                            if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
+                                if !json.trim().is_empty() {
+                                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                    let decoded = STANDARD.decode(json.trim())
+                                        .ok()
+                                        .and_then(|b| String::from_utf8(b).ok())
+                                        .unwrap_or(json);
+                                    if self.db.import_from_json(&decoded).is_ok() {
+                                        if let Ok(Some(u)) = self.db.get_user() {
+                                            self.identity.user_uuid = u.id;
+                                            if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                                let _ = std::fs::write(&key_path, json_str);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let _ = self.db.set_setting("last_pull_seq", "0");
+                        let _ = self.trigger_sync();
+                        self.reload_data()?;
+                        self.notifications.push(Notification::info(
+                            "¡Bienvenido de regreso! Tu crónica ha sido restaurada desde el exilio.".to_string(),
+                        ));
+                        self.active_screen = ActiveScreen::Dashboard;
+                        self.active_tab_idx = 0;
+                    }
+                    Ok(_) => {
+                        self.restore_error = Some(
+                            "Código inválido — longitud de llave incorrecta. ¿Acaso lo transcribiste a mano? Mal.".to_string(),
+                        );
+                    }
+                    Err(_) => {
+                        self.restore_error = Some(
+                            "Eso no es base64. El Grimorio de Codificación llora por ti.".to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_onboarding_key(&mut self, key: KeyEvent) -> Result<()> {
         match self.onboarding_focus {
             OnboardingFocus::NameInput => match key.code {
@@ -4203,8 +4372,21 @@ impl App {
         }
 
         self.reload_data()?;
-        self.active_screen = ActiveScreen::Dashboard;
-        self.active_tab_idx = 0;
+        // Si el héroe llegó por el Gateway, muestra el prólogo antes del tablero
+        if self.onboarding_from_gateway {
+            self.onboarding_from_gateway = false;
+            self.prologue_page = 0;
+            self.prologue_line_idx = 0;
+            self.prologue_char_in_line = 0;
+            self.prologue_delay_ticks = 20;
+            self.prologue_skip_checked = false;
+            self.prologue_next_is_onboarding = false;
+            self.audio_player.play_cinematic();
+            self.active_screen = ActiveScreen::Prologue;
+        } else {
+            self.active_screen = ActiveScreen::Dashboard;
+            self.active_tab_idx = 0;
+        }
 
         Ok(())
     }
