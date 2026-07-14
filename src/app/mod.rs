@@ -100,13 +100,17 @@ pub enum ModalType {
     SupportRealm,
     NewProject {
         name: String,
+        name_cursor: usize,
         desc: String,
+        desc_cursor: usize,
         focus_idx: usize,
     },
     EditProject {
         id: Uuid,
         name: String,
+        name_cursor: usize,
         desc: String,
+        desc_cursor: usize,
         focus_idx: usize,
     },
     NewTask {
@@ -185,6 +189,8 @@ pub enum ModalType {
     // Exporta la llave privada en base64 para transferirla a otro dispositivo — órale, con cuidado
     ExportProfile {
         transfer_code: String,
+        backup_in_progress: bool,
+        backup_message: String,
     },
     // Importa una identidad desde un transfer code — restaura al héroe en una máquina nueva
     RestoreIdentity {
@@ -225,6 +231,10 @@ pub enum ModalType {
     },
     AddReaction {
         message_id: Uuid,
+    },
+    MentionSelect {
+        selected_idx: usize,
+        usernames: Vec<String>,
     },
     // Selector de tema visual — cambia los colores de toda la UI al vuelo
     ThemeSelect {
@@ -392,7 +402,7 @@ fn pick_sprite_message() -> (String, &'static str) {
         return (msg, "Final Reminder (Probably)");
     }
     let pools: &[(&[&str], &str)] = &[
-        (SPRITE_MSG_USELESS,    "Notification Notification"),
+        (SPRITE_MSG_USELESS,    "Notification Swarm"),
         (SPRITE_MSG_SATIRE,     "Important Notification"),
         (SPRITE_MSG_CLASS_LORE, "Follow-up Notification"),
         (SPRITE_MSG_SPEAKING,   "Extremely Important Notification"),
@@ -506,6 +516,7 @@ pub struct App {
     pub tasks_due_today: Vec<Task>,
     pub projects: Vec<Project>,
     pub should_quit: bool,
+    pub quitting_after_sync: bool,
 
     pub selected_project_idx: usize,
     pub active_project_id: Option<Uuid>,
@@ -628,6 +639,8 @@ pub struct App {
     // El sync corre en un hilo aparte — este Arc/Mutex permite pasarle el resultado al hilo principal
     pub sync_in_progress: bool,
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
+    // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
+    pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
@@ -658,6 +671,14 @@ pub struct App {
     pub prologue_next_is_onboarding: bool, // where to go when prologue finishes
     pub prologue_delay_ticks: usize, // ticks to wait before typewriter starts (audio warm-up)
     pub prologue_skip_checked: bool, // "don't show again" checkbox state
+
+    // Gateway — pantalla de selección inicial para nuevos aventureros sin usuario registrado
+    pub gateway_selected_idx: usize,
+    // Restore — pantalla de restauración de identidad desde código de transferencia
+    pub restore_input: String,
+    pub restore_error: Option<String>,
+    // bandera para saber si el onboarding vino del Gateway — define qué pantalla sigue al terminar
+    pub onboarding_from_gateway: bool,
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
@@ -686,31 +707,19 @@ pub fn open_url(url: &str) {
         .spawn();
 }
 
-// Arma la lista plana para el panel de tareas del dashboard — padres ordenados por fecha, cada uno seguido de sus pasos
-fn dashboard_flat_items(all_tasks: &[Task]) -> Vec<(bool, Uuid, Task)> {
-    let mut parents: Vec<&Task> = all_tasks
+// Victorias rápidas del dashboard: tareas sin pasos pendientes, candidatas a completarse en minutos
+fn dashboard_quick_wins(all_tasks: &[Task]) -> Vec<Task> {
+    all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none())
-        .collect();
-    parents.sort_by(|a, b| match (a.due_date, b.due_date) {
-        (Some(d1), Some(d2)) => d1.cmp(&d2),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => b.created_at.cmp(&a.created_at),
-    });
-    let mut flat = Vec::new();
-    for parent in parents {
-        flat.push((false, parent.id, parent.clone()));
-        let mut steps: Vec<&Task> = all_tasks
-            .iter()
-            .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
-            .collect();
-        steps.sort_by_key(|s| s.created_at);
-        for step in steps {
-            flat.push((true, parent.id, step.clone()));
-        }
-    }
-    flat
+        .filter(|t| {
+            !t.completed
+                && t.parent_task_id.is_none()
+                && !all_tasks
+                    .iter()
+                    .any(|s| s.parent_task_id == Some(t.id) && !s.completed)
+        })
+        .cloned()
+        .collect()
 }
 
 impl App {
@@ -724,63 +733,63 @@ impl App {
         let questline_pool = vec![
             (
                 "The productivity app that finally admitted motivation was never coming.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Turning obvious life advice into a role-playing game since yesterday.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "The world's most elaborate reminder to finish your tasks.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Because apparently crossing things off a list releases chemicals.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "All the discipline. None of the enlightenment.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A sophisticated system for repeatedly doing things you already knew you should do.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Making productivity feel important enough to finally do it.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A highly advanced system for avoiding the consequences of avoiding things.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Proof that adding experience points makes humans do almost anything.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "If discipline were easy, this app wouldn't exist.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Finally, a place where checking a box counts as heroism.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Making responsible decisions look far more epic than they actually are.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Because 'just do it' lacked proper worldbuilding.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A game about productivity. Unfortunately, the productivity part is real.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Helping ambitious people procrastinate less creatively.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "You are now entering a high-fantasy interpretation of personal responsibility.",
@@ -931,126 +940,6 @@ impl App {
                 "Questline",
             ),
             (
-                "Every free trial eventually becomes a subscription.",
-                "Auditor Prime",
-            ),
-            (
-                "The budget was balanced. The consequences were not.",
-                "Ledgermaster Vex",
-            ),
-            (
-                "A coin saved is a coin someone forgot to expense.",
-                "The Keeper of Receipts",
-            ),
-            (
-                "Nothing terrifies mortals more than an unexpected audit.",
-                "Accountant Emeritus #4",
-            ),
-            (
-                "The difference between a plan and a disaster is usually a spreadsheet.",
-                "Master of Spreadsheets",
-            ),
-            (
-                "Reality compiled successfully. Nobody knows why.",
-                "Archmage Segfault",
-            ),
-            (
-                "I should really document this.",
-                "The Nameless Warlock",
-            ),
-            (
-                "The bug was removed. Three more attended the funeral.",
-                "Daemon Lord Null",
-            ),
-            (
-                "There is no temporary solution older than production code.",
-                "The Ancient Maintainer",
-            ),
-            (
-                "If it works, do not touch it. If it doesn't work, nobody knows why.",
-                "Warlock of Forty-Seven Tabs",
-            ),
-            (
-                "The answer was in your notes all along.",
-                "Archivist Thorn",
-            ),
-            (
-                "I took a note about this somewhere.",
-                "The Sage of Infinite Notes",
-            ),
-            (
-                "Knowledge is power. Searchability is greater power.",
-                "Keeper of the Living Archive",
-            ),
-            (
-                "I forgot where I wrote that, but I definitely wrote it.",
-                "The Forgotten Rememberer",
-            ),
-            (
-                "Every great idea begins as a note titled 'Untitled'.",
-                "Master Linkwright",
-            ),
-            (
-                "The hardest boss fight remains: getting started.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Motivation is a visitor. Discipline pays rent.",
-                "Brother Completion",
-            ),
-            (
-                "A completed task weighs nothing.",
-                "Dame Productivity",
-            ),
-            (
-                "The first checkbox is always the strongest.",
-                "Paladin of the First Task",
-            ),
-            (
-                "A task delayed gathers experience points.",
-                "The Last Finisher",
-            ),
-            (
-                "Perfect systems do not exist. Good systems survive users.",
-                "The Architect of Folders",
-            ),
-            (
-                "Every folder eventually becomes archaeology.",
-                "Framework Sage Varon",
-            ),
-            (
-                "Order is simply organized panic.",
-                "Lord Structure",
-            ),
-            (
-                "A good workflow survives contact with reality.",
-                "Builder of Systems",
-            ),
-            (
-                "Nothing is more permanent than a temporary process.",
-                "The Refactor King",
-            ),
-            (
-                "Tomorrow has an excellent reputation it does not deserve.",
-                "The Keeper of Tuesdays",
-            ),
-            (
-                "The meeting consumed two hours and produced three meetings.",
-                "Master of Lost Afternoons",
-            ),
-            (
-                "A calendar is merely a collection of future regrets.",
-                "Chronomancer Vale",
-            ),
-            (
-                "The deadline was visible from the beginning.",
-                "The Calendar Oracle",
-            ),
-            (
-                "Time management mostly consists of admitting what will not get done.",
-                "The Last Hourglass",
-            ),
-            (
                 "I can absolutely handle that tomorrow.",
                 "Past You",
             ),
@@ -1059,120 +948,8 @@ impl App {
                 "Future You",
             ),
             (
-                "Keep postponing things. You're doing great.",
-                "The Great Backlog",
-            ),
-            (
-                "Just one more feature.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "This could have been an email.",
-                "A Concerned Deadline Wraith",
-            ),
-            (
-                "You clicked me. That's on you.",
-                "Meeting Mimic #27",
-            ),
-            (
-                "Your task list is delicious.",
-                "The Great Backlog",
-            ),
-            (
-                "I was promised fewer meetings.",
-                "The Last Remaining QA Tester",
-            ),
-            (
                 "You said five minutes three hours ago.",
                 "The Coffee Machine",
-            ),
-            (
-                "The roots grow. The tasks remain.",
-                "The Evergrowth",
-            ),
-            (
-                "I support your goals, but your calendar concerns me.",
-                "A Notification Sprite",
-            ),
-            (
-                "The project expanded to fill the available enthusiasm.",
-                "An Overworked Project Manager",
-            ),
-            (
-                "This seemed easier in planning.",
-                "Grand Planner Elric",
-            ),
-            (
-                "The roadmap was clear until reality joined the meeting.",
-                "Lord Structure",
-            ),
-            (
-                "The backlog remembers every promise.",
-                "The Great Backlog",
-            ),
-            (
-                "You do not lack time. You lack willingness to start.",
-                "The Seventh Minute",
-            ),
-            (
-                "Heroism is mostly administration with better marketing.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Every legend begins with a task nobody wanted to do.",
-                "Brother Completion",
-            ),
-            (
-                "The road to greatness is surprisingly administrative.",
-                "Dame Productivity",
-            ),
-            (
-                "A legendary journey through the dangerous realm of basic responsibility.",
-                "The Last Finisher",
-            ),
-            (
-                "The dragon was never the problem. The paperwork was.",
-                "Paladin of the First Task",
-            ),
-            (
-                "Thousands of years of civilization culminated in another status meeting.",
-                "Master of Lost Afternoons",
-            ),
-            (
-                "The universe rewards consistency far more often than brilliance.",
-                "The Architect of Folders",
-            ),
-            (
-                "You are one completed task away from feeling slightly better.",
-                "The Evergrowth",
-            ),
-            (
-                "Progress is simply stubbornness with a better public image.",
-                "Archivist Thorn",
-            ),
-            (
-                "The first step is rarely difficult. The first click is.",
-                "Future You",
-            ),
-            (
-                "No chosen one. No destiny. Just consistent effort and decent note-taking.",
-                "The Chronicle",
-            ),
-            (
-                "The Chronicle records persistence. The Chronicle also records excuses.",
-                "The Chronicle",
-            ),
-            (
-                "Remember: the backlog is doing pushups while you read this.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "The fantasy RPG where the dragon is your inbox.",
-                "A Concerned Deadline Wraith",
-            ),
-            (
-                "Because 'just do it' lacked proper worldbuilding.",
-                "The Nameless Warlock",
             ),
             (
                 "Your ancestors crossed oceans. You answered three emails.",
@@ -1187,72 +964,8 @@ impl App {
                 "System Notification",
             ),
             (
-                "The productivity app that finally admitted motivation was never coming.",
-                "Brother Completion",
-            ),
-            (
-                "A sophisticated system for repeatedly doing things you already knew you should do.",
-                "The Architect of Folders",
-            ),
-            (
-                "The reward for completing your tasks: more tasks.",
-                "The Great Backlog",
-            ),
-            (
-                "Eventually the tasks finish themselves. This is not that strategy.",
-                "Auditor Prime",
-            ),
-            (
-                "Come for the quests. Stay because the backlog is gaining strength.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "Not guaranteed to increase productivity. Guaranteed to make it look cooler.",
-                "Warlock of Forty-Seven Tabs",
-            ),
-            (
-                "Every day is a side quest until the deadline arrives.",
-                "The Keeper of Tuesdays",
-            ),
-            (
-                "The only RPG where the final boss is your own calendar.",
-                "The Calendar Oracle",
-            ),
-            (
-                "The hero's journey, but with spreadsheets.",
-                "Master of Spreadsheets",
-            ),
-            (
-                "Saving the realm from chaos, one checkbox at a time.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Motivation is temporary. The Chronicle is forever.",
-                "The Chronicle",
-            ),
-            (
-                "The path to greatness is surprisingly administrative.",
-                "Grand Planner Elric",
-            ),
-            (
-                "You could be working right now.",
-                "The Coffee Machine",
-            ),
-            (
                 "We both know why you opened the app.",
                 "Future You",
-            ),
-            (
-                "The task has not become easier since yesterday.",
-                "The Great Backlog",
-            ),
-            (
-                "You seek wisdom. The task seeks completion.",
-                "The Evergrowth",
-            ),
-            (
-                "Another day, another opportunity to stop making excuses.",
-                "Brother Completion",
             ),
         ];
 
@@ -1606,6 +1319,7 @@ impl App {
             tasks_due_today: Vec::new(),
             projects: Vec::new(),
             should_quit: false,
+            quitting_after_sync: false,
 
             selected_project_idx: 0,
             active_project_id: None,
@@ -1700,6 +1414,7 @@ impl App {
             all_journals: Vec::new(),
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
             last_chat_poll: std::time::Instant::now()
@@ -1728,6 +1443,11 @@ impl App {
             prologue_delay_ticks: 0,
             prologue_skip_checked: false,
 
+            gateway_selected_idx: 0,
+            restore_input: String::new(),
+            restore_error: None,
+            onboarding_from_gateway: false,
+
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
         };
@@ -1735,6 +1455,7 @@ impl App {
         app.reload_data()?;
         if app.user.is_some() {
             app.check_new_day()?;
+            let _ = app.check_action_achievements();
         }
 
         // Checa la versión en un hilo aparte para no bloquear el arranque — el resultado llega después
@@ -1959,8 +1680,8 @@ impl App {
     }
 
     pub fn reload_data(&mut self) -> Result<()> {
+        self.user = self.db.get_user()?;
         if self.user.is_some() {
-            self.user = self.db.get_user()?;
             if let Some(ref u) = self.user {
                 self.theme_service.set_class(u.class);
             }
@@ -2012,7 +1733,9 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            self.notifications.push(Notification::info(
+                "Use [q] to quit — seals the Chronicle and syncs before exit.",
+            ));
             return Ok(());
         }
 
@@ -2037,7 +1760,9 @@ impl App {
         let in_text_entry = self.searching
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding;
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore;
 
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
@@ -2134,7 +1859,9 @@ impl App {
         let in_text_entry = self.searching
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding;
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore;
 
         if !in_text_entry {
             match key.code {
@@ -2304,26 +2031,29 @@ impl App {
 
         match self.active_screen {
             ActiveScreen::Intro => {
-                let skip = self.db.get_setting("prologue_skip")
-                    .ok().flatten()
-                    .map(|v| v == "1")
-                    .unwrap_or(false);
-                self.prologue_next_is_onboarding = self.user.is_none();
-                if skip {
-                    if self.prologue_next_is_onboarding {
-                        self.active_screen = ActiveScreen::Onboarding;
-                    } else {
+                if self.user.is_none() {
+                    // Primer arranque — manda al aventurero a elegir su destino en el Gateway
+                    self.gateway_selected_idx = 0;
+                    self.active_screen = ActiveScreen::Gateway;
+                } else {
+                    // Usuario existente — respeta la preferencia de skip del prólogo
+                    let skip = self.db.get_setting("prologue_skip")
+                        .ok().flatten()
+                        .map(|v| v == "1")
+                        .unwrap_or(false);
+                    if skip {
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
+                    } else {
+                        self.prologue_page = 0;
+                        self.prologue_line_idx = 0;
+                        self.prologue_char_in_line = 0;
+                        self.prologue_delay_ticks = 20;
+                        self.prologue_skip_checked = false;
+                        self.prologue_next_is_onboarding = false;
+                        self.audio_player.play_cinematic();
+                        self.active_screen = ActiveScreen::Prologue;
                     }
-                } else {
-                    self.prologue_page = 0;
-                    self.prologue_line_idx = 0;
-                    self.prologue_char_in_line = 0;
-                    self.prologue_delay_ticks = 20;
-                    self.prologue_skip_checked = false;
-                    self.audio_player.play_cinematic();
-                    self.active_screen = ActiveScreen::Prologue;
                 }
             }
             ActiveScreen::Prologue => {
@@ -2367,6 +2097,12 @@ impl App {
                     self.prologue_line_idx = 0;
                     self.prologue_char_in_line = 0;
                 }
+            }
+            ActiveScreen::Gateway => {
+                self.handle_gateway_key(key)?;
+            }
+            ActiveScreen::Restore => {
+                self.handle_restore_key(key)?;
             }
             ActiveScreen::Onboarding => {
                 self.handle_onboarding_key(key)?;
@@ -2413,9 +2149,15 @@ impl App {
             ModalType::None => Ok(false),
             ModalType::QuitConfirm { .. } => {
                 match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.should_quit = true;
-                        self.modal_state = ModalType::None;
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        if self.auto_sync && self.config.sync_enabled && !self.sync_in_progress {
+                            // Sincroniza antes de salir — el loop detecta cuando termina y cierra
+                            self.start_background_sync();
+                            self.quitting_after_sync = true;
+                        } else {
+                            self.should_quit = true;
+                            self.modal_state = ModalType::None;
+                        }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.modal_state = ModalType::None;
@@ -2468,6 +2210,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.db.delete_project_permanently(pid)?;
+                        self.audio_player.play_delete();
                         self.mark_dirty();
                         self.selected_archive_idx = 0;
                         self.reload_data()?;
@@ -2485,6 +2228,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.db.delete_codex(cid)?;
+                        self.audio_player.play_delete();
                         self.mark_dirty();
                         self.selected_notes_flat_idx = 0;
                         self.selected_note_idx = 0;
@@ -2649,7 +2393,7 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Char('c') => {
-                        if let ModalType::ExportProfile { ref transfer_code } = self.modal_state.clone() {
+                        if let ModalType::ExportProfile { ref transfer_code, .. } = self.modal_state.clone() {
                             match crate::services::identity::copy_to_clipboard(transfer_code) {
                                 Ok(_) => {
                                     self.sync_status_msg = "Transfer Code copied to clipboard!".to_string();
@@ -2683,9 +2427,22 @@ impl App {
                         use base64::{engine::general_purpose::STANDARD, Engine as _};
                         let trimmed = val.trim().to_string();
                         match STANDARD.decode(&trimmed) {
-                            Ok(secret_bytes) if secret_bytes.len() == 32 => {
+                            Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
                                 use ed25519_dalek::{SigningKey, VerifyingKey};
-                                let secret_arr: [u8; 32] = secret_bytes.try_into().unwrap();
+                                
+                                let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
+                                    let mut uuid_bytes = [0u8; 16];
+                                    uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
+                                    let user_uuid = Uuid::from_bytes(uuid_bytes);
+                                    let mut secret_bytes = [0u8; 32];
+                                    secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
+                                    (user_uuid, secret_bytes)
+                                } else {
+                                    let mut secret_bytes = [0u8; 32];
+                                    secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
+                                    (self.identity.user_uuid, secret_bytes)
+                                };
+
                                 let signing_key = SigningKey::from_bytes(&secret_arr);
                                 let verifying_key: VerifyingKey = signing_key.verifying_key();
                                 let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
@@ -2698,7 +2455,7 @@ impl App {
                                 let _ = std::fs::copy(&db_path, &backup_path);
 
                                 let new_identity = crate::services::identity::Identity {
-                                    user_uuid: self.identity.user_uuid,
+                                    user_uuid,
                                     public_key: public_hex,
                                     secret_key: secret_hex,
                                     created_at: self.identity.created_at.clone(),
@@ -2728,13 +2485,22 @@ impl App {
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string()
                                                 ));
+                                                // If we had a 32-byte code (where we didn't know the user_uuid beforehand),
+                                                // now that the database has been imported, we can extract the correct
+                                                // user_uuid and update identity.key so they match!
+                                                if let Ok(Some(u)) = self.db.get_user() {
+                                                    self.identity.user_uuid = u.id;
+                                                    if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                                        let _ = std::fs::write(&key_path, json_str);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
-                                // Reset the pull cursor — PC-B's old seq belongs to a different
-                                // identity's account; without this we'd miss all of PC-A's history
+                                // Reset del cursor de pull y del contador de conflictos — el nuevo nodo arranca limpio
                                 let _ = self.db.set_setting("last_pull_seq", "0");
+                                let _ = self.db.set_setting("conflict_count", "0");
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored! Syncing now...".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
@@ -3834,6 +3600,38 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::MentionSelect {
+                selected_idx,
+                ref usernames,
+            } => {
+                let mut sel = selected_idx;
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Up => {
+                        sel = if sel > 0 { sel - 1 } else { usernames.len() - 1 };
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: sel,
+                            usernames: usernames.clone(),
+                        };
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1) % usernames.len();
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: sel,
+                            usernames: usernames.clone(),
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let selected_username = &usernames[sel];
+                        self.fellowship_chat_input.push_str(&format!("@{}", selected_username));
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::ChapterComplete => {
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
@@ -4041,6 +3839,150 @@ impl App {
         }
     }
 
+    /// Maneja las teclas de la pantalla de selección inicial — navega entre las dos opciones y confirma.
+    fn handle_gateway_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.gateway_selected_idx > 0 {
+                    self.gateway_selected_idx -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.gateway_selected_idx < 1 {
+                    self.gateway_selected_idx += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if self.gateway_selected_idx == 0 {
+                    // Nuevo aventurero → pantalla de selección de clase
+                    self.onboarding_from_gateway = true;
+                    self.onboarding_username = String::new();
+                    self.onboarding_class_idx = 0;
+                    self.onboarding_focus = OnboardingFocus::NameInput;
+                    self.onboarding_error = None;
+                    self.active_screen = ActiveScreen::Onboarding;
+                } else {
+                    // Exiliado con código → portal de restauración de identidad
+                    self.restore_input = String::new();
+                    self.restore_error = None;
+                    self.active_screen = ActiveScreen::Restore;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Maneja las teclas del portal de restauración — procesa el código de transferencia al presionar Enter.
+    fn handle_restore_key(&mut self, key: KeyEvent) -> Result<()> {
+        match key.code {
+            KeyCode::Esc => {
+                self.restore_error = None;
+                self.active_screen = ActiveScreen::Gateway;
+            }
+            KeyCode::Char(c) => {
+                self.restore_input.push(c);
+                self.restore_error = None;
+            }
+            KeyCode::Backspace => {
+                self.restore_input.pop();
+                self.restore_error = None;
+            }
+            KeyCode::Enter => {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                let trimmed = self.restore_input.trim().to_string();
+                match STANDARD.decode(&trimmed) {
+                    Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
+                        use ed25519_dalek::{SigningKey, VerifyingKey};
+
+                        let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
+                            let mut uuid_bytes = [0u8; 16];
+                            uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
+                            let user_uuid = Uuid::from_bytes(uuid_bytes);
+                            let mut secret_bytes = [0u8; 32];
+                            secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
+                            (user_uuid, secret_bytes)
+                        } else {
+                            let mut secret_bytes = [0u8; 32];
+                            secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
+                            (self.identity.user_uuid, secret_bytes)
+                        };
+
+                        let signing_key   = SigningKey::from_bytes(&secret_arr);
+                        let verifying_key: VerifyingKey = signing_key.verifying_key();
+                        let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
+                        let public_hex: String = verifying_key.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+
+                        let storage_dir = crate::storage::get_storage_dir()?;
+                        let db_path     = storage_dir.join("questline.db");
+                        let ts          = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+                        let backup_path = storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
+                        let _ = std::fs::copy(&db_path, &backup_path);
+
+                        let new_identity = crate::services::identity::Identity {
+                            user_uuid,
+                            public_key: public_hex,
+                            secret_key: secret_hex,
+                            created_at: self.identity.created_at.clone(),
+                        };
+                        let key_path = storage_dir.join("identity.key");
+                        if let Ok(json_str) = serde_json::to_string_pretty(&new_identity) {
+                            let _ = std::fs::write(&key_path, json_str);
+                        }
+                        self.identity = new_identity;
+
+                        if self.config.sync_enabled {
+                            let client = crate::services::api_client::ApiClient::new(
+                                &self.server_url,
+                                self.identity.clone(),
+                                &self.device_id,
+                            );
+                            if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
+                                if !json.trim().is_empty() {
+                                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                    let decoded = STANDARD.decode(json.trim())
+                                        .ok()
+                                        .and_then(|b| String::from_utf8(b).ok())
+                                        .unwrap_or(json);
+                                    if self.db.import_from_json(&decoded).is_ok() {
+                                        if let Ok(Some(u)) = self.db.get_user() {
+                                            self.identity.user_uuid = u.id;
+                                            if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                                let _ = std::fs::write(&key_path, json_str);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        let _ = self.db.set_setting("last_pull_seq", "0");
+                        let _ = self.db.set_setting("conflict_count", "0");
+                        let _ = self.trigger_sync();
+                        self.reload_data()?;
+                        self.notifications.push(Notification::info(
+                            "Welcome back! Your chronicle has been restored from exile.".to_string(),
+                        ));
+                        self.active_screen = ActiveScreen::Dashboard;
+                        self.active_tab_idx = 0;
+                    }
+                    Ok(_) => {
+                        self.restore_error = Some(
+                            "Invalid code — wrong key length. Did you type it by hand? Bold move.".to_string(),
+                        );
+                    }
+                    Err(_) => {
+                        self.restore_error = Some(
+                            "That is not valid base64. The Encoding Grimoire weeps for you.".to_string(),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_onboarding_key(&mut self, key: KeyEvent) -> Result<()> {
         match self.onboarding_focus {
             OnboardingFocus::NameInput => match key.code {
@@ -4152,8 +4094,21 @@ impl App {
         }
 
         self.reload_data()?;
-        self.active_screen = ActiveScreen::Dashboard;
-        self.active_tab_idx = 0;
+        // Si el héroe llegó por el Gateway, muestra el prólogo antes del tablero
+        if self.onboarding_from_gateway {
+            self.onboarding_from_gateway = false;
+            self.prologue_page = 0;
+            self.prologue_line_idx = 0;
+            self.prologue_char_in_line = 0;
+            self.prologue_delay_ticks = 20;
+            self.prologue_skip_checked = false;
+            self.prologue_next_is_onboarding = false;
+            self.audio_player.play_cinematic();
+            self.active_screen = ActiveScreen::Prologue;
+        } else {
+            self.active_screen = ActiveScreen::Dashboard;
+            self.active_tab_idx = 0;
+        }
 
         Ok(())
     }
@@ -4469,6 +4424,35 @@ impl App {
                     }
                     return Ok(true);
                 }
+                KeyCode::Char('@') => {
+                    let mut usernames = Vec::new();
+                    let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+                    if !shared_projects.is_empty() && self.selected_fellowship_project_idx < shared_projects.len() {
+                        let proj = &shared_projects[self.selected_fellowship_project_idx];
+                        let members = self.db.get_project_members(&proj.id.to_string()).unwrap_or_default();
+                        for m in members {
+                            usernames.push(m.1);
+                        }
+                    }
+                    let companions = self.db.get_presence_list().unwrap_or_default();
+                    for c in companions {
+                        usernames.push(c.1);
+                    }
+                    usernames.sort();
+                    usernames.dedup();
+                    if let Some(ref u) = self.user {
+                        usernames.retain(|name| name != &u.username);
+                    }
+                    if !usernames.is_empty() {
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: 0,
+                            usernames,
+                        };
+                    } else {
+                        self.fellowship_chat_input.push('@');
+                    }
+                    return Ok(true);
+                }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.fellowship_chat_input.push(c);
                     return Ok(true);
@@ -4702,7 +4686,7 @@ impl App {
                         '0' => state.goto_line_start(),
                         '$' => state.goto_line_end(),
                         'G' => state.goto_file_end(),
-                        'y' => state.yank_visual(),
+                        'y' | 'Y' => state.yank_visual(),
                         'd' | 'x' => { state.push_undo(); state.delete_visual(); }
                         'c' => { state.push_undo(); state.change_visual(); }
                         'v' | 'V' => {
@@ -4766,6 +4750,7 @@ impl App {
                     (_, 'C') => { state.push_undo(); state.change_to_end(); }
                     (_, 'p') => { state.push_undo(); state.paste_after(); }
                     (_, 'P') => { state.push_undo(); state.paste_before(); }
+                    (_, 'Y') => state.yank_line(),
                     (_, 'u') => state.undo(),
                     (_, 'v') => state.enter_visual_char(),
                     (_, 'V') => state.enter_visual_line(),
@@ -4930,34 +4915,57 @@ impl App {
                     let db_path = storage_dir.join("questline.db");
                     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                     let backup_path = storage_dir.join(format!("questline_backup_{}.db", ts));
+
+                    let secret_bytes: Vec<u8> = self.identity.secret_key
+                        .as_bytes()
+                        .chunks(2)
+                        .filter_map(|c| {
+                            let s = std::str::from_utf8(c).ok()?;
+                            u8::from_str_radix(s, 16).ok()
+                        })
+                        .collect();
+                    let mut transfer_bytes = Vec::new();
+                    transfer_bytes.extend_from_slice(self.identity.user_uuid.as_bytes());
+                    transfer_bytes.extend_from_slice(&secret_bytes);
+                    let transfer_code = STANDARD.encode(&transfer_bytes);
+
+                    // Copia local primero (rápida), luego abre el modal de inmediato
                     match std::fs::copy(&db_path, &backup_path) {
                         Ok(_) => {
-                            let secret_bytes: Vec<u8> = self.identity.secret_key
-                                .as_bytes()
-                                .chunks(2)
-                                .filter_map(|c| {
-                                    let s = std::str::from_utf8(c).ok()?;
-                                    u8::from_str_radix(s, 16).ok()
-                                })
-                                .collect();
-                            let transfer_code = STANDARD.encode(&secret_bytes);
-                            // Also upload to cloud so 'r' on PC-B works right after identity transfer
-                            if self.config.sync_enabled {
+                            let (backup_in_progress, backup_message) = if self.config.sync_enabled {
+                                // El upload a nube corre en hilo aparte — el modal se abre sin esperar
+                                let result_slot = std::sync::Arc::clone(&self.export_backup_result);
                                 if let Ok(json) = self.db.export_to_json() {
-                                    let client = crate::services::api_client::ApiClient::new(
-                                        &self.server_url,
-                                        self.identity.clone(),
-                                        &self.device_id,
-                                    );
-                                    self.sync_status_msg = match client.send_request("POST", "recovery", &json) {
-                                        Ok(_) => format!("Profile exported & cloud backup saved! Local: {}", backup_path.display()),
-                                        Err(e) => format!("Profile exported to {} (cloud backup failed: {})", backup_path.display(), e),
-                                    };
+                                    let server_url = self.server_url.clone();
+                                    let identity = self.identity.clone();
+                                    let device_id = self.device_id.clone();
+                                    let backup_display = backup_path.display().to_string();
+                                    std::thread::spawn(move || {
+                                        let client = crate::services::api_client::ApiClient::new(
+                                            &server_url,
+                                            identity,
+                                            &device_id,
+                                        );
+                                        let outcome = match client.send_request("POST", "recovery", &json) {
+                                            Ok(_) => Ok(format!("Profile exported & cloud backup saved! Local: {}", backup_display)),
+                                            Err(e) => Err(format!("Profile exported to {} (cloud backup failed: {})", backup_display, e)),
+                                        };
+                                        if let Ok(mut slot) = result_slot.lock() {
+                                            *slot = Some(outcome);
+                                        }
+                                    });
+                                    (true, "Sealing your chronicle into the Æther... do not import on the new device until the backup completes.".to_string())
+                                } else {
+                                    (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
                                 }
                             } else {
-                                self.sync_status_msg = format!("Profile exported! Backup saved to {}", backup_path.display());
+                                (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
+                            };
+
+                            if !backup_in_progress {
+                                self.sync_status_msg = backup_message.clone();
                             }
-                            self.modal_state = ModalType::ExportProfile { transfer_code };
+                            self.modal_state = ModalType::ExportProfile { transfer_code, backup_in_progress, backup_message };
                         }
                         Err(e) => {
                             self.sync_status_msg = format!("Export Failed: {}", e);
@@ -5007,15 +5015,17 @@ impl App {
                 self.active_tab_idx = 7;
             }
             KeyCode::Char('6') if self.active_screen != ActiveScreen::Workspace => {
-                self.active_screen = ActiveScreen::SyncSettings;
-                self.active_tab_idx = 12;
-            }
-            KeyCode::Char('7') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
+                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                self.reload_data()?;
+                // Sync inmediato al abrir Fellowship — muestra datos frescos sin esperar el intervalo
+                if !self.sync_in_progress && self.config.sync_enabled {
+                    self.start_background_sync();
+                }
             }
-            KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
+            KeyCode::Char('7') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::GreatChronicle;
                 self.active_tab_idx = 14;
                 self.great_chronicle_scroll = 0;
@@ -5027,9 +5037,9 @@ impl App {
                 self.pull_great_chronicle_async();
                 self.pull_chapter_progress_async();
             }
-            KeyCode::Char('D') => {
-                self.active_screen = ActiveScreen::Dashboard;
-                self.active_tab_idx = 0;
+            KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
+                self.active_screen = ActiveScreen::SyncSettings;
+                self.active_tab_idx = 12;
             }
             KeyCode::Char('d') => {
                 if self.active_screen == ActiveScreen::Projects {
@@ -5083,58 +5093,47 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     open_url("https://ko-fi.com/Y4H021XN7F");
                     self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
-                } else {
-                    self.active_screen = ActiveScreen::Projects;
-                    self.active_tab_idx = 1;
                 }
-            }
-            KeyCode::Char('H') => {
-                self.active_screen = ActiveScreen::Character;
-                self.active_tab_idx = 2;
             }
             KeyCode::Char('f') | KeyCode::Char('F') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Focus;
                 self.active_tab_idx = 6;
             }
-            KeyCode::Char('F') => {
-                self.active_screen = ActiveScreen::Fellowship;
-                self.active_tab_idx = 8;
-                self.pull_invitations_async();
-            }
-
-            KeyCode::Char('S') if self.active_screen == ActiveScreen::Projects => {
-                self.active_screen = ActiveScreen::Fellowship;
-                self.active_tab_idx = 8;
-                self.pull_invitations_async();
-            }
             KeyCode::Char('A') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Archive;
                 self.active_tab_idx = 10;
             }
-            KeyCode::Char('S') => {
-                self.active_screen = ActiveScreen::SyncSettings;
-                self.active_tab_idx = 12;
-            }
-
-            KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.active_screen = ActiveScreen::Library;
-                self.active_tab_idx = 4;
-            }
-            KeyCode::Char('g') | KeyCode::Char('G') => {
-                self.active_screen = ActiveScreen::GreatChronicle;
-                self.active_tab_idx = 14;
-                self.great_chronicle_scroll = 0;
-                self.chapter_panel_scroll = 0;
-                self.chapter_panel_focused = true;
-                self.great_chronicle_entries =
-                    self.db.get_global_chronicle_entries().unwrap_or_default();
-                self.load_chapter_progress_from_cache();
-                self.pull_great_chronicle_async();
-                self.pull_chapter_progress_async();
+            KeyCode::Char('g') | KeyCode::Char('G') if self.active_screen == ActiveScreen::Library => {
+                self.active_screen = ActiveScreen::Legends;
+                self.active_tab_idx = 5;
             }
             KeyCode::Char('w') => {
                 if self.active_screen == ActiveScreen::Dashboard {
                     self.water_tree()?;
+                }
+            }
+            // Abre la quest principal directamente en su workspace desde el dashboard
+            KeyCode::Char('o') | KeyCode::Char('O')
+                if self.active_screen == ActiveScreen::Dashboard =>
+            {
+                let today = chrono::Local::now().date_naive();
+                if let Some(task) = crate::services::planner::find_main_quest(&self.all_tasks, today) {
+                    if let Some(p_id) = task.project_id {
+                        self.active_project_id = Some(p_id);
+                        self.active_screen = ActiveScreen::Workspace;
+                        self.workspace_tab_idx = 0;
+                        self.audio_player.play_open_tasks();
+                        self.workspace_sidebar_focused = false;
+                        self.task_filter = "All".to_string();
+                        let proj_tasks = self.db.get_tasks().unwrap_or_default();
+                        let mut sorted: Vec<&Task> = proj_tasks
+                            .iter()
+                            .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
+                            .collect();
+                        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                        self.selected_task_idx = sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
+                        self.reload_data()?;
+                    }
                 }
             }
             KeyCode::Char('e') | KeyCode::Char('E')
@@ -5143,7 +5142,7 @@ impl App {
             {
                 if self.active_screen == ActiveScreen::Dashboard {
                     // Cycle active ambient effect
-                    self.active_ambient_effect = (self.active_ambient_effect + 1) % 6;
+                    self.active_ambient_effect = (self.active_ambient_effect + 1) % 7;
                     self.db.set_setting(
                         "active_ambient_effect",
                         &self.active_ambient_effect.to_string(),
@@ -5158,6 +5157,7 @@ impl App {
                                 3 => "Rain",
                                 4 => "Snow",
                                 5 => "Glowing Runes",
+                                6 => "Matrix Rain",
                                 _ => "Off",
                             }
                         )));
@@ -5235,7 +5235,7 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
                 if self.active_screen == ActiveScreen::Character {
                     if let Some(ref u) = self.user {
                         if u.level >= 10 && u.specialization.is_none() {
@@ -5247,6 +5247,18 @@ impl App {
                                 selected_idx: 0,
                             };
                         }
+                    }
+                } else if self.active_screen == ActiveScreen::Projects {
+                    let active: Vec<&Project> =
+                        self.projects.iter().filter(|p| !p.archived).collect();
+                    if !active.is_empty() && self.selected_project_idx < active.len() {
+                        self.modal_state = ModalType::InviteMember {
+                            identity: String::new(),
+                            username: String::new(),
+                            role_idx: 0,
+                            project_idx: self.selected_project_idx,
+                            focus_idx: 0,
+                        };
                     }
                 }
             }
@@ -5260,43 +5272,44 @@ impl App {
                     self.chapter_panel_focused = true;
                 }
             }
-            KeyCode::Tab => {
-                self.active_tab_idx = (self.active_tab_idx + 1) % 15;
-                while self.active_tab_idx == 3
-                    || self.active_tab_idx == 5
-                    || self.active_tab_idx == 6
-                    || self.active_tab_idx == 8
-                    || self.active_tab_idx == 9
-                    || self.active_tab_idx == 10
-                    || self.active_tab_idx == 11
-                    || self.active_tab_idx == 14
-                {
-                    self.active_tab_idx = (self.active_tab_idx + 1) % 15;
-                }
-                self.sync_screen_tab();
-            }
-            KeyCode::BackTab => {
-                if self.active_tab_idx > 0 {
-                    self.active_tab_idx -= 1;
+            // En el dashboard, Tab navega entre paneles internos en lugar de cambiar de pantalla
+            KeyCode::Tab | KeyCode::BackTab if self.active_screen == ActiveScreen::Dashboard => {
+                self.dashboard_task_focus = !self.dashboard_task_focus;
+                if self.dashboard_task_focus {
+                    let tasks = self.db.get_tasks().unwrap_or_default();
+                    let wins = dashboard_quick_wins(&tasks);
+                    if self.selected_dashboard_task_idx >= wins.len() {
+                        self.selected_dashboard_task_idx = 0;
+                    }
                 } else {
-                    self.active_tab_idx = 14;
-                }
-                while self.active_tab_idx == 3
-                    || self.active_tab_idx == 5
-                    || self.active_tab_idx == 6
-                    || self.active_tab_idx == 8
-                    || self.active_tab_idx == 9
-                    || self.active_tab_idx == 10
-                    || self.active_tab_idx == 11
-                    || self.active_tab_idx == 14
-                {
-                    if self.active_tab_idx > 0 {
-                        self.active_tab_idx -= 1;
-                    } else {
-                        self.active_tab_idx = 14;
+                    let rituals = self.db.get_rituals().unwrap_or_default();
+                    if self.selected_ritual_idx >= rituals.len() {
+                        self.selected_ritual_idx = 0;
                     }
                 }
-                self.sync_screen_tab();
+            }
+            KeyCode::Tab if self.active_screen == ActiveScreen::Library => {
+                if self.library_active_col < 2 {
+                    self.library_active_col += 1;
+                    self.library_scroll_offset = 0;
+                }
+            }
+            KeyCode::BackTab if self.active_screen == ActiveScreen::Library => {
+                if self.library_active_col > 0 {
+                    self.library_active_col -= 1;
+                    self.library_scroll_offset = 0;
+                }
+            }
+            KeyCode::Tab if self.active_screen == ActiveScreen::Character => {
+                let has_reflections = !self.db.get_reflections().unwrap_or_default().is_empty();
+                if has_reflections && self.character_focus < 2 {
+                    self.character_focus += 1;
+                }
+            }
+            KeyCode::BackTab if self.active_screen == ActiveScreen::Character => {
+                if self.character_focus > 0 {
+                    self.character_focus -= 1;
+                }
             }
             // Screen specific arrows and edits
             KeyCode::Up => {
@@ -5346,12 +5359,12 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        if !flat.is_empty() {
+                        let wins = dashboard_quick_wins(&tasks);
+                        if !wins.is_empty() {
                             self.selected_dashboard_task_idx = if self.selected_dashboard_task_idx > 0 {
                                 self.selected_dashboard_task_idx - 1
                             } else {
-                                flat.len() - 1
+                                wins.len() - 1
                             };
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
@@ -5516,10 +5529,10 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        if !flat.is_empty() {
+                        let wins = dashboard_quick_wins(&tasks);
+                        if !wins.is_empty() {
                             self.selected_dashboard_task_idx =
-                                (self.selected_dashboard_task_idx + 1) % flat.len();
+                                (self.selected_dashboard_task_idx + 1) % wins.len();
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() {
@@ -5625,32 +5638,33 @@ impl App {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
-                        self.active_project_id = Some(active[self.selected_project_idx].id);
+                        let proj = active[self.selected_project_idx];
+                        let proj_is_shared = proj.is_shared;
+                        self.active_project_id = Some(proj.id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
+                        self.audio_player.play_open_tasks();
                         self.workspace_sidebar_focused = true;
                         self.selected_task_idx = 0;
                         self.selected_note_idx = 0;
                         self.selected_notes_flat_idx = 0;
                         self.selected_journal_idx = 0;
                         self.reload_data()?;
+                        if proj_is_shared {
+                            self.start_background_sync();
+                        }
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        let sel = self.selected_dashboard_task_idx.min(flat.len().saturating_sub(1));
-                        if let Some((is_step, parent_id, task)) = flat.get(sel).cloned() {
-                            let nav_task_id = if is_step { parent_id } else { task.id };
-                            let nav_project_id = if is_step {
-                                tasks.iter().find(|t| t.id == parent_id).and_then(|t| t.project_id)
-                            } else {
-                                task.project_id
-                            };
-                            if let Some(p_id) = nav_project_id {
+                        let wins = dashboard_quick_wins(&tasks);
+                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        if let Some(task) = wins.get(sel).cloned() {
+                            if let Some(p_id) = task.project_id {
                                 self.active_project_id = Some(p_id);
                                 self.active_screen = ActiveScreen::Workspace;
                                 self.workspace_tab_idx = 0;
+                                self.audio_player.play_open_tasks();
                                 self.workspace_sidebar_focused = false;
                                 self.task_filter = "All".to_string();
                                 let proj_tasks = self.db.get_tasks().unwrap_or_default();
@@ -5658,7 +5672,7 @@ impl App {
                                     .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
                                     .collect();
                                 proj_tasks_sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                self.selected_task_idx = proj_tasks_sorted.iter().position(|t| t.id == nav_task_id).unwrap_or(0);
+                                self.selected_task_idx = proj_tasks_sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
                                 self.dashboard_task_focus = false;
                                 self.reload_data()?;
                             }
@@ -5765,148 +5779,75 @@ impl App {
             KeyCode::Char(' ') => {
                 if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
+                        // Victorias rápidas: tareas sin pasos pendientes, siempre son tareas padre
                         let all_tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&all_tasks);
-                        let sel = self.selected_dashboard_task_idx.min(flat.len().saturating_sub(1));
-                        if let Some((is_step, _parent_id, task)) = flat.get(sel).cloned() {
-                            if is_step {
-                                if task.completed {
-                                    // Reabrir paso — el XP ya fue cobrado, no se devuelve
-                                    let mut t = task;
-                                    t.completed = false;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.notifications.push(Notification::info("Trial reopened. XP already claimed — face it again with fresh resolve.".to_string()));
-                                    self.reload_data()?;
-                                } else {
-                                    let already_awarded = task.xp_awarded;
-                                    let mut t = task;
-                                    t.completed = true;
-                                    t.xp_awarded = true;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.audio_player.play_task_complete();
-                                    if !already_awarded {
-                                        let is_high = t.priority == TaskPriority::High;
-                                        let xp = if is_high { 50 } else { 25 };
-                                        let label = if is_high { "Resolve Hero Step Quest" } else { "Complete Step Quest" };
-                                        self.grant_xp(label, xp)?;
-                                        self.apply_class_passive("task_complete", 0)?;
-                                    }
-                                    self.trigger_ambient_particles();
-                                    self.complete_productive_action()?;
-                                    self.grow_tree(2)?;
-                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                    self.check_action_achievements()?;
-                                    let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                    if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                        self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                    }
-                                    self.reload_data()?;
-                                }
-                            } else {
-                                if task.completed {
-                                    let steps: Vec<Task> = all_tasks.iter()
-                                        .filter(|t| t.parent_task_id == Some(task.id))
-                                        .cloned()
-                                        .collect();
-                                    for step in &steps {
-                                        if step.completed {
-                                            let mut s = step.clone();
-                                            s.completed = false;
-                                            self.db.update_task(&s)?;
-                                        }
-                                    }
-                                    let mut t = task;
-                                    t.completed = false;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.notifications.push(Notification::info("Quest unsealed. XP already claimed — the path forward is yours to walk again.".to_string()));
-                                    let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                    if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                        self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                    }
-                                    self.reload_data()?;
-                                } else {
-                                    let incomplete_steps: Vec<Task> = all_tasks.iter()
-                                        .filter(|t| t.parent_task_id == Some(task.id) && !t.completed)
-                                        .cloned()
-                                        .collect();
-                                    if !incomplete_steps.is_empty() {
-                                        let n = incomplete_steps.len();
-                                        let msg = if n == 1 {
-                                            "One trial remains unsealed. Face it before this quest can be closed.".to_string()
-                                        } else {
-                                            format!("{} trials remain unsealed. Resolve them before this quest can be claimed.", n)
-                                        };
-                                        self.notifications.push(Notification::warning(msg));
-                                    } else {
-                                        let already_awarded = task.xp_awarded;
-                                        let total_steps = all_tasks.iter()
-                                            .filter(|t| t.parent_task_id == Some(task.id))
-                                            .count();
-                                        let mut t = task;
-                                        t.completed = true;
-                                        t.xp_awarded = true;
-                                        self.db.update_task(&t)?;
-                                        self.mark_dirty();
-                                        self.audio_player.play_task_complete();
-                                        if !already_awarded {
-                                            let is_high = t.priority == TaskPriority::High;
-                                            let val = if is_high { 50 } else { 25 };
-                                            let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
-                                            self.grant_xp(title, val)?;
-                                            let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
-                                            self.apply_class_passive(passive_trigger, 0)?;
-                                        }
-                                        self.trigger_ambient_particles();
-                                        self.increment_quest_progress(10, 1)?;
-                                        let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
-                                        self.simulate_memory_fragment_unlock(frag_trigger)?;
-                                        self.complete_productive_action()?;
-                                        let growth = if t.priority == TaskPriority::High { 4 } else { 2 };
-                                        self.grow_tree(growth)?;
-                                        self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                        if t.priority == TaskPriority::High {
-                                            self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
-                                        }
-                                        self.check_action_achievements()?;
-                                        let chronicle_desc = if total_steps > 0 {
-                                            format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
-                                        } else {
-                                            "completed 1 quest.".to_string()
-                                        };
-                                        self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
-                                        self.maybe_spawn_task_completion_sprite();
-                                        if let Some(recurrence) = t.recurrence {
-                                            let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
-                                            let next_task = Task {
-                                                id: Uuid::new_v4(),
-                                                project_id: t.project_id,
-                                                title: t.title.clone(),
-                                                description: t.description.clone(),
-                                                due_date: Some(next_due),
-                                                completed: false,
-                                                priority: t.priority,
-                                                created_at: Utc::now(),
-                                                updated_at: Utc::now(),
-                                                owner_identity: t.owner_identity.clone(),
-                                                owner_username: t.owner_username.clone(),
-                                                parent_task_id: None,
-                                                xp_awarded: false,
-                                                recurrence: Some(recurrence),
-                                            };
-                                            let _ = self.db.insert_task(&next_task);
-                                        }
-                                        let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                        if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                            self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                        }
-                                        self.reload_data()?;
-                                        self.maybe_show_support_realm_prompt()?;
-                                    }
-                                }
+                        let wins = dashboard_quick_wins(&all_tasks);
+                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        if let Some(task) = wins.get(sel).cloned() {
+                            let already_awarded = task.xp_awarded;
+                            let total_steps = all_tasks
+                                .iter()
+                                .filter(|s| s.parent_task_id == Some(task.id))
+                                .count();
+                            let mut t = task;
+                            t.completed = true;
+                            t.xp_awarded = true;
+                            self.db.update_task(&t)?;
+                            self.mark_dirty();
+                            self.audio_player.play_task_complete();
+                            if !already_awarded {
+                                let is_high = t.priority == TaskPriority::High;
+                                let val = if is_high { 50 } else { 25 };
+                                let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                self.grant_xp(title, val)?;
+                                let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
+                                self.apply_class_passive(passive_trigger, 0)?;
                             }
+                            self.trigger_ambient_particles();
+                            self.increment_quest_progress(10, 1)?;
+                            let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
+                            self.simulate_memory_fragment_unlock(frag_trigger)?;
+                            self.complete_productive_action()?;
+                            let growth = if t.priority == TaskPriority::High { 4 } else { 2 };
+                            self.grow_tree(growth)?;
+                            self.update_daily_adventure_progress("complete_tasks", 1)?;
+                            if t.priority == TaskPriority::High {
+                                self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
+                            }
+                            self.check_action_achievements()?;
+                            let chronicle_desc = if total_steps > 0 {
+                                format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
+                            } else {
+                                "completed 1 quest.".to_string()
+                            };
+                            self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
+                            self.maybe_spawn_task_completion_sprite();
+                            if let Some(recurrence) = t.recurrence {
+                                let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
+                                let next_task = Task {
+                                    id: Uuid::new_v4(),
+                                    project_id: t.project_id,
+                                    title: t.title.clone(),
+                                    description: t.description.clone(),
+                                    due_date: Some(next_due),
+                                    completed: false,
+                                    priority: t.priority,
+                                    created_at: Utc::now(),
+                                    updated_at: Utc::now(),
+                                    owner_identity: t.owner_identity.clone(),
+                                    owner_username: t.owner_username.clone(),
+                                    parent_task_id: None,
+                                    xp_awarded: false,
+                                    recurrence: Some(recurrence),
+                                };
+                                let _ = self.db.insert_task(&next_task);
+                            }
+                            let new_wins = dashboard_quick_wins(&self.db.get_tasks().unwrap_or_default());
+                            if self.selected_dashboard_task_idx >= new_wins.len() && !new_wins.is_empty() {
+                                self.selected_dashboard_task_idx = new_wins.len() - 1;
+                            }
+                            self.reload_data()?;
+                            self.maybe_show_support_realm_prompt()?;
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
@@ -6030,7 +5971,9 @@ impl App {
                 if self.active_screen == ActiveScreen::Projects {
                     self.modal_state = ModalType::NewProject {
                         name: String::new(),
+                        name_cursor: 0,
                         desc: String::new(),
+                        desc_cursor: 0,
                         focus_idx: 0,
                     };
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -6049,10 +5992,15 @@ impl App {
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
                         let p = active[self.selected_project_idx];
+                        let name_len = p.name.len();
+                        let desc_str = p.description.clone().unwrap_or_default();
+                        let desc_len = desc_str.len();
                         self.modal_state = ModalType::EditProject {
                             id: p.id,
                             name: p.name.clone(),
-                            desc: p.description.clone().unwrap_or_default(),
+                            name_cursor: name_len,
+                            desc: desc_str,
+                            desc_cursor: desc_len,
                             focus_idx: 0,
                         };
                     }
@@ -6153,6 +6101,7 @@ impl App {
                             let ritual_name = rituals[self.selected_ritual_idx].name.clone();
                             let r_id = rituals[self.selected_ritual_idx].id.clone();
                             self.db.delete_ritual(&r_id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_ritual_idx = self.selected_ritual_idx.saturating_sub(1);
                             self.notifications.push(Notification::info(format!("Sidequest '{}' removed.", ritual_name)));
@@ -6171,23 +6120,35 @@ impl App {
     }
 
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        let (mut name, mut desc, mut focus_idx, is_edit, p_id) = match self.modal_state {
+        let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) = match self.modal_state {
             ModalType::NewProject {
                 ref name,
+                name_cursor,
                 ref desc,
+                desc_cursor,
                 focus_idx,
-            } => (name.clone(), desc.clone(), focus_idx, false, None),
+            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, false, None),
             ModalType::EditProject {
                 id,
                 ref name,
+                name_cursor,
                 ref desc,
+                desc_cursor,
                 focus_idx,
-            } => (name.clone(), desc.clone(), focus_idx, true, Some(id)),
+            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, true, Some(id)),
             _ => return Ok(()),
         };
 
+        name_cursor = name_cursor.min(name.len());
+        desc_cursor = desc_cursor.min(desc.len());
+
         match key.code {
             KeyCode::Esc => {
+                if is_edit {
+                    // en edición ESC guarda automáticamente antes de cerrar; en creación
+                    // (New Realm Quest) ESC sigue cancelando sin crear el proyecto
+                    self.save_project_modal(&name, &desc, p_id)?;
+                }
                 self.modal_state = ModalType::None;
             }
             KeyCode::Tab => {
@@ -6196,13 +6157,17 @@ impl App {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
@@ -6213,13 +6178,137 @@ impl App {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Left => {
+                if focus_idx == 0 {
+                    if name_cursor > 0 {
+                        name_cursor -= 1;
+                        while name_cursor > 0 && !name.is_char_boundary(name_cursor) {
+                            name_cursor -= 1;
+                        }
+                    }
+                } else {
+                    if desc_cursor > 0 {
+                        desc_cursor -= 1;
+                        while desc_cursor > 0 && !desc.is_char_boundary(desc_cursor) {
+                            desc_cursor -= 1;
+                        }
+                    }
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Right => {
+                if focus_idx == 0 {
+                    if name_cursor < name.len() {
+                        name_cursor += 1;
+                        while name_cursor < name.len() && !name.is_char_boundary(name_cursor) {
+                            name_cursor += 1;
+                        }
+                    }
+                } else {
+                    if desc_cursor < desc.len() {
+                        desc_cursor += 1;
+                        while desc_cursor < desc.len() && !desc.is_char_boundary(desc_cursor) {
+                            desc_cursor += 1;
+                        }
+                    }
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Home => {
+                if focus_idx == 0 {
+                    name_cursor = 0;
+                } else {
+                    desc_cursor = 0;
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::End => {
+                if focus_idx == 0 {
+                    name_cursor = name.len();
+                } else {
+                    desc_cursor = desc.len();
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
@@ -6227,88 +6316,180 @@ impl App {
             KeyCode::Char(c) => {
                 if focus_idx == 0 {
                     if name.len() < 30 {
-                        name.push(c);
+                        name.insert(name_cursor, c);
+                        name_cursor += c.len_utf8();
                     }
                 } else {
                     if desc.len() < 100 {
-                        desc.push(c);
+                        desc.insert(desc_cursor, c);
+                        desc_cursor += c.len_utf8();
                     }
                 }
                 self.modal_state = if is_edit {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
             }
             KeyCode::Backspace => {
                 if focus_idx == 0 {
-                    name.pop();
+                    if name_cursor > 0 {
+                        let mut prev = name_cursor - 1;
+                        while prev > 0 && !name.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        name.remove(prev);
+                        name_cursor = prev;
+                    }
                 } else {
-                    desc.pop();
+                    if desc_cursor > 0 {
+                        let mut prev = desc_cursor - 1;
+                        while prev > 0 && !desc.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        desc.remove(prev);
+                        desc_cursor = prev;
+                    }
                 }
                 self.modal_state = if is_edit {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
             }
-            KeyCode::Enter if !name.trim().is_empty() => {
-                let project_desc = if desc.trim().is_empty() {
-                    None
-                } else {
-                    Some(desc.trim().to_string())
-                };
-                if let Some(id) = p_id {
-                    if let Some(mut existing) = self.projects.iter().find(|x| x.id == id).cloned() {
-                        existing.name = name.trim().to_string();
-                        existing.description = project_desc;
-                        self.db.update_project(&existing)?;
-                        self.mark_dirty();
+            KeyCode::Delete => {
+                if focus_idx == 0 {
+                    if name_cursor < name.len() {
+                        name.remove(name_cursor);
                     }
                 } else {
-                    let p = Project {
-                        id: Uuid::new_v4(),
-                        name: name.trim().to_string(),
-                        description: project_desc,
-                        created_at: Utc::now(),
-                        archived: false,
-                        completed: false,
-                        owner_identity: Some(self.identity.public_key.clone()),
-                        owner_username: Some(
-                            self.user
-                                .as_ref()
-                                .map(|u| u.username.clone())
-                                .unwrap_or_else(|| "Gibranlp".to_string()),
-                        ),
-                        is_shared: false,
-                    };
-                    self.db.insert_project(&p)?;
-                    self.mark_dirty();
-                    self.apply_class_passive("project_create", 0)?;
+                    if desc_cursor < desc.len() {
+                        desc.remove(desc_cursor);
+                    }
                 }
-                self.reload_data()?;
-                self.modal_state = ModalType::None;
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Enter => {
+                if focus_idx == 1 {
+                    if desc.len() < 100 {
+                        desc.insert(desc_cursor, '\n');
+                        desc_cursor += 1;
+                    }
+                    self.modal_state = if is_edit {
+                        ModalType::EditProject {
+                            id: p_id.unwrap(),
+                            name,
+                            name_cursor,
+                            desc,
+                            desc_cursor,
+                            focus_idx,
+                        }
+                    } else {
+                        ModalType::NewProject {
+                            name,
+                            name_cursor,
+                            desc,
+                            desc_cursor,
+                            focus_idx,
+                        }
+                    };
+                } else if !name.trim().is_empty() {
+                    self.save_project_modal(&name, &desc, p_id)?;
+                    self.modal_state = ModalType::None;
+                }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    // guarda (crea o actualiza) el proyecto del modal de nombre/descripción — usado por Enter y por
+    // ESC (que ahora guarda en automático antes de cerrar en vez de descartar los cambios)
+    fn save_project_modal(&mut self, name: &str, desc: &str, p_id: Option<Uuid>) -> Result<()> {
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        let project_desc = {
+            let trimmed = desc.trim_start_matches(|c: char| c.is_whitespace() && c != '\n')
+                               .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        if let Some(id) = p_id {
+            if let Some(mut existing) = self.projects.iter().find(|x| x.id == id).cloned() {
+                existing.name = name.trim().to_string();
+                existing.description = project_desc;
+                self.db.update_project(&existing)?;
+                self.mark_dirty();
+            }
+        } else {
+            let p = Project {
+                id: Uuid::new_v4(),
+                name: name.trim().to_string(),
+                description: project_desc,
+                created_at: Utc::now(),
+                archived: false,
+                completed: false,
+                owner_identity: Some(self.identity.public_key.clone()),
+                owner_username: Some(
+                    self.user
+                        .as_ref()
+                        .map(|u| u.username.clone())
+                        .unwrap_or_else(|| "Gibranlp".to_string()),
+                ),
+                is_shared: false,
+            };
+            self.db.insert_project(&p)?;
+            self.mark_dirty();
+            self.apply_class_passive("project_create", 0)?;
+        }
+        self.reload_data()?;
         Ok(())
     }
 
@@ -7016,6 +7197,7 @@ impl App {
                 {
                     let t = &proj_tasks[self.selected_task_idx];
                     self.db.delete_task(t.id)?;
+                    self.audio_player.play_delete();
                     self.mark_dirty();
                     self.selected_task_idx = 0;
                     self.reload_data()?;
@@ -7025,6 +7207,7 @@ impl App {
                         Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                             let n = &proj_notes[*note_idx];
                             self.db.delete_note(n.id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_notes_flat_idx = 0;
                             self.selected_note_idx = 0;
@@ -7049,6 +7232,7 @@ impl App {
                         {
                             let m_id = milestones[self.selected_milestone_idx].id;
                             self.db.delete_milestone(m_id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_milestone_idx = 0;
                             self.reload_data()?;
@@ -7253,6 +7437,7 @@ impl App {
                         KeyCode::Delete => {
                             if let Some(step) = steps.get(step_selected_idx) {
                                 self.db.delete_task(step.id)?;
+                                self.audio_player.play_delete();
                                 self.mark_dirty();
                                 self.reload_data()?;
                             }
@@ -7914,6 +8099,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn sync_screen_tab(&mut self) {
         self.active_screen = match self.active_tab_idx {
             0 => ActiveScreen::Dashboard,
@@ -8209,11 +8395,11 @@ impl App {
         let old_stage = tree.stage;
         let new_stage = match tree.growth {
             0..10 => 1,
-            10..25 => 2,
-            25..50 => 3,
-            50..100 => 4,
-            100..200 => 5,
-            200..350 => 6,
+            10..40 => 2,
+            40..120 => 3,
+            120..350 => 4,
+            350..900 => 5,
+            900..2200 => 6,
             _ => 7,
         };
 
@@ -8978,6 +9164,7 @@ impl App {
                     self.active_project_id = Some(id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                 }
             }
             SearchResultType::Task => {
@@ -8985,6 +9172,7 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                     // Resetea filtro y modo drill-down para que la tarea sea visible
                     self.task_filter = "All".to_string();
                     self.viewing_step_for_task = None;
@@ -9041,6 +9229,7 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                     self.task_filter = "All".to_string();
                     self.viewing_step_for_task = None;
                     if let Ok(step_uuid) = uuid::Uuid::parse_str(&result.item_id) {
@@ -9233,22 +9422,51 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Dashboard",
                 description: "Navigate to your Dashboard",
-                shortcut: "D / 1",
+                shortcut: "1",
                 id: "open_dashboard",
             },
             CommandAction {
                 name: "Open Projects",
                 description: "Navigate to Projects list",
-                shortcut: "P / 2",
+                shortcut: "2",
                 id: "open_projects",
             },
             CommandAction {
                 name: "Open Character",
                 description: "Navigate to Character screen",
-                shortcut: "H / 3",
+                shortcut: "3",
                 id: "open_character",
             },
-
+            CommandAction {
+                name: "Open Library",
+                description: "Navigate to Library screen",
+                shortcut: "4",
+                id: "open_library",
+            },
+            CommandAction {
+                name: "Open Music",
+                description: "Navigate to Soundscapes & music player",
+                shortcut: "5",
+                id: "open_music",
+            },
+            CommandAction {
+                name: "Open Fellowship",
+                description: "Navigate to Fellowship screen",
+                shortcut: "6",
+                id: "open_fellowship",
+            },
+            CommandAction {
+                name: "Open Chronicle",
+                description: "Navigate to Great Chronicle activity feed",
+                shortcut: "7",
+                id: "open_chronicle",
+            },
+            CommandAction {
+                name: "Open Sync",
+                description: "Navigate to Sync Settings",
+                shortcut: "8",
+                id: "open_sync",
+            },
             CommandAction {
                 name: "Open Focus",
                 description: "Navigate to Focus screen",
@@ -9256,28 +9474,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "open_focus",
             },
             CommandAction {
-                name: "Open Sync",
-                description: "Navigate to Sync Settings",
-                shortcut: "S / 6",
-                id: "open_sync",
-            },
-            CommandAction {
                 name: "Open Statistics",
                 description: "Navigate to Statistics screen",
                 shortcut: "G",
                 id: "open_stats",
-            },
-            CommandAction {
-                name: "Open Fellowship",
-                description: "Navigate to Fellowship screen",
-                shortcut: "S (from Projects)",
-                id: "open_fellowship",
-            },
-            CommandAction {
-                name: "Open Library",
-                description: "Navigate to Library screen",
-                shortcut: "L / 4",
-                id: "open_library",
             },
             CommandAction {
                 name: "Open Archive",
@@ -9330,14 +9530,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "View Achievements",
                 description: "Check all unlocked titles and stats",
-                shortcut: "H / 3",
+                shortcut: "3",
                 id: "view_achievements",
-            },
-            CommandAction {
-                name: "Open Music",
-                description: "Navigate to Soundscapes & music player",
-                shortcut: "M / 5",
-                id: "open_music",
             },
             CommandAction {
                 name: "Cycle Ambient Effect",
@@ -9409,6 +9603,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
+                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                self.reload_data()?;
+            }
+            "open_chronicle" => {
+                self.active_screen = ActiveScreen::GreatChronicle;
+                self.active_tab_idx = 14;
+                self.great_chronicle_scroll = 0;
+                self.chapter_panel_scroll = 0;
+                self.chapter_panel_focused = true;
+                self.great_chronicle_entries =
+                    self.db.get_global_chronicle_entries().unwrap_or_default();
+                self.load_chapter_progress_from_cache();
+                self.pull_great_chronicle_async();
+                self.pull_chapter_progress_async();
             }
             "open_library" => {
                 self.active_screen = ActiveScreen::Library;
@@ -9493,7 +9701,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             "cycle_ambient" => {
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
-                self.active_ambient_effect = (self.active_ambient_effect + 1) % 6;
+                self.active_ambient_effect = (self.active_ambient_effect + 1) % 7;
                 self.db.set_setting(
                     "active_ambient_effect",
                     &self.active_ambient_effect.to_string(),
@@ -9508,6 +9716,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         3 => "Rain",
                         4 => "Snow",
                         5 => "Glowing Runes",
+                        6 => "Matrix Rain",
                         _ => "Off",
                     }
                 )));
@@ -9676,7 +9885,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
 
-        let should_spawn = self.ambient_particles_ticks_remaining > 0;
+        let should_spawn = true;
         if self.ambient_particles_ticks_remaining > 0 {
             self.ambient_particles_ticks_remaining -= 1;
         }
@@ -9686,11 +9895,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         let mut rng = rand::thread_rng();
 
         let max_particles = match self.active_ambient_effect {
-            3 => 40,
-            _ => 20,
+            3 => 120, // Rain
+            6 => 120, // Matrix Rain
+            4 => 60,  // Snow
+            1 | 5 => 50, // Leaves, Runes
+            2 => 40,  // Stars
+            _ => 30,
         };
 
-        if should_spawn && self.ambient_particles.len() < max_particles && rng.gen_bool(0.3) {
+        let spawn_prob = match self.active_ambient_effect {
+            3 | 6 => 0.5, // High spawn rate for rain/matrix
+            _ => 0.25,
+        };
+
+        if should_spawn && self.ambient_particles.len() < max_particles && rng.gen_bool(spawn_prob) {
             let symbol = match self.active_ambient_effect {
                 1 => *['*', 'o', '~', 's'].choose(&mut rng).unwrap_or(&'*'),
                 2 => *['.', '*', '+'].choose(&mut rng).unwrap_or(&'.'),
@@ -9699,6 +9917,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 5 => *['A', '7', '@', '#', '!', 'Z', '$', '%']
                     .choose(&mut rng)
                     .unwrap_or(&'*'),
+                6 => *['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '@', '#', '$', '%', '&', '*', '+', '=', '<', '>', '?']
+                    .choose(&mut rng)
+                    .unwrap_or(&'1'),
                 _ => '*',
             };
 
@@ -9714,6 +9935,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 3 => ratatui::style::Color::Rgb(14, 165, 233),
                 4 => ratatui::style::Color::White,
                 5 => ratatui::style::Color::Rgb(168, 85, 247),
+                6 => *[
+                    ratatui::style::Color::Rgb(34, 197, 94),
+                    ratatui::style::Color::Rgb(22, 163, 74),
+                    ratatui::style::Color::Rgb(74, 222, 128),
+                ]
+                .choose(&mut rng)
+                .unwrap_or(&ratatui::style::Color::Green),
                 _ => ratatui::style::Color::White,
             };
 
@@ -9723,11 +9951,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 3 => rng.gen_range(0.8..1.3),
                 4 => rng.gen_range(0.08..0.18),
                 5 => rng.gen_range(0.15..0.35),
+                6 => rng.gen_range(0.3..0.6),
                 _ => 0.1,
             };
 
             self.ambient_particles.push(Particle {
-                x: rng.gen_range(0..180),
+                x: rng.gen_range(0..200),
                 y: 0.0,
                 speed,
                 symbol,
@@ -9753,38 +9982,77 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     fn check_action_achievements(&mut self) -> Result<()> {
         let stats = self.db.get_statistics()?;
+
+        // Task achievements
         if stats.tasks_completed >= 1 {
             self.unlock_achievement("first_quest")?;
         }
+
+        // Note / journal achievements
         if stats.notes_created >= 25 {
             self.unlock_achievement("scholar")?;
         }
         if stats.journal_entries >= 50 {
             self.unlock_achievement("chronicler")?;
         }
-        if stats.projects_created >= 10 {
+
+        // Project achievements — "Complete 10 projects" tracks completed, not created
+        if stats.projects_completed >= 10 {
             self.unlock_achievement("project_master")?;
         }
 
+        // Focus session achievements
+        if stats.sessions_completed >= 1 {
+            self.unlock_achievement("first_focus")?;
+        }
+        if stats.sessions_completed >= 100 {
+            self.unlock_achievement("deep_worker")?;
+        }
+        if stats.sessions_completed >= 500 {
+            self.unlock_achievement("master_concentration")?;
+        }
+        let max_duration = self.db.get_max_focus_session_duration()?;
+        if max_duration >= 90 {
+            self.unlock_achievement("ninety_minute_sage")?;
+        }
+
+        // Soundscape achievements
         let silent_count = self.db.count_focus_sessions_with_soundscape(&["Silent"])?;
         if silent_count >= 25 {
             self.unlock_achievement("silent_monk")?;
         }
-        let forest_count = self
-            .db
-            .count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
+        let forest_count = self.db.count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
         if forest_count >= 50 {
             self.unlock_achievement("forest_wanderer")?;
         }
-        let rain_count = self
-            .db
-            .count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
+        let rain_count = self.db.count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
         if rain_count >= 50 {
             self.unlock_achievement("rain_listener")?;
         }
         let unique_soundscapes = self.db.count_unique_soundscapes_used()?;
         if unique_soundscapes >= 8 {
             self.unlock_achievement("master_atmosphere")?;
+        }
+
+        // Codex achievements
+        let codex_count = self.db.count_codices().unwrap_or(0);
+        if codex_count >= 3 {
+            self.unlock_achievement("archivist")?;
+        }
+        if codex_count >= 10 {
+            self.unlock_achievement("grand_archivist")?;
+        }
+
+        // Tree achievement — retroactive if already at stage 5+
+        let zen_stage = self.db.get_zen_tree().map(|t| t.stage).unwrap_or(0);
+        if zen_stage >= 5 {
+            self.unlock_achievement("ancient_gardener")?;
+        }
+
+        // Streak achievement — use >= so it triggers even if already past 100
+        let streak = self.db.get_streak()?;
+        if streak.current_streak >= 100 {
+            self.unlock_achievement("hundred_day_journey")?;
         }
 
         // Stage 6 milestone check: 1000 tasks
@@ -9798,15 +10066,6 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     "SUCCESS"
                 );
             }
-        }
-
-        // Codex (note folder) achievements
-        let codex_count = self.db.count_codices().unwrap_or(0);
-        if codex_count >= 3 {
-            self.unlock_achievement("archivist")?;
-        }
-        if codex_count >= 10 {
-            self.unlock_achievement("grand_archivist")?;
         }
 
         self.check_stage6_unlocks()?;
@@ -9883,7 +10142,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 .map(|p| p.is_shared)
                 .unwrap_or(false);
         let interval = if is_shared_workspace {
-            std::time::Duration::from_secs(15)
+            std::time::Duration::from_secs(8)
         } else {
             std::time::Duration::from_secs(30)
         };
@@ -9915,6 +10174,26 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         Ok(())
     }
 
+    /// Revisa si el hilo de backup de nube terminó y actualiza el modal ExportProfile.
+    pub fn tick_export_backup(&mut self) {
+        let outcome = if let Ok(mut slot) = self.export_backup_result.lock() {
+            slot.take()
+        } else {
+            return;
+        };
+        if let Some(result) = outcome {
+            let msg = match result {
+                Ok(m) => m,
+                Err(m) => m,
+            };
+            self.sync_status_msg = msg.clone();
+            if let ModalType::ExportProfile { ref mut backup_in_progress, ref mut backup_message, .. } = self.modal_state {
+                *backup_in_progress = false;
+                *backup_message = msg;
+            }
+        }
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -9929,11 +10208,17 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_chat_poll(&mut self) -> Result<()> {
-        // Only run when the fellowship chat tab is visible and cloud sync is enabled
-        if self.active_screen != ActiveScreen::Fellowship
-            || self.selected_fellowship_tab != 0
-            || !self.config.sync_enabled
-        {
+        if !self.config.sync_enabled {
+            return Ok(());
+        }
+        let in_fellowship_chat = self.active_screen == ActiveScreen::Fellowship
+            && self.selected_fellowship_tab == 0;
+        let in_shared_workspace = self.active_screen == ActiveScreen::Workspace
+            && self.active_project_id
+                .and_then(|id| self.projects.iter().find(|p| p.id == id))
+                .map(|p| p.is_shared)
+                .unwrap_or(false);
+        if !in_fellowship_chat && !in_shared_workspace {
             return Ok(());
         }
 
@@ -9947,6 +10232,18 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         self.last_chat_timestamp.insert(poll.project_id.clone(), ts);
                     }
                     if poll.new_message_count > 0 {
+                        let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                        // Notificar si el usuario está en Workspace (no en la pestaña del chat)
+                        if self.active_screen != ActiveScreen::Fellowship || self.selected_fellowship_tab != 0 {
+                            self.notifications.push(Notification::info(format!(
+                                "{} new message(s) from your fellowship.",
+                                poll.new_message_count
+                            )));
+                        }
+                        // Actividad detectada — sincronizar tareas/notas de inmediato
+                        if !self.sync_in_progress && self.config.sync_enabled {
+                            self.start_background_sync();
+                        }
                         self.reload_data()?;
                     }
                 }
@@ -9954,16 +10251,35 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return Ok(());
         }
 
-        // Poll every 4 seconds
-        if self.last_chat_poll.elapsed() < std::time::Duration::from_millis(4000) {
+        // Poll de chat/presencia: cada 4s en Fellowship, cada 10s en Workspace para no saturar
+        let poll_interval = if self.active_screen == ActiveScreen::Fellowship {
+            std::time::Duration::from_millis(4000)
+        } else {
+            std::time::Duration::from_millis(10000)
+        };
+        if self.last_chat_poll.elapsed() < poll_interval {
             return Ok(());
         }
 
-        let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-        if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
+        // En Workspace usamos el proyecto activo; en Fellowship el proyecto seleccionado
+        let proj_id_opt = if self.active_screen == ActiveScreen::Workspace {
+            self.active_project_id.map(|id| id.to_string())
+        } else {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
+                return Ok(());
+            }
+            Some(shared[self.selected_fellowship_project_idx].id.to_string())
+        };
+        let proj_id = match proj_id_opt {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        // Validar que el proyecto sea compartido antes de hacer llamadas de red
+        if !self.projects.iter().any(|p| p.id.to_string() == proj_id && p.is_shared) {
             return Ok(());
         }
-        let proj_id = shared[self.selected_fellowship_project_idx].id.to_string();
 
         // Get the `since` timestamp — from our map, or seed from the DB max
         let since = match self.last_chat_timestamp.get(&proj_id) {
@@ -10287,29 +10603,48 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     // Heartbeat de presencia — solo corre si estamos en un workspace compartido con sync activo
     pub fn tick_presence_update(&mut self) -> Result<()> {
-        if self.active_screen != ActiveScreen::Workspace || !self.auto_sync {
+        if !self.auto_sync {
             return Ok(());
         }
-        let p_id = match self.active_project_id {
-            Some(pid) => pid,
-            None => return Ok(()),
-        };
-        let is_shared = self.projects.iter()
-            .find(|p| p.id == p_id)
-            .map(|p| p.is_shared)
-            .unwrap_or(false);
-        if !is_shared {
+        // Presencia activa tanto en Workspace (proyecto activo) como en Fellowship (vista del equipo)
+        let in_workspace = self.active_screen == ActiveScreen::Workspace;
+        let in_fellowship = self.active_screen == ActiveScreen::Fellowship;
+        if !in_workspace && !in_fellowship {
             return Ok(());
         }
-        if self.last_presence_update.elapsed() < std::time::Duration::from_secs(60) {
+        if self.last_presence_update.elapsed() < std::time::Duration::from_secs(30) {
             return Ok(());
         }
+
         let identity_key = self.identity.public_key.clone();
         let username = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
         let now_str = chrono::Utc::now().to_rfc3339();
-        let proj_str = p_id.to_string();
-        let _ = self.db.update_presence(&identity_key, &username, true, &now_str, Some(&proj_str), "Visible");
+
+        // Determinar el proyecto activo: en Workspace usamos active_project_id, en Fellowship el proyecto seleccionado
+        let project_id = if in_workspace {
+            self.active_project_id.map(|id| id.to_string())
+        } else {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            shared.get(self.selected_fellowship_project_idx).map(|p| p.id.to_string())
+        };
+
+        let is_relevant_project = project_id.as_deref()
+            .and_then(|pid| self.projects.iter().find(|p| p.id.to_string() == pid))
+            .map(|p| p.is_shared)
+            .unwrap_or(in_fellowship); // en Fellowship siempre es relevante
+
+        if !is_relevant_project {
+            return Ok(());
+        }
+
+        let _ = self.db.update_presence(
+            &identity_key, &username, true, &now_str,
+            project_id.as_deref(), "Visible",
+        );
         self.last_presence_update = std::time::Instant::now();
+
+        // Housekeeping: marcar offline a usuarios sin heartbeat reciente
+        let _ = self.db.mark_stale_presence_offline(10);
         Ok(())
     }
 
@@ -10351,6 +10686,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         use rand::Rng;
         if rand::thread_rng().r#gen::<f64>() > chance { return; }
         let (msg, title) = pick_task_completion_sprite_message();
+        self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
@@ -10389,6 +10725,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if rand::thread_rng().r#gen::<f64>() > spawn_chance { return; }
 
         let (msg, title) = pick_sprite_message();
+        self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
@@ -10845,20 +11182,6 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     }
                 }
 
-                // Unlock Focus Achievements
-                let stats = self.db.get_statistics()?;
-                if stats.sessions_completed >= 1 {
-                    self.unlock_achievement("first_focus")?;
-                }
-                if stats.sessions_completed >= 100 {
-                    self.unlock_achievement("deep_worker")?;
-                }
-                if stats.sessions_completed >= 500 {
-                    self.unlock_achievement("master_concentration")?;
-                }
-                if duration >= 90 {
-                    self.unlock_achievement("ninety_minute_sage")?;
-                }
                 self.check_action_achievements()?;
 
                 // Perform productive actions triggers
@@ -10867,6 +11190,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.reload_data()?;
 
                 // One-time support prompt after the first meaningful focus session
+                let stats = self.db.get_statistics()?;
                 if stats.sessions_completed == 1 {
                     self.maybe_show_support_realm_prompt()?;
                 }
@@ -11631,6 +11955,8 @@ mod app_tests {
             owner_identity: None,
             owner_username: None,
             parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
         };
         app.db.insert_task(&t).unwrap();
         app.active_project_id = Some(proj.id);
@@ -11897,6 +12223,8 @@ mod app_tests {
                 owner_identity: None,
                 owner_username: None,
                 parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
             };
             app.db.insert_task(&t).unwrap();
         }
@@ -12416,8 +12744,13 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
 
-        // Key 'S' -> SyncSettings
+        // Key 'S' -> should NOT switch screens globally anymore
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+
+        // Switch to SyncSettings using key '6' for the next test
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
         assert_eq!(app.active_tab_idx, 12);
@@ -12444,13 +12777,12 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Archive);
         assert_eq!(app.active_tab_idx, 10);
 
-        // Key 'F' on Dashboard -> should switch to Fellowship
+        // Key 'F' on Dashboard -> should NOT switch to Fellowship anymore
         app.active_screen = ActiveScreen::Dashboard;
         app.active_tab_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
-        assert_eq!(app.active_tab_idx, 8);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         // Key 'F' on Projects -> should switch to Focus
         app.active_screen = ActiveScreen::Projects;
@@ -12460,21 +12792,38 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Focus);
         assert_eq!(app.active_tab_idx, 6);
 
-        // Key 'S' on Dashboard -> should switch to SyncSettings
+        // Key 'S' on Dashboard -> should NOT switch to SyncSettings anymore
         app.active_screen = ActiveScreen::Dashboard;
         app.active_tab_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
-        assert_eq!(app.active_tab_idx, 12);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
-        // Key 'S' on Projects -> should switch to Fellowship
+        // Key 'S' on Projects -> should NOT switch to Fellowship anymore
         app.active_screen = ActiveScreen::Projects;
         app.active_tab_idx = 1;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
-        assert_eq!(app.active_tab_idx, 8);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        // Pressing 'S' on Projects screen with a project -> should open ProjectSharing modal
+        let p_id = uuid::Uuid::new_v4();
+        let test_proj = crate::models::project::Project {
+            id: p_id,
+            name: "Test Project".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.projects = vec![test_proj];
+        app.selected_project_idx = 0;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0));
 
         let _ = std::fs::remove_file(db_file);
     }

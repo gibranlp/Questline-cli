@@ -321,6 +321,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             &tasks,
             viewing_step_for_task,
             parent_quest_title.as_deref(),
+            is_shared,
+            &app.identity.public_key,
         ),
         1 => {
             draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices);
@@ -337,7 +339,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         _ => {
             let (overview_members, overview_activity) = if is_shared {
                 (
-                    app.db.get_project_members(&p_id.to_string()).unwrap_or_default(),
+                    app.db.get_presence_for_project(&p_id.to_string()).unwrap_or_default(),
                     app.db.get_activity_log_for_project(&p_id.to_string(), 20).unwrap_or_default(),
                 )
             } else {
@@ -905,6 +907,8 @@ fn draw_tasks_tab(
     all_tasks: &[Task],
     viewing_step_for_task: Option<uuid::Uuid>,
     parent_quest_title: Option<&str>,
+    is_shared: bool,
+    my_identity: &str,
 ) {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused { theme.border } else { accent_color };
@@ -1013,6 +1017,20 @@ fn draw_tasks_tab(
                         }
                         if !recur_badge.is_empty() {
                             spans.push(Span::styled(recur_badge, Style::default().fg(Color::Cyan)));
+                        }
+                        // Badge de compañero — muestra quién creó la tarea en proyectos compartidos
+                        if is_shared {
+                            if let Some(ref owner) = t.owner_username {
+                                let is_mine = t.owner_identity.as_deref()
+                                    .map(|id| id == my_identity)
+                                    .unwrap_or(true);
+                                if !is_mine && !owner.is_empty() {
+                                    spans.push(Span::styled(
+                                        format!(" @{}", owner),
+                                        Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC),
+                                    ));
+                                }
+                            }
                         }
                         ListItem::new(Line::from(spans))
                     }
@@ -1692,7 +1710,8 @@ fn draw_overview_tab(
     project_stats: &ProjectStats,
     theme: &Theme,
     sidebar_focused: bool,
-    members: &[(String, String, String)],
+    // (identity, username, role, is_online, last_seen, current_project)
+    members: &[(String, String, String, bool, String, Option<String>)],
     activity: &[(String, Option<String>, String, String, String, String, String)],
 ) {
     let accent_color = theme.primary;
@@ -1756,14 +1775,28 @@ fn draw_overview_tab(
         .split(area);
 
     // 1. Metadata Block
-    let metadata_text = vec![
-        Line::from(vec![
+    let mut metadata_text = Vec::new();
+    let desc = project.description.as_deref().unwrap_or("None");
+    let mut desc_lines = desc.lines();
+    if let Some(first_line) = desc_lines.next() {
+        metadata_text.push(Line::from(vec![
             Span::styled("  Description: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                project.description.as_deref().unwrap_or("None"),
-                Style::default().fg(Color::White),
-            ),
-        ]),
+            Span::styled(first_line, Style::default().fg(Color::White)),
+        ]));
+        for remaining_line in desc_lines {
+            metadata_text.push(Line::from(vec![
+                Span::styled("               ", Style::default().fg(theme.muted)),
+                Span::styled(remaining_line, Style::default().fg(Color::White)),
+            ]));
+        }
+    } else {
+        metadata_text.push(Line::from(vec![
+            Span::styled("  Description: ", Style::default().fg(theme.muted)),
+            Span::styled("None", Style::default().fg(Color::White)),
+        ]));
+    }
+
+    metadata_text.extend(vec![
         Line::from(vec![
             Span::styled("  Created At:  ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -1775,7 +1808,7 @@ fn draw_overview_tab(
             Span::styled("  Chronicle Age: ", Style::default().fg(theme.muted)),
             Span::styled(age_str, Style::default().fg(theme.warning)),
         ]),
-    ];
+    ]);
     let metadata_p = Paragraph::new(metadata_text)
         .block(
             Block::default()
@@ -1958,20 +1991,33 @@ fn draw_overview_tab(
             .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
             .split(chunks[3]);
 
+        let online_count = members.iter().filter(|m| m.3).count();
         let companion_items: Vec<ListItem> = if members.is_empty() {
             vec![ListItem::new("  No companions yet.").style(Style::default().fg(theme.muted))]
         } else {
-            members.iter().map(|(_, username, role)| {
-                ListItem::new(format!("  {} ({})", username, role))
-                    .style(Style::default().fg(theme.text))
+            members.iter().map(|(_, username, role, is_online, _, _)| {
+                let dot = if *is_online { "● " } else { "○ " };
+                let dot_color = if *is_online { theme.success } else { theme.muted };
+                let name_color = if *is_online { Color::White } else { Color::Gray };
+                ListItem::new(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(dot, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+                    Span::styled(username.clone(), Style::default().fg(name_color)),
+                    Span::styled(format!(" [{}]", role), Style::default().fg(theme.muted)),
+                ]))
             }).collect()
+        };
+        let companion_title = if online_count > 0 {
+            format!(" Fellowship  ● {} online ", online_count)
+        } else {
+            " Fellowship Companions ".to_string()
         };
         let companion_list = List::new(companion_items).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(accent_color))
-                .title(" Fellowship Companions "),
+                .title(Span::styled(companion_title, Style::default().fg(theme.success).add_modifier(Modifier::BOLD))),
         );
         f.render_widget(companion_list, fellowship_split[0]);
 

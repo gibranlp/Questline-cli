@@ -90,6 +90,31 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ### Quest System
 Tasks in Questline are quests. They carry priority, due dates, subtasks, and steps. Completing a quest earns XP, waters your Zen Tree, and pushes chapter objectives forward. Fail to complete daily quests and the realm takes notice.
 
+### The Main Quest
+
+Every time the Dashboard opens, Questline convenes an emergency session of the Planning Council — a deterministic scoring engine that reviews every incomplete task in your backlog and selects the single most important thing to do right now.
+
+The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points.
+
+| Condition | Points |
+|---|---|
+| Overdue | +100 |
+| Due today | +60 |
+| Due tomorrow | +40 |
+| Due within three days | +25 |
+| Due within seven days | +10 |
+| High priority | +30 |
+| Medium priority | +10 |
+| Low priority | +0 |
+
+The scores stack. A High priority task due today scores 90. An overdue task of any priority scores at least 100 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
+
+The Council does not consider how long the task will take, how much you dread it, how many times you have quietly moved it to tomorrow, or whether finishing it would actually matter. Those are judgment calls. The Council only counts points.
+
+The second-highest scoring task is displayed as the Recommended Next Quest — a polite suggestion from an entity that has never experienced a Tuesday afternoon.
+
+Press `o` from the Dashboard to open the current Main Quest directly in its workspace.
+
 ### Scrolls and Codices
 Notes are scrolls organized into codices — thematic collections tied to your projects. Write in Markdown, search across your full knowledge base, and share scrolls with your fellowship.
 
@@ -212,6 +237,21 @@ If Questline helps you on your adventures, consider starring the repository and 
 ---
 
 ## Changelog
+
+### v1.1.0 — The Nodes Remember
+*Released 2026-07-14*
+
+- **Multi-device sync deduplication:** A new `processed_remote_events` table tracks every applied sync event. Already-processed events are skipped on subsequent syncs, ending the conflict accumulation that previously inflated counts into the tens of thousands.
+- **Device heartbeat:** Each device now broadcasts its identity during every sync. All your nodes appear in the Sync screen with last-seen timestamps and online status.
+- **Fellowship presence:** Companions in shared projects show as online or offline in the project companion list, chat title, and Companions tab. Presence decays after 10 minutes of inactivity.
+- **Real-time companion sync:** Shared project workspaces sync every 8 seconds and trigger an immediate sync on open. Chat polling also runs in the background while working inside a shared project.
+- **Companion task ownership badges:** Tasks created by companions in shared projects display their owner's username next to the task title.
+- **Dashboard progression tree:** The Adventurer panel now shows your current unlocked class power and the next milestone to reach, styled in your class color.
+- **New Evergrowth rendering and dashboard layout:** Updated visual presentation for the Evergrowth panel and overall dashboard structure.
+- **Navigation reorder:** Sections renumbered — `6` = Fellowship, `7` = Great Chronicle, `8` = Sync Settings.
+- **Sync-sealed exit:** Ctrl+C no longer quits. Pressing `q` opens the quit confirm; confirming triggers a final sync before the application closes.
+
+---
 
 ### v1.0.9 — The Scrollkeeper Awakens
 *Released 2026-07-11*

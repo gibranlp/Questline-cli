@@ -1428,7 +1428,7 @@ impl Database {
 
     pub fn get_statistics(&self) -> Result<Statistics> {
         let tasks_completed: i32 = self.conn.query_row(
-            "SELECT count(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL",
+            "SELECT count(*) FROM tasks WHERE completed = 1",
             [],
             |row| row.get(0),
         )?;
@@ -1533,6 +1533,7 @@ impl Database {
             .get_setting("last_restore")?
             .unwrap_or_else(|| "Never".to_string());
         let devices_connected = self.get_devices().map(|d| d.len()).unwrap_or(0) as i32;
+        let active_devices = self.count_active_devices(5).unwrap_or(0) as i32;
 
         Ok(Statistics {
             tasks_completed,
@@ -1555,6 +1556,7 @@ impl Database {
             sync_count,
             backup_count,
             devices_connected,
+            active_devices,
             last_restore,
             conflict_count,
         })
@@ -1668,6 +1670,15 @@ impl Database {
             |row| row.get(0)
         )?;
         Ok(count)
+    }
+
+    pub fn get_max_focus_session_duration(&self) -> Result<i32> {
+        let max: i32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(duration_mins), 0) FROM focus_sessions",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(max)
     }
 
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
@@ -1837,7 +1848,7 @@ impl Database {
 
     pub fn get_daily_adventures_completed_count(&self) -> Result<i64> {
         let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM xp_events WHERE description LIKE 'Daily Quest:%'",
+            "SELECT count(*) FROM xp_events WHERE event_type LIKE 'Daily Quest:%'",
             [],
             |row| row.get(0),
         )?;
@@ -2259,6 +2270,28 @@ impl Database {
         Ok(())
     }
 
+    /// Aplica un registro de dispositivo recibido desde otro nodo — upsert seguro.
+    pub fn upsert_remote_device(&self, device_id: &str, device_name: &str, last_sync: Option<&str>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO devices (device_id, device_name, created_at, last_sync)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(device_id) DO UPDATE SET device_name = excluded.device_name, last_sync = excluded.last_sync",
+            params![device_id, device_name, Utc::now().to_rfc3339(), last_sync],
+        )?;
+        Ok(())
+    }
+
+    /// Cuenta cuántos dispositivos han sincronizado en los últimos N minutos (activos ahora mismo).
+    pub fn count_active_devices(&self, within_minutes: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::minutes(within_minutes)).to_rfc3339();
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM devices WHERE last_sync > ?1",
+            params![cutoff],
+            |r| r.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
     pub fn get_pending_sync_logs(&self) -> Result<Vec<(String, String, String, String, String)>> {
         let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0")?;
         let rows = stmt.query_map([], |row| {
@@ -2286,6 +2319,38 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         stmt.execute(params.as_slice())?;
+        Ok(())
+    }
+
+    /// Carga todos los IDs de eventos remotos ya procesados en un HashSet para dedup O(1) durante el pull.
+    pub fn load_processed_remote_ids(&self) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = self.conn.prepare("SELECT id FROM processed_remote_events")?;
+        let ids = stmt.query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(ids)
+    }
+
+    /// Registra los IDs de eventos remotos recién aplicados para no repetirlos en futuros syncs.
+    pub fn mark_remote_events_processed(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() { return Ok(()); }
+        let now = Utc::now().to_rfc3339();
+        for id in ids {
+            let _ = self.conn.execute(
+                "INSERT OR IGNORE INTO processed_remote_events (id, processed_at) VALUES (?1, ?2)",
+                params![id, now],
+            );
+        }
+        Ok(())
+    }
+
+    /// Limpia entradas antiguas de processed_remote_events para no crecer indefinidamente.
+    pub fn cleanup_processed_remote_events(&self, days: i64) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let _ = self.conn.execute(
+            "DELETE FROM processed_remote_events WHERE processed_at < ?1",
+            params![cutoff],
+        );
         Ok(())
     }
 
@@ -2377,7 +2442,7 @@ impl Database {
         );
         metadata.insert(
             "version".to_string(),
-            serde_json::Value::String("1.0.4".to_string()),
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
         metadata.insert(
             "export_date".to_string(),
@@ -2469,6 +2534,10 @@ impl Database {
         ))?)
     }
 
+    /// Importa datos desde un JSON de export hacia el esquema actual.
+    /// Las columnas del JSON que no existen en el esquema actual se ignoran — esto permite migrar
+    /// de un schema viejo a uno nuevo sin romper el import cuando se renombran o eliminan columnas.
+    /// Las tablas del JSON que no existen en el schema nuevo también se saltan silenciosamente.
     pub fn import_from_json(&self, json_str: &str) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(json_str)?;
         let map = value
@@ -2487,6 +2556,25 @@ impl Database {
                     return Err(anyhow::anyhow!("Invalid table name: {}", table_name));
                 }
 
+                // Si la tabla ya no existe en el nuevo schema, se salta sin error
+                let table_exists: bool = self.conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table_name],
+                    |r| r.get::<_, i32>(0).map(|c| c > 0),
+                )?;
+                if !table_exists {
+                    continue;
+                }
+
+                // Obtiene las columnas que realmente existen en la tabla del schema actual
+                let mut col_stmt = self.conn.prepare(
+                    &format!("SELECT name FROM pragma_table_info('{}')", table_name),
+                )?;
+                let existing_cols: std::collections::HashSet<String> = col_stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
                 self.conn
                     .execute(&format!("DELETE FROM {}", table_name), [])?;
 
@@ -2502,6 +2590,10 @@ impl Database {
                     let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
                     for (col, val) in row_obj {
+                        // Columnas del export que ya no existen en el schema nuevo se ignoran
+                        if !existing_cols.contains(col) {
+                            continue;
+                        }
                         cols.push(col.clone());
                         placeholders.push(format!("?{}", cols.len()));
 
@@ -2581,6 +2673,58 @@ impl Database {
         )?;
         let compound_id = format!("{}__{}", project_id, identity);
         let _ = self.log_change("project_member", &compound_id, "add");
+        Ok(())
+    }
+
+    /// Retorna todos los miembros de un proyecto con su estado de presencia actual.
+    /// El campo `is_online` se deriva: online=1 y last_seen dentro de los últimos 10 minutos.
+    pub fn get_presence_for_project(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(String, String, String, bool, String, Option<String>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT pm.user_identity, pm.user_username, pm.role,
+                    COALESCE(p.online, 0), COALESCE(p.last_seen, ''), p.current_project
+             FROM project_members pm
+             LEFT JOIN presence p ON p.user_identity = pm.user_identity
+             WHERE pm.project_id = ?1
+             ORDER BY COALESCE(p.online, 0) DESC, pm.user_username ASC",
+        )?;
+        let cutoff = (Utc::now() - chrono::Duration::minutes(10)).to_rfc3339();
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i32>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            let (identity, username, role, online_int, last_seen, current_proj) = r?;
+            let is_online = if online_int != 0 {
+                // Validamos con el timestamp — si no es parseable asumimos que viene del server y está bien
+                let stale = chrono::DateTime::parse_from_rfc3339(&last_seen)
+                    .map(|dt| dt.to_rfc3339() < cutoff)
+                    .unwrap_or(false);
+                !stale
+            } else {
+                false
+            };
+            list.push((identity, username, role, is_online, last_seen, current_proj));
+        }
+        Ok(list)
+    }
+
+    /// Marca como offline a todos los usuarios cuyo last_seen sea más viejo que el cutoff.
+    pub fn mark_stale_presence_offline(&self, older_than_minutes: i64) -> Result<()> {
+        let cutoff = (Utc::now() - chrono::Duration::minutes(older_than_minutes)).to_rfc3339();
+        let _ = self.conn.execute(
+            "UPDATE presence SET online = 0 WHERE online = 1 AND last_seen < ?1 AND length(last_seen) > 10",
+            params![cutoff],
+        );
         Ok(())
     }
 

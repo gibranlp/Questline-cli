@@ -2,9 +2,11 @@
 // services/mod.rs — re-exports de los servicios
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod api_client;
+pub mod bonsai;
 pub mod config;
 pub mod identity;
 pub mod logger;
+pub mod planner;
 pub mod sync_engine;
 pub mod theme;
 pub mod xp;
