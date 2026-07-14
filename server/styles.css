@@ -207,13 +207,15 @@ h2 .accent { animation: cycleColor 9s linear infinite; }
 .feature-desc { font-size:0.95rem; color:var(--text-dim); line-height:1.7; }
 
 /* ── ZEN TREE ── */
-.tree-section { display:grid; grid-template-columns:auto 1fr; gap:3rem; align-items:center; margin-top:2rem; }
-.tree-ascii { font-size:1.25rem; line-height:1.5; white-space:pre; color:var(--sage); text-shadow:0 0 12px var(--sage); transition:opacity 0.35s ease; }
-.tree-stages { list-style:none; display:flex; flex-direction:column; gap:0.5rem; }
-.tree-stage { display:flex; align-items:center; gap:0.75rem; font-size:0.97rem; }
-.tree-stage .stage-dot { width:8px;height:8px;border-radius:50%;background:var(--text-dimmer);flex-shrink:0; }
+.tree-section { margin-top:2rem; }
+.tree-stages { list-style:none; display:flex; flex-direction:row; flex-wrap:nowrap; gap:0 1.75rem; overflow-x:auto; padding-bottom:0.25rem; }
+.tree-stage { display:flex; align-items:center; gap:0.5rem; font-size:0.85rem; white-space:nowrap; flex-shrink:0; }
+.tree-stage .stage-dot { width:7px;height:7px;border-radius:50%;background:var(--text-dimmer);flex-shrink:0; }
 .tree-stage .stage-name { color:var(--text-dim); }
-.tree-stage.active .stage-name { color:var(--text); }
+.tree-stage.active .stage-name { color:var(--text); font-weight:700; }
+.tree-active-desc { color:var(--text-dim); font-size:0.88rem; margin-top:0.75rem; min-height:1.3em; }
+.tree-ascii-wrap { display:flex; justify-content:center; margin-top:1.5rem; }
+.tree-ascii { font-size:1.1rem; line-height:1.4; white-space:pre; transition:opacity 0.7s ease; }
 
 /* ── TERMINAL ── */
 .term {
@@ -418,7 +420,8 @@ footer span { animation:cycleColor 9s linear infinite; }
 /* ── RESPONSIVE ── */
 @media (max-width:720px) {
   .two-col,.three-col,.features-grid,.manual-grid { grid-template-columns:1fr; }
-  .tree-section { grid-template-columns:1fr; }
+  .tree-stages { gap:0 1rem; }
+  .tree-ascii { font-size:0.85rem; }
   .soon-box { padding:2rem 1.5rem; }
   .screenshot-grid { grid-template-columns:1fr 1fr; }
   nav ul { display:none; }
