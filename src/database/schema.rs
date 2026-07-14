@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS codices (
     name TEXT NOT NULL,
     created_at TEXT NOT NULL,
     parent_codex_id TEXT,
+    collapsed INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY(parent_codex_id) REFERENCES codices(id) ON DELETE SET NULL
 );
