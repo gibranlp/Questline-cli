@@ -762,6 +762,38 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
+            // Modal de MentionSelect — para autocompletar menciones en el chat de Fellowship
+            if let questline::app::ModalType::MentionSelect { selected_idx, ref usernames } = app.modal_state {
+                let overlay_area = questline::screens::intro::centered_rect(35, 25, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(" Mention User ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                    
+                let mut list_items = Vec::new();
+                for (idx, username) in usernames.iter().enumerate() {
+                    let prefix = if idx == selected_idx { "> " } else { "  " };
+                    let style = if idx == selected_idx {
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(200, 200, 200))
+                    };
+                    list_items.push(Line::from(vec![
+                        Span::styled(prefix, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("@{}", username), style),
+                    ]));
+                }
+                
+                let p = Paragraph::new(list_items)
+                    .block(block)
+                    .alignment(ratatui::layout::Alignment::Left);
+                f.render_widget(p, overlay_area);
+            }
+
             // Modal de celebración — se abre cuando el usuario logra algo chingón, puede traer ASCII art
             if let questline::app::ModalType::Celebration { ref title, ref details, ref ascii_art } = app.modal_state {
                 let overlay_area = questline::screens::intro::centered_rect(65, 45, size);
@@ -1254,6 +1286,205 @@ async fn main() -> Result<()> {
                     .block(block)
                     .wrap(ratatui::widgets::Wrap { trim: false });
                 f.render_widget(p, overlay_area);
+            }
+
+            // Project Sharing configuration modal
+            if let questline::app::ModalType::ProjectSharing { project_id } = app.modal_state {
+                let overlay_area = centered_rect_fixed_height(60, 11, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+
+                let project = app.projects.iter().find(|p| p.id == project_id);
+                let (proj_name, is_shared) = if let Some(p) = project {
+                    (p.name.as_str(), p.is_shared)
+                } else {
+                    ("Unknown Project", false)
+                };
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(
+                        " Project Sharing Configuration ",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ));
+
+                let status_text = if is_shared {
+                    Span::styled("SHARED (Active)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                } else {
+                    Span::styled("LOCAL ONLY (Inactive)", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                };
+
+                let action_prompt = if is_shared {
+                    "Press [S] to disable sharing and make this project local."
+                } else {
+                    "Press [S] to enable sharing and publish this project."
+                };
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  Project: ", Style::default().fg(theme.muted)),
+                        Span::styled(proj_name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  Current Status: ", Style::default().fg(theme.muted)),
+                        status_text,
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("  {}", action_prompt),
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  [Esc] Cancel / Close",
+                        Style::default().fg(theme.muted),
+                    )),
+                ];
+
+                let p = Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(p, overlay_area);
+            }
+
+            // Invite Member modal
+            if let questline::app::ModalType::InviteMember {
+                ref identity,
+                ref username,
+                role_idx,
+                project_idx,
+                focus_idx,
+            } = app.modal_state
+            {
+                let area = questline::screens::intro::centered_rect(60, 65, size);
+                f.render_widget(Clear, area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+
+                let roles = ["Owner", "Steward", "Companion", "Observer"];
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(theme.warning))
+                    .title(Span::styled(
+                        " Invite Companion to Fellowship Project ",
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+
+                let inner_layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3), // Project select
+                        Constraint::Length(3), // Identity input
+                        Constraint::Length(3), // Username input
+                        Constraint::Length(3), // Role select
+                        Constraint::Length(7), // Role permissions description
+                        Constraint::Min(1),    // Help footer
+                    ])
+                    .split(block.inner(area));
+
+                f.render_widget(block, area);
+
+                let active_projects: Vec<_> = app.projects.iter().filter(|p| !p.archived).collect();
+                let project_text = if active_projects.is_empty() {
+                    "No active projects available".to_string()
+                } else if project_idx < active_projects.len() {
+                    let p = active_projects[project_idx];
+                    let shared_status = if p.is_shared { " (Shared)" } else { " (Not Shared Yet)" };
+                    format!("◀ {} {}  ▶", p.name, shared_status)
+                } else {
+                    "Invalid selection".to_string()
+                };
+
+                let input_project = Paragraph::new(format!("  {}", project_text)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if focus_idx == 0 {
+                            theme.warning
+                        } else {
+                            theme.muted
+                        }))
+                        .title(" Project to Share "),
+                );
+                f.render_widget(input_project, inner_layout[0]);
+
+                let input_identity = Paragraph::new(format!("  {}", identity)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if focus_idx == 1 {
+                            theme.warning
+                        } else {
+                            theme.muted
+                        }))
+                        .title(" Identity Public Key (Hex) "),
+                );
+                f.render_widget(input_identity, inner_layout[1]);
+
+                let input_username = Paragraph::new(format!("  {}", username)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if focus_idx == 2 {
+                            theme.warning
+                        } else {
+                            theme.muted
+                        }))
+                        .title(" Companion Name / Label "),
+                );
+                f.render_widget(input_username, inner_layout[2]);
+
+                let mut role_spans = Vec::new();
+                for (idx, r) in roles.iter().enumerate() {
+                    let is_sel = idx == role_idx;
+                    let style = if is_sel {
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD)
+                            .bg(theme.panel)
+                    } else {
+                        Style::default().fg(theme.text)
+                    };
+                    role_spans.push(Span::styled(format!(" {} ", r), style));
+                    if idx < roles.len() - 1 {
+                        role_spans.push(Span::styled(" | ", Style::default().fg(theme.muted)));
+                    }
+                }
+                let role_p = Paragraph::new(Line::from(role_spans)).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(if focus_idx == 3 {
+                            theme.warning
+                        } else {
+                            theme.muted
+                        }))
+                        .title(" Fellowship Role "),
+                );
+                f.render_widget(role_p, inner_layout[3]);
+
+                let permissions_text = match role_idx {
+                    0 => "  Permissions: Full Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Invite, modify, and remove members\n  • Delete project / transfer ownership",
+                    1 => "  Permissions: Administrative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Invite new members (Companion/Observer roles)\n  • Cannot delete project or transfer ownership",
+                    2 => "  Permissions: Standard Collaborative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Cannot manage members or project settings",
+                    3 => "  Permissions: Read-Only Access\n  • View project board, tasks, and notes\n  • Read Chronicle messages and activity feed\n  • Cannot add/edit tasks/notes or post messages",
+                    _ => "",
+                };
+
+                let perm_p = Paragraph::new(permissions_text).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.border))
+                        .title(Span::styled(" Selected Role Permissions ", Style::default().fg(theme.warning))),
+                );
+                f.render_widget(perm_p, inner_layout[4]);
+
+                let help_p = Paragraph::new("  [Tab/Shift-Tab] navigate  |  [←/→] select project/change role  |  [Enter] send invitation  |  [Esc] cancel")
+                    .style(Style::default().fg(theme.muted));
+                f.render_widget(help_p, inner_layout[5]);
             }
 
             // Confirm de borrar proyecto — advertencia roja porque esto no tiene vuelta atrás

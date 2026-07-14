@@ -100,13 +100,17 @@ pub enum ModalType {
     SupportRealm,
     NewProject {
         name: String,
+        name_cursor: usize,
         desc: String,
+        desc_cursor: usize,
         focus_idx: usize,
     },
     EditProject {
         id: Uuid,
         name: String,
+        name_cursor: usize,
         desc: String,
+        desc_cursor: usize,
         focus_idx: usize,
     },
     NewTask {
@@ -225,6 +229,10 @@ pub enum ModalType {
     },
     AddReaction {
         message_id: Uuid,
+    },
+    MentionSelect {
+        selected_idx: usize,
+        usernames: Vec<String>,
     },
     // Selector de tema visual — cambia los colores de toda la UI al vuelo
     ThemeSelect {
@@ -1948,8 +1956,8 @@ impl App {
     }
 
     pub fn reload_data(&mut self) -> Result<()> {
+        self.user = self.db.get_user()?;
         if self.user.is_some() {
-            self.user = self.db.get_user()?;
             if let Some(ref u) = self.user {
                 self.theme_service.set_class(u.class);
             }
@@ -2672,9 +2680,22 @@ impl App {
                         use base64::{engine::general_purpose::STANDARD, Engine as _};
                         let trimmed = val.trim().to_string();
                         match STANDARD.decode(&trimmed) {
-                            Ok(secret_bytes) if secret_bytes.len() == 32 => {
+                            Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
                                 use ed25519_dalek::{SigningKey, VerifyingKey};
-                                let secret_arr: [u8; 32] = secret_bytes.try_into().unwrap();
+                                
+                                let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
+                                    let mut uuid_bytes = [0u8; 16];
+                                    uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
+                                    let user_uuid = Uuid::from_bytes(uuid_bytes);
+                                    let mut secret_bytes = [0u8; 32];
+                                    secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
+                                    (user_uuid, secret_bytes)
+                                } else {
+                                    let mut secret_bytes = [0u8; 32];
+                                    secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
+                                    (self.identity.user_uuid, secret_bytes)
+                                };
+
                                 let signing_key = SigningKey::from_bytes(&secret_arr);
                                 let verifying_key: VerifyingKey = signing_key.verifying_key();
                                 let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
@@ -2687,7 +2708,7 @@ impl App {
                                 let _ = std::fs::copy(&db_path, &backup_path);
 
                                 let new_identity = crate::services::identity::Identity {
-                                    user_uuid: self.identity.user_uuid,
+                                    user_uuid,
                                     public_key: public_hex,
                                     secret_key: secret_hex,
                                     created_at: self.identity.created_at.clone(),
@@ -2717,6 +2738,15 @@ impl App {
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string()
                                                 ));
+                                                // If we had a 32-byte code (where we didn't know the user_uuid beforehand),
+                                                // now that the database has been imported, we can extract the correct
+                                                // user_uuid and update identity.key so they match!
+                                                if let Ok(Some(u)) = self.db.get_user() {
+                                                    self.identity.user_uuid = u.id;
+                                                    if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                                        let _ = std::fs::write(&key_path, json_str);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -3823,6 +3853,38 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::MentionSelect {
+                selected_idx,
+                ref usernames,
+            } => {
+                let mut sel = selected_idx;
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Up => {
+                        sel = if sel > 0 { sel - 1 } else { usernames.len() - 1 };
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: sel,
+                            usernames: usernames.clone(),
+                        };
+                    }
+                    KeyCode::Down => {
+                        sel = (sel + 1) % usernames.len();
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: sel,
+                            usernames: usernames.clone(),
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let selected_username = &usernames[sel];
+                        self.fellowship_chat_input.push_str(&format!("@{}", selected_username));
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::ChapterComplete => {
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc | KeyCode::Char(' ') => {
@@ -4458,6 +4520,35 @@ impl App {
                     }
                     return Ok(true);
                 }
+                KeyCode::Char('@') => {
+                    let mut usernames = Vec::new();
+                    let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+                    if !shared_projects.is_empty() && self.selected_fellowship_project_idx < shared_projects.len() {
+                        let proj = &shared_projects[self.selected_fellowship_project_idx];
+                        let members = self.db.get_project_members(&proj.id.to_string()).unwrap_or_default();
+                        for m in members {
+                            usernames.push(m.1);
+                        }
+                    }
+                    let companions = self.db.get_presence_list().unwrap_or_default();
+                    for c in companions {
+                        usernames.push(c.1);
+                    }
+                    usernames.sort();
+                    usernames.dedup();
+                    if let Some(ref u) = self.user {
+                        usernames.retain(|name| name != &u.username);
+                    }
+                    if !usernames.is_empty() {
+                        self.modal_state = ModalType::MentionSelect {
+                            selected_idx: 0,
+                            usernames,
+                        };
+                    } else {
+                        self.fellowship_chat_input.push('@');
+                    }
+                    return Ok(true);
+                }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.fellowship_chat_input.push(c);
                     return Ok(true);
@@ -4691,7 +4782,7 @@ impl App {
                         '0' => state.goto_line_start(),
                         '$' => state.goto_line_end(),
                         'G' => state.goto_file_end(),
-                        'y' => state.yank_visual(),
+                        'y' | 'Y' => state.yank_visual(),
                         'd' | 'x' => { state.push_undo(); state.delete_visual(); }
                         'c' => { state.push_undo(); state.change_visual(); }
                         'v' | 'V' => {
@@ -4755,6 +4846,7 @@ impl App {
                     (_, 'C') => { state.push_undo(); state.change_to_end(); }
                     (_, 'p') => { state.push_undo(); state.paste_after(); }
                     (_, 'P') => { state.push_undo(); state.paste_before(); }
+                    (_, 'Y') => state.yank_line(),
                     (_, 'u') => state.undo(),
                     (_, 'v') => state.enter_visual_char(),
                     (_, 'V') => state.enter_visual_line(),
@@ -4929,7 +5021,12 @@ impl App {
                                     u8::from_str_radix(s, 16).ok()
                                 })
                                 .collect();
-                            let transfer_code = STANDARD.encode(&secret_bytes);
+                            
+                            let mut transfer_bytes = Vec::new();
+                            transfer_bytes.extend_from_slice(self.identity.user_uuid.as_bytes());
+                            transfer_bytes.extend_from_slice(&secret_bytes);
+                            
+                            let transfer_code = STANDARD.encode(&transfer_bytes);
                             // Also upload to cloud so 'r' on PC-B works right after identity transfer
                             if self.config.sync_enabled {
                                 if let Ok(json) = self.db.export_to_json() {
@@ -5003,6 +5100,8 @@ impl App {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
+                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                self.reload_data()?;
             }
             KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::GreatChronicle;
@@ -5015,10 +5114,6 @@ impl App {
                 self.load_chapter_progress_from_cache();
                 self.pull_great_chronicle_async();
                 self.pull_chapter_progress_async();
-            }
-            KeyCode::Char('D') => {
-                self.active_screen = ActiveScreen::Dashboard;
-                self.active_tab_idx = 0;
             }
             KeyCode::Char('d') => {
                 if self.active_screen == ActiveScreen::Projects {
@@ -5072,54 +5167,19 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     open_url("https://ko-fi.com/Y4H021XN7F");
                     self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
-                } else {
-                    self.active_screen = ActiveScreen::Projects;
-                    self.active_tab_idx = 1;
                 }
-            }
-            KeyCode::Char('H') => {
-                self.active_screen = ActiveScreen::Character;
-                self.active_tab_idx = 2;
             }
             KeyCode::Char('f') | KeyCode::Char('F') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Focus;
                 self.active_tab_idx = 6;
             }
-            KeyCode::Char('F') => {
-                self.active_screen = ActiveScreen::Fellowship;
-                self.active_tab_idx = 8;
-                self.pull_invitations_async();
-            }
-
-            KeyCode::Char('S') if self.active_screen == ActiveScreen::Projects => {
-                self.active_screen = ActiveScreen::Fellowship;
-                self.active_tab_idx = 8;
-                self.pull_invitations_async();
-            }
             KeyCode::Char('A') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Archive;
                 self.active_tab_idx = 10;
             }
-            KeyCode::Char('S') => {
-                self.active_screen = ActiveScreen::SyncSettings;
-                self.active_tab_idx = 12;
-            }
-
-            KeyCode::Char('l') | KeyCode::Char('L') => {
-                self.active_screen = ActiveScreen::Library;
-                self.active_tab_idx = 4;
-            }
-            KeyCode::Char('g') | KeyCode::Char('G') => {
-                self.active_screen = ActiveScreen::GreatChronicle;
-                self.active_tab_idx = 14;
-                self.great_chronicle_scroll = 0;
-                self.chapter_panel_scroll = 0;
-                self.chapter_panel_focused = true;
-                self.great_chronicle_entries =
-                    self.db.get_global_chronicle_entries().unwrap_or_default();
-                self.load_chapter_progress_from_cache();
-                self.pull_great_chronicle_async();
-                self.pull_chapter_progress_async();
+            KeyCode::Char('g') | KeyCode::Char('G') if self.active_screen == ActiveScreen::Library => {
+                self.active_screen = ActiveScreen::Legends;
+                self.active_tab_idx = 5;
             }
             KeyCode::Char('w') => {
                 if self.active_screen == ActiveScreen::Dashboard {
@@ -5155,7 +5215,7 @@ impl App {
             {
                 if self.active_screen == ActiveScreen::Dashboard {
                     // Cycle active ambient effect
-                    self.active_ambient_effect = (self.active_ambient_effect + 1) % 6;
+                    self.active_ambient_effect = (self.active_ambient_effect + 1) % 7;
                     self.db.set_setting(
                         "active_ambient_effect",
                         &self.active_ambient_effect.to_string(),
@@ -5170,6 +5230,7 @@ impl App {
                                 3 => "Rain",
                                 4 => "Snow",
                                 5 => "Glowing Runes",
+                                6 => "Matrix Rain",
                                 _ => "Off",
                             }
                         )));
@@ -5247,7 +5308,7 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s') | KeyCode::Char('S') => {
                 if self.active_screen == ActiveScreen::Character {
                     if let Some(ref u) = self.user {
                         if u.level >= 10 && u.specialization.is_none() {
@@ -5259,6 +5320,18 @@ impl App {
                                 selected_idx: 0,
                             };
                         }
+                    }
+                } else if self.active_screen == ActiveScreen::Projects {
+                    let active: Vec<&Project> =
+                        self.projects.iter().filter(|p| !p.archived).collect();
+                    if !active.is_empty() && self.selected_project_idx < active.len() {
+                        self.modal_state = ModalType::InviteMember {
+                            identity: String::new(),
+                            username: String::new(),
+                            role_idx: 0,
+                            project_idx: self.selected_project_idx,
+                            focus_idx: 0,
+                        };
                     }
                 }
             }
@@ -5288,43 +5361,28 @@ impl App {
                     }
                 }
             }
-            KeyCode::Tab => {
-                self.active_tab_idx = (self.active_tab_idx + 1) % 15;
-                while self.active_tab_idx == 3
-                    || self.active_tab_idx == 5
-                    || self.active_tab_idx == 6
-                    || self.active_tab_idx == 8
-                    || self.active_tab_idx == 9
-                    || self.active_tab_idx == 10
-                    || self.active_tab_idx == 11
-                    || self.active_tab_idx == 14
-                {
-                    self.active_tab_idx = (self.active_tab_idx + 1) % 15;
+            KeyCode::Tab if self.active_screen == ActiveScreen::Library => {
+                if self.library_active_col < 2 {
+                    self.library_active_col += 1;
+                    self.library_scroll_offset = 0;
                 }
-                self.sync_screen_tab();
             }
-            KeyCode::BackTab => {
-                if self.active_tab_idx > 0 {
-                    self.active_tab_idx -= 1;
-                } else {
-                    self.active_tab_idx = 14;
+            KeyCode::BackTab if self.active_screen == ActiveScreen::Library => {
+                if self.library_active_col > 0 {
+                    self.library_active_col -= 1;
+                    self.library_scroll_offset = 0;
                 }
-                while self.active_tab_idx == 3
-                    || self.active_tab_idx == 5
-                    || self.active_tab_idx == 6
-                    || self.active_tab_idx == 8
-                    || self.active_tab_idx == 9
-                    || self.active_tab_idx == 10
-                    || self.active_tab_idx == 11
-                    || self.active_tab_idx == 14
-                {
-                    if self.active_tab_idx > 0 {
-                        self.active_tab_idx -= 1;
-                    } else {
-                        self.active_tab_idx = 14;
-                    }
+            }
+            KeyCode::Tab if self.active_screen == ActiveScreen::Character => {
+                let has_reflections = !self.db.get_reflections().unwrap_or_default().is_empty();
+                if has_reflections && self.character_focus < 2 {
+                    self.character_focus += 1;
                 }
-                self.sync_screen_tab();
+            }
+            KeyCode::BackTab if self.active_screen == ActiveScreen::Character => {
+                if self.character_focus > 0 {
+                    self.character_focus -= 1;
+                }
             }
             // Screen specific arrows and edits
             KeyCode::Up => {
@@ -5979,7 +6037,9 @@ impl App {
                 if self.active_screen == ActiveScreen::Projects {
                     self.modal_state = ModalType::NewProject {
                         name: String::new(),
+                        name_cursor: 0,
                         desc: String::new(),
+                        desc_cursor: 0,
                         focus_idx: 0,
                     };
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -5998,10 +6058,15 @@ impl App {
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
                         let p = active[self.selected_project_idx];
+                        let name_len = p.name.len();
+                        let desc_str = p.description.clone().unwrap_or_default();
+                        let desc_len = desc_str.len();
                         self.modal_state = ModalType::EditProject {
                             id: p.id,
                             name: p.name.clone(),
-                            desc: p.description.clone().unwrap_or_default(),
+                            name_cursor: name_len,
+                            desc: desc_str,
+                            desc_cursor: desc_len,
                             focus_idx: 0,
                         };
                     }
@@ -6120,23 +6185,35 @@ impl App {
     }
 
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        let (mut name, mut desc, mut focus_idx, is_edit, p_id) = match self.modal_state {
+        let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) = match self.modal_state {
             ModalType::NewProject {
                 ref name,
+                name_cursor,
                 ref desc,
+                desc_cursor,
                 focus_idx,
-            } => (name.clone(), desc.clone(), focus_idx, false, None),
+            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, false, None),
             ModalType::EditProject {
                 id,
                 ref name,
+                name_cursor,
                 ref desc,
+                desc_cursor,
                 focus_idx,
-            } => (name.clone(), desc.clone(), focus_idx, true, Some(id)),
+            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, true, Some(id)),
             _ => return Ok(()),
         };
 
+        name_cursor = name_cursor.min(name.len());
+        desc_cursor = desc_cursor.min(desc.len());
+
         match key.code {
             KeyCode::Esc => {
+                if is_edit {
+                    // en edición ESC guarda automáticamente antes de cerrar; en creación
+                    // (New Realm Quest) ESC sigue cancelando sin crear el proyecto
+                    self.save_project_modal(&name, &desc, p_id)?;
+                }
                 self.modal_state = ModalType::None;
             }
             KeyCode::Tab => {
@@ -6145,13 +6222,17 @@ impl App {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
@@ -6162,13 +6243,137 @@ impl App {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Left => {
+                if focus_idx == 0 {
+                    if name_cursor > 0 {
+                        name_cursor -= 1;
+                        while name_cursor > 0 && !name.is_char_boundary(name_cursor) {
+                            name_cursor -= 1;
+                        }
+                    }
+                } else {
+                    if desc_cursor > 0 {
+                        desc_cursor -= 1;
+                        while desc_cursor > 0 && !desc.is_char_boundary(desc_cursor) {
+                            desc_cursor -= 1;
+                        }
+                    }
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Right => {
+                if focus_idx == 0 {
+                    if name_cursor < name.len() {
+                        name_cursor += 1;
+                        while name_cursor < name.len() && !name.is_char_boundary(name_cursor) {
+                            name_cursor += 1;
+                        }
+                    }
+                } else {
+                    if desc_cursor < desc.len() {
+                        desc_cursor += 1;
+                        while desc_cursor < desc.len() && !desc.is_char_boundary(desc_cursor) {
+                            desc_cursor += 1;
+                        }
+                    }
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Home => {
+                if focus_idx == 0 {
+                    name_cursor = 0;
+                } else {
+                    desc_cursor = 0;
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::End => {
+                if focus_idx == 0 {
+                    name_cursor = name.len();
+                } else {
+                    desc_cursor = desc.len();
+                }
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
@@ -6176,88 +6381,180 @@ impl App {
             KeyCode::Char(c) => {
                 if focus_idx == 0 {
                     if name.len() < 30 {
-                        name.push(c);
+                        name.insert(name_cursor, c);
+                        name_cursor += c.len_utf8();
                     }
                 } else {
                     if desc.len() < 100 {
-                        desc.push(c);
+                        desc.insert(desc_cursor, c);
+                        desc_cursor += c.len_utf8();
                     }
                 }
                 self.modal_state = if is_edit {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
             }
             KeyCode::Backspace => {
                 if focus_idx == 0 {
-                    name.pop();
+                    if name_cursor > 0 {
+                        let mut prev = name_cursor - 1;
+                        while prev > 0 && !name.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        name.remove(prev);
+                        name_cursor = prev;
+                    }
                 } else {
-                    desc.pop();
+                    if desc_cursor > 0 {
+                        let mut prev = desc_cursor - 1;
+                        while prev > 0 && !desc.is_char_boundary(prev) {
+                            prev -= 1;
+                        }
+                        desc.remove(prev);
+                        desc_cursor = prev;
+                    }
                 }
                 self.modal_state = if is_edit {
                     ModalType::EditProject {
                         id: p_id.unwrap(),
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 } else {
                     ModalType::NewProject {
                         name,
+                        name_cursor,
                         desc,
+                        desc_cursor,
                         focus_idx,
                     }
                 };
             }
-            KeyCode::Enter if !name.trim().is_empty() => {
-                let project_desc = if desc.trim().is_empty() {
-                    None
-                } else {
-                    Some(desc.trim().to_string())
-                };
-                if let Some(id) = p_id {
-                    if let Some(mut existing) = self.projects.iter().find(|x| x.id == id).cloned() {
-                        existing.name = name.trim().to_string();
-                        existing.description = project_desc;
-                        self.db.update_project(&existing)?;
-                        self.mark_dirty();
+            KeyCode::Delete => {
+                if focus_idx == 0 {
+                    if name_cursor < name.len() {
+                        name.remove(name_cursor);
                     }
                 } else {
-                    let p = Project {
-                        id: Uuid::new_v4(),
-                        name: name.trim().to_string(),
-                        description: project_desc,
-                        created_at: Utc::now(),
-                        archived: false,
-                        completed: false,
-                        owner_identity: Some(self.identity.public_key.clone()),
-                        owner_username: Some(
-                            self.user
-                                .as_ref()
-                                .map(|u| u.username.clone())
-                                .unwrap_or_else(|| "Gibranlp".to_string()),
-                        ),
-                        is_shared: false,
-                    };
-                    self.db.insert_project(&p)?;
-                    self.mark_dirty();
-                    self.apply_class_passive("project_create", 0)?;
+                    if desc_cursor < desc.len() {
+                        desc.remove(desc_cursor);
+                    }
                 }
-                self.reload_data()?;
-                self.modal_state = ModalType::None;
+                self.modal_state = if is_edit {
+                    ModalType::EditProject {
+                        id: p_id.unwrap(),
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                } else {
+                    ModalType::NewProject {
+                        name,
+                        name_cursor,
+                        desc,
+                        desc_cursor,
+                        focus_idx,
+                    }
+                };
+            }
+            KeyCode::Enter => {
+                if focus_idx == 1 {
+                    if desc.len() < 100 {
+                        desc.insert(desc_cursor, '\n');
+                        desc_cursor += 1;
+                    }
+                    self.modal_state = if is_edit {
+                        ModalType::EditProject {
+                            id: p_id.unwrap(),
+                            name,
+                            name_cursor,
+                            desc,
+                            desc_cursor,
+                            focus_idx,
+                        }
+                    } else {
+                        ModalType::NewProject {
+                            name,
+                            name_cursor,
+                            desc,
+                            desc_cursor,
+                            focus_idx,
+                        }
+                    };
+                } else if !name.trim().is_empty() {
+                    self.save_project_modal(&name, &desc, p_id)?;
+                    self.modal_state = ModalType::None;
+                }
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    // guarda (crea o actualiza) el proyecto del modal de nombre/descripción — usado por Enter y por
+    // ESC (que ahora guarda en automático antes de cerrar en vez de descartar los cambios)
+    fn save_project_modal(&mut self, name: &str, desc: &str, p_id: Option<Uuid>) -> Result<()> {
+        if name.trim().is_empty() {
+            return Ok(());
+        }
+        let project_desc = {
+            let trimmed = desc.trim_start_matches(|c: char| c.is_whitespace() && c != '\n')
+                               .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+        if let Some(id) = p_id {
+            if let Some(mut existing) = self.projects.iter().find(|x| x.id == id).cloned() {
+                existing.name = name.trim().to_string();
+                existing.description = project_desc;
+                self.db.update_project(&existing)?;
+                self.mark_dirty();
+            }
+        } else {
+            let p = Project {
+                id: Uuid::new_v4(),
+                name: name.trim().to_string(),
+                description: project_desc,
+                created_at: Utc::now(),
+                archived: false,
+                completed: false,
+                owner_identity: Some(self.identity.public_key.clone()),
+                owner_username: Some(
+                    self.user
+                        .as_ref()
+                        .map(|u| u.username.clone())
+                        .unwrap_or_else(|| "Gibranlp".to_string()),
+                ),
+                is_shared: false,
+            };
+            self.db.insert_project(&p)?;
+            self.mark_dirty();
+            self.apply_class_passive("project_create", 0)?;
+        }
+        self.reload_data()?;
         Ok(())
     }
 
@@ -7863,6 +8160,7 @@ impl App {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn sync_screen_tab(&mut self) {
         self.active_screen = match self.active_tab_idx {
             0 => ActiveScreen::Dashboard,
@@ -9358,6 +9656,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
+                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                self.reload_data()?;
             }
             "open_library" => {
                 self.active_screen = ActiveScreen::Library;
@@ -9442,7 +9742,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             "cycle_ambient" => {
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
-                self.active_ambient_effect = (self.active_ambient_effect + 1) % 6;
+                self.active_ambient_effect = (self.active_ambient_effect + 1) % 7;
                 self.db.set_setting(
                     "active_ambient_effect",
                     &self.active_ambient_effect.to_string(),
@@ -9457,6 +9757,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         3 => "Rain",
                         4 => "Snow",
                         5 => "Glowing Runes",
+                        6 => "Matrix Rain",
                         _ => "Off",
                     }
                 )));
@@ -9625,7 +9926,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
 
-        let should_spawn = self.ambient_particles_ticks_remaining > 0;
+        let should_spawn = true;
         if self.ambient_particles_ticks_remaining > 0 {
             self.ambient_particles_ticks_remaining -= 1;
         }
@@ -9635,11 +9936,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         let mut rng = rand::thread_rng();
 
         let max_particles = match self.active_ambient_effect {
-            3 => 40,
-            _ => 20,
+            3 => 120, // Rain
+            6 => 120, // Matrix Rain
+            4 => 60,  // Snow
+            1 | 5 => 50, // Leaves, Runes
+            2 => 40,  // Stars
+            _ => 30,
         };
 
-        if should_spawn && self.ambient_particles.len() < max_particles && rng.gen_bool(0.3) {
+        let spawn_prob = match self.active_ambient_effect {
+            3 | 6 => 0.5, // High spawn rate for rain/matrix
+            _ => 0.25,
+        };
+
+        if should_spawn && self.ambient_particles.len() < max_particles && rng.gen_bool(spawn_prob) {
             let symbol = match self.active_ambient_effect {
                 1 => *['*', 'o', '~', 's'].choose(&mut rng).unwrap_or(&'*'),
                 2 => *['.', '*', '+'].choose(&mut rng).unwrap_or(&'.'),
@@ -9648,6 +9958,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 5 => *['A', '7', '@', '#', '!', 'Z', '$', '%']
                     .choose(&mut rng)
                     .unwrap_or(&'*'),
+                6 => *['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '@', '#', '$', '%', '&', '*', '+', '=', '<', '>', '?']
+                    .choose(&mut rng)
+                    .unwrap_or(&'1'),
                 _ => '*',
             };
 
@@ -9663,6 +9976,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 3 => ratatui::style::Color::Rgb(14, 165, 233),
                 4 => ratatui::style::Color::White,
                 5 => ratatui::style::Color::Rgb(168, 85, 247),
+                6 => *[
+                    ratatui::style::Color::Rgb(34, 197, 94),
+                    ratatui::style::Color::Rgb(22, 163, 74),
+                    ratatui::style::Color::Rgb(74, 222, 128),
+                ]
+                .choose(&mut rng)
+                .unwrap_or(&ratatui::style::Color::Green),
                 _ => ratatui::style::Color::White,
             };
 
@@ -9672,11 +9992,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 3 => rng.gen_range(0.8..1.3),
                 4 => rng.gen_range(0.08..0.18),
                 5 => rng.gen_range(0.15..0.35),
+                6 => rng.gen_range(0.3..0.6),
                 _ => 0.1,
             };
 
             self.ambient_particles.push(Particle {
-                x: rng.gen_range(0..180),
+                x: rng.gen_range(0..200),
                 y: 0.0,
                 speed,
                 symbol,
@@ -9926,6 +10247,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         self.last_chat_timestamp.insert(poll.project_id.clone(), ts);
                     }
                     if poll.new_message_count > 0 {
+                        let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                         self.reload_data()?;
                     }
                 }
@@ -11597,6 +11919,8 @@ mod app_tests {
             owner_identity: None,
             owner_username: None,
             parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
         };
         app.db.insert_task(&t).unwrap();
         app.active_project_id = Some(proj.id);
@@ -11863,6 +12187,8 @@ mod app_tests {
                 owner_identity: None,
                 owner_username: None,
                 parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
             };
             app.db.insert_task(&t).unwrap();
         }
@@ -12382,8 +12708,13 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
 
-        // Key 'S' -> SyncSettings
+        // Key 'S' -> should NOT switch screens globally anymore
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+
+        // Switch to SyncSettings using key '6' for the next test
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
         assert_eq!(app.active_tab_idx, 12);
@@ -12410,13 +12741,12 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Archive);
         assert_eq!(app.active_tab_idx, 10);
 
-        // Key 'F' on Dashboard -> should switch to Fellowship
+        // Key 'F' on Dashboard -> should NOT switch to Fellowship anymore
         app.active_screen = ActiveScreen::Dashboard;
         app.active_tab_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
-        assert_eq!(app.active_tab_idx, 8);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         // Key 'F' on Projects -> should switch to Focus
         app.active_screen = ActiveScreen::Projects;
@@ -12426,21 +12756,38 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Focus);
         assert_eq!(app.active_tab_idx, 6);
 
-        // Key 'S' on Dashboard -> should switch to SyncSettings
+        // Key 'S' on Dashboard -> should NOT switch to SyncSettings anymore
         app.active_screen = ActiveScreen::Dashboard;
         app.active_tab_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
-        assert_eq!(app.active_tab_idx, 12);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
-        // Key 'S' on Projects -> should switch to Fellowship
+        // Key 'S' on Projects -> should NOT switch to Fellowship anymore
         app.active_screen = ActiveScreen::Projects;
         app.active_tab_idx = 1;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
-        assert_eq!(app.active_tab_idx, 8);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        // Pressing 'S' on Projects screen with a project -> should open ProjectSharing modal
+        let p_id = uuid::Uuid::new_v4();
+        let test_proj = crate::models::project::Project {
+            id: p_id,
+            name: "Test Project".to_string(),
+            description: None,
+            created_at: chrono::Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.projects = vec![test_proj];
+        app.selected_project_idx = 0;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0));
 
         let _ = std::fs::remove_file(db_file);
     }

@@ -1428,7 +1428,7 @@ impl Database {
 
     pub fn get_statistics(&self) -> Result<Statistics> {
         let tasks_completed: i32 = self.conn.query_row(
-            "SELECT count(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL",
+            "SELECT count(*) FROM tasks WHERE completed = 1",
             [],
             |row| row.get(0),
         )?;
@@ -1846,7 +1846,7 @@ impl Database {
 
     pub fn get_daily_adventures_completed_count(&self) -> Result<i64> {
         let count: i64 = self.conn.query_row(
-            "SELECT count(*) FROM xp_events WHERE description LIKE 'Daily Quest:%'",
+            "SELECT count(*) FROM xp_events WHERE event_type LIKE 'Daily Quest:%'",
             [],
             |row| row.get(0),
         )?;

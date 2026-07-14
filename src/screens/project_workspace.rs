@@ -1756,14 +1756,28 @@ fn draw_overview_tab(
         .split(area);
 
     // 1. Metadata Block
-    let metadata_text = vec![
-        Line::from(vec![
+    let mut metadata_text = Vec::new();
+    let desc = project.description.as_deref().unwrap_or("None");
+    let mut desc_lines = desc.lines();
+    if let Some(first_line) = desc_lines.next() {
+        metadata_text.push(Line::from(vec![
             Span::styled("  Description: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                project.description.as_deref().unwrap_or("None"),
-                Style::default().fg(Color::White),
-            ),
-        ]),
+            Span::styled(first_line, Style::default().fg(Color::White)),
+        ]));
+        for remaining_line in desc_lines {
+            metadata_text.push(Line::from(vec![
+                Span::styled("               ", Style::default().fg(theme.muted)),
+                Span::styled(remaining_line, Style::default().fg(Color::White)),
+            ]));
+        }
+    } else {
+        metadata_text.push(Line::from(vec![
+            Span::styled("  Description: ", Style::default().fg(theme.muted)),
+            Span::styled("None", Style::default().fg(Color::White)),
+        ]));
+    }
+
+    metadata_text.extend(vec![
         Line::from(vec![
             Span::styled("  Created At:  ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -1775,7 +1789,7 @@ fn draw_overview_tab(
             Span::styled("  Chronicle Age: ", Style::default().fg(theme.muted)),
             Span::styled(age_str, Style::default().fg(theme.warning)),
         ]),
-    ];
+    ]);
     let metadata_p = Paragraph::new(metadata_text)
         .block(
             Block::default()

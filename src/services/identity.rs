@@ -31,7 +31,14 @@ impl Identity {
         // Si ya existe el archivo, cárgalo y listo — no regeneres llaves innecesariamente
         if key_path.exists() {
             let file_content = std::fs::read_to_string(&key_path)?;
-            let identity: Identity = serde_json::from_str(&file_content)?;
+            let mut identity: Identity = serde_json::from_str(&file_content)?;
+            if let Some(user_id) = existing_user_id {
+                if identity.user_uuid != user_id {
+                    identity.user_uuid = user_id;
+                    let json_str = serde_json::to_string_pretty(&identity)?;
+                    std::fs::write(&key_path, json_str)?;
+                }
+            }
             return Ok(identity);
         }
 

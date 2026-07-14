@@ -670,6 +670,8 @@ impl<'a> SyncEngine<'a> {
                     match log.entity_type.as_str() {
                         "user" => {
                             if let Ok(u) = serde_json::from_str::<crate::models::User>(content) {
+                                // Clear the table first to enforce singleton constraint and avoid duplicating users
+                                let _ = self.db.conn.execute("DELETE FROM users", []);
                                 let _ = self.db.conn.execute(
                                     "INSERT OR REPLACE INTO users (id, username, class, level, xp, created_at, specialization) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                                     params![
@@ -1098,6 +1100,8 @@ mod tests {
             owner_identity: None,
             owner_username: None,
             parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
         };
 
         db.insert_task(&task).expect("Failed to insert task");
@@ -1127,6 +1131,7 @@ mod tests {
             updated_at: Utc::now(),
             sharing_permission: "read_only".to_string(),
             codex_id: None,
+            owner_identity: None,
         };
 
         db.insert_note(&note).expect("Failed to insert note");
