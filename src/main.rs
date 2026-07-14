@@ -205,6 +205,10 @@ async fn main() -> Result<()> {
             }
         }
 
+        if app.quitting_after_sync && !app.sync_in_progress {
+            app.should_quit = true;
+        }
+
         if app.should_quit {
             break;
         }
@@ -212,6 +216,7 @@ async fn main() -> Result<()> {
         app.terminal_height = terminal.size().map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_auto_sync()?;
+        app.tick_export_backup();
         app.tick_chat_poll()?;
         app.tick_presence_update()?;
         app.tick_focus_session()?;
@@ -431,9 +436,9 @@ async fn main() -> Result<()> {
                         ("Hero",       ActiveScreen::Character),
                         ("Library",    ActiveScreen::Library),
                         ("Music",      ActiveScreen::Soundscapes),
-                        ("Sync",       ActiveScreen::SyncSettings),
                         ("Fellowship", ActiveScreen::Fellowship),
                         ("Chronicle",  ActiveScreen::GreatChronicle),
+                        ("Sync",       ActiveScreen::SyncSettings),
                     ];
 
                     let muted = Color::Rgb(90, 90, 90);
@@ -1260,7 +1265,17 @@ async fn main() -> Result<()> {
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(format!("\"{}\"", quote), Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC))));
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled("Are you sure you want to quit? [Y/N]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+                if app.quitting_after_sync {
+                    let spinner = ["▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱",
+                                   "▰▰▰▰▰▱▱▱", "▰▰▰▰▰▰▱▱", "▰▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰▰"];
+                    let spin = spinner[(app.quit_confirm_ticks / 6) as usize % 8];
+                    lines.push(Line::from(Span::styled(
+                        format!("{} Sealing the Chronicle before departure…", spin),
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    )));
+                } else {
+                    lines.push(Line::from(Span::styled("Are you sure you want to quit? [Y/N]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
+                }
 
                 let p = Paragraph::new(lines)
                     .block(block)
@@ -1694,10 +1709,10 @@ async fn main() -> Result<()> {
                     Line::from(Span::styled("Global Shortcuts:", Style::default().fg(theme.primary).add_modifier(Modifier::UNDERLINED | Modifier::BOLD))),
                     Line::from("  Ctrl+P / : / Ctrl+K / F1  Command Palette (Fuzzy Navigation & Commands)"),
                     Line::from("  ?            Show Keyboard Shortcuts Help (Context-Sensitive)"),
-                    Line::from("  D/P/H/L/G/M/S Switch tabs directly"),
+                    Line::from("  1-8          Switch sections directly"),
                     Line::from("  Tab          Cycle input focus/fields"),
                     Line::from("  Shift+Tab    Cycle fields backwards"),
-                    Line::from("  Ctrl+C       Force Quit Application"),
+                    Line::from("  q / Q        Quit (seals Chronicle + syncs before exit)"),
                     Line::from(""),
                 ];
 

@@ -203,6 +203,21 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v1.1.0", "Jul 14, 2026",
+            "The Nodes Remember",
+            &[
+                "Multi-device sync: processed events deduplication — no more phantom conflicts",
+                "Device heartbeat: all your nodes visible in Sync screen with online status",
+                "Fellowship presence: companions show online/offline in shared projects",
+                "Real-time companion sync: shared workspaces sync every 8s, instantly on open",
+                "Companion task ownership badges in shared project task lists",
+                "Dashboard: class progression tree shows current power and next milestone",
+                "New Evergrowth rendering and dashboard layout",
+                "Navigation reorder: 6=Fellowship, 7=Chronicle, 8=Sync",
+                "Ctrl+C blocked — q/Q triggers a final sync before exit",
+            ],
+        ),
+        (
             "v1.0.9", "Jul 11, 2026",
             "The Scrollkeeper Awakens",
             &[

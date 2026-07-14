@@ -565,7 +565,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "   Devices Registered:     ",
+                "   Nodes Registered:       ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -575,8 +575,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("  |  {} conflicts", stats.conflict_count),
-                Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                format!("  |  {} online now", stats.active_devices),
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if stats.conflict_count > 0 {
+                    format!("  |  {} resolved conflicts", stats.conflict_count)
+                } else {
+                    "  |  no conflicts".to_string()
+                },
+                Style::default().fg(if stats.conflict_count > 0 { theme.warning } else { theme.muted }),
             ),
         ]),
         Line::from(""),
@@ -650,8 +658,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     // modal de exportar perfil — muestra el transfer code partido a la mitad para que quepa
-    if let ModalType::ExportProfile { transfer_code } = &app.modal_state {
-        let area = centered_rect(70, 40, size);
+    if let ModalType::ExportProfile { transfer_code, backup_in_progress, backup_message } = &app.modal_state {
+        let area = centered_rect(70, 46, size);
         f.render_widget(Clear, area);
         f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
 
@@ -676,6 +684,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Min(3),
+                Constraint::Length(1),
+                Constraint::Length(3),
                 Constraint::Length(1),
                 Constraint::Length(1),
             ])
@@ -703,9 +713,40 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .style(Style::default().fg(theme.danger));
         f.render_widget(warn, inner_layout[4]);
 
+        // barra de progreso animada mientras el cloud backup está en curso
+        if *backup_in_progress {
+            let spinner_frames = ["▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱", "▰▰▰▰▰▱▱▱", "▰▰▰▰▰▰▱▱", "▰▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰▰"];
+            let frame = (app.intro_ticks / 6) as usize % spinner_frames.len();
+            let bar = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    format!("  {} Sealing chronicle into the Æther...", spinner_frames[frame]),
+                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "  Do NOT import on your new device until this completes.",
+                    Style::default().fg(theme.muted),
+                )),
+            ])
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.warning)));
+            f.render_widget(bar, inner_layout[5]);
+        } else {
+            let done = Paragraph::new(vec![
+                Line::from(Span::styled(
+                    "  ▰▰▰▰▰▰▰▰  Chronicle sealed. Safe to import on your new device.",
+                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    &backup_message[..backup_message.len().min(80)],
+                    Style::default().fg(theme.muted),
+                )),
+            ])
+            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::LightGreen)));
+            f.render_widget(done, inner_layout[5]);
+        }
+
         let help = Paragraph::new("  [c] Copy to Clipboard  |  [Esc] Close")
             .style(Style::default().fg(theme.muted));
-        f.render_widget(help, inner_layout[5]);
+        f.render_widget(help, inner_layout[7]);
     }
 
     // modal para restaurar identidad — órale, cuidado con este, reemplaza la llave actual

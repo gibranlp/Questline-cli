@@ -37,19 +37,29 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let is_selected = idx == app.selected_fellowship_project_idx;
             let marker = if is_selected { " > " } else { "   " };
             let style = if is_selected {
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD)
+                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
 
+            // Contamos cuántos miembros están online en este proyecto para el badge lateral
+            let members = app.db.get_presence_for_project(&proj.id.to_string()).unwrap_or_default();
+            let online_n = members.iter().filter(|m| m.3).count();
+            let online_badge = if online_n > 0 {
+                format!("● {}", online_n)
+            } else {
+                String::new()
+            };
+
             proj_lines.push(Line::from(vec![
                 Span::styled(marker, Style::default().fg(accent_color)),
-                Span::styled(format!("{}", proj.name), style),
+                Span::styled(proj.name.clone(), style),
+                Span::styled(
+                    if online_n > 0 { format!("  {}", online_badge) } else { String::new() },
+                    Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+                ),
             ]));
 
-            // Si no hay owner_username, al menos no tronamos con unwrap
             let owner_name = proj.owner_username.as_deref().unwrap_or("Unknown");
             proj_lines.push(Line::from(vec![Span::styled(
                 format!("     Owner: {}", owner_name),
@@ -366,12 +376,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 } else {
                     accent_color
                 };
-                // Contamos cuántos compañeros están online según el campo c.2 (is_online)
-                let online_count = app.db.get_presence_list()
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|c| c.2)
-                    .count();
+                // Contamos solo miembros de ESTE proyecto que están online — no contamos a todos
+                let proj_members = app.db.get_presence_for_project(&current_proj.id.to_string()).unwrap_or_default();
+                let online_count = proj_members.iter().filter(|m| m.3).count();
                 let online_badge = if online_count > 0 {
                     format!("● {} online  ", online_count)
                 } else {
@@ -498,67 +505,96 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             f.render_widget(invite_p, right_chunks[1]);
         }
         2 => {
-            // Tab de compañeros — lista de presencia con punto verde/gris según heartbeat
-            let companions = app.db.get_presence_list().unwrap_or_default();
+            // Tab de compañeros — muestra miembros DEL PROYECTO SELECCIONADO con su presencia
+            let (members, proj_name) = if shared_projects.is_empty() || app.selected_fellowship_project_idx >= shared_projects.len() {
+                (Vec::new(), "None".to_string())
+            } else {
+                let proj = shared_projects[app.selected_fellowship_project_idx];
+                let m = app.db.get_presence_for_project(&proj.id.to_string()).unwrap_or_default();
+                (m, proj.name.clone())
+            };
             let mut comp_lines = vec![Line::from("")];
 
-            if companions.is_empty() {
-                comp_lines.push(Line::from(
-                    "   No companions registered in this Sync mesh yet.",
-                ));
+            if members.is_empty() {
+                comp_lines.push(Line::from("   No companions in this project yet."));
+                comp_lines.push(Line::from("   Invite members with [i] to see them here."));
             } else {
-                // c.2 es el campo is_online del registro de presencia
-                let online_n = companions.iter().filter(|c| c.2).count();
+                let online_n = members.iter().filter(|m| m.3).count();
                 comp_lines.push(Line::from(vec![
                     Span::styled(
-                        format!("   {} online  •  {} total", online_n, companions.len()),
+                        format!("   {} online  •  {} members", online_n, members.len()),
                         Style::default().fg(theme.muted),
                     ),
                 ]));
                 comp_lines.push(Line::from(""));
-                // Renders the member list with their current presence status
-                for comp in &companions {
-                    let dot = if comp.2 { "● " } else { "○ " };
-                    let dot_color = if comp.2 { theme.success } else { theme.muted };
+
+                for member in &members {
+                    // member: (identity, username, role, is_online, last_seen, current_project)
+                    let (identity, username, role, is_online, last_seen, current_proj) =
+                        (&member.0, &member.1, &member.2, member.3, &member.4, &member.5);
+
+                    let dot = if is_online { "● " } else { "○ " };
+                    let dot_color = if is_online { theme.success } else { theme.muted };
+                    let name_color = if is_online { Color::White } else { Color::Gray };
 
                     comp_lines.push(Line::from(vec![
                         Span::styled("   ", Style::default()),
                         Span::styled(dot, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
+                        Span::styled(username.clone(), Style::default().fg(name_color).add_modifier(Modifier::BOLD)),
                         Span::styled(
-                            comp.1.clone(),
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                            format!("  [{}]", role),
+                            Style::default().fg(theme.muted),
                         ),
                     ]));
-                    comp_lines.push(Line::from(vec![Span::styled(
-                        format!("       {}", &comp.0[..comp.0.len().min(24)]),
-                        Style::default().fg(theme.muted),
-                    )]));
-                    // Si está online muestra en qué pantalla anda; si no, cuándo fue la última vez
-                    let detail = if comp.2 {
-                        comp.4.as_deref().map(|p| format!("       on: {}", p)).unwrap_or_default()
+
+                    // Mostrar en qué proyecto está o cuándo fue la última actividad
+                    let detail = if is_online {
+                        if let Some(proj) = current_proj {
+                            if !proj.is_empty() {
+                                format!("       In: {}", proj)
+                            } else {
+                                "       Active now".to_string()
+                            }
+                        } else {
+                            "       Active now".to_string()
+                        }
+                    } else if !last_seen.is_empty() && last_seen != "Never" {
+                        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(last_seen) {
+                            let mins = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes();
+                            if mins < 60 {
+                                format!("       Last seen {} min ago", mins)
+                            } else if mins < 1440 {
+                                format!("       Last seen {} h ago", mins / 60)
+                            } else {
+                                format!("       Last seen {} days ago", mins / 1440)
+                            }
+                        } else {
+                            format!("       Last seen: {}", last_seen)
+                        }
                     } else {
-                        format!("       last seen: {}", comp.3)
+                        "       Never seen online".to_string()
                     };
-                    if !detail.is_empty() {
-                        comp_lines.push(Line::from(vec![Span::styled(
-                            detail,
-                            Style::default().fg(if comp.2 { Color::LightCyan } else { theme.text }),
-                        )]));
-                    }
+                    comp_lines.push(Line::from(vec![Span::styled(
+                        detail,
+                        Style::default().fg(if is_online { Color::LightCyan } else { theme.muted }),
+                    )]));
+                    comp_lines.push(Line::from(vec![Span::styled(
+                        format!("       id: {}…", &identity[..identity.len().min(20)]),
+                        Style::default().fg(theme.border),
+                    )]));
                     comp_lines.push(Line::from(""));
                 }
             }
 
+            let comp_title = format!(" {} — Members ", proj_name);
             let comp_p = Paragraph::new(comp_lines).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(accent_color))
                     .title(Span::styled(
-                        " Fellowship Companion Presence ",
-                        Style::default()
-                            .fg(theme.warning)
-                            .add_modifier(Modifier::BOLD),
+                        comp_title,
+                        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
                     )),
             );
             f.render_widget(comp_p, right_chunks[1]);

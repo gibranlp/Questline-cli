@@ -507,7 +507,17 @@ fn draw_hero_panel(
         1.0
     };
 
-    // Bloque exterior con bordes
+    // Poder actual desbloqueado y el siguiente objetivo del árbol de progresión
+    let powers = user.class.powers();
+    let current_power = powers.iter()
+        .rev()
+        .find(|(lvl, _, _)| *lvl <= user.level)
+        .map(|(_, name, _)| *name)
+        .unwrap_or("");
+    let next_power = powers.iter()
+        .find(|(lvl, _, _)| *lvl > user.level)
+        .map(|(lvl, name, _)| (*lvl, *name));
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -518,8 +528,19 @@ fn draw_hero_panel(
 
     let info_rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
+
+    let mut progression_spans = vec![
+        Span::styled("→ ", Style::default().fg(theme.muted)),
+        Span::styled(current_power, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+    ];
+    if let Some((next_lvl, next_name)) = next_power {
+        progression_spans.push(Span::styled(
+            format!("  ⟶  {} ({})", next_name, next_lvl),
+            Style::default().fg(theme.muted),
+        ));
+    }
 
     let info = Paragraph::new(vec![
         Line::from(vec![
@@ -534,6 +555,7 @@ fn draw_hero_panel(
                 Style::default().fg(theme.muted),
             ),
         ]),
+        Line::from(progression_spans),
     ]);
     f.render_widget(info, info_rows[0]);
 

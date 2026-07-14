@@ -111,6 +111,7 @@ pub struct Statistics {
     pub sync_count: i32,
     pub backup_count: i32,
     pub devices_connected: i32,
+    pub active_devices: i32,
     pub last_restore: String,
     pub conflict_count: i32,
 }

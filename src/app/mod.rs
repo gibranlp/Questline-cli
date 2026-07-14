@@ -189,6 +189,8 @@ pub enum ModalType {
     // Exporta la llave privada en base64 para transferirla a otro dispositivo — órale, con cuidado
     ExportProfile {
         transfer_code: String,
+        backup_in_progress: bool,
+        backup_message: String,
     },
     // Importa una identidad desde un transfer code — restaura al héroe en una máquina nueva
     RestoreIdentity {
@@ -400,7 +402,7 @@ fn pick_sprite_message() -> (String, &'static str) {
         return (msg, "Final Reminder (Probably)");
     }
     let pools: &[(&[&str], &str)] = &[
-        (SPRITE_MSG_USELESS,    "Notification Notification"),
+        (SPRITE_MSG_USELESS,    "Notification Swarm"),
         (SPRITE_MSG_SATIRE,     "Important Notification"),
         (SPRITE_MSG_CLASS_LORE, "Follow-up Notification"),
         (SPRITE_MSG_SPEAKING,   "Extremely Important Notification"),
@@ -514,6 +516,7 @@ pub struct App {
     pub tasks_due_today: Vec<Task>,
     pub projects: Vec<Project>,
     pub should_quit: bool,
+    pub quitting_after_sync: bool,
 
     pub selected_project_idx: usize,
     pub active_project_id: Option<Uuid>,
@@ -636,6 +639,8 @@ pub struct App {
     // El sync corre en un hilo aparte — este Arc/Mutex permite pasarle el resultado al hilo principal
     pub sync_in_progress: bool,
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
+    // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
+    pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
@@ -728,63 +733,63 @@ impl App {
         let questline_pool = vec![
             (
                 "The productivity app that finally admitted motivation was never coming.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Turning obvious life advice into a role-playing game since yesterday.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "The world's most elaborate reminder to finish your tasks.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Because apparently crossing things off a list releases chemicals.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "All the discipline. None of the enlightenment.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A sophisticated system for repeatedly doing things you already knew you should do.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Making productivity feel important enough to finally do it.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A highly advanced system for avoiding the consequences of avoiding things.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Proof that adding experience points makes humans do almost anything.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "If discipline were easy, this app wouldn't exist.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Finally, a place where checking a box counts as heroism.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Making responsible decisions look far more epic than they actually are.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Because 'just do it' lacked proper worldbuilding.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "A game about productivity. Unfortunately, the productivity part is real.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "Helping ambitious people procrastinate less creatively.",
-                "Questline",
+                "The Chronicle",
             ),
             (
                 "You are now entering a high-fantasy interpretation of personal responsibility.",
@@ -935,126 +940,6 @@ impl App {
                 "Questline",
             ),
             (
-                "Every free trial eventually becomes a subscription.",
-                "Auditor Prime",
-            ),
-            (
-                "The budget was balanced. The consequences were not.",
-                "Ledgermaster Vex",
-            ),
-            (
-                "A coin saved is a coin someone forgot to expense.",
-                "The Keeper of Receipts",
-            ),
-            (
-                "Nothing terrifies mortals more than an unexpected audit.",
-                "Accountant Emeritus #4",
-            ),
-            (
-                "The difference between a plan and a disaster is usually a spreadsheet.",
-                "Master of Spreadsheets",
-            ),
-            (
-                "Reality compiled successfully. Nobody knows why.",
-                "Archmage Segfault",
-            ),
-            (
-                "I should really document this.",
-                "The Nameless Warlock",
-            ),
-            (
-                "The bug was removed. Three more attended the funeral.",
-                "Daemon Lord Null",
-            ),
-            (
-                "There is no temporary solution older than production code.",
-                "The Ancient Maintainer",
-            ),
-            (
-                "If it works, do not touch it. If it doesn't work, nobody knows why.",
-                "Warlock of Forty-Seven Tabs",
-            ),
-            (
-                "The answer was in your notes all along.",
-                "Archivist Thorn",
-            ),
-            (
-                "I took a note about this somewhere.",
-                "The Sage of Infinite Notes",
-            ),
-            (
-                "Knowledge is power. Searchability is greater power.",
-                "Keeper of the Living Archive",
-            ),
-            (
-                "I forgot where I wrote that, but I definitely wrote it.",
-                "The Forgotten Rememberer",
-            ),
-            (
-                "Every great idea begins as a note titled 'Untitled'.",
-                "Master Linkwright",
-            ),
-            (
-                "The hardest boss fight remains: getting started.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Motivation is a visitor. Discipline pays rent.",
-                "Brother Completion",
-            ),
-            (
-                "A completed task weighs nothing.",
-                "Dame Productivity",
-            ),
-            (
-                "The first checkbox is always the strongest.",
-                "Paladin of the First Task",
-            ),
-            (
-                "A task delayed gathers experience points.",
-                "The Last Finisher",
-            ),
-            (
-                "Perfect systems do not exist. Good systems survive users.",
-                "The Architect of Folders",
-            ),
-            (
-                "Every folder eventually becomes archaeology.",
-                "Framework Sage Varon",
-            ),
-            (
-                "Order is simply organized panic.",
-                "Lord Structure",
-            ),
-            (
-                "A good workflow survives contact with reality.",
-                "Builder of Systems",
-            ),
-            (
-                "Nothing is more permanent than a temporary process.",
-                "The Refactor King",
-            ),
-            (
-                "Tomorrow has an excellent reputation it does not deserve.",
-                "The Keeper of Tuesdays",
-            ),
-            (
-                "The meeting consumed two hours and produced three meetings.",
-                "Master of Lost Afternoons",
-            ),
-            (
-                "A calendar is merely a collection of future regrets.",
-                "Chronomancer Vale",
-            ),
-            (
-                "The deadline was visible from the beginning.",
-                "The Calendar Oracle",
-            ),
-            (
-                "Time management mostly consists of admitting what will not get done.",
-                "The Last Hourglass",
-            ),
-            (
                 "I can absolutely handle that tomorrow.",
                 "Past You",
             ),
@@ -1063,120 +948,8 @@ impl App {
                 "Future You",
             ),
             (
-                "Keep postponing things. You're doing great.",
-                "The Great Backlog",
-            ),
-            (
-                "Just one more feature.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "This could have been an email.",
-                "A Concerned Deadline Wraith",
-            ),
-            (
-                "You clicked me. That's on you.",
-                "Meeting Mimic #27",
-            ),
-            (
-                "Your task list is delicious.",
-                "The Great Backlog",
-            ),
-            (
-                "I was promised fewer meetings.",
-                "The Last Remaining QA Tester",
-            ),
-            (
                 "You said five minutes three hours ago.",
                 "The Coffee Machine",
-            ),
-            (
-                "The roots grow. The tasks remain.",
-                "The Evergrowth",
-            ),
-            (
-                "I support your goals, but your calendar concerns me.",
-                "A Notification Sprite",
-            ),
-            (
-                "The project expanded to fill the available enthusiasm.",
-                "An Overworked Project Manager",
-            ),
-            (
-                "This seemed easier in planning.",
-                "Grand Planner Elric",
-            ),
-            (
-                "The roadmap was clear until reality joined the meeting.",
-                "Lord Structure",
-            ),
-            (
-                "The backlog remembers every promise.",
-                "The Great Backlog",
-            ),
-            (
-                "You do not lack time. You lack willingness to start.",
-                "The Seventh Minute",
-            ),
-            (
-                "Heroism is mostly administration with better marketing.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Every legend begins with a task nobody wanted to do.",
-                "Brother Completion",
-            ),
-            (
-                "The road to greatness is surprisingly administrative.",
-                "Dame Productivity",
-            ),
-            (
-                "A legendary journey through the dangerous realm of basic responsibility.",
-                "The Last Finisher",
-            ),
-            (
-                "The dragon was never the problem. The paperwork was.",
-                "Paladin of the First Task",
-            ),
-            (
-                "Thousands of years of civilization culminated in another status meeting.",
-                "Master of Lost Afternoons",
-            ),
-            (
-                "The universe rewards consistency far more often than brilliance.",
-                "The Architect of Folders",
-            ),
-            (
-                "You are one completed task away from feeling slightly better.",
-                "The Evergrowth",
-            ),
-            (
-                "Progress is simply stubbornness with a better public image.",
-                "Archivist Thorn",
-            ),
-            (
-                "The first step is rarely difficult. The first click is.",
-                "Future You",
-            ),
-            (
-                "No chosen one. No destiny. Just consistent effort and decent note-taking.",
-                "The Chronicle",
-            ),
-            (
-                "The Chronicle records persistence. The Chronicle also records excuses.",
-                "The Chronicle",
-            ),
-            (
-                "Remember: the backlog is doing pushups while you read this.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "The fantasy RPG where the dragon is your inbox.",
-                "A Concerned Deadline Wraith",
-            ),
-            (
-                "Because 'just do it' lacked proper worldbuilding.",
-                "The Nameless Warlock",
             ),
             (
                 "Your ancestors crossed oceans. You answered three emails.",
@@ -1191,72 +964,8 @@ impl App {
                 "System Notification",
             ),
             (
-                "The productivity app that finally admitted motivation was never coming.",
-                "Brother Completion",
-            ),
-            (
-                "A sophisticated system for repeatedly doing things you already knew you should do.",
-                "The Architect of Folders",
-            ),
-            (
-                "The reward for completing your tasks: more tasks.",
-                "The Great Backlog",
-            ),
-            (
-                "Eventually the tasks finish themselves. This is not that strategy.",
-                "Auditor Prime",
-            ),
-            (
-                "Come for the quests. Stay because the backlog is gaining strength.",
-                "An Anonymous Scope Dragon",
-            ),
-            (
-                "Not guaranteed to increase productivity. Guaranteed to make it look cooler.",
-                "Warlock of Forty-Seven Tabs",
-            ),
-            (
-                "Every day is a side quest until the deadline arrives.",
-                "The Keeper of Tuesdays",
-            ),
-            (
-                "The only RPG where the final boss is your own calendar.",
-                "The Calendar Oracle",
-            ),
-            (
-                "The hero's journey, but with spreadsheets.",
-                "Master of Spreadsheets",
-            ),
-            (
-                "Saving the realm from chaos, one checkbox at a time.",
-                "Sir Checklist the Relentless",
-            ),
-            (
-                "Motivation is temporary. The Chronicle is forever.",
-                "The Chronicle",
-            ),
-            (
-                "The path to greatness is surprisingly administrative.",
-                "Grand Planner Elric",
-            ),
-            (
-                "You could be working right now.",
-                "The Coffee Machine",
-            ),
-            (
                 "We both know why you opened the app.",
                 "Future You",
-            ),
-            (
-                "The task has not become easier since yesterday.",
-                "The Great Backlog",
-            ),
-            (
-                "You seek wisdom. The task seeks completion.",
-                "The Evergrowth",
-            ),
-            (
-                "Another day, another opportunity to stop making excuses.",
-                "Brother Completion",
             ),
         ];
 
@@ -1610,6 +1319,7 @@ impl App {
             tasks_due_today: Vec::new(),
             projects: Vec::new(),
             should_quit: false,
+            quitting_after_sync: false,
 
             selected_project_idx: 0,
             active_project_id: None,
@@ -1704,6 +1414,7 @@ impl App {
             all_journals: Vec::new(),
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
             last_chat_poll: std::time::Instant::now()
@@ -2022,7 +1733,9 @@ impl App {
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
-            self.should_quit = true;
+            self.notifications.push(Notification::info(
+                "Use [q] to quit — seals the Chronicle and syncs before exit.",
+            ));
             return Ok(());
         }
 
@@ -2436,9 +2149,15 @@ impl App {
             ModalType::None => Ok(false),
             ModalType::QuitConfirm { .. } => {
                 match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') => {
-                        self.should_quit = true;
-                        self.modal_state = ModalType::None;
+                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                        if self.auto_sync && self.config.sync_enabled && !self.sync_in_progress {
+                            // Sincroniza antes de salir — el loop detecta cuando termina y cierra
+                            self.start_background_sync();
+                            self.quitting_after_sync = true;
+                        } else {
+                            self.should_quit = true;
+                            self.modal_state = ModalType::None;
+                        }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.modal_state = ModalType::None;
@@ -2672,7 +2391,7 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Char('c') => {
-                        if let ModalType::ExportProfile { ref transfer_code } = self.modal_state.clone() {
+                        if let ModalType::ExportProfile { ref transfer_code, .. } = self.modal_state.clone() {
                             match crate::services::identity::copy_to_clipboard(transfer_code) {
                                 Ok(_) => {
                                     self.sync_status_msg = "Transfer Code copied to clipboard!".to_string();
@@ -2777,9 +2496,9 @@ impl App {
                                         }
                                     }
                                 }
-                                // Reset the pull cursor — PC-B's old seq belongs to a different
-                                // identity's account; without this we'd miss all of PC-A's history
+                                // Reset del cursor de pull y del contador de conflictos — el nuevo nodo arranca limpio
                                 let _ = self.db.set_setting("last_pull_seq", "0");
+                                let _ = self.db.set_setting("conflict_count", "0");
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored! Syncing now...".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
@@ -4236,22 +3955,23 @@ impl App {
                         }
 
                         let _ = self.db.set_setting("last_pull_seq", "0");
+                        let _ = self.db.set_setting("conflict_count", "0");
                         let _ = self.trigger_sync();
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
-                            "¡Bienvenido de regreso! Tu crónica ha sido restaurada desde el exilio.".to_string(),
+                            "Welcome back! Your chronicle has been restored from exile.".to_string(),
                         ));
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
                     }
                     Ok(_) => {
                         self.restore_error = Some(
-                            "Código inválido — longitud de llave incorrecta. ¿Acaso lo transcribiste a mano? Mal.".to_string(),
+                            "Invalid code — wrong key length. Did you type it by hand? Bold move.".to_string(),
                         );
                     }
                     Err(_) => {
                         self.restore_error = Some(
-                            "Eso no es base64. El Grimorio de Codificación llora por ti.".to_string(),
+                            "That is not valid base64. The Encoding Grimoire weeps for you.".to_string(),
                         );
                     }
                 }
@@ -5193,39 +4913,57 @@ impl App {
                     let db_path = storage_dir.join("questline.db");
                     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                     let backup_path = storage_dir.join(format!("questline_backup_{}.db", ts));
+
+                    let secret_bytes: Vec<u8> = self.identity.secret_key
+                        .as_bytes()
+                        .chunks(2)
+                        .filter_map(|c| {
+                            let s = std::str::from_utf8(c).ok()?;
+                            u8::from_str_radix(s, 16).ok()
+                        })
+                        .collect();
+                    let mut transfer_bytes = Vec::new();
+                    transfer_bytes.extend_from_slice(self.identity.user_uuid.as_bytes());
+                    transfer_bytes.extend_from_slice(&secret_bytes);
+                    let transfer_code = STANDARD.encode(&transfer_bytes);
+
+                    // Copia local primero (rápida), luego abre el modal de inmediato
                     match std::fs::copy(&db_path, &backup_path) {
                         Ok(_) => {
-                            let secret_bytes: Vec<u8> = self.identity.secret_key
-                                .as_bytes()
-                                .chunks(2)
-                                .filter_map(|c| {
-                                    let s = std::str::from_utf8(c).ok()?;
-                                    u8::from_str_radix(s, 16).ok()
-                                })
-                                .collect();
-                            
-                            let mut transfer_bytes = Vec::new();
-                            transfer_bytes.extend_from_slice(self.identity.user_uuid.as_bytes());
-                            transfer_bytes.extend_from_slice(&secret_bytes);
-                            
-                            let transfer_code = STANDARD.encode(&transfer_bytes);
-                            // Also upload to cloud so 'r' on PC-B works right after identity transfer
-                            if self.config.sync_enabled {
+                            let (backup_in_progress, backup_message) = if self.config.sync_enabled {
+                                // El upload a nube corre en hilo aparte — el modal se abre sin esperar
+                                let result_slot = std::sync::Arc::clone(&self.export_backup_result);
                                 if let Ok(json) = self.db.export_to_json() {
-                                    let client = crate::services::api_client::ApiClient::new(
-                                        &self.server_url,
-                                        self.identity.clone(),
-                                        &self.device_id,
-                                    );
-                                    self.sync_status_msg = match client.send_request("POST", "recovery", &json) {
-                                        Ok(_) => format!("Profile exported & cloud backup saved! Local: {}", backup_path.display()),
-                                        Err(e) => format!("Profile exported to {} (cloud backup failed: {})", backup_path.display(), e),
-                                    };
+                                    let server_url = self.server_url.clone();
+                                    let identity = self.identity.clone();
+                                    let device_id = self.device_id.clone();
+                                    let backup_display = backup_path.display().to_string();
+                                    std::thread::spawn(move || {
+                                        let client = crate::services::api_client::ApiClient::new(
+                                            &server_url,
+                                            identity,
+                                            &device_id,
+                                        );
+                                        let outcome = match client.send_request("POST", "recovery", &json) {
+                                            Ok(_) => Ok(format!("Profile exported & cloud backup saved! Local: {}", backup_display)),
+                                            Err(e) => Err(format!("Profile exported to {} (cloud backup failed: {})", backup_display, e)),
+                                        };
+                                        if let Ok(mut slot) = result_slot.lock() {
+                                            *slot = Some(outcome);
+                                        }
+                                    });
+                                    (true, "Sealing your chronicle into the Æther... do not import on the new device until the backup completes.".to_string())
+                                } else {
+                                    (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
                                 }
                             } else {
-                                self.sync_status_msg = format!("Profile exported! Backup saved to {}", backup_path.display());
+                                (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
+                            };
+
+                            if !backup_in_progress {
+                                self.sync_status_msg = backup_message.clone();
                             }
-                            self.modal_state = ModalType::ExportProfile { transfer_code };
+                            self.modal_state = ModalType::ExportProfile { transfer_code, backup_in_progress, backup_message };
                         }
                         Err(e) => {
                             self.sync_status_msg = format!("Export Failed: {}", e);
@@ -5275,17 +5013,17 @@ impl App {
                 self.active_tab_idx = 7;
             }
             KeyCode::Char('6') if self.active_screen != ActiveScreen::Workspace => {
-                self.active_screen = ActiveScreen::SyncSettings;
-                self.active_tab_idx = 12;
-            }
-            KeyCode::Char('7') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
                 let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                 self.reload_data()?;
+                // Sync inmediato al abrir Fellowship — muestra datos frescos sin esperar el intervalo
+                if !self.sync_in_progress && self.config.sync_enabled {
+                    self.start_background_sync();
+                }
             }
-            KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
+            KeyCode::Char('7') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::GreatChronicle;
                 self.active_tab_idx = 14;
                 self.great_chronicle_scroll = 0;
@@ -5296,6 +5034,10 @@ impl App {
                 self.load_chapter_progress_from_cache();
                 self.pull_great_chronicle_async();
                 self.pull_chapter_progress_async();
+            }
+            KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
+                self.active_screen = ActiveScreen::SyncSettings;
+                self.active_tab_idx = 12;
             }
             KeyCode::Char('d') => {
                 if self.active_screen == ActiveScreen::Projects {
@@ -5893,7 +5635,9 @@ impl App {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
-                        self.active_project_id = Some(active[self.selected_project_idx].id);
+                        let proj = active[self.selected_project_idx];
+                        let proj_is_shared = proj.is_shared;
+                        self.active_project_id = Some(proj.id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
                         self.workspace_sidebar_focused = true;
@@ -5902,6 +5646,9 @@ impl App {
                         self.selected_notes_flat_idx = 0;
                         self.selected_journal_idx = 0;
                         self.reload_data()?;
+                        if proj_is_shared {
+                            self.start_background_sync();
+                        }
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
@@ -9662,22 +9409,51 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Dashboard",
                 description: "Navigate to your Dashboard",
-                shortcut: "D / 1",
+                shortcut: "1",
                 id: "open_dashboard",
             },
             CommandAction {
                 name: "Open Projects",
                 description: "Navigate to Projects list",
-                shortcut: "P / 2",
+                shortcut: "2",
                 id: "open_projects",
             },
             CommandAction {
                 name: "Open Character",
                 description: "Navigate to Character screen",
-                shortcut: "H / 3",
+                shortcut: "3",
                 id: "open_character",
             },
-
+            CommandAction {
+                name: "Open Library",
+                description: "Navigate to Library screen",
+                shortcut: "4",
+                id: "open_library",
+            },
+            CommandAction {
+                name: "Open Music",
+                description: "Navigate to Soundscapes & music player",
+                shortcut: "5",
+                id: "open_music",
+            },
+            CommandAction {
+                name: "Open Fellowship",
+                description: "Navigate to Fellowship screen",
+                shortcut: "6",
+                id: "open_fellowship",
+            },
+            CommandAction {
+                name: "Open Chronicle",
+                description: "Navigate to Great Chronicle activity feed",
+                shortcut: "7",
+                id: "open_chronicle",
+            },
+            CommandAction {
+                name: "Open Sync",
+                description: "Navigate to Sync Settings",
+                shortcut: "8",
+                id: "open_sync",
+            },
             CommandAction {
                 name: "Open Focus",
                 description: "Navigate to Focus screen",
@@ -9685,28 +9461,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "open_focus",
             },
             CommandAction {
-                name: "Open Sync",
-                description: "Navigate to Sync Settings",
-                shortcut: "S / 6",
-                id: "open_sync",
-            },
-            CommandAction {
                 name: "Open Statistics",
                 description: "Navigate to Statistics screen",
                 shortcut: "G",
                 id: "open_stats",
-            },
-            CommandAction {
-                name: "Open Fellowship",
-                description: "Navigate to Fellowship screen",
-                shortcut: "S (from Projects)",
-                id: "open_fellowship",
-            },
-            CommandAction {
-                name: "Open Library",
-                description: "Navigate to Library screen",
-                shortcut: "L / 4",
-                id: "open_library",
             },
             CommandAction {
                 name: "Open Archive",
@@ -9759,14 +9517,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "View Achievements",
                 description: "Check all unlocked titles and stats",
-                shortcut: "H / 3",
+                shortcut: "3",
                 id: "view_achievements",
-            },
-            CommandAction {
-                name: "Open Music",
-                description: "Navigate to Soundscapes & music player",
-                shortcut: "M / 5",
-                id: "open_music",
             },
             CommandAction {
                 name: "Cycle Ambient Effect",
@@ -9840,6 +9592,18 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.pull_invitations_async();
                 let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                 self.reload_data()?;
+            }
+            "open_chronicle" => {
+                self.active_screen = ActiveScreen::GreatChronicle;
+                self.active_tab_idx = 14;
+                self.great_chronicle_scroll = 0;
+                self.chapter_panel_scroll = 0;
+                self.chapter_panel_focused = true;
+                self.great_chronicle_entries =
+                    self.db.get_global_chronicle_entries().unwrap_or_default();
+                self.load_chapter_progress_from_cache();
+                self.pull_great_chronicle_async();
+                self.pull_chapter_progress_async();
             }
             "open_library" => {
                 self.active_screen = ActiveScreen::Library;
@@ -10365,7 +10129,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 .map(|p| p.is_shared)
                 .unwrap_or(false);
         let interval = if is_shared_workspace {
-            std::time::Duration::from_secs(15)
+            std::time::Duration::from_secs(8)
         } else {
             std::time::Duration::from_secs(30)
         };
@@ -10397,6 +10161,26 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         Ok(())
     }
 
+    /// Revisa si el hilo de backup de nube terminó y actualiza el modal ExportProfile.
+    pub fn tick_export_backup(&mut self) {
+        let outcome = if let Ok(mut slot) = self.export_backup_result.lock() {
+            slot.take()
+        } else {
+            return;
+        };
+        if let Some(result) = outcome {
+            let msg = match result {
+                Ok(m) => m,
+                Err(m) => m,
+            };
+            self.sync_status_msg = msg.clone();
+            if let ModalType::ExportProfile { ref mut backup_in_progress, ref mut backup_message, .. } = self.modal_state {
+                *backup_in_progress = false;
+                *backup_message = msg;
+            }
+        }
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -10411,11 +10195,17 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_chat_poll(&mut self) -> Result<()> {
-        // Only run when the fellowship chat tab is visible and cloud sync is enabled
-        if self.active_screen != ActiveScreen::Fellowship
-            || self.selected_fellowship_tab != 0
-            || !self.config.sync_enabled
-        {
+        if !self.config.sync_enabled {
+            return Ok(());
+        }
+        let in_fellowship_chat = self.active_screen == ActiveScreen::Fellowship
+            && self.selected_fellowship_tab == 0;
+        let in_shared_workspace = self.active_screen == ActiveScreen::Workspace
+            && self.active_project_id
+                .and_then(|id| self.projects.iter().find(|p| p.id == id))
+                .map(|p| p.is_shared)
+                .unwrap_or(false);
+        if !in_fellowship_chat && !in_shared_workspace {
             return Ok(());
         }
 
@@ -10430,6 +10220,17 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     }
                     if poll.new_message_count > 0 {
                         let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                        // Notificar si el usuario está en Workspace (no en la pestaña del chat)
+                        if self.active_screen != ActiveScreen::Fellowship || self.selected_fellowship_tab != 0 {
+                            self.notifications.push(Notification::info(format!(
+                                "{} new message(s) from your fellowship.",
+                                poll.new_message_count
+                            )));
+                        }
+                        // Actividad detectada — sincronizar tareas/notas de inmediato
+                        if !self.sync_in_progress && self.config.sync_enabled {
+                            self.start_background_sync();
+                        }
                         self.reload_data()?;
                     }
                 }
@@ -10437,16 +10238,35 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return Ok(());
         }
 
-        // Poll every 4 seconds
-        if self.last_chat_poll.elapsed() < std::time::Duration::from_millis(4000) {
+        // Poll de chat/presencia: cada 4s en Fellowship, cada 10s en Workspace para no saturar
+        let poll_interval = if self.active_screen == ActiveScreen::Fellowship {
+            std::time::Duration::from_millis(4000)
+        } else {
+            std::time::Duration::from_millis(10000)
+        };
+        if self.last_chat_poll.elapsed() < poll_interval {
             return Ok(());
         }
 
-        let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-        if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
+        // En Workspace usamos el proyecto activo; en Fellowship el proyecto seleccionado
+        let proj_id_opt = if self.active_screen == ActiveScreen::Workspace {
+            self.active_project_id.map(|id| id.to_string())
+        } else {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
+                return Ok(());
+            }
+            Some(shared[self.selected_fellowship_project_idx].id.to_string())
+        };
+        let proj_id = match proj_id_opt {
+            Some(id) => id,
+            None => return Ok(()),
+        };
+
+        // Validar que el proyecto sea compartido antes de hacer llamadas de red
+        if !self.projects.iter().any(|p| p.id.to_string() == proj_id && p.is_shared) {
             return Ok(());
         }
-        let proj_id = shared[self.selected_fellowship_project_idx].id.to_string();
 
         // Get the `since` timestamp — from our map, or seed from the DB max
         let since = match self.last_chat_timestamp.get(&proj_id) {
@@ -10770,29 +10590,48 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     // Heartbeat de presencia — solo corre si estamos en un workspace compartido con sync activo
     pub fn tick_presence_update(&mut self) -> Result<()> {
-        if self.active_screen != ActiveScreen::Workspace || !self.auto_sync {
+        if !self.auto_sync {
             return Ok(());
         }
-        let p_id = match self.active_project_id {
-            Some(pid) => pid,
-            None => return Ok(()),
-        };
-        let is_shared = self.projects.iter()
-            .find(|p| p.id == p_id)
-            .map(|p| p.is_shared)
-            .unwrap_or(false);
-        if !is_shared {
+        // Presencia activa tanto en Workspace (proyecto activo) como en Fellowship (vista del equipo)
+        let in_workspace = self.active_screen == ActiveScreen::Workspace;
+        let in_fellowship = self.active_screen == ActiveScreen::Fellowship;
+        if !in_workspace && !in_fellowship {
             return Ok(());
         }
-        if self.last_presence_update.elapsed() < std::time::Duration::from_secs(60) {
+        if self.last_presence_update.elapsed() < std::time::Duration::from_secs(30) {
             return Ok(());
         }
+
         let identity_key = self.identity.public_key.clone();
         let username = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
         let now_str = chrono::Utc::now().to_rfc3339();
-        let proj_str = p_id.to_string();
-        let _ = self.db.update_presence(&identity_key, &username, true, &now_str, Some(&proj_str), "Visible");
+
+        // Determinar el proyecto activo: en Workspace usamos active_project_id, en Fellowship el proyecto seleccionado
+        let project_id = if in_workspace {
+            self.active_project_id.map(|id| id.to_string())
+        } else {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            shared.get(self.selected_fellowship_project_idx).map(|p| p.id.to_string())
+        };
+
+        let is_relevant_project = project_id.as_deref()
+            .and_then(|pid| self.projects.iter().find(|p| p.id.to_string() == pid))
+            .map(|p| p.is_shared)
+            .unwrap_or(in_fellowship); // en Fellowship siempre es relevante
+
+        if !is_relevant_project {
+            return Ok(());
+        }
+
+        let _ = self.db.update_presence(
+            &identity_key, &username, true, &now_str,
+            project_id.as_deref(), "Visible",
+        );
         self.last_presence_update = std::time::Instant::now();
+
+        // Housekeeping: marcar offline a usuarios sin heartbeat reciente
+        let _ = self.db.mark_stale_presence_offline(10);
         Ok(())
     }
 

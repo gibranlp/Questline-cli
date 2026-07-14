@@ -238,6 +238,21 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v1.1.0 — The Nodes Remember
+*Released 2026-07-14*
+
+- **Multi-device sync deduplication:** A new `processed_remote_events` table tracks every applied sync event. Already-processed events are skipped on subsequent syncs, ending the conflict accumulation that previously inflated counts into the tens of thousands.
+- **Device heartbeat:** Each device now broadcasts its identity during every sync. All your nodes appear in the Sync screen with last-seen timestamps and online status.
+- **Fellowship presence:** Companions in shared projects show as online or offline in the project companion list, chat title, and Companions tab. Presence decays after 10 minutes of inactivity.
+- **Real-time companion sync:** Shared project workspaces sync every 8 seconds and trigger an immediate sync on open. Chat polling also runs in the background while working inside a shared project.
+- **Companion task ownership badges:** Tasks created by companions in shared projects display their owner's username next to the task title.
+- **Dashboard progression tree:** The Adventurer panel now shows your current unlocked class power and the next milestone to reach, styled in your class color.
+- **New Evergrowth rendering and dashboard layout:** Updated visual presentation for the Evergrowth panel and overall dashboard structure.
+- **Navigation reorder:** Sections renumbered — `6` = Fellowship, `7` = Great Chronicle, `8` = Sync Settings.
+- **Sync-sealed exit:** Ctrl+C no longer quits. Pressing `q` opens the quit confirm; confirming triggers a final sync before the application closes.
+
+---
+
 ### v1.0.9 — The Scrollkeeper Awakens
 *Released 2026-07-11*
 
