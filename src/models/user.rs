@@ -306,7 +306,7 @@ impl User {
         if level >= 100 {
             0
         } else {
-            200 + (level * level * 20)
+            200 + (level * level * 12)
         }
     }
 
@@ -372,9 +372,9 @@ mod tests {
 
     #[test]
     fn test_xp_formula() {
-        assert_eq!(User::xp_for_next_level(1), 220);
-        assert_eq!(User::xp_for_next_level(2), 280);
-        assert_eq!(User::xp_for_next_level(10), 2200);
+        assert_eq!(User::xp_for_next_level(1), 212);
+        assert_eq!(User::xp_for_next_level(2), 248);
+        assert_eq!(User::xp_for_next_level(10), 1400);
         assert_eq!(User::xp_for_next_level(100), 0);
     }
 

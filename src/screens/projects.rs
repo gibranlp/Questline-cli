@@ -95,7 +95,7 @@ pub fn draw(
         let desc = p.description.as_deref().unwrap_or("No description.");
         let date_str = p.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string();
 
-        let text = vec![
+        let mut text = vec![
             Line::from(""),
             Line::from(vec![
                 Span::styled("  Realm:     ", Style::default().fg(theme.muted)),
@@ -113,10 +113,16 @@ pub fn draw(
             ]),
             Line::from(""),
             Line::from("  Description:"),
-            Line::from(Span::styled(
-                format!("  {}", desc),
+        ];
+
+        for line in desc.lines() {
+            text.push(Line::from(Span::styled(
+                format!("  {}", line),
                 Style::default().fg(theme.text),
-            )),
+            )));
+        }
+
+        text.extend(vec![
             Line::from(""),
             Line::from(""),
             Line::from(Span::styled(
@@ -125,7 +131,7 @@ pub fn draw(
                     .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             )),
-        ];
+        ]);
 
         Paragraph::new(text)
             .block(
@@ -204,18 +210,22 @@ pub fn draw(
     match modal {
         ModalType::NewProject {
             name,
+            name_cursor,
             desc,
+            desc_cursor,
             focus_idx,
         } => {
-            draw_project_modal(f, " New Realm Quest ", name, desc, *focus_idx, theme);
+            draw_project_modal(f, " New Realm Quest ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
         }
         ModalType::EditProject {
             name,
+            name_cursor,
             desc,
+            desc_cursor,
             focus_idx,
             ..
         } => {
-            draw_project_modal(f, " Edit Realm Quest ", name, desc, *focus_idx, theme);
+            draw_project_modal(f, " Edit Realm Quest ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
         }
         _ => {}
     }
@@ -226,7 +236,9 @@ fn draw_project_modal(
     f: &mut Frame,
     title: &str,
     name: &str,
+    name_cursor: usize,
     desc: &str,
+    desc_cursor: usize,
     focus_idx: usize,
     theme: &Theme,
 ) {
@@ -258,7 +270,7 @@ fn draw_project_modal(
         ));
     f.render_widget(main_block, area);
 
-    // borde activo según focus_idx — 0 = nombre, 1 = descripción; muestra "_" si está vacío y enfocado
+    // borde activo según focus_idx — 0 = nombre, 1 = descripción
     let name_border_style = if focus_idx == 0 {
         Style::default()
             .fg(accent_color)
@@ -266,12 +278,29 @@ fn draw_project_modal(
     } else {
         Style::default().fg(theme.border)
     };
-    let name_text = if name.is_empty() && focus_idx == 0 {
-        "_"
+
+    let mut name_spans = Vec::new();
+    if focus_idx == 0 {
+        let s = name;
+        let c_pos = name_cursor.min(s.len());
+        let before = &s[..c_pos];
+        let after = &s[c_pos..];
+        name_spans.push(Span::styled(before, Style::default()));
+        if let Some(first_char) = after.chars().next() {
+            let char_len = first_char.len_utf8();
+            name_spans.push(Span::styled(
+                &after[..char_len],
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            name_spans.push(Span::styled(&after[char_len..], Style::default()));
+        } else {
+            name_spans.push(Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)));
+        }
     } else {
-        name
-    };
-    let name_p = Paragraph::new(name_text).block(
+        name_spans.push(Span::styled(name, Style::default()));
+    }
+
+    let name_p = Paragraph::new(Line::from(name_spans)).block(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
@@ -288,25 +317,78 @@ fn draw_project_modal(
     } else {
         Style::default().fg(theme.border)
     };
-    let desc_text = if desc.is_empty() && focus_idx == 1 {
-        "_"
-    } else {
-        desc
-    };
-    let desc_p = Paragraph::new(desc_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(desc_border_style)
-                .title(" Description "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: true });
+
+    let desc_lines = desc_lines_with_cursor(desc, desc_cursor, focus_idx == 1);
+
+    // no .wrap() here on purpose: ratatui's WordWrapper collapses a whitespace-only line to ""
+    // regardless of the trim flag, and a freshly-started empty line (right after Enter) is
+    // exactly that — just the cursor's single reversed space. The name field above has the
+    // same no-wrap treatment and doesn't hit this.
+    let desc_p = Paragraph::new(desc_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(desc_border_style)
+            .title(" Description "),
+    );
     f.render_widget(desc_p, chunks[1]);
 
     // Dialog shortcuts guide
-    let helper = Paragraph::new("Tab: switch fields | Enter: save | ESC: cancel")
+    let helper = Paragraph::new("Tab: switch fields | Arrows/Home/End: move cursor | Enter: new line / save | ESC: save & close")
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center);
     f.render_widget(helper, chunks[2]);
+}
+
+// arma el texto de la descripción como varias Line — respeta los \n reales en vez de meterlos
+// en una sola Line (que ratatui no interpreta como salto de línea) y, si está enfocado, dibuja
+// el cursor (carácter reversed) en la línea que le corresponde
+fn desc_lines_with_cursor(desc: &str, cursor: usize, focused: bool) -> Vec<Line<'static>> {
+    if !focused {
+        return desc.split('\n').map(|l| Line::from(l.to_string())).collect();
+    }
+
+    let c_pos = cursor.min(desc.len());
+    let before = &desc[..c_pos];
+    let after = &desc[c_pos..];
+
+    let mut lines: Vec<Line> = Vec::new();
+    let mut before_parts: Vec<&str> = before.split('\n').collect();
+    let last_before = before_parts.pop().unwrap_or("");
+    for part in before_parts {
+        lines.push(Line::from(part.to_string()));
+    }
+
+    let mut cur_line_spans: Vec<Span> = vec![Span::styled(last_before.to_string(), Style::default())];
+
+    if let Some(first_char) = after.chars().next() {
+        if first_char == '\n' {
+            cur_line_spans.push(Span::styled(" ".to_string(), Style::default().add_modifier(Modifier::REVERSED)));
+            lines.push(Line::from(cur_line_spans));
+            let rest = &after[1..];
+            for part in rest.split('\n') {
+                lines.push(Line::from(part.to_string()));
+            }
+        } else {
+            let char_len = first_char.len_utf8();
+            cur_line_spans.push(Span::styled(
+                first_char.to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
+            let rest = &after[char_len..];
+            let mut rest_parts = rest.split('\n');
+            if let Some(first_rest) = rest_parts.next() {
+                cur_line_spans.push(Span::styled(first_rest.to_string(), Style::default()));
+            }
+            lines.push(Line::from(cur_line_spans));
+            for part in rest_parts {
+                lines.push(Line::from(part.to_string()));
+            }
+        }
+    } else {
+        cur_line_spans.push(Span::styled(" ".to_string(), Style::default().add_modifier(Modifier::REVERSED)));
+        lines.push(Line::from(cur_line_spans));
+    }
+
+    lines
 }

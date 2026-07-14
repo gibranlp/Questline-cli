@@ -120,11 +120,23 @@ impl AudioPlayer {
     }
 
     pub fn play_task_creation(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/taskcreation.ogg"));
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/TaskCreattion.wav"));
     }
 
     pub fn play_task_complete(&self) {
         self.play_effect_bytes(include_bytes!("../../assets/sounds/focus-task-complete.ogg"));
+    }
+
+    pub fn play_delete(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/Delete.wav"));
+    }
+
+    pub fn play_notification_swarm(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
+    }
+
+    pub fn play_open_tasks(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/OpenTasks.wav"));
     }
 
     // dispara el audio cinemático en su propio sink para que suene encima del soundscape
@@ -699,10 +711,19 @@ fn trigger_local_folder(
 mod tests {
     #[test]
     fn test_sound_decoding() {
-        let cursor1 = std::io::Cursor::new(include_bytes!("../../assets/sounds/taskcreation.ogg"));
-        let _decoder1 = rodio::Decoder::new(cursor1).expect("Failed to decode embedded taskcreation.ogg bytes");
+        let cursor1 = std::io::Cursor::new(include_bytes!("../../assets/sounds/TaskCreattion.wav"));
+        let _decoder1 = rodio::Decoder::new(cursor1).expect("Failed to decode TaskCreattion.wav");
 
         let cursor2 = std::io::Cursor::new(include_bytes!("../../assets/sounds/focus-task-complete.ogg"));
-        let _decoder2 = rodio::Decoder::new(cursor2).expect("Failed to decode embedded focus-task-complete.ogg bytes");
+        let _decoder2 = rodio::Decoder::new(cursor2).expect("Failed to decode focus-task-complete.ogg");
+
+        let cursor3 = std::io::Cursor::new(include_bytes!("../../assets/sounds/Delete.wav"));
+        let _decoder3 = rodio::Decoder::new(cursor3).expect("Failed to decode Delete.wav");
+
+        let cursor4 = std::io::Cursor::new(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
+        let _decoder4 = rodio::Decoder::new(cursor4).expect("Failed to decode NotificationSwarm.mp3");
+
+        let cursor5 = std::io::Cursor::new(include_bytes!("../../assets/sounds/OpenTasks.wav"));
+        let _decoder5 = rodio::Decoder::new(cursor5).expect("Failed to decode OpenTasks.wav");
     }
 }

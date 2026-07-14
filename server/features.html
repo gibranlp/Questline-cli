@@ -25,6 +25,20 @@
     #features h2 {
       text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
     }
+
+    /* Colored tree spans — each character type has its own glow */
+    .tree-leaf  { color: #22c55e; text-shadow: 0 0 10px rgba(34,197,94,0.65); }
+    .tree-trunk { color: #9b6a2f; text-shadow: 0 0 6px  rgba(120,80,30,0.45); }
+    .tree-root  { color: #5c3317; text-shadow: 0 0 4px  rgba(70,40,15,0.40); }
+
+    /* Stage indicator dots get a pulse when active */
+    .tree-stage.active .stage-dot {
+      animation: dot-pulse 2s ease-in-out infinite;
+    }
+    @keyframes dot-pulse {
+      0%,100% { box-shadow: 0 0 5px currentColor; }
+      50%      { box-shadow: 0 0 14px currentColor; }
+    }
   </style>
 </head>
 <body>
@@ -130,28 +144,19 @@
     </div>
 
     <div class="tree-section" style="margin-top:3rem;">
-      <div class="tree-ascii" id="zen-tree-display">          .-^^^^^^^^-.
-      .^^^^^^^^^^^^^^^^^^.
-    .^^^^^^^^^^^^^^^^^^^^^^.
-  .^^^^^^^^^^^^^^^^^^^^^^^^^^.
- &lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
-&lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
- &lt;^^^^^^^^^^^^^^^^^^^^^^^^^^^^&gt;
-   \^^^^^^^^^^^^^^^^^^^^^^^^/
-        ||||||||||||
-        ||||||||||||
-     ___||||||||||||___</div>
-      <div>
-        <p class="section-header" style="margin-bottom:1rem;">// Zen Tree Growth Stages</p>
-        <ul class="tree-stages">
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 1 — Acorn &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Your tree exists. Barely.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 2 — Sprout &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; Signs of life. Encouragingly.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 3 — Young Entling &nbsp;&nbsp; Something is growing here.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 4 — Grove Guardian &nbsp; Consistency is paying off.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 5 — Ancient Ent &nbsp;&nbsp;&nbsp; Long-term commitment, confirmed.</span></li>
-          <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Stage 6 — Evergrowth Elder  The long game. Respected.</span></li>
-          <li class="tree-stage active"><span class="stage-dot"></span><span class="stage-name">Stage 7 — Evergrowth Tree &nbsp; Either exceptional or alarming.</span></li>
-        </ul>
+      <p class="section-header" style="margin-bottom:1rem;">// Zen Tree Growth Stages</p>
+      <ul class="tree-stages">
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Acorn</span></li>
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Sprout</span></li>
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Young Entling</span></li>
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Grove Guardian</span></li>
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Ancient Ent</span></li>
+        <li class="tree-stage"><span class="stage-dot"></span><span class="stage-name">Evergrowth Elder</span></li>
+        <li class="tree-stage active"><span class="stage-dot"></span><span class="stage-name">Evergrowth Tree</span></li>
+      </ul>
+      <p class="tree-active-desc" id="tree-active-desc">Stage 7 — Evergrowth Tree. Either exceptional or alarming.</p>
+      <div class="tree-ascii-wrap">
+        <div class="tree-ascii" id="zen-tree-display"></div>
       </div>
     </div>
   </div>
@@ -174,40 +179,221 @@
     });
   }, { passive: true });
 
-  // ── Zen Tree: cycle through 7 stages ────────────────────────────────
-  const dots = document.querySelectorAll('.tree-stage .stage-dot');
+  // ── Procedural Bonsai Generator (port of services/bonsai.rs) ─────────
+
+  // Mulberry32 — seeded PRNG, returns a closure producing floats in [0, 1)
+  function mkRng(seed) {
+    let a = seed | 0;
+    return () => {
+      a = a + 0x6D2B79F5 | 0;
+      let t = Math.imul(a ^ a >>> 15, 1 | a);
+      t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+
+  // Box-Muller Gaussian, clamped to ±3σ
+  function gauss(mean, std, rng) {
+    const u1 = Math.max(rng(), 1e-10);
+    const u2 = rng();
+    const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+    return Math.max(mean - 3*std, Math.min(mean + 3*std, mean + std * z));
+  }
+
+  function escHtml(ch) {
+    return ch === '&' ? '&amp;' : ch === '<' ? '&lt;' : ch === '>' ? '&gt;' : ch;
+  }
+
+  const BRANCH_CHARS = ['~', ';', ':', '='];
+  const LEAF_CHARS   = ['&', '%', '#', '@'];
+  const CHAR_H  = 1.8;     // web chars closer to square than terminal
+  const A_MEAN  = 0.698;   // ~40° branching angle
+  const A_STD   = 0.140;   // ~8° noise
+  const L_SCALE = 0.75;    // branch length shrink per layer
+  const B_MEAN  = 2.0;     // mean branches per node
+  const B_STD   = 0.5;
+  const N_LEAVES = 4;
+  const LEAF_LEN = 4;
+
+  function lineChar(theta) {
+    const a = Math.abs(theta);
+    if (a > Math.PI / 3) return '|';
+    if (a < Math.PI / 6) return '_';
+    return theta > 0 ? '/' : '\\';
+  }
+
+  function generateBonsai(rows, cols, seed, stage) {
+    // buf[row][col] = { ch, type } where type is 'leaf' | 'trunk' | 'root'
+    const buf = Array.from({length: rows}, () => Array(cols).fill(null));
+    const rng = mkRng(seed);
+
+    const toScreen = (x, y) => [
+      Math.round(rows - 1 - y / CHAR_H),
+      Math.round(x),
+    ];
+
+    const put = (row, col, ch, type) => {
+      if (row >= 0 && row < rows && col >= 0 && col < cols)
+        buf[row][col] = { ch, type };
+    };
+
+    const drawSegment = (x0, y0, x1, y1, width, theta) => {
+      const [r0, c0] = toScreen(x0, y0);
+      const [r1, c1] = toScreen(x1, y1);
+      const base = lineChar(theta);
+      const dr = Math.abs(r1 - r0), dc = Math.abs(c1 - c0);
+      const half = Math.max(0, Math.floor((width - 1) / 2));
+
+      const paintCell = (row, col) => {
+        put(row, col, base, 'trunk');
+      };
+
+      if (dr >= dc) {
+        if (r0 === r1) return;
+        const [sr, er, sc, ec] = r0 <= r1 ? [r0,r1,c0,c1] : [r1,r0,c1,c0];
+        for (let row = sr; row <= er; row++) {
+          const t = (row - sr) / (er - sr);
+          const mid = Math.round(sc + t * (ec - sc));
+          for (let d = -half; d <= half; d++) paintCell(row, mid + d);
+        }
+      } else {
+        if (c0 === c1) return;
+        const [sc, ec, sr, er] = c0 <= c1 ? [c0,c1,r0,r1] : [c1,c0,r1,r0];
+        for (let col = sc; col <= ec; col++) {
+          const t = (col - sc) / (ec - sc);
+          const mid = Math.round(sr + t * (er - sr));
+          for (let d = -half; d <= half; d++) paintCell(mid + d, col);
+        }
+      }
+    };
+
+    const drawLeaves = (x, y) => {
+      for (let i = 0; i < N_LEAVES; i++) {
+        const vx = rng()*2 - 1, vy = rng()*2 - 1;
+        const mag = Math.sqrt(vx*vx + vy*vy) || 1e-6;
+        let dvx = vx/mag, dvy = vy/mag, px = x, py = y;
+        for (let j = 0; j < LEAF_LEN; j++) {
+          px += dvx; py += dvy;
+          const ch = LEAF_CHARS[Math.floor(rng() * 4)];
+          const [row, col] = toScreen(px, py);
+          put(row, col, ch, 'leaf');
+          dvy -= j / LEAF_LEN;
+        }
+      }
+    };
+
+    const drawBranch = (x, y, layer, numLayers, len, width, theta) => {
+      if (layer >= numLayers) { drawLeaves(x, y); return; }
+      const ex = x + len * Math.sin(theta);
+      const ey = y + len * Math.cos(theta);
+      drawSegment(x, y, ex, ey, width, theta);
+      const n = Math.min(3, Math.max(0, Math.round(gauss(B_MEAN, B_STD, rng))));
+      const step = len / Math.max(1, n);
+      let sign = 1;
+      for (let i = 0; i < n; i++) {
+        const dist = (i + 1) * step;
+        drawBranch(
+          x + dist * Math.sin(theta),
+          y + dist * Math.cos(theta),
+          layer + 1, numLayers,
+          len * L_SCALE,
+          Math.max(1, width - 1),
+          theta + sign * gauss(A_MEAN, A_STD, rng)
+        );
+        sign = -sign;
+      }
+    };
+
+    const params = [
+      [2, 3.0], [3, 5.0], [4, 7.5], [5, 9.5], [6, 11.5], [7, 13.5], [8, 16.0],
+    ];
+    const [numLayers, baseLen] = params[Math.min(Math.max(stage - 1, 0), 6)];
+    const len = Math.min(baseLen, rows * CHAR_H * 0.72, cols * 0.45);
+    const width = Math.max(1, Math.round(len / 8));
+    // tronco siempre vertical para evitar sesgo lateral dependiente de la semilla
+    drawBranch(cols / 2, 1.5, 1, numLayers, len, width, 0);
+
+    // Convert buffer to HTML string (groups consecutive same-type cells into one span)
+    return buf.map(row => {
+      let html = '', i = 0;
+      while (i < row.length) {
+        if (!row[i]) {
+          let n = 0;
+          while (i < row.length && !row[i]) { n++; i++; }
+          html += ' '.repeat(n);
+        } else {
+          const type = row[i].type;
+          let s = '';
+          while (i < row.length && row[i] && row[i].type === type) {
+            s += escHtml(row[i].ch); i++;
+          }
+          html += `<span class="tree-${type}">${s}</span>`;
+        }
+      }
+      return html;
+    }).join('\n');
+  }
+
+  // ── Animation ─────────────────────────────────────────────────────────
+  const dots      = document.querySelectorAll('.tree-stage .stage-dot');
   const stageRows = document.querySelectorAll('.tree-stage');
-  const treeDisplay = document.getElementById('zen-tree-display');
-  const colors = ['rgb(168,85,247)','rgb(255,105,180)','rgb(6,182,212)','rgb(59,130,246)','rgb(249,115,22)','rgb(245,158,11)','rgb(6,182,212)'];
-  const treeArt = [
-    `    .\n   ( )`,
-    `    .\n   \\|/\n    |\n    '`,
-    `    ,\n   \\|/\n  --|--\n    |\n   / \\`,
-    `    .^.\n   /^^\\\n  <^^^^>\n    ||\n    ||\n   /__\\`,
-    `     .-^^^-.\n   .^^^^^^^^^.\n  <^^^^^^^^^^^>\n <^^^^^^^^^^^^^>\n      ||||\n      ||||\n     /||||\\`,
-    `        .-^^^^^-.\n     .^^^^^^^^^^^^.\n   .^^^^^^^^^^^^^^^^.\n  <^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^>\n        ||||||\n        ||||||\n      __||||||__`,
-    `          .-^^^^^^^^^-.\n      .^^^^^^^^^^^^^^^^^^.\n    .^^^^^^^^^^^^^^^^^^^^^^.\n  .^^^^^^^^^^^^^^^^^^^^^^^^^^.\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n<^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n <^^^^^^^^^^^^^^^^^^^^^^^^^^^^>\n   \\^^^^^^^^^^^^^^^^^^^^^^^^/\n        ||||||||||||\n        ||||||||||||\n     ___||||||||||||___`,
+  const treeDisplay   = document.getElementById('zen-tree-display');
+  const activeDescEl  = document.getElementById('tree-active-desc');
+
+  const dotColors = [
+    '#78716c', '#84cc16', '#22c55e',
+    '#16a34a', '#15803d', '#4ade80', '#86efac',
   ];
-  let cur = 6;
+
+  const stageDescs = [
+    'Stage 1 — Acorn. Your tree exists. Barely.',
+    'Stage 2 — Sprout. Signs of life. Encouragingly.',
+    'Stage 3 — Young Entling. Something is growing here.',
+    'Stage 4 — Grove Guardian. Consistency is paying off.',
+    'Stage 5 — Ancient Ent. Long-term commitment, confirmed.',
+    'Stage 6 — Evergrowth Elder. The long game. Respected.',
+    'Stage 7 — Evergrowth Tree. Either exceptional or alarming.',
+  ];
+
+  // Seed from today's date — same tree all day, changes overnight
+  const daySeed = Math.floor(Date.now() / 86400000);
+  const ROWS = 22, COLS = 72;
+
+  // Pre-generate all 7 stages up front (< 50 ms total)
+  const treeHtml = Array.from({length: 7}, (_, i) =>
+    generateBonsai(ROWS, COLS, daySeed, i + 1)
+  );
+
+  const STAGE_MS = 3000;   // 3 seconds per stage while growing
+  const HOLD_MS  = 900000; // 15 minutes at stage 7 before cycling
+
+  let animIdx = 6; // start at stage 7 — visitors see the full tree immediately
+
   const applyStage = (idx) => {
-    dots.forEach(d => { d.style.background = ''; d.style.boxShadow = ''; });
-    dots[idx].style.background = colors[idx];
-    dots[idx].style.boxShadow = '0 0 8px ' + colors[idx];
-    stageRows.forEach(r => r.classList.remove('active'));
-    stageRows[idx].classList.add('active');
+    dots.forEach((d, i) => {
+      d.style.background = i === idx ? dotColors[i] : '';
+      d.style.color      = dotColors[i];
+      d.style.boxShadow  = i === idx ? `0 0 8px ${dotColors[i]}` : '';
+    });
+    stageRows.forEach((r, i) => r.classList.toggle('active', i === idx));
+    if (activeDescEl) activeDescEl.textContent = stageDescs[idx];
     if (treeDisplay) {
       treeDisplay.style.opacity = '0';
       setTimeout(() => {
-        treeDisplay.textContent = treeArt[idx];
+        treeDisplay.innerHTML = treeHtml[idx];
         treeDisplay.style.opacity = '1';
-      }, 350);
+      }, 400);
     }
   };
-  applyStage(cur);
-  setInterval(() => {
-    cur = (cur + 1) % dots.length;
-    applyStage(cur);
-  }, 1800);
+
+  applyStage(animIdx);
+
+  const tick = () => {
+    animIdx = (animIdx + 1) % treeHtml.length;
+    applyStage(animIdx);
+    setTimeout(tick, animIdx === treeHtml.length - 1 ? HOLD_MS : STAGE_MS);
+  };
+  setTimeout(tick, HOLD_MS);
 </script>
 
 <div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>

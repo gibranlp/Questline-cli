@@ -5,6 +5,7 @@
 use crate::app::{App, ModalType};
 use crate::models::{Project, Task};
 use crate::screens::intro::centered_rect;
+use crate::services::bonsai::BonsaiGrid;
 use crate::theme::Theme;
 use chrono::Utc;
 use ratatui::{
@@ -196,60 +197,64 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         ])
         .split(chunks[3]);
 
-    // animación del árbol: crece de etapa 1 hasta la etapa actual, luego se queda
-    // 20 ticks/stage = 1 segundo por etapa; HOLD_TICKS = 3 segundos en la etapa final antes de reiniciar
+    // Animación del árbol: crece lentamente de etapa 1 a la actual, luego espera
+    // 160 ticks/etapa = 8 segundos por transición; 18 000 ticks = 15 minutos en la etapa final
     let zen_tree = app.db.get_zen_tree().unwrap();
     let current_stage = zen_tree.stage.max(1) as usize;
-    const TICKS_PER_STAGE: usize = 20;
-    const HOLD_TICKS: usize = 60;
-    let cycle_len = current_stage * TICKS_PER_STAGE + HOLD_TICKS;
+    const STAGE_TICKS: usize = 160;
+    const HOLD_TICKS: usize = 18_000;
+    let grow_ticks = current_stage * STAGE_TICKS;
+    let cycle_len = grow_ticks + HOLD_TICKS;
     let cycle_pos = app.music_scroll_ticks % cycle_len;
-    let animated_stage = if cycle_pos >= current_stage * TICKS_PER_STAGE {
-        current_stage
+    let animated_stage = if cycle_pos >= grow_ticks {
+        current_stage as i32
     } else {
-        (cycle_pos / TICKS_PER_STAGE + 1).min(current_stage)
-    } as i32;
-
-    let tree_color = if animated_stage == zen_tree.stage {
-        theme.success
-    } else {
-        Color::Rgb(34, 120, 60) // verde más oscuro mientras crece
+        (cycle_pos / STAGE_TICKS + 1).min(current_stage) as i32
     };
 
-    let art_str = crate::models::ZenTree::ascii_art_at_stage(animated_stage);
-    let mut tree_lines: Vec<Line> = vec![Line::from("")];
-    for art_line in art_str.lines() {
-        tree_lines.push(Line::from(Span::styled(
-            art_line.to_string(),
-            Style::default().fg(tree_color).add_modifier(Modifier::BOLD),
-        )));
-    }
-    tree_lines.push(Line::from(""));
-    tree_lines.push(Line::from(vec![
-        Span::styled("Companion Tree: ", Style::default().fg(theme.muted)),
-        Span::styled(
-            zen_tree.stage_name(),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
-        ),
-    ]));
-    tree_lines.push(Line::from(vec![
-        Span::styled("Growth: ", Style::default().fg(theme.muted)),
-        Span::styled(
-            format!("{} pts", zen_tree.growth),
-            Style::default().fg(theme.success),
-        ),
-    ]));
+    // Borde del bloque; el área interior se divide en árbol (arriba) y estadísticas (abajo)
+    let tree_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(" Companion Tree ");
+    let tree_inner = tree_block.inner(mid_chunks[0]);
+    f.render_widget(tree_block, mid_chunks[0]);
 
-    let tree_box = Paragraph::new(tree_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .title(" Companion Tree "),
-        )
+    if tree_inner.height > 3 && tree_inner.width > 4 {
+        let tree_sections = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(2)])
+            .split(tree_inner);
+
+        let grid = BonsaiGrid::generate(
+            tree_sections[0].height as usize,
+            tree_sections[0].width as usize,
+            zen_tree.growth as u64,
+            animated_stage,
+            zen_tree.health,
+        );
+        f.render_widget(Paragraph::new(grid.into_lines()), tree_sections[0]);
+
+        let tree_stats = Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Stage: ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    zen_tree.stage_name(),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  Growth: ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    format!("{} pts", zen_tree.growth),
+                    Style::default().fg(theme.success),
+                ),
+            ]),
+        ])
         .alignment(Alignment::Center);
-    f.render_widget(tree_box, mid_chunks[0]);
+        f.render_widget(tree_stats, tree_sections[1]);
+    }
 
     // Right: quote del app — se selecciona aleatoriamente al iniciar la sesión
     let quote_text = vec![
