@@ -90,6 +90,31 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ### Quest System
 Tasks in Questline are quests. They carry priority, due dates, subtasks, and steps. Completing a quest earns XP, waters your Zen Tree, and pushes chapter objectives forward. Fail to complete daily quests and the realm takes notice.
 
+### The Main Quest
+
+Every time the Dashboard opens, Questline convenes an emergency session of the Planning Council — a deterministic scoring engine that reviews every incomplete task in your backlog and selects the single most important thing to do right now.
+
+The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points.
+
+| Condition | Points |
+|---|---|
+| Overdue | +100 |
+| Due today | +60 |
+| Due tomorrow | +40 |
+| Due within three days | +25 |
+| Due within seven days | +10 |
+| High priority | +30 |
+| Medium priority | +10 |
+| Low priority | +0 |
+
+The scores stack. A High priority task due today scores 90. An overdue task of any priority scores at least 100 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
+
+The Council does not consider how long the task will take, how much you dread it, how many times you have quietly moved it to tomorrow, or whether finishing it would actually matter. Those are judgment calls. The Council only counts points.
+
+The second-highest scoring task is displayed as the Recommended Next Quest — a polite suggestion from an entity that has never experienced a Tuesday afternoon.
+
+Press `o` from the Dashboard to open the current Main Quest directly in its workspace.
+
 ### Scrolls and Codices
 Notes are scrolls organized into codices — thematic collections tied to your projects. Write in Markdown, search across your full knowledge base, and share scrolls with your fellowship.
 

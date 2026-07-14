@@ -686,31 +686,19 @@ pub fn open_url(url: &str) {
         .spawn();
 }
 
-// Arma la lista plana para el panel de tareas del dashboard — padres ordenados por fecha, cada uno seguido de sus pasos
-fn dashboard_flat_items(all_tasks: &[Task]) -> Vec<(bool, Uuid, Task)> {
-    let mut parents: Vec<&Task> = all_tasks
+// Victorias rápidas del dashboard: tareas sin pasos pendientes, candidatas a completarse en minutos
+fn dashboard_quick_wins(all_tasks: &[Task]) -> Vec<Task> {
+    all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none())
-        .collect();
-    parents.sort_by(|a, b| match (a.due_date, b.due_date) {
-        (Some(d1), Some(d2)) => d1.cmp(&d2),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => b.created_at.cmp(&a.created_at),
-    });
-    let mut flat = Vec::new();
-    for parent in parents {
-        flat.push((false, parent.id, parent.clone()));
-        let mut steps: Vec<&Task> = all_tasks
-            .iter()
-            .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
-            .collect();
-        steps.sort_by_key(|s| s.created_at);
-        for step in steps {
-            flat.push((true, parent.id, step.clone()));
-        }
-    }
-    flat
+        .filter(|t| {
+            !t.completed
+                && t.parent_task_id.is_none()
+                && !all_tasks
+                    .iter()
+                    .any(|s| s.parent_task_id == Some(t.id) && !s.completed)
+        })
+        .cloned()
+        .collect()
 }
 
 impl App {
@@ -5137,6 +5125,29 @@ impl App {
                     self.water_tree()?;
                 }
             }
+            // Abre la quest principal directamente en su workspace desde el dashboard
+            KeyCode::Char('o') | KeyCode::Char('O')
+                if self.active_screen == ActiveScreen::Dashboard =>
+            {
+                let today = chrono::Local::now().date_naive();
+                if let Some(task) = crate::services::planner::find_main_quest(&self.all_tasks, today) {
+                    if let Some(p_id) = task.project_id {
+                        self.active_project_id = Some(p_id);
+                        self.active_screen = ActiveScreen::Workspace;
+                        self.workspace_tab_idx = 0;
+                        self.workspace_sidebar_focused = false;
+                        self.task_filter = "All".to_string();
+                        let proj_tasks = self.db.get_tasks().unwrap_or_default();
+                        let mut sorted: Vec<&Task> = proj_tasks
+                            .iter()
+                            .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
+                            .collect();
+                        sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                        self.selected_task_idx = sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
+                        self.reload_data()?;
+                    }
+                }
+            }
             KeyCode::Char('e') | KeyCode::Char('E')
                 if self.active_screen == ActiveScreen::Dashboard
                     || key.code == KeyCode::Char('E') =>
@@ -5260,6 +5271,22 @@ impl App {
                     self.chapter_panel_focused = true;
                 }
             }
+            // En el dashboard, Tab navega entre paneles internos en lugar de cambiar de pantalla
+            KeyCode::Tab | KeyCode::BackTab if self.active_screen == ActiveScreen::Dashboard => {
+                self.dashboard_task_focus = !self.dashboard_task_focus;
+                if self.dashboard_task_focus {
+                    let tasks = self.db.get_tasks().unwrap_or_default();
+                    let wins = dashboard_quick_wins(&tasks);
+                    if self.selected_dashboard_task_idx >= wins.len() {
+                        self.selected_dashboard_task_idx = 0;
+                    }
+                } else {
+                    let rituals = self.db.get_rituals().unwrap_or_default();
+                    if self.selected_ritual_idx >= rituals.len() {
+                        self.selected_ritual_idx = 0;
+                    }
+                }
+            }
             KeyCode::Tab => {
                 self.active_tab_idx = (self.active_tab_idx + 1) % 15;
                 while self.active_tab_idx == 3
@@ -5346,12 +5373,12 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        if !flat.is_empty() {
+                        let wins = dashboard_quick_wins(&tasks);
+                        if !wins.is_empty() {
                             self.selected_dashboard_task_idx = if self.selected_dashboard_task_idx > 0 {
                                 self.selected_dashboard_task_idx - 1
                             } else {
-                                flat.len() - 1
+                                wins.len() - 1
                             };
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
@@ -5516,10 +5543,10 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        if !flat.is_empty() {
+                        let wins = dashboard_quick_wins(&tasks);
+                        if !wins.is_empty() {
                             self.selected_dashboard_task_idx =
-                                (self.selected_dashboard_task_idx + 1) % flat.len();
+                                (self.selected_dashboard_task_idx + 1) % wins.len();
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() {
@@ -5638,16 +5665,10 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&tasks);
-                        let sel = self.selected_dashboard_task_idx.min(flat.len().saturating_sub(1));
-                        if let Some((is_step, parent_id, task)) = flat.get(sel).cloned() {
-                            let nav_task_id = if is_step { parent_id } else { task.id };
-                            let nav_project_id = if is_step {
-                                tasks.iter().find(|t| t.id == parent_id).and_then(|t| t.project_id)
-                            } else {
-                                task.project_id
-                            };
-                            if let Some(p_id) = nav_project_id {
+                        let wins = dashboard_quick_wins(&tasks);
+                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        if let Some(task) = wins.get(sel).cloned() {
+                            if let Some(p_id) = task.project_id {
                                 self.active_project_id = Some(p_id);
                                 self.active_screen = ActiveScreen::Workspace;
                                 self.workspace_tab_idx = 0;
@@ -5658,7 +5679,7 @@ impl App {
                                     .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
                                     .collect();
                                 proj_tasks_sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                self.selected_task_idx = proj_tasks_sorted.iter().position(|t| t.id == nav_task_id).unwrap_or(0);
+                                self.selected_task_idx = proj_tasks_sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
                                 self.dashboard_task_focus = false;
                                 self.reload_data()?;
                             }
@@ -5765,148 +5786,75 @@ impl App {
             KeyCode::Char(' ') => {
                 if self.active_screen == ActiveScreen::Dashboard {
                     if self.dashboard_task_focus {
+                        // Victorias rápidas: tareas sin pasos pendientes, siempre son tareas padre
                         let all_tasks = self.db.get_tasks().unwrap_or_default();
-                        let flat = dashboard_flat_items(&all_tasks);
-                        let sel = self.selected_dashboard_task_idx.min(flat.len().saturating_sub(1));
-                        if let Some((is_step, _parent_id, task)) = flat.get(sel).cloned() {
-                            if is_step {
-                                if task.completed {
-                                    // Reabrir paso — el XP ya fue cobrado, no se devuelve
-                                    let mut t = task;
-                                    t.completed = false;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.notifications.push(Notification::info("Trial reopened. XP already claimed — face it again with fresh resolve.".to_string()));
-                                    self.reload_data()?;
-                                } else {
-                                    let already_awarded = task.xp_awarded;
-                                    let mut t = task;
-                                    t.completed = true;
-                                    t.xp_awarded = true;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.audio_player.play_task_complete();
-                                    if !already_awarded {
-                                        let is_high = t.priority == TaskPriority::High;
-                                        let xp = if is_high { 50 } else { 25 };
-                                        let label = if is_high { "Resolve Hero Step Quest" } else { "Complete Step Quest" };
-                                        self.grant_xp(label, xp)?;
-                                        self.apply_class_passive("task_complete", 0)?;
-                                    }
-                                    self.trigger_ambient_particles();
-                                    self.complete_productive_action()?;
-                                    self.grow_tree(2)?;
-                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                    self.check_action_achievements()?;
-                                    let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                    if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                        self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                    }
-                                    self.reload_data()?;
-                                }
-                            } else {
-                                if task.completed {
-                                    let steps: Vec<Task> = all_tasks.iter()
-                                        .filter(|t| t.parent_task_id == Some(task.id))
-                                        .cloned()
-                                        .collect();
-                                    for step in &steps {
-                                        if step.completed {
-                                            let mut s = step.clone();
-                                            s.completed = false;
-                                            self.db.update_task(&s)?;
-                                        }
-                                    }
-                                    let mut t = task;
-                                    t.completed = false;
-                                    self.db.update_task(&t)?;
-                                    self.mark_dirty();
-                                    self.notifications.push(Notification::info("Quest unsealed. XP already claimed — the path forward is yours to walk again.".to_string()));
-                                    let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                    if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                        self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                    }
-                                    self.reload_data()?;
-                                } else {
-                                    let incomplete_steps: Vec<Task> = all_tasks.iter()
-                                        .filter(|t| t.parent_task_id == Some(task.id) && !t.completed)
-                                        .cloned()
-                                        .collect();
-                                    if !incomplete_steps.is_empty() {
-                                        let n = incomplete_steps.len();
-                                        let msg = if n == 1 {
-                                            "One trial remains unsealed. Face it before this quest can be closed.".to_string()
-                                        } else {
-                                            format!("{} trials remain unsealed. Resolve them before this quest can be claimed.", n)
-                                        };
-                                        self.notifications.push(Notification::warning(msg));
-                                    } else {
-                                        let already_awarded = task.xp_awarded;
-                                        let total_steps = all_tasks.iter()
-                                            .filter(|t| t.parent_task_id == Some(task.id))
-                                            .count();
-                                        let mut t = task;
-                                        t.completed = true;
-                                        t.xp_awarded = true;
-                                        self.db.update_task(&t)?;
-                                        self.mark_dirty();
-                                        self.audio_player.play_task_complete();
-                                        if !already_awarded {
-                                            let is_high = t.priority == TaskPriority::High;
-                                            let val = if is_high { 50 } else { 25 };
-                                            let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
-                                            self.grant_xp(title, val)?;
-                                            let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
-                                            self.apply_class_passive(passive_trigger, 0)?;
-                                        }
-                                        self.trigger_ambient_particles();
-                                        self.increment_quest_progress(10, 1)?;
-                                        let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
-                                        self.simulate_memory_fragment_unlock(frag_trigger)?;
-                                        self.complete_productive_action()?;
-                                        let growth = if t.priority == TaskPriority::High { 4 } else { 2 };
-                                        self.grow_tree(growth)?;
-                                        self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                        if t.priority == TaskPriority::High {
-                                            self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
-                                        }
-                                        self.check_action_achievements()?;
-                                        let chronicle_desc = if total_steps > 0 {
-                                            format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
-                                        } else {
-                                            "completed 1 quest.".to_string()
-                                        };
-                                        self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
-                                        self.maybe_spawn_task_completion_sprite();
-                                        if let Some(recurrence) = t.recurrence {
-                                            let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
-                                            let next_task = Task {
-                                                id: Uuid::new_v4(),
-                                                project_id: t.project_id,
-                                                title: t.title.clone(),
-                                                description: t.description.clone(),
-                                                due_date: Some(next_due),
-                                                completed: false,
-                                                priority: t.priority,
-                                                created_at: Utc::now(),
-                                                updated_at: Utc::now(),
-                                                owner_identity: t.owner_identity.clone(),
-                                                owner_username: t.owner_username.clone(),
-                                                parent_task_id: None,
-                                                xp_awarded: false,
-                                                recurrence: Some(recurrence),
-                                            };
-                                            let _ = self.db.insert_task(&next_task);
-                                        }
-                                        let new_flat = dashboard_flat_items(&self.db.get_tasks().unwrap_or_default());
-                                        if self.selected_dashboard_task_idx >= new_flat.len() && !new_flat.is_empty() {
-                                            self.selected_dashboard_task_idx = new_flat.len() - 1;
-                                        }
-                                        self.reload_data()?;
-                                        self.maybe_show_support_realm_prompt()?;
-                                    }
-                                }
+                        let wins = dashboard_quick_wins(&all_tasks);
+                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        if let Some(task) = wins.get(sel).cloned() {
+                            let already_awarded = task.xp_awarded;
+                            let total_steps = all_tasks
+                                .iter()
+                                .filter(|s| s.parent_task_id == Some(task.id))
+                                .count();
+                            let mut t = task;
+                            t.completed = true;
+                            t.xp_awarded = true;
+                            self.db.update_task(&t)?;
+                            self.mark_dirty();
+                            self.audio_player.play_task_complete();
+                            if !already_awarded {
+                                let is_high = t.priority == TaskPriority::High;
+                                let val = if is_high { 50 } else { 25 };
+                                let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                self.grant_xp(title, val)?;
+                                let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
+                                self.apply_class_passive(passive_trigger, 0)?;
                             }
+                            self.trigger_ambient_particles();
+                            self.increment_quest_progress(10, 1)?;
+                            let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
+                            self.simulate_memory_fragment_unlock(frag_trigger)?;
+                            self.complete_productive_action()?;
+                            let growth = if t.priority == TaskPriority::High { 4 } else { 2 };
+                            self.grow_tree(growth)?;
+                            self.update_daily_adventure_progress("complete_tasks", 1)?;
+                            if t.priority == TaskPriority::High {
+                                self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
+                            }
+                            self.check_action_achievements()?;
+                            let chronicle_desc = if total_steps > 0 {
+                                format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
+                            } else {
+                                "completed 1 quest.".to_string()
+                            };
+                            self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
+                            self.maybe_spawn_task_completion_sprite();
+                            if let Some(recurrence) = t.recurrence {
+                                let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
+                                let next_task = Task {
+                                    id: Uuid::new_v4(),
+                                    project_id: t.project_id,
+                                    title: t.title.clone(),
+                                    description: t.description.clone(),
+                                    due_date: Some(next_due),
+                                    completed: false,
+                                    priority: t.priority,
+                                    created_at: Utc::now(),
+                                    updated_at: Utc::now(),
+                                    owner_identity: t.owner_identity.clone(),
+                                    owner_username: t.owner_username.clone(),
+                                    parent_task_id: None,
+                                    xp_awarded: false,
+                                    recurrence: Some(recurrence),
+                                };
+                                let _ = self.db.insert_task(&next_task);
+                            }
+                            let new_wins = dashboard_quick_wins(&self.db.get_tasks().unwrap_or_default());
+                            if self.selected_dashboard_task_idx >= new_wins.len() && !new_wins.is_empty() {
+                                self.selected_dashboard_task_idx = new_wins.len() - 1;
+                            }
+                            self.reload_data()?;
+                            self.maybe_show_support_realm_prompt()?;
                         }
                     } else { match self.db.get_rituals() { Ok(rituals) => {
                         if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
@@ -8209,11 +8157,11 @@ impl App {
         let old_stage = tree.stage;
         let new_stage = match tree.growth {
             0..10 => 1,
-            10..25 => 2,
-            25..50 => 3,
-            50..100 => 4,
-            100..200 => 5,
-            200..350 => 6,
+            10..40 => 2,
+            40..120 => 3,
+            120..350 => 4,
+            350..900 => 5,
+            900..2200 => 6,
             _ => 7,
         };
 
