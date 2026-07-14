@@ -349,6 +349,12 @@ CREATE TABLE IF NOT EXISTS chapter_contribution_log (
     PRIMARY KEY (chapter_id, objective_type)
 );
 
+-- evita reprocesar eventos remotos que ya fueron aplicados — sin esto, cada sync replays toda la historia del servidor
+CREATE TABLE IF NOT EXISTS processed_remote_events (
+    id TEXT PRIMARY KEY,
+    processed_at TEXT NOT NULL
+);
+
 -- índices base — presentes desde el inicio
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);

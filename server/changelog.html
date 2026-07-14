@@ -128,6 +128,122 @@
       </div>
     </div>
 
+    <!-- v1.1.0 -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.1.0</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Nodes Remember</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-14</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — The Realm Was Always Two Computers</span>
+
+  The conflict counter read 42,349.
+
+  One hero. Two machines. One at work, one at home.
+  Same profile. Same quests. Same Evergrowth, allegedly.
+  And somewhere between the two of them,
+  the sync engine had developed a strong opinion
+  about everything that had ever happened.
+
+  42,349 opinions, to be precise.
+
+  <span class="hi">None of them were actually conflicts.</span>
+
+  The sync engine was simply rereading the entire history of the realm
+  on every pass, rediscovering the same events it had already processed,
+  and tallying them as new disagreements.
+  It was not malicious. It was thorough in the wrong direction.
+
+  The fix was a table.
+  Every processed event now gets a name.
+  Next time the engine arrives and asks "have you seen this before?"
+  the answer is yes, sit down, we handled it in July.
+
+  The conflict counter now reads what it should.
+  The hero with 42,349 conflicts went to bed that night
+  with zero pending.
+  They did not thank us. They were asleep.
+
+  <span class="hi">The realm was always multiple devices. It simply refused to admit it.</span>
+
+  Each node now introduces itself during every sync.
+  Device name. Last seen. Online status.
+  The Sync screen no longer shows one lonely node
+  pretending to be the only version of you that exists.
+  It shows all of them, ranked by how recently they checked in.
+
+  The devices that have not been seen in a while
+  are still listed. The Chronicle does not forget.
+  It just shows them in a dimmer color to indicate
+  they are probably under a desk somewhere.
+
+  Your companions can now see you too.
+
+  Not metaphorically. The presence system tracks
+  who is actually in a shared project right now —
+  a green dot for alive, a grey dot for missing in action,
+  a timestamp for "last seen 47 minutes ago, unclear what happened."
+
+  The shared workspace does not wait anymore either.
+  Open a shared project and the sync fires immediately.
+  No waiting for the 8-second interval.
+  No staring at yesterday's data while your companion
+  has already completed three tasks you were planning to start.
+
+  <span class="hi">The dashboard has been rebuilt from the ground up.</span>
+
+  The Evergrowth has a new shape. A new texture.
+  It has always been growing in the background, patient and indifferent.
+  It now looks like it knows you have been watching.
+
+  The Adventurer panel finally admits what you have unlocked.
+  Every hero has powers. They were always there in the tree.
+  The dashboard simply never mentioned them —
+  as if the fact that you had achieved "Debug Familiar" at level 10
+  was private information the UI had agreed to keep to itself.
+
+  It is no longer keeping it to itself.
+
+  Your current power sits beneath your title, in your class color,
+  with an arrow pointing to what you are working toward.
+  The dashboard now tells you where you are in the story.
+
+  <span class="hi">You can no longer slam the door on the way out.</span>
+
+  Ctrl+C has been decommissioned as an exit strategy.
+  Not blocked — it simply does nothing useful now.
+  What it does instead is remind you, politely,
+  that the Chronicle deserves a proper farewell.
+
+  Press Q. Confirm. The sync fires.
+  The Chronicle is sealed.
+  The realm records your departure correctly.
+  Then, and only then, the terminal clears.
+
+  42,349 conflicts. Zero remaining.
+  A dashboard that knows your name and your power level.
+  Companions who can tell if you are actually at your desk.
+  And an exit that treats the Chronicle with the respect
+  it probably deserved from the beginning.
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Multi-device sync deduplication — processed events tracked, no more phantom conflicts</span>
+<span class="cmd">  ✓  Device heartbeat — every node broadcasts identity and last-seen to the realm</span>
+<span class="cmd">  ✓  Sync screen shows all your devices with online status and timestamps</span>
+<span class="cmd">  ✓  Fellowship presence — companions show online/offline in shared project views</span>
+<span class="cmd">  ✓  Presence visible in companion list, chat title, and Companions tab</span>
+<span class="cmd">  ✓  Shared workspaces sync every 8s and immediately on open</span>
+<span class="cmd">  ✓  Companion task ownership badges — tasks show who created them</span>
+<span class="cmd">  ✓  Dashboard rebuilt — new Evergrowth rendering and layout</span>
+<span class="cmd">  ✓  Adventurer panel shows current class power and next milestone in class color</span>
+<span class="cmd">  ✓  Navigation reorder — 6 Fellowship · 7 Chronicle · 8 Sync</span>
+<span class="cmd">  ✓  Ctrl+C blocked — q confirms, sync seals the Chronicle, then exit</span>
+<span class="cmd">  –  The hero with 42,349 conflicts has not sent a thank-you note. The Chronicle noted the absence.</span></pre>
+      </div>
+    </div>
+
     <!-- v1.0.9 -->
     <div style="margin-top:2.5rem;">
       <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">

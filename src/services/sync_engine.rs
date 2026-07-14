@@ -438,6 +438,36 @@ impl<'a> SyncEngine<'a> {
             });
         }
 
+        // Heartbeat del dispositivo — lleva identidad del usuario para actualizar presencia en otros nodos
+        {
+            let now_str = Utc::now().to_rfc3339();
+            let username = self.db.get_user()
+                .ok()
+                .and_then(|u| u)
+                .map(|u| u.username)
+                .unwrap_or_else(|| "Unknown".to_string());
+            let hostname = std::env::var("HOSTNAME")
+                .or_else(|_| std::fs::read_to_string("/etc/hostname").map(|s| s.trim().to_string()))
+                .unwrap_or_else(|_| "Unknown Node".to_string());
+            let device_info = serde_json::json!({
+                "device_id": self.device_id,
+                "device_name": hostname,
+                "last_sync": now_str,
+                "user_identity": self.identity.public_key,
+                "username": username,
+            }).to_string();
+            local_payload.push(SyncLogEntry {
+                id: format!("device_heartbeat__{}__{}", self.device_id, Utc::now().format("%Y%m%d_%H%M")),
+                entity_type: "device".to_string(),
+                entity_id: self.device_id.to_string(),
+                operation: "heartbeat".to_string(),
+                timestamp: now_str,
+                content: Some(device_info),
+                device_id: self.device_id.to_string(),
+                seq: 0,
+            });
+        }
+
         // Si falla el push, no jalamos nada — así no pisamos cambios que aún no subimos
         let pushed_ids: Vec<String> = if !local_payload.is_empty() {
             let serialized = serde_json::to_string(&local_payload)?;
@@ -460,12 +490,25 @@ impl<'a> SyncEngine<'a> {
         let pulled_data = self.provider.pull(&self.identity.public_key, "", since_seq)?;
         let remote_logs: Vec<SyncLogEntry> = serde_json::from_str(&pulled_data)?;
 
+        // Dedup por ID — si el servidor no retorna seq reales (todos llegan con seq=0), este set
+        // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
+        let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
+        let mut newly_processed_ids: Vec<String> = Vec::new();
+
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
         for log in remote_logs {
             if log.seq > max_seq { max_seq = log.seq; }
             // Ignorar eventos que generamos nosotros mismos — ya los tenemos localmente
             if log.device_id == self.device_id {
+                // Marcar como procesados para que no los replays si llegan de vuelta del server
+                if !already_processed.contains(&log.id) {
+                    newly_processed_ids.push(log.id);
+                }
+                continue;
+            }
+            // Saltar eventos que ya aplicamos en un sync anterior — end del ciclo de replay infinito
+            if already_processed.contains(&log.id) {
                 continue;
             }
 
@@ -662,6 +705,8 @@ impl<'a> SyncEngine<'a> {
                         Err(_) => true,
                     }
                 }
+                // Dispositivos: siempre aplicamos — upsert idempotente
+                "device" => true,
                 _ => false,
             };
 
@@ -1005,10 +1050,33 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
+                        // Dispositivos remotos: upsert device + actualiza presencia del usuario en ese nodo
+                        "device" => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                                let did = v["device_id"].as_str().unwrap_or_default();
+                                let dname = v["device_name"].as_str().unwrap_or("Unknown Node");
+                                let last = v["last_sync"].as_str();
+                                if !did.is_empty() {
+                                    let _ = self.db.upsert_remote_device(did, dname, last);
+                                    // Si el heartbeat trae identidad del usuario, actualizamos su presencia
+                                    let user_identity = v["user_identity"].as_str().unwrap_or_default();
+                                    let username = v["username"].as_str().unwrap_or_default();
+                                    if !user_identity.is_empty() && !username.is_empty() {
+                                        let seen = last.unwrap_or_else(|| log.timestamp.as_str());
+                                        let _ = self.db.update_presence(
+                                            user_identity, username, true, seen, None, "Visible",
+                                        );
+                                    }
+                                    pulled_count += 1;
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
             }
+            // Marcar como procesado independientemente de si `is_newer` — queremos dedup siempre
+            newly_processed_ids.push(log.id);
         }
 
         // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
@@ -1016,12 +1084,18 @@ impl<'a> SyncEngine<'a> {
             let _ = self.db.set_setting("last_pull_seq", &max_seq.to_string());
         }
 
+        // Persistir IDs de eventos aplicados — end del loop infinito de replay
+        let _ = self.db.mark_remote_events_processed(&newly_processed_ids);
+
         // Solo marcamos como synced DESPUÉS de que el pull también termine — si pull falla, re-intentamos todo
         if !pushed_ids.is_empty() {
             self.db.mark_sync_logs_synced(&pushed_ids)?;
         }
 
         self.db.update_device_sync_time(self.device_id)?;
+
+        // Limpiar entradas antiguas de dedup (>90 días) — housekeeping silencioso
+        let _ = self.db.cleanup_processed_remote_events(90);
 
         Ok((pushed_count, pulled_count, conflicts))
     }
