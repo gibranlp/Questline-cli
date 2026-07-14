@@ -630,6 +630,8 @@ pub struct App {
     pub codices: Vec<crate::models::Codex>,
     pub viewing_step_for_task: Option<Uuid>,
     pub selected_notes_flat_idx: usize,
+    pub note_preview_scroll: usize,
+    pub note_preview_focused: bool,
 
     // Cachés de performance — se llenan en reload_data() para no golpear la DB en cada frame
     pub all_tasks: Vec<Task>,
@@ -1409,6 +1411,8 @@ impl App {
             codices: Vec::new(),
             viewing_step_for_task: None,
             selected_notes_flat_idx: 0,
+            note_preview_scroll: 0,
+            note_preview_focused: false,
             all_tasks: Vec::new(),
             all_notes: Vec::new(),
             all_journals: Vec::new(),
@@ -4613,8 +4617,15 @@ impl App {
         if state.editing_title {
             match key.code {
                 KeyCode::Esc => {
-                    self.editor_state = None;
-                    self.active_screen = ActiveScreen::Workspace;
+                    if state.note_id.is_some() {
+                        // Editing existing note — Esc returns to body without discarding
+                        state.editing_title = false;
+                        state.mode = EditorMode::Normal;
+                    } else {
+                        // New note — Esc cancels creation
+                        self.editor_state = None;
+                        self.active_screen = ActiveScreen::Workspace;
+                    }
                 }
                 KeyCode::Enter | KeyCode::Tab | KeyCode::Down => {
                     state.editing_title = false;
@@ -6503,6 +6514,7 @@ impl App {
 
         Self::append_codex_subtree(&mut flat, &proj_notes, codices, None);
 
+        // grouped includes ALL notes in a codex, even inside collapsed ones (so they don't appear as ungrouped)
         let grouped: std::collections::HashSet<usize> = proj_notes.iter()
             .filter(|(_, n)| n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id))
             .map(|(i, _)| *i)
@@ -6524,17 +6536,19 @@ impl App {
     fn append_codex_subtree(flat: &mut Vec<(Option<Uuid>, Option<usize>)>, proj_notes: &[(usize, &Note)], codices: &[crate::models::Codex], parent: Option<Uuid>) {
         let children: Vec<&crate::models::Codex> = codices.iter()
             .filter(|c| c.parent_codex_id == parent)
-            .collect(); // ordenados por nombre vía DB ORDER BY LOWER(name)
+            .collect();
         for codex in children {
-            flat.push((Some(codex.id), None));
-            Self::append_codex_subtree(flat, proj_notes, codices, Some(codex.id));
-            let mut notes: Vec<(usize, &Note)> = proj_notes.iter()
-                .filter(|(_, n)| n.codex_id == Some(codex.id))
-                .map(|(i, n)| (*i, *n))
-                .collect();
-            notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-            for (idx, _) in notes {
-                flat.push((Some(codex.id), Some(idx)));
+            flat.push((Some(codex.id), None)); // header always visible
+            if !codex.collapsed {
+                Self::append_codex_subtree(flat, proj_notes, codices, Some(codex.id));
+                let mut notes: Vec<(usize, &Note)> = proj_notes.iter()
+                    .filter(|(_, n)| n.codex_id == Some(codex.id))
+                    .map(|(i, n)| (*i, *n))
+                    .collect();
+                notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+                for (idx, _) in notes {
+                    flat.push((Some(codex.id), Some(idx)));
+                }
             }
         }
     }
@@ -6732,7 +6746,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                if self.viewing_step_for_task.is_some() {
+                if self.note_preview_focused {
+                    self.note_preview_focused = false;
+                } else if self.viewing_step_for_task.is_some() {
                     self.viewing_step_for_task = None;
                     self.selected_task_idx = 0;
                 } else {
@@ -6755,12 +6771,20 @@ impl App {
                 self.workspace_tab_idx = if self.workspace_tab_idx > 0 { self.workspace_tab_idx - 1 } else { 3 };
                 self.workspace_sidebar_focused = false;
             }
+            KeyCode::Left if self.note_preview_focused => {
+                self.note_preview_focused = false;
+            }
             KeyCode::Left if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_some() && self.workspace_tab_idx == 0 => {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
             }
             KeyCode::Left if !self.workspace_sidebar_focused => {
                 self.workspace_sidebar_focused = true;
+            }
+            // → en tab de notas mueve el foco al panel de preview
+            KeyCode::Right if !self.workspace_sidebar_focused && self.workspace_tab_idx == 1 && !self.note_preview_focused => {
+                self.note_preview_focused = true;
+                self.note_preview_scroll = 0;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_none() && self.workspace_tab_idx == 0 => {
@@ -6781,6 +6805,12 @@ impl App {
             }
             KeyCode::Down if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
+            }
+            KeyCode::Up if self.note_preview_focused => {
+                self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
+            }
+            KeyCode::Down if self.note_preview_focused => {
+                self.note_preview_scroll += 1;
             }
             KeyCode::Up => match self.workspace_tab_idx {
                 0 => {
@@ -6809,6 +6839,8 @@ impl App {
                         if let Some(note_idx) = flat[idx].1 {
                             self.selected_note_idx = note_idx;
                         }
+                        self.note_preview_scroll = 0;
+                        self.note_preview_focused = false;
                     }
                 }
                 2 => {
@@ -6855,6 +6887,8 @@ impl App {
                         if let Some(note_idx) = flat[idx].1 {
                             self.selected_note_idx = note_idx;
                         }
+                        self.note_preview_scroll = 0;
+                        self.note_preview_focused = false;
                     }
                 }
                 2 => {
@@ -7173,7 +7207,6 @@ impl App {
                         }
                         Some((Some(codex_id), None)) => {
                             let cid = *codex_id;
-                            // 'e' renames the codex; Enter is a no-op (tree is always expanded)
                             if key.code == KeyCode::Char('e') {
                                 let current_name = self.codices.iter()
                                     .find(|c| c.id == cid)
@@ -7183,6 +7216,17 @@ impl App {
                                     codex_id: cid,
                                     name: current_name,
                                 };
+                            } else if key.code == KeyCode::Enter {
+                                // Toggle collapse state — persists to DB and syncs via log_change
+                                if let Some(codex) = self.codices.iter_mut().find(|c| c.id == cid) {
+                                    codex.collapsed = !codex.collapsed;
+                                    let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
+                                }
+                                // Clamp selection in case previously visible items are now hidden
+                                let new_flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                                if self.selected_notes_flat_idx >= new_flat.len() {
+                                    self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
+                                }
                             }
                         }
                         _ => {}
@@ -7537,6 +7581,7 @@ impl App {
                             name: name.trim().to_string(),
                             created_at: Utc::now(),
                             parent_codex_id: pcid,
+                            collapsed: false,
                         };
                         self.modal_state = ModalType::None;
                         self.db.insert_codex(&codex)?;

@@ -958,13 +958,14 @@ impl<'a> SyncEngine<'a> {
                                 );
                             } else if let Ok(c) = serde_json::from_str::<crate::models::Codex>(content) {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at, parent_codex_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                                     params![
                                         c.id.to_string(),
                                         c.project_id.to_string(),
                                         c.name,
                                         c.created_at.to_rfc3339(),
                                         c.parent_codex_id.map(|id| id.to_string()),
+                                        c.collapsed as i32,
                                     ],
                                 );
                             }

@@ -325,7 +325,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             &app.identity.public_key,
         ),
         1 => {
-            draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices);
+            draw_notes_tab(f, body_chunks[1], &filtered_notes, selected_item_idx, theme, sidebar_focused, &app.codices, app.note_preview_focused, app.note_preview_scroll);
         }
         2 => draw_journal_tab(
             f,
@@ -410,7 +410,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             txt(" Scrolls  "),
             key("n"), txt(" New"),
             sep(),
-            key("Enter"), txt(" Open"),
+            key("Enter"), txt(" Open/Toggle"),
             sep(),
             key("e"), txt(" Rename"),
             sep(),
@@ -419,6 +419,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             key("d"), txt(" Codex"),
             sep(),
             key("Del"), txt(" Remove"),
+            sep(),
+            key("→"), txt(" Preview"),
         ],
         2 => vec![
             txt(" Journal  "),
@@ -1454,25 +1456,28 @@ fn append_display_subtree(
         .filter(|c| c.parent_codex_id == parent)
         .collect();
     for codex in children {
-        flat_list.push((format!("{}◆ {} ", indent, codex.name), None, true));
-        // Recurse into sub-codices first
-        append_display_subtree(flat_list, notes, codices, Some(codex.id), depth + 1);
-        // Then direct notes in this codex
-        let mut codex_notes: Vec<(usize, &&Note)> = notes.iter().enumerate()
-            .filter(|(_, n)| n.codex_id == Some(codex.id))
-            .collect();
-        codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        for (idx, note) in codex_notes {
-            let lock = if note.sharing_permission == "read_only" { "[R] " } else { "" };
-            flat_list.push((format!("{}· {}{} ", note_indent, lock, note.title), Some(idx), false));
+        let icon = if codex.collapsed { "▶" } else { "▼" };
+        flat_list.push((format!("{}{} {} ", indent, icon, codex.name), None, true));
+        if !codex.collapsed {
+            append_display_subtree(flat_list, notes, codices, Some(codex.id), depth + 1);
+            let mut codex_notes: Vec<(usize, &&Note)> = notes.iter().enumerate()
+                .filter(|(_, n)| n.codex_id == Some(codex.id))
+                .collect();
+            codex_notes.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
+            for (idx, note) in codex_notes {
+                let lock = if note.sharing_permission == "read_only" { "[R] " } else { "" };
+                flat_list.push((format!("{}· {}{} ", note_indent, lock, note.title), Some(idx), false));
+            }
         }
     }
 }
 
 // Tab de notas — lista de scrolls a la izquierda (árbol expandido con indentación), preview a la derecha
-fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx: usize, theme: &Theme, sidebar_focused: bool, codices: &[crate::models::Codex]) {
+fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx: usize, theme: &Theme, sidebar_focused: bool, codices: &[crate::models::Codex], preview_focused: bool, preview_scroll: usize) {
     let accent_color = theme.primary;
-    let content_border = if sidebar_focused { theme.border } else { accent_color };
+    let list_border = if sidebar_focused || preview_focused { theme.border } else { accent_color };
+    let preview_border = if preview_focused { accent_color } else { theme.border };
+    let content_border = list_border;
 
     let sub_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -1482,7 +1487,7 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         ])
         .split(area);
 
-    // Full DFS tree — all codices always expanded with depth-based indentation
+    // DFS tree — collapsed codices (codex.collapsed == true) hide their children
     let mut flat_list: Vec<(String, Option<usize>, bool)> = Vec::new();
     append_display_subtree(&mut flat_list, notes, codices, None, 0);
 
@@ -1499,6 +1504,10 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         let lock = if notes[*idx].sharing_permission == "read_only" { "[R] " } else { "" };
         flat_list.push((format!("· {}{} ", lock, notes[*idx].title), Some(*idx), false));
     }
+
+    // scroll_padding = half the visible list height → selected stays near the middle
+    let visible_height = sub_chunks[0].height.saturating_sub(2) as usize;
+    let scroll_padding = (visible_height / 2).max(1);
 
     let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {
         vec![ListItem::new("  No project scrolls. Press [n] to write.")]
@@ -1536,14 +1545,20 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         }).collect()
     };
 
-    let list_widget = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(content_border))
-            .title(" Project Scrolls "),
-    );
-    f.render_widget(list_widget, sub_chunks[0]);
+    let total_items = list_items.len();
+    let list_widget = List::new(list_items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(content_border))
+                .title(" Project Scrolls "),
+        )
+        .scroll_padding(scroll_padding);
+
+    let mut list_state = ratatui::widgets::ListState::default()
+        .with_selected(Some(selected_flat_idx.min(total_items.saturating_sub(1))));
+    f.render_stateful_widget(list_widget, sub_chunks[0], &mut list_state);
 
     // Convertimos la posición plana a índice real de nota — los headers no tienen nota
     let selected_note_idx: Option<usize> = flat_list.get(selected_flat_idx)
@@ -1555,13 +1570,14 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
         });
 
     // Note preview panel
+    let preview_title = if preview_focused { " Document Preview  ↑↓ Scroll " } else { " Document Preview " };
     let preview_widget = if notes.is_empty() || selected_note_idx.map_or(true, |i| i >= notes.len()) {
         Paragraph::new("\n  No scroll selected.").block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .title(" Document Preview "),
+                .border_style(Style::default().fg(preview_border))
+                .title(preview_title),
         )
     } else {
         let n = notes[selected_note_idx.unwrap()];
@@ -1622,10 +1638,11 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.border))
-                    .title(" Document Preview "),
+                    .border_style(Style::default().fg(preview_border))
+                    .title(preview_title),
             )
             .wrap(ratatui::widgets::Wrap { trim: false })
+            .scroll((preview_scroll as u16, 0))
     };
     f.render_widget(preview_widget, sub_chunks[1]);
 }
