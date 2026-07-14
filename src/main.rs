@@ -261,6 +261,23 @@ async fn main() -> Result<()> {
                         &theme,
                     );
                 }
+                ActiveScreen::Gateway => {
+                    screens::gateway::draw(
+                        f,
+                        app.gateway_selected_idx,
+                        app.intro_ticks,
+                        &theme,
+                    );
+                }
+                ActiveScreen::Restore => {
+                    screens::restore::draw(
+                        f,
+                        &app.restore_input,
+                        app.restore_error.as_deref(),
+                        app.intro_ticks,
+                        &theme,
+                    );
+                }
                 ActiveScreen::Prologue => {
                     screens::prologue::draw(f, &app, &theme);
                 }
@@ -542,6 +559,8 @@ async fn main() -> Result<()> {
 
             // Overlay de notificación flotante — aparece sobre cualquier pantalla de gameplay
             if app.active_screen != ActiveScreen::Intro
+                && app.active_screen != ActiveScreen::Gateway
+                && app.active_screen != ActiveScreen::Restore
                 && app.active_screen != ActiveScreen::Prologue
                 && app.active_screen != ActiveScreen::Onboarding
             {
@@ -714,6 +733,8 @@ async fn main() -> Result<()> {
 
             // Dibuja las partículas ambientales directo en el buffer — sin widget, cell por cell
             if app.active_screen != ActiveScreen::Intro
+                && app.active_screen != ActiveScreen::Gateway
+                && app.active_screen != ActiveScreen::Restore
                 && app.active_screen != ActiveScreen::Onboarding
                 && app.active_screen != ActiveScreen::Editor
                 && app.ambient_effects_enabled

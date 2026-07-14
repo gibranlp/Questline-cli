@@ -2386,7 +2386,7 @@ impl Database {
         );
         metadata.insert(
             "version".to_string(),
-            serde_json::Value::String("1.0.4".to_string()),
+            serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
         );
         metadata.insert(
             "export_date".to_string(),
@@ -2478,6 +2478,10 @@ impl Database {
         ))?)
     }
 
+    /// Importa datos desde un JSON de export hacia el esquema actual.
+    /// Las columnas del JSON que no existen en el esquema actual se ignoran — esto permite migrar
+    /// de un schema viejo a uno nuevo sin romper el import cuando se renombran o eliminan columnas.
+    /// Las tablas del JSON que no existen en el schema nuevo también se saltan silenciosamente.
     pub fn import_from_json(&self, json_str: &str) -> Result<()> {
         let value: serde_json::Value = serde_json::from_str(json_str)?;
         let map = value
@@ -2496,6 +2500,25 @@ impl Database {
                     return Err(anyhow::anyhow!("Invalid table name: {}", table_name));
                 }
 
+                // Si la tabla ya no existe en el nuevo schema, se salta sin error
+                let table_exists: bool = self.conn.query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+                    params![table_name],
+                    |r| r.get::<_, i32>(0).map(|c| c > 0),
+                )?;
+                if !table_exists {
+                    continue;
+                }
+
+                // Obtiene las columnas que realmente existen en la tabla del schema actual
+                let mut col_stmt = self.conn.prepare(
+                    &format!("SELECT name FROM pragma_table_info('{}')", table_name),
+                )?;
+                let existing_cols: std::collections::HashSet<String> = col_stmt
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
                 self.conn
                     .execute(&format!("DELETE FROM {}", table_name), [])?;
 
@@ -2511,6 +2534,10 @@ impl Database {
                     let mut vals: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
                     for (col, val) in row_obj {
+                        // Columnas del export que ya no existen en el schema nuevo se ignoran
+                        if !existing_cols.contains(col) {
+                            continue;
+                        }
                         cols.push(col.clone());
                         placeholders.push(format!("?{}", cols.len()));
 

@@ -8,6 +8,7 @@ pub mod dashboard;
 pub mod editor;
 pub mod fellowship;
 pub mod focus;
+pub mod gateway;
 pub mod great_chronicle;
 pub mod intro;
 pub mod prologue;
@@ -16,6 +17,7 @@ pub mod library;
 pub mod onboarding;
 pub mod project_workspace;
 pub mod projects;
+pub mod restore;
 pub mod soundscapes;
 pub mod sync;
 
@@ -23,6 +25,8 @@ pub mod sync;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActiveScreen {
     Intro,
+    Gateway,
+    Restore,
     Prologue,
     Onboarding,
     Dashboard,

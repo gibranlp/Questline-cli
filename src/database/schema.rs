@@ -349,6 +349,7 @@ CREATE TABLE IF NOT EXISTS chapter_contribution_log (
     PRIMARY KEY (chapter_id, objective_type)
 );
 
+-- índices base — presentes desde el inicio
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_notes_project_id ON notes(project_id);
@@ -359,4 +360,19 @@ CREATE INDEX IF NOT EXISTS idx_milestones_project_id ON milestones(project_id);
 CREATE INDEX IF NOT EXISTS idx_chronicle_messages_project_id ON chronicle_messages(project_id);
 CREATE INDEX IF NOT EXISTS idx_great_chronicle_day ON great_chronicle(day_number);
 CREATE INDEX IF NOT EXISTS idx_lore_library_category ON lore_library(category);
+
+-- índices de query hotpaths — los que faltaban según patrones reales de acceso
+CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+CREATE INDEX IF NOT EXISTS idx_tasks_completed_due ON tasks(completed, due_date);
+CREATE INDEX IF NOT EXISTS idx_tasks_created_at ON tasks(created_at);
+CREATE INDEX IF NOT EXISTS idx_xp_events_timestamp ON xp_events(timestamp);
+CREATE INDEX IF NOT EXISTS idx_sync_log_entity ON sync_log(entity_type, entity_id);
+CREATE INDEX IF NOT EXISTS idx_journal_entries_date ON journal_entries(entry_date);
+CREATE INDEX IF NOT EXISTS idx_chronicle_messages_timestamp ON chronicle_messages(timestamp);
+CREATE INDEX IF NOT EXISTS idx_activity_log_project ON activity_log(project_id);
+CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
+CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+CREATE INDEX IF NOT EXISTS idx_global_chronicle_timestamp ON global_chronicle(timestamp);
+CREATE INDEX IF NOT EXISTS idx_notes_updated_at ON notes(updated_at);
+CREATE INDEX IF NOT EXISTS idx_focus_sessions_completed_at ON focus_sessions(completed_at);
 ";

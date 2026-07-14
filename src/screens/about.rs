@@ -579,7 +579,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         ("Interface  ", "Ratatui + Crossterm"),
         ("Database   ", "SQLite"),
         ("Sync       ", "Questline Cloud"),
-        ("License    ", "Proprietary"),
+        ("License    ", "MIT"),
     ] {
         lines.push(Line::from(vec![
             Span::styled(format!("  {label} : "), Style::default().fg(theme.muted)),
