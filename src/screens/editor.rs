@@ -905,13 +905,18 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
     } else {
         state.title.clone()
     };
+    let title_block_label = if state.editing_title {
+        " Scroll Title  Enter/↓: Body "
+    } else {
+        " Scroll Title  k/↑: edit "
+    };
     f.render_widget(
         Paragraph::new(title_text).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(title_border_style)
-                .title(" Scroll Title "),
+                .title(title_block_label),
         ),
         chunks[0],
     );
@@ -977,15 +982,27 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         status_spans.push(Span::styled(format!(" {pending}_ "), Style::default().fg(theme.warning)));
         status_spans.push(Span::styled("  ", Style::default()));
     }
-    status_spans.extend([
-        Span::styled("Ctrl+S", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
-        Span::styled(" Save", Style::default().fg(theme.muted)),
-        Span::styled("  Esc", Style::default().fg(accent)),
-        Span::styled(" Cancel", Style::default().fg(theme.muted)),
-        Span::styled("  ?", Style::default().fg(accent)),
-        Span::styled(" Help", Style::default().fg(theme.muted)),
-        Span::styled(pos_str, Style::default().fg(theme.muted)),
-    ]);
+    if state.editing_title {
+        let esc_label = if state.note_id.is_some() { " Body" } else { " Cancel" };
+        status_spans.extend([
+            Span::styled("Ctrl+S", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(" Save", Style::default().fg(theme.muted)),
+            Span::styled("  Enter", Style::default().fg(accent)),
+            Span::styled(" Body", Style::default().fg(theme.muted)),
+            Span::styled("  Esc", Style::default().fg(accent)),
+            Span::styled(esc_label, Style::default().fg(theme.muted)),
+        ]);
+    } else {
+        status_spans.extend([
+            Span::styled("Ctrl+S", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(" Save", Style::default().fg(theme.muted)),
+            Span::styled("  Esc", Style::default().fg(accent)),
+            Span::styled(" Cancel", Style::default().fg(theme.muted)),
+            Span::styled("  ?", Style::default().fg(accent)),
+            Span::styled(" Help", Style::default().fg(theme.muted)),
+            Span::styled(pos_str, Style::default().fg(theme.muted)),
+        ]);
+    }
 
     f.render_widget(
         Paragraph::new(Line::from(status_spans)).block(
@@ -996,6 +1013,25 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         ),
         chunks[2],
     );
+
+    // ── Terminal cursor ───────────────────────────────────────────────────────
+    if !state.show_help {
+        if state.editing_title {
+            let col = state.title.chars().count() as u16;
+            f.set_cursor(
+                (chunks[0].x + 1 + col).min(chunks[0].x + chunks[0].width.saturating_sub(2)),
+                chunks[0].y + 1,
+            );
+        } else if state.mode == EditorMode::Insert {
+            let line = &state.lines[state.cursor_y];
+            let visual_col = line[..state.cursor_x.min(line.len())].chars().count() as u16;
+            let rel_y = state.cursor_y.saturating_sub(state.scroll_offset) as u16;
+            f.set_cursor(
+                (chunks[1].x + 1 + visual_col).min(chunks[1].x + chunks[1].width.saturating_sub(2)),
+                (chunks[1].y + 1 + rel_y).min(chunks[1].y + chunks[1].height.saturating_sub(2)),
+            );
+        }
+    }
 
     // ── Help popup ────────────────────────────────────────────────────────────
     if state.show_help {
