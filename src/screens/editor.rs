@@ -354,18 +354,27 @@ impl EditorState {
         }
     }
 
+    pub fn set_yank_register(&mut self, text: String, is_line: bool) {
+        self.yank_register = text;
+        self.yank_is_line = is_line;
+        let _ = crate::services::identity::copy_to_clipboard(&self.yank_register);
+    }
+
     // ── Normal-mode edits ─────────────────────────────────────────────────────
 
     // x: delete char under cursor
     pub fn delete_char(&mut self) {
         if self.editing_title { return; }
-        let line = &mut self.lines[self.cursor_y];
-        if line.is_empty() { return; }
-        let x = floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1)));
-        let len = char_end(line, x) - x;
-        self.yank_register = line[x..x+len].to_string();
-        self.yank_is_line = false;
-        line.drain(x..x+len);
+        let (x, len) = {
+            let line = &self.lines[self.cursor_y];
+            if line.is_empty() { return; }
+            let x = floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1)));
+            let len = char_end(line, x) - x;
+            (x, len)
+        };
+        let text = self.lines[self.cursor_y][x..x+len].to_string();
+        self.set_yank_register(text, false);
+        self.lines[self.cursor_y].drain(x..x+len);
         self.cursor_x = x;
         self.clamp_to_normal();
     }
@@ -373,11 +382,13 @@ impl EditorState {
     // X: delete char before cursor
     pub fn delete_char_before(&mut self) {
         if self.editing_title || self.cursor_x == 0 { return; }
-        let line = &mut self.lines[self.cursor_y];
-        let prev = line[..self.cursor_x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-        self.yank_register = line[prev..self.cursor_x].to_string();
-        self.yank_is_line = false;
-        line.drain(prev..self.cursor_x);
+        let prev = {
+            let line = &self.lines[self.cursor_y];
+            line[..self.cursor_x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+        };
+        let text = self.lines[self.cursor_y][prev..self.cursor_x].to_string();
+        self.set_yank_register(text, false);
+        self.lines[self.cursor_y].drain(prev..self.cursor_x);
         self.cursor_x = prev;
         self.clamp_to_normal();
     }
@@ -385,8 +396,7 @@ impl EditorState {
     // dd: delete line
     pub fn delete_line(&mut self) {
         if self.editing_title { return; }
-        self.yank_register = self.lines[self.cursor_y].clone();
-        self.yank_is_line = true;
+        self.set_yank_register(self.lines[self.cursor_y].clone(), true);
         if self.lines.len() == 1 {
             self.lines[0].clear();
             self.cursor_x = 0;
@@ -400,19 +410,20 @@ impl EditorState {
     // D: delete to end of line
     pub fn delete_to_end(&mut self) {
         if self.editing_title { return; }
-        let line = &mut self.lines[self.cursor_y];
-        let x = floor_char_boundary(line, self.cursor_x.min(line.len()));
-        self.yank_register = line[x..].to_string();
-        self.yank_is_line = false;
-        line.truncate(x);
+        let x = {
+            let line = &self.lines[self.cursor_y];
+            floor_char_boundary(line, self.cursor_x.min(line.len()))
+        };
+        let text = self.lines[self.cursor_y][x..].to_string();
+        self.set_yank_register(text, false);
+        self.lines[self.cursor_y].truncate(x);
         self.clamp_to_normal();
     }
 
     // yy: yank line
     pub fn yank_line(&mut self) {
         if self.editing_title { return; }
-        self.yank_register = self.lines[self.cursor_y].clone();
-        self.yank_is_line = true;
+        self.set_yank_register(self.lines[self.cursor_y].clone(), true);
     }
 
     // p: paste after
@@ -494,8 +505,7 @@ impl EditorState {
     pub fn delete_inner_word(&mut self) {
         if self.editing_title { return; }
         let (s, e) = self.inner_word_range();
-        self.yank_register = self.lines[self.cursor_y][s..e].to_string();
-        self.yank_is_line = false;
+        self.set_yank_register(self.lines[self.cursor_y][s..e].to_string(), false);
         self.lines[self.cursor_y].drain(s..e);
         self.cursor_x = s;
         self.clamp_to_normal();
@@ -510,8 +520,7 @@ impl EditorState {
         if y_start == y_end {
             let s = floor_char_boundary(&self.lines[y_start], x_start.min(self.lines[y_start].len()));
             let e = floor_char_boundary(&self.lines[y_start], x_end.min(self.lines[y_start].len()));
-            self.yank_register = self.lines[y_start][s..e].to_string();
-            self.yank_is_line = false;
+            self.set_yank_register(self.lines[y_start][s..e].to_string(), false);
             self.lines[y_start].drain(s..e);
             self.cursor_x = s;
             self.cursor_y = y_start;
@@ -567,8 +576,7 @@ impl EditorState {
 
     pub fn change_line(&mut self) {
         if self.editing_title { return; }
-        self.yank_register = self.lines[self.cursor_y].clone();
-        self.yank_is_line = false;
+        self.set_yank_register(self.lines[self.cursor_y].clone(), false);
         self.lines[self.cursor_y].clear();
         self.cursor_x = 0;
         self.mode = EditorMode::Insert;
@@ -638,15 +646,14 @@ impl EditorState {
     }
 
     pub fn yank_visual(&mut self) {
-        self.yank_register = self.get_visual_text();
-        self.yank_is_line = matches!(self.mode, EditorMode::Visual { line_mode: true, .. });
+        let is_line = matches!(self.mode, EditorMode::Visual { line_mode: true, .. });
+        self.set_yank_register(self.get_visual_text(), is_line);
         self.mode = EditorMode::Normal;
     }
 
     pub fn delete_visual(&mut self) {
         let Some((sy, sx, ey, ex, line_mode)) = self.visual_range() else { return; };
-        self.yank_register = self.get_visual_text();
-        self.yank_is_line = line_mode;
+        self.set_yank_register(self.get_visual_text(), line_mode);
 
         if line_mode {
             for _ in sy..=ey { self.lines.remove(sy); }

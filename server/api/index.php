@@ -395,19 +395,32 @@ if (!$requestTime || abs(time() - $requestTime) > 300) {
 
 // ── Paso 3: Registra al héroe en su primera visita o verifica que la llave cuadre
 try {
-    $stmt = $pdo->prepare("SELECT public_key FROM users WHERE id = ?");
-    $stmt->execute([$userId]);
-    $user = $stmt->fetch();
-    
-    if (!$user) {
-        // Usuario nuevo — se registra al vuelo, sin formularios ni nada
-        $stmt = $pdo->prepare("INSERT INTO users (id, public_key) VALUES (?, ?)");
-        $stmt->execute([$userId, $identity]);
-    } else if ($user['public_key'] !== $identity) {
-        log_api_event($pdo, $userId, $deviceId, 'AUTH_FAILURE', "Identity public key mismatch for user ID $userId");
-        http_response_code(403);
-        echo json_encode(["error" => "Security Error: User ID public key mismatch"]);
-        exit;
+    // Primero, buscamos si ya existe la llave pública (identity)
+    $stmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
+    $stmt->execute([$identity]);
+    $existingUser = $stmt->fetch();
+
+    if ($existingUser) {
+        // Si ya existe la llave pública, forzamos el user ID al que está registrado en la base de datos.
+        // Esto soluciona el problema de tener el mismo par de llaves en múltiples PCs con diferentes UUIDs.
+        $userId = $existingUser['id'];
+    } else {
+        // Si la llave pública no existe, validamos el user ID enviado por el cliente
+        $stmt = $pdo->prepare("SELECT public_key FROM users WHERE id = ?");
+        $stmt->execute([$userId]);
+        $userById = $stmt->fetch();
+
+        if ($userById) {
+            // Si el user ID ya está tomado por otra llave pública, esto es un error grave de conflicto
+            log_api_event($pdo, $userId, $deviceId, 'AUTH_FAILURE', "User ID already taken by different public key");
+            http_response_code(403);
+            echo json_encode(["error" => "Security Error: User ID already taken by different public key"]);
+            exit;
+        } else {
+            // Registramos al usuario nuevo con la combinación dada
+            $stmt = $pdo->prepare("INSERT INTO users (id, public_key) VALUES (?, ?)");
+            $stmt->execute([$userId, $identity]);
+        }
     }
 } catch (PDOException $e) {
     error_log("[Questline API] Auth DB error (step 3): " . $e->getMessage());

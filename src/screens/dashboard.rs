@@ -936,13 +936,44 @@ fn draw_fellowship_panel(
         .into_iter()
         .filter(|i| i.7 == "Pending")
         .count();
-    let mentions = app
-        .db
-        .get_notifications()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|n| n.1 == "mention" && !n.5)
-        .count();
+
+    let my_name = app.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+    let my_identity = app.identity.public_key.clone();
+    let last_viewed = app.db.get_setting("last_viewed_fellowship").unwrap_or(None)
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+
+    // Count unread messages and mentions from chronicle_messages
+    let mut unread_count = 0;
+    let mut mentions = 0;
+    if let Ok(mut stmt) = app.db.conn.prepare("SELECT content, sender_identity FROM chronicle_messages WHERE timestamp > ?1 AND sender_identity != ?2") {
+        if let Ok(mut rows) = stmt.query(rusqlite::params![last_viewed, my_identity]) {
+            while let Ok(Some(row)) = rows.next() {
+                let content: String = row.get(0).unwrap_or_default();
+                unread_count += 1;
+                if !my_name.is_empty() && content.to_lowercase().contains(&format!("@{}", my_name.to_lowercase())) {
+                    mentions += 1;
+                }
+            }
+        }
+    }
+
+    let border_color = if mentions > 0 {
+        Color::Magenta
+    } else if unread_count > 0 {
+        Color::Cyan
+    } else if pending > 0 {
+        theme.warning
+    } else {
+        theme.border
+    };
+
+    let title = if mentions > 0 {
+        format!(" Fellowship [Mentions: {}] 🔔 ", mentions)
+    } else if unread_count > 0 {
+        format!(" Fellowship [Unread: {}] ✉ ", unread_count)
+    } else {
+        " Fellowship ".to_string()
+    };
 
     let lines = vec![
         Line::from(vec![
@@ -956,6 +987,11 @@ fn draw_fellowship_panel(
                 format!("{}", pending),
                 Style::default().fg(if pending > 0 { theme.warning } else { theme.disabled }),
             ),
+            Span::styled("   Unread: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}", unread_count),
+                Style::default().fg(if unread_count > 0 { Color::Cyan } else { theme.disabled }),
+            ),
             Span::styled("   Mentions: ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}", mentions),
@@ -968,8 +1004,8 @@ fn draw_fellowship_panel(
         Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" Fellowship "),
+            .border_style(Style::default().fg(border_color))
+            .title(title),
     );
     f.render_widget(p, area);
 }
