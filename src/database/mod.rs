@@ -312,6 +312,14 @@ impl Database {
             conn.execute("ALTER TABLE codices ADD COLUMN parent_codex_id TEXT;", [])?;
         }
 
+        let has_codex_collapsed: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('codices') WHERE name='collapsed'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_codex_collapsed {
+            conn.execute("ALTER TABLE codices ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0;", [])?;
+        }
+
         for (id, name, desc) in Achievement::static_list() {
             conn.execute(
                 "INSERT OR IGNORE INTO achievements (id, name, description, unlocked_at) VALUES (?1, ?2, ?3, NULL)",
@@ -2080,13 +2088,14 @@ impl Database {
 
     pub fn insert_codex(&self, codex: &Codex) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 codex.id.to_string(),
                 codex.project_id.to_string(),
                 codex.name,
                 codex.created_at.to_rfc3339(),
                 codex.parent_codex_id.map(|id| id.to_string()),
+                codex.collapsed as i32,
             ],
         )?;
         let _ = self.log_change("codex", &codex.id.to_string(), "create");
@@ -2098,7 +2107,7 @@ impl Database {
 
     pub fn get_codices_for_project(&self, project_id: Uuid) -> Result<Vec<Codex>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at, parent_codex_id FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
+            "SELECT id, project_id, name, created_at, parent_codex_id, collapsed FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
         )?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
@@ -2106,6 +2115,7 @@ impl Database {
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
             let parent_str: Option<String> = row.get(4)?;
+            let collapsed: i32 = row.get(5).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
@@ -2115,7 +2125,7 @@ impl Database {
                 Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id })
+            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id, collapsed: collapsed != 0 })
         })?;
         let mut list = Vec::new();
         for r in rows { list.push(r?); }
@@ -2124,7 +2134,7 @@ impl Database {
 
     pub fn get_codex_by_id(&self, id: &str) -> Result<Codex> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at, parent_codex_id FROM codices WHERE id = ?1"
+            "SELECT id, project_id, name, created_at, parent_codex_id, collapsed FROM codices WHERE id = ?1"
         )?;
         let codex = stmt.query_row(params![id], |row| {
             let id_str: String = row.get(0)?;
@@ -2132,6 +2142,7 @@ impl Database {
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
             let parent_str: Option<String> = row.get(4)?;
+            let collapsed: i32 = row.get(5).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
@@ -2141,9 +2152,18 @@ impl Database {
                 Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id })
+            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id, collapsed: collapsed != 0 })
         })?;
         Ok(codex)
+    }
+
+    pub fn set_codex_collapsed(&self, id: Uuid, collapsed: bool) -> Result<()> {
+        self.conn.execute(
+            "UPDATE codices SET collapsed = ?1 WHERE id = ?2",
+            params![collapsed as i32, id.to_string()],
+        )?;
+        let _ = self.log_change("codex", &id.to_string(), "update");
+        Ok(())
     }
 
     pub fn update_codex_name(&self, id: Uuid, name: &str) -> Result<()> {

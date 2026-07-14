@@ -12,4 +12,6 @@ pub struct Codex {
     pub name: String,
     pub created_at: DateTime<Utc>,
     pub parent_codex_id: Option<Uuid>,
+    #[serde(default)]
+    pub collapsed: bool,
 }
