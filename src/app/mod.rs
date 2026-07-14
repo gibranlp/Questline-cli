@@ -2210,6 +2210,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.db.delete_project_permanently(pid)?;
+                        self.audio_player.play_delete();
                         self.mark_dirty();
                         self.selected_archive_idx = 0;
                         self.reload_data()?;
@@ -2227,6 +2228,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.db.delete_codex(cid)?;
+                        self.audio_player.play_delete();
                         self.mark_dirty();
                         self.selected_notes_flat_idx = 0;
                         self.selected_note_idx = 0;
@@ -5120,6 +5122,7 @@ impl App {
                         self.active_project_id = Some(p_id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
+                        self.audio_player.play_open_tasks();
                         self.workspace_sidebar_focused = false;
                         self.task_filter = "All".to_string();
                         let proj_tasks = self.db.get_tasks().unwrap_or_default();
@@ -5640,6 +5643,7 @@ impl App {
                         self.active_project_id = Some(proj.id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
+                        self.audio_player.play_open_tasks();
                         self.workspace_sidebar_focused = true;
                         self.selected_task_idx = 0;
                         self.selected_note_idx = 0;
@@ -5660,6 +5664,7 @@ impl App {
                                 self.active_project_id = Some(p_id);
                                 self.active_screen = ActiveScreen::Workspace;
                                 self.workspace_tab_idx = 0;
+                                self.audio_player.play_open_tasks();
                                 self.workspace_sidebar_focused = false;
                                 self.task_filter = "All".to_string();
                                 let proj_tasks = self.db.get_tasks().unwrap_or_default();
@@ -6096,6 +6101,7 @@ impl App {
                             let ritual_name = rituals[self.selected_ritual_idx].name.clone();
                             let r_id = rituals[self.selected_ritual_idx].id.clone();
                             self.db.delete_ritual(&r_id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_ritual_idx = self.selected_ritual_idx.saturating_sub(1);
                             self.notifications.push(Notification::info(format!("Sidequest '{}' removed.", ritual_name)));
@@ -7191,6 +7197,7 @@ impl App {
                 {
                     let t = &proj_tasks[self.selected_task_idx];
                     self.db.delete_task(t.id)?;
+                    self.audio_player.play_delete();
                     self.mark_dirty();
                     self.selected_task_idx = 0;
                     self.reload_data()?;
@@ -7200,6 +7207,7 @@ impl App {
                         Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                             let n = &proj_notes[*note_idx];
                             self.db.delete_note(n.id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_notes_flat_idx = 0;
                             self.selected_note_idx = 0;
@@ -7224,6 +7232,7 @@ impl App {
                         {
                             let m_id = milestones[self.selected_milestone_idx].id;
                             self.db.delete_milestone(m_id)?;
+                            self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_milestone_idx = 0;
                             self.reload_data()?;
@@ -7428,6 +7437,7 @@ impl App {
                         KeyCode::Delete => {
                             if let Some(step) = steps.get(step_selected_idx) {
                                 self.db.delete_task(step.id)?;
+                                self.audio_player.play_delete();
                                 self.mark_dirty();
                                 self.reload_data()?;
                             }
@@ -9154,6 +9164,7 @@ impl App {
                     self.active_project_id = Some(id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                 }
             }
             SearchResultType::Task => {
@@ -9161,6 +9172,7 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                     // Resetea filtro y modo drill-down para que la tarea sea visible
                     self.task_filter = "All".to_string();
                     self.viewing_step_for_task = None;
@@ -9217,6 +9229,7 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.audio_player.play_open_tasks();
                     self.task_filter = "All".to_string();
                     self.viewing_step_for_task = None;
                     if let Ok(step_uuid) = uuid::Uuid::parse_str(&result.item_id) {
@@ -10673,6 +10686,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         use rand::Rng;
         if rand::thread_rng().r#gen::<f64>() > chance { return; }
         let (msg, title) = pick_task_completion_sprite_message();
+        self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
@@ -10711,6 +10725,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if rand::thread_rng().r#gen::<f64>() > spawn_chance { return; }
 
         let (msg, title) = pick_sprite_message();
+        self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
