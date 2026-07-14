@@ -1670,6 +1670,15 @@ impl Database {
         Ok(count)
     }
 
+    pub fn get_max_focus_session_duration(&self) -> Result<i32> {
+        let max: i32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(duration_mins), 0) FROM focus_sessions",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(max)
+    }
+
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
         self.conn.execute(
             "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",

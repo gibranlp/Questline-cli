@@ -1723,6 +1723,7 @@ impl App {
         app.reload_data()?;
         if app.user.is_some() {
             app.check_new_day()?;
+            let _ = app.check_action_achievements();
         }
 
         // Checa la versión en un hilo aparte para no bloquear el arranque — el resultado llega después
@@ -9701,38 +9702,77 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     fn check_action_achievements(&mut self) -> Result<()> {
         let stats = self.db.get_statistics()?;
+
+        // Task achievements
         if stats.tasks_completed >= 1 {
             self.unlock_achievement("first_quest")?;
         }
+
+        // Note / journal achievements
         if stats.notes_created >= 25 {
             self.unlock_achievement("scholar")?;
         }
         if stats.journal_entries >= 50 {
             self.unlock_achievement("chronicler")?;
         }
-        if stats.projects_created >= 10 {
+
+        // Project achievements — "Complete 10 projects" tracks completed, not created
+        if stats.projects_completed >= 10 {
             self.unlock_achievement("project_master")?;
         }
 
+        // Focus session achievements
+        if stats.sessions_completed >= 1 {
+            self.unlock_achievement("first_focus")?;
+        }
+        if stats.sessions_completed >= 100 {
+            self.unlock_achievement("deep_worker")?;
+        }
+        if stats.sessions_completed >= 500 {
+            self.unlock_achievement("master_concentration")?;
+        }
+        let max_duration = self.db.get_max_focus_session_duration()?;
+        if max_duration >= 90 {
+            self.unlock_achievement("ninety_minute_sage")?;
+        }
+
+        // Soundscape achievements
         let silent_count = self.db.count_focus_sessions_with_soundscape(&["Silent"])?;
         if silent_count >= 25 {
             self.unlock_achievement("silent_monk")?;
         }
-        let forest_count = self
-            .db
-            .count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
+        let forest_count = self.db.count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
         if forest_count >= 50 {
             self.unlock_achievement("forest_wanderer")?;
         }
-        let rain_count = self
-            .db
-            .count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
+        let rain_count = self.db.count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
         if rain_count >= 50 {
             self.unlock_achievement("rain_listener")?;
         }
         let unique_soundscapes = self.db.count_unique_soundscapes_used()?;
         if unique_soundscapes >= 8 {
             self.unlock_achievement("master_atmosphere")?;
+        }
+
+        // Codex achievements
+        let codex_count = self.db.count_codices().unwrap_or(0);
+        if codex_count >= 3 {
+            self.unlock_achievement("archivist")?;
+        }
+        if codex_count >= 10 {
+            self.unlock_achievement("grand_archivist")?;
+        }
+
+        // Tree achievement — retroactive if already at stage 5+
+        let zen_stage = self.db.get_zen_tree().map(|t| t.stage).unwrap_or(0);
+        if zen_stage >= 5 {
+            self.unlock_achievement("ancient_gardener")?;
+        }
+
+        // Streak achievement — use >= so it triggers even if already past 100
+        let streak = self.db.get_streak()?;
+        if streak.current_streak >= 100 {
+            self.unlock_achievement("hundred_day_journey")?;
         }
 
         // Stage 6 milestone check: 1000 tasks
@@ -9746,15 +9786,6 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     "SUCCESS"
                 );
             }
-        }
-
-        // Codex (note folder) achievements
-        let codex_count = self.db.count_codices().unwrap_or(0);
-        if codex_count >= 3 {
-            self.unlock_achievement("archivist")?;
-        }
-        if codex_count >= 10 {
-            self.unlock_achievement("grand_archivist")?;
         }
 
         self.check_stage6_unlocks()?;
@@ -10793,20 +10824,6 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     }
                 }
 
-                // Unlock Focus Achievements
-                let stats = self.db.get_statistics()?;
-                if stats.sessions_completed >= 1 {
-                    self.unlock_achievement("first_focus")?;
-                }
-                if stats.sessions_completed >= 100 {
-                    self.unlock_achievement("deep_worker")?;
-                }
-                if stats.sessions_completed >= 500 {
-                    self.unlock_achievement("master_concentration")?;
-                }
-                if duration >= 90 {
-                    self.unlock_achievement("ninety_minute_sage")?;
-                }
                 self.check_action_achievements()?;
 
                 // Perform productive actions triggers
@@ -10815,6 +10832,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.reload_data()?;
 
                 // One-time support prompt after the first meaningful focus session
+                let stats = self.db.get_statistics()?;
                 if stats.sessions_completed == 1 {
                     self.maybe_show_support_realm_prompt()?;
                 }

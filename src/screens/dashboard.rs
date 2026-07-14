@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::app::{App, ModalType};
-use crate::models::{Task, TaskPriority, User};
+use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
 use crate::services::planner::{self, format_duration, DashboardPlan, ScoredTask};
@@ -660,6 +660,60 @@ fn draw_evergrowth_panel(
     }
 }
 
+fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn achievement_progress(
+    id: &str,
+    stats: &Statistics,
+    streak_days: i32,
+    zen_stage: i32,
+    silent: i32,
+    forest: i32,
+    rain: i32,
+    unique_sc: i32,
+    codices: i32,
+) -> Option<(i32, i32, &'static str)> {
+    match id {
+        "first_quest"          => Some((stats.tasks_completed.min(1), 1, "task completed")),
+        "scholar"              => Some((stats.notes_created, 25, "notes created")),
+        "chronicler"           => Some((stats.journal_entries, 50, "journal entries")),
+        "project_master"       => Some((stats.projects_completed, 10, "projects completed")),
+        "ancient_gardener"     => Some((zen_stage, 5, "tree stages grown")),
+        "hundred_day_journey"  => Some((streak_days, 100, "day streak")),
+        "first_focus"          => Some((stats.sessions_completed.min(1), 1, "focus session")),
+        "deep_worker"          => Some((stats.sessions_completed, 100, "focus sessions")),
+        "master_concentration" => Some((stats.sessions_completed, 500, "focus sessions")),
+        "silent_monk"          => Some((silent, 25, "silent sessions")),
+        "forest_wanderer"      => Some((forest, 50, "forest sessions")),
+        "rain_listener"        => Some((rain, 50, "rain sessions")),
+        "master_atmosphere"    => Some((unique_sc, 8, "soundscapes used")),
+        "archivist"            => Some((codices, 3, "codices")),
+        "grand_archivist"      => Some((codices, 10, "codices")),
+        _                      => None,
+    }
+}
+
 fn draw_streaks_panel(
     f: &mut Frame,
     app: &App,
@@ -669,6 +723,14 @@ fn draw_streaks_panel(
     let streak = app.db.get_streak().unwrap();
     let achievements = app.db.get_achievements().unwrap_or_default();
     let unlocked = achievements.iter().filter(|a| a.unlocked_at.is_some()).count();
+
+    let stats = app.db.get_statistics().unwrap();
+    let zen_stage = app.db.get_zen_tree().map(|t| t.stage).unwrap_or(0);
+    let silent_count = app.db.count_focus_sessions_with_soundscape(&["Silent"]).unwrap_or(0);
+    let forest_count = app.db.count_focus_sessions_with_soundscape(&["Forest Sounds"]).unwrap_or(0);
+    let rain_count = app.db.count_focus_sessions_with_soundscape(&["Rain Sounds"]).unwrap_or(0);
+    let unique_sc = app.db.count_unique_soundscapes_used().unwrap_or(0);
+    let codex_count = app.db.count_codices().unwrap_or(0);
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -701,26 +763,78 @@ fn draw_streaks_panel(
     ]);
     f.render_widget(streak_info, rows[0]);
 
+    // 1 most-recently unlocked + 2 closest to completion
+    let progress_ratio = |a: &Achievement| -> f64 {
+        achievement_progress(
+            &a.id, &stats, streak.current_streak, zen_stage,
+            silent_count, forest_count, rain_count, unique_sc, codex_count,
+        )
+        .map(|(cur, tgt, _)| if tgt > 0 { cur as f64 / tgt as f64 } else { 0.0 })
+        .unwrap_or(0.0)
+    };
+
+    let mut unlocked_sorted: Vec<&Achievement> =
+        achievements.iter().filter(|a| a.unlocked_at.is_some()).collect();
+    unlocked_sorted.sort_by(|a, b| b.unlocked_at.cmp(&a.unlocked_at));
+
+    let mut locked_sorted: Vec<&Achievement> =
+        achievements.iter().filter(|a| a.unlocked_at.is_none()).collect();
+    locked_sorted.sort_by(|a, b| {
+        progress_ratio(b)
+            .partial_cmp(&progress_ratio(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let display: Vec<&Achievement> = unlocked_sorted
+        .into_iter()
+        .take(1)
+        .chain(locked_sorted.into_iter().take(2))
+        .collect();
+
+    // "      " prefix = 6 chars, 2 for border
+    let desc_width = area.width.saturating_sub(8) as usize;
+
+    let make_desc_items = |text: &str, color: Color| -> Vec<ListItem<'static>> {
+        word_wrap(text, desc_width)
+            .into_iter()
+            .map(|line| {
+                ListItem::new(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(line, Style::default().fg(color)),
+                ]))
+            })
+            .collect()
+    };
+
     let ach_items: Vec<ListItem> = if achievements.is_empty() {
         vec![ListItem::new(Span::styled(
             " No achievements recorded.",
             Style::default().fg(theme.muted),
         ))]
     } else {
-        achievements
+        display
             .iter()
-            .take(3)
-            .map(|a| {
+            .flat_map(|a| {
                 if a.unlocked_at.is_some() {
-                    ListItem::new(Line::from(vec![
+                    let mut items = vec![ListItem::new(Line::from(vec![
                         Span::styled(" [+] ", Style::default().fg(theme.success)),
-                        Span::styled(a.name.as_str(), Style::default().fg(theme.text)),
-                    ]))
+                        Span::styled(a.name.clone(), Style::default().fg(theme.text).add_modifier(Modifier::BOLD)),
+                    ]))];
+                    items.extend(make_desc_items(&a.description, theme.success));
+                    items
                 } else {
-                    ListItem::new(Line::from(vec![
+                    let desc = achievement_progress(
+                        &a.id, &stats, streak.current_streak, zen_stage,
+                        silent_count, forest_count, rain_count, unique_sc, codex_count,
+                    )
+                    .map(|(cur, tgt, unit)| format!("{} / {} {}", cur, tgt, unit))
+                    .unwrap_or_else(|| a.description.clone());
+                    let mut items = vec![ListItem::new(Line::from(vec![
                         Span::styled(" [ ] ", Style::default().fg(theme.disabled)),
-                        Span::styled(a.name.as_str(), Style::default().fg(theme.muted)),
-                    ]))
+                        Span::styled(a.name.clone(), Style::default().fg(theme.muted).add_modifier(Modifier::BOLD)),
+                    ]))];
+                    items.extend(make_desc_items(&desc, theme.disabled));
+                    items
                 }
             })
             .collect()
@@ -907,25 +1021,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(area);
 
-    // ── Columna izquierda — héroe y reino ───────────────────────────────────
+    // ── Columna izquierda — árbol y logros ──────────────────────────────────
     let left_rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(6),  // héroe
-            Constraint::Min(14),    // evergrowth — crece con la terminal
-            Constraint::Length(9),  // rachas y logros
-            Constraint::Length(5),  // trabajo profundo
-            Constraint::Length(3),  // reflexión
-            Constraint::Length(4),  // compañerismo — altura fija y compacta
+            Constraint::Min(14),    // evergrowth — más espacio al quitar los paneles de abajo
+            Constraint::Length(13), // rachas y logros
         ])
         .split(main_cols[0]);
 
     draw_hero_panel(f, theme, left_rows[0], user);
     draw_evergrowth_panel(f, app, theme, left_rows[1]);
     draw_streaks_panel(f, app, theme, left_rows[2]);
-    draw_focus_panel(f, app, theme, left_rows[3]);
-    draw_reflection_panel(f, theme, left_rows[4], reflected_today);
-    draw_fellowship_panel(f, app, theme, left_rows[5]);
 
     // ── Columna derecha — campaña de hoy ────────────────────────────────────
     let right_rows = Layout::default()
@@ -935,6 +1043,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             Constraint::Length(7),  // quest principal
             Constraint::Min(8),     // siguiente quest + quests diarias
             Constraint::Length(9),  // victorias rápidas + carga de trabajo
+            Constraint::Length(4),  // trabajo profundo + reflexión + compañerismo
         ])
         .split(main_cols[1]);
 
@@ -956,6 +1065,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .split(right_rows[3]);
     draw_quick_wins(f, app, theme, bottom_row[0], &plan.quick_wins);
     draw_workload(f, theme, bottom_row[1], plan.total_quest_count, plan.estimated_minutes);
+
+    // Fila de trabajo profundo, reflexión y compañerismo
+    let stats_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(38), // trabajo profundo
+            Constraint::Percentage(32), // reflexión
+            Constraint::Percentage(30), // compañerismo
+        ])
+        .split(right_rows[4]);
+    draw_focus_panel(f, app, theme, stats_row[0]);
+    draw_reflection_panel(f, theme, stats_row[1], reflected_today);
+    draw_fellowship_panel(f, app, theme, stats_row[2]);
 
     // ── Modales flotantes ────────────────────────────────────────────────────
     match &app.modal_state {
