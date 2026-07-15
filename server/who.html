@@ -34,7 +34,7 @@
 
 <nav>
   <a href="index.html" class="nav-brand">QUESTLINE</a>
-  <ul>
+  <ul id="nav-menu">
     <li><a href="chapter.html">Chapter I</a></li>
     <li><a href="what.html">What</a></li>
     <li><a href="who.html">Who</a></li>
@@ -48,6 +48,9 @@
     <li><a href="https://discord.gg/b64a3c9qFw" target="_blank" rel="noopener" class="discord-link">Discord</a></li>
     <li><a href="https://github.com/gibranlp/Questline-cli" target="_blank" rel="noopener">GitHub</a></li>
   </ul>
+  <button class="nav-hamburger" id="nav-hamburger" aria-label="Menu">
+    <span></span><span></span><span></span>
+  </button>
 </nav>
 
 <!-- ══════════════════════════════════════════════════════ WHO FOR -->
@@ -170,16 +173,24 @@
     if (a.getAttribute('href') === _page) a.classList.add('active');
   });
 
-  // ── Parallax: image moves at 15% of scroll speed ─────────────────────
-  const whoBg = document.getElementById('who-bg');
-  let whoRaf = null;
-  window.addEventListener('scroll', () => {
-    if (whoRaf) cancelAnimationFrame(whoRaf);
-    whoRaf = requestAnimationFrame(() => {
-      const shift = window.scrollY * 0.15;
-      whoBg.style.backgroundPosition = `0 0, center calc(50% - ${shift}px)`;
+  // Mobile nav toggle
+  (function() {
+    var btn = document.getElementById('nav-hamburger');
+    var menu = document.getElementById('nav-menu');
+    var nav = btn ? btn.closest('nav') : null;
+    if (!btn || !menu || !nav) return;
+    btn.addEventListener('click', function() {
+      btn.classList.toggle('open');
+      nav.classList.toggle('nav-open');
     });
-  }, { passive: true });
+    menu.querySelectorAll('a').forEach(function(a) {
+      a.addEventListener('click', function() {
+        btn.classList.remove('open');
+        nav.classList.remove('nav-open');
+      });
+    });
+  })();
+
 </script>
 
 <div class="support-pill"><a href="https://ko-fi.com/Y4H021XN7F" target="_blank" rel="noopener">Ko-Fi</a><a href="https://github.com/sponsors/gibranlp" target="_blank" rel="noopener">Sponsor</a></div>
