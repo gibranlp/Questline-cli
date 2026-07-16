@@ -1,0 +1,27 @@
+# ── Questline Data — Public static JSON ───────────────────────────
+# Archivos servidos directamente; el rewrite padre los excluye con !-f
+
+Options -Indexes
+
+<IfModule mod_headers.c>
+    Header always set Access-Control-Allow-Origin  "*"
+    Header always set Access-Control-Allow-Methods "GET, OPTIONS"
+    Header always set Access-Control-Allow-Headers "Content-Type"
+    Header always set Content-Type                 "application/json; charset=utf-8"
+    # Cache de 1 hora en el cliente — suficiente para lore que cambia con cada release
+    Header always set Cache-Control                "public, max-age=3600"
+</IfModule>
+
+# Bloquear todo excepto JSON y OPTIONS
+<LimitExcept GET OPTIONS>
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</LimitExcept>
+
+# No exponer archivos ocultos
+<FilesMatch "^\.">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+</FilesMatch>

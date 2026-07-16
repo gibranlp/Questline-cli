@@ -91,20 +91,40 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                 $stmt->execute([$user_id]);
                 $success_msg = "Backup successfully deleted.";
             }
-        } elseif ($action === 'add_webhook') {
-            $user_id = $_POST['user_id'] ?? '';
-            $url = $_POST['url'] ?? '';
-            if (!empty($user_id) && !empty($url)) {
-                $stmt = $pdo->prepare("INSERT INTO webhooks (user_id, url, events) VALUES (?, ?, '*')");
-                $stmt->execute([$user_id, $url]);
-                $success_msg = "Webhook registered successfully.";
+        } elseif ($action === 'generate_access_code') {
+            $label     = substr(trim($_POST['label'] ?? ''), 0, 255);
+            $cliPubKey = trim($_POST['cli_public_key'] ?? '');
+            $linkedId  = null;
+            if (strlen($cliPubKey) === 64 && ctype_xdigit($cliPubKey)) {
+                $stmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
+                $stmt->execute([$cliPubKey]);
+                $found = $stmt->fetchColumn();
+                if ($found) {
+                    $linkedId = $found;
+                } else {
+                    header("Location: " . $_SERVER['PHP_SELF'] . "?err=" . urlencode("CLI public key not found — user must sync their CLI at least once before linking."));
+                    exit;
+                }
             }
-        } elseif ($action === 'delete_webhook') {
-            $webhook_id = $_POST['webhook_id'] ?? '';
-            if (!empty($webhook_id)) {
-                $stmt = $pdo->prepare("DELETE FROM webhooks WHERE id = ?");
-                $stmt->execute([$webhook_id]);
-                $success_msg = "Webhook deleted successfully.";
+            $code = strtoupper(bin2hex(random_bytes(8)));
+            $code = implode('-', str_split($code, 4));
+            $stmt = $pdo->prepare("INSERT INTO access_codes (code, label, created_by, linked_user_id) VALUES (?, ?, 'admin', ?)");
+            $stmt->execute([$code, $label ?: null, $linkedId]);
+            $success_msg = "Access code generated: $code" . ($linkedId ? " (linked to existing CLI account)" : '');
+        } elseif ($action === 'revoke_access_code') {
+            $code = trim($_POST['code'] ?? '');
+            if (!empty($code)) {
+                $stmt = $pdo->prepare("UPDATE access_codes SET redeemed_by_user_id = 'REVOKED', redeemed_at = CURRENT_TIMESTAMP WHERE code = ?");
+                $stmt->execute([$code]);
+                $success_msg = "Access code revoked.";
+            }
+        } elseif ($action === 'toggle_supporter') {
+            $uid  = trim($_POST['user_id'] ?? '');
+            $flag = intval($_POST['supporter'] ?? 0);
+            if (!empty($uid)) {
+                $stmt = $pdo->prepare("UPDATE users SET supporter = ? WHERE id = ?");
+                $stmt->execute([$flag, $uid]);
+                $success_msg = "Supporter status updated.";
             }
         } elseif ($action === 'clear_logs') {
             $pdo->exec("TRUNCATE TABLE api_logs");
@@ -141,11 +161,160 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             ('Observer', 'chat', 1);");
             
             $success_msg = "All database tables reset to default state.";
+
+        // ── CRUD del Lore Library — lee/escribe los JSON en server/data/ ─────────
+
+        } elseif (in_array($action, ['lore_add','lore_edit','lore_delete','quest_add','quest_edit','quest_delete'])) {
+
+            $LORE_FILE   = dirname(__DIR__) . '/data/lore.json';
+            $QUESTS_FILE = dirname(__DIR__) . '/data/quests.json';
+
+            // Construye el objeto unlock desde los campos del formulario
+            $build_unlock = function() {
+                $type = $_POST['unlock_type'] ?? 'free';
+                $u = ['type' => $type, 'display' => trim($_POST['unlock_display'] ?? '')];
+                if ($type === 'level' || $type === 'class_level') {
+                    $u['level'] = (int)($_POST['unlock_level'] ?? 0);
+                }
+                if ($type === 'class_level') {
+                    $u['class'] = trim($_POST['unlock_class'] ?? '');
+                }
+                if ($type === 'milestone') {
+                    $u['milestone_id'] = trim($_POST['unlock_milestone_id'] ?? '');
+                }
+                if ($type === 'chapter_reward') {
+                    $u['chapter_id'] = trim($_POST['unlock_chapter_id'] ?? '');
+                }
+                return $u;
+            };
+
+            if ($action === 'lore_add' || $action === 'lore_edit') {
+                $raw  = file_get_contents($LORE_FILE);
+                $data = json_decode($raw, true);
+                $entries = &$data['entries'];
+
+                $id         = trim($_POST['entry_id'] ?? '');
+                $category   = trim($_POST['category'] ?? '');
+                $title      = trim($_POST['title'] ?? '');
+                $content    = str_replace("\r\n", "\n", $_POST['content'] ?? '');
+                $class_filt = trim($_POST['class_filter'] ?? '') ?: null;
+                $rarity     = trim($_POST['rarity'] ?? '') ?: null;
+                $sort_order = (int)($_POST['sort_order'] ?? 0);
+
+                if (!$id || !$category || !$title) {
+                    throw new Exception("ID, Category y Title son obligatorios.");
+                }
+
+                $entry = [
+                    'id'          => $id,
+                    'category'    => $category,
+                    'title'       => $title,
+                    'content'     => $content,
+                    'class_filter'=> $class_filt,
+                    'unlock'      => $build_unlock(),
+                    'rarity'      => $rarity,
+                    'sort_order'  => $sort_order,
+                ];
+
+                if ($action === 'lore_add') {
+                    // Verifica duplicados
+                    foreach ($entries as $e) {
+                        if ($e['id'] === $id) throw new Exception("Ya existe una entrada con ID '$id'.");
+                    }
+                    $entries[] = $entry;
+                    $success_msg = "Lore entry '$id' added.";
+                } else {
+                    // Reemplaza la entrada existente
+                    $found = false;
+                    foreach ($entries as &$e) {
+                        if ($e['id'] === $id) { $e = $entry; $found = true; break; }
+                    }
+                    unset($e);
+                    if (!$found) throw new Exception("Entry '$id' not found.");
+                    $success_msg = "Lore entry '$id' updated.";
+                }
+
+                // Ordena por sort_order para mantener el JSON legible
+                usort($data['entries'], fn($a,$b) => ($a['sort_order'] ?? 0) <=> ($b['sort_order'] ?? 0));
+                file_put_contents($LORE_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+
+            } elseif ($action === 'lore_delete') {
+                $id   = trim($_POST['entry_id'] ?? '');
+                $raw  = file_get_contents($LORE_FILE);
+                $data = json_decode($raw, true);
+                $before = count($data['entries']);
+                $data['entries'] = array_values(array_filter($data['entries'], fn($e) => $e['id'] !== $id));
+                if (count($data['entries']) === $before) throw new Exception("Entry '$id' not found.");
+                file_put_contents($LORE_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+                $success_msg = "Lore entry '$id' deleted.";
+
+            } elseif ($action === 'quest_add' || $action === 'quest_edit') {
+                $raw  = file_get_contents($QUESTS_FILE);
+                $data = json_decode($raw, true);
+                $quests = &$data['quests'];
+
+                $class    = trim($_POST['quest_class'] ?? '');
+                $level    = (int)($_POST['quest_level'] ?? 0);
+                $name     = trim($_POST['quest_name'] ?? '');
+                $desc     = trim($_POST['quest_description'] ?? '');
+                $obj_type = trim($_POST['obj_type'] ?? '');
+                $obj_tgt  = (int)($_POST['obj_target'] ?? 0);
+                $reward   = trim($_POST['lore_reward'] ?? '');
+                $reward_id= trim($_POST['reward_lore_id'] ?? '');
+
+                if (!$class || !$level || !$name) throw new Exception("Class, Level y Name son obligatorios.");
+
+                $quest = [
+                    'class'         => $class,
+                    'level'         => $level,
+                    'name'          => $name,
+                    'description'   => $desc,
+                    'objective'     => ['type' => $obj_type, 'target' => $obj_tgt],
+                    'lore_reward'   => $reward,
+                    'reward_lore_id'=> $reward_id,
+                ];
+
+                if ($action === 'quest_add') {
+                    foreach ($quests as $q) {
+                        if ($q['class'] === $class && $q['level'] === $level) {
+                            throw new Exception("Ya existe una quest para $class nivel $level.");
+                        }
+                    }
+                    $quests[] = $quest;
+                    $success_msg = "Quest '$name' added.";
+                } else {
+                    $orig_class = trim($_POST['orig_class'] ?? $class);
+                    $orig_level = (int)($_POST['orig_level'] ?? $level);
+                    $found = false;
+                    foreach ($quests as &$q) {
+                        if ($q['class'] === $orig_class && $q['level'] === $orig_level) {
+                            $q = $quest; $found = true; break;
+                        }
+                    }
+                    unset($q);
+                    if (!$found) throw new Exception("Quest not found.");
+                    $success_msg = "Quest '$name' updated.";
+                }
+
+                usort($data['quests'], fn($a,$b) => $a['class'] <=> $b['class'] ?: $a['level'] <=> $b['level']);
+                file_put_contents($QUESTS_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+
+            } elseif ($action === 'quest_delete') {
+                $class = trim($_POST['quest_class'] ?? '');
+                $level = (int)($_POST['quest_level'] ?? 0);
+                $raw   = file_get_contents($QUESTS_FILE);
+                $data  = json_decode($raw, true);
+                $before = count($data['quests']);
+                $data['quests'] = array_values(array_filter($data['quests'], fn($q) => !($q['class'] === $class && $q['level'] === $level)));
+                if (count($data['quests']) === $before) throw new Exception("Quest not found.");
+                file_put_contents($QUESTS_FILE, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES));
+                $success_msg = "Quest deleted.";
+            }
         }
-        
+
         header("Location: " . $_SERVER['PHP_SELF'] . "?msg=" . urlencode($success_msg));
         exit;
-    } catch (PDOException $e) {
+    } catch (Exception $e) {
         header("Location: " . $_SERVER['PHP_SELF'] . "?err=" . urlencode("Action failed: " . $e->getMessage()));
         exit;
     }
@@ -194,8 +363,199 @@ $backups = $pdo->query("SELECT b.user_id, b.created_at, LENGTH(b.backup_data) as
 // Logs de errores y auth failures — los primeros 20 más recientes
 $error_logs = $pdo->query("SELECT log_type, message, created_at FROM api_logs ORDER BY created_at DESC LIMIT 20")->fetchAll();
 
-// Webhooks registrados
-$webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.username, '—') as username FROM webhooks w LEFT JOIN users u ON w.user_id = u.id ORDER BY w.created_at DESC")->fetchAll();
+// Access codes para el panel de webapp
+try {
+    $access_codes = $pdo->query("SELECT code, label, created_by, created_at, redeemed_by_user_id, redeemed_at, linked_user_id FROM access_codes ORDER BY created_at DESC LIMIT 100")->fetchAll();
+    $supporters = $pdo->query("
+        SELECT u.id, u.public_key, u.email, u.supporter, u.created_at,
+               wa.username
+        FROM users u
+        LEFT JOIN webapp_accounts wa ON wa.user_id = u.id
+        WHERE u.supporter = 1
+        ORDER BY u.created_at DESC LIMIT 50
+    ")->fetchAll();
+} catch (PDOException $e) {
+    $access_codes = [];
+    $supporters = [];
+}
+
+// ── Funciones helper para renderizar los formularios de lore ──────────────────
+function _lore_sel(array $opts, string $cur): string {
+    $out = '';
+    foreach ($opts as $o) {
+        $val   = htmlspecialchars($o);
+        $label = htmlspecialchars($o ?: '(none)');
+        $sel   = ($o === $cur) ? ' selected' : '';
+        $out  .= "<option value=\"$val\"$sel>$label</option>";
+    }
+    return $out;
+}
+
+function _lore_input(string $name, string $val, string $type='text', string $extra=''): string {
+    $s = 'background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;';
+    return "<input type=\"$type\" name=\"$name\" value=\"" . htmlspecialchars($val) . "\" style=\"$s\" $extra>";
+}
+
+function _lore_field(string $label, string $input_html): string {
+    return '<div style="display:flex;flex-direction:column;gap:.25rem;margin-bottom:.75rem;">'
+         . '<label style="font-size:.75rem;color:var(--text-muted)">' . $label . '</label>'
+         . $input_html . '</div>';
+}
+
+function lore_entry_form_fields(?array $e): string {
+    $u     = $e['unlock'] ?? [];
+    $utype = $u['type'] ?? 'free';
+    $id    = $e['id'] ?? '';
+
+    $classes   = ['Code Warlock','Task Paladin','Mind Sage','Systems Architect','Time Chronomancer','Arch Accountant'];
+    $categories= ['World','Class','Memory','Achievement'];
+    $utypes    = ['free','level','class_level','discovery','chapter_reward','milestone'];
+    $rarities  = ['','common','rare','legendary'];
+
+    $sel_input = 'background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;';
+
+    $lv_disp  = in_array($utype, ['level','class_level']) ? '' : 'display:none;';
+    $cls_disp = ($utype === 'class_level')  ? '' : 'display:none;';
+    $mil_disp = ($utype === 'milestone')    ? '' : 'display:none;';
+    $ch_disp  = ($utype === 'chapter_reward') ? '' : 'display:none;';
+
+    $readonly = $e ? 'readonly' : '';
+
+    ob_start(); ?>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+        <div>
+            <?= _lore_field('ID *',
+                "<input type=\"text\" name=\"entry_id\" value=\"" . htmlspecialchars($id) . "\" required $readonly
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;font-size:.85rem;\">") ?>
+            <?= _lore_field('Category *',
+                "<select name=\"category\" style=\"$sel_input\">" . _lore_sel($categories, $e['category'] ?? '') . "</select>") ?>
+            <?= _lore_field('Title *',
+                "<input type=\"text\" name=\"title\" value=\"" . htmlspecialchars($e['title'] ?? '') . "\" required
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            <?= _lore_field('Class Filter',
+                "<select name=\"class_filter\" style=\"$sel_input\">" . _lore_sel(array_merge([''], $classes), $e['class_filter'] ?? '') . "</select>") ?>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:.5rem;">
+                <?= _lore_field('Rarity',
+                    "<select name=\"rarity\" style=\"$sel_input\">" . _lore_sel($rarities, $e['rarity'] ?? '') . "</select>") ?>
+                <?= _lore_field('Sort Order',
+                    "<input type=\"number\" name=\"sort_order\" value=\"" . intval($e['sort_order'] ?? 0) . "\"
+                     style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            </div>
+        </div>
+        <div>
+            <?= _lore_field('Unlock Type *',
+                "<select name=\"unlock_type\" onchange=\"updateUnlockFields(this)\" style=\"$sel_input\">"
+                . _lore_sel($utypes, $utype) . "</select>") ?>
+            <div class="lore-field-row" style="<?= $lv_disp ?>">
+                <?= _lore_field('Unlock Level',
+                    "<input type=\"number\" id=\"unlock_level\" name=\"unlock_level\" value=\"" . intval($u['level'] ?? 0) . "\"
+                     style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            </div>
+            <div class="lore-field-row" style="<?= $cls_disp ?>">
+                <?= _lore_field('Unlock Class',
+                    "<select id=\"unlock_class\" name=\"unlock_class\" style=\"$sel_input\">"
+                    . _lore_sel(array_merge([''], $classes), $u['class'] ?? '') . "</select>") ?>
+            </div>
+            <div class="lore-field-row" style="<?= $mil_disp ?>">
+                <?= _lore_field('Milestone ID',
+                    "<input type=\"text\" id=\"unlock_milestone_id\" name=\"unlock_milestone_id\" value=\"" . htmlspecialchars($u['milestone_id'] ?? '') . "\"
+                     style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            </div>
+            <div class="lore-field-row" style="<?= $ch_disp ?>">
+                <?= _lore_field('Chapter ID',
+                    "<input type=\"text\" id=\"unlock_chapter_id\" name=\"unlock_chapter_id\" value=\"" . htmlspecialchars($u['chapter_id'] ?? '') . "\"
+                     style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            </div>
+            <?= _lore_field('Unlock Display Text',
+                "<input type=\"text\" name=\"unlock_display\" value=\"" . htmlspecialchars($u['display'] ?? '') . "\"
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+        </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:.25rem;margin-bottom:.75rem;margin-top:.25rem;">
+        <label style="font-size:.75rem;color:var(--text-muted)">Content</label>
+        <textarea name="content" rows="8"
+            style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.6rem .8rem;border-radius:4px;font-family:inherit;font-size:.82rem;resize:vertical;"><?= htmlspecialchars($e['content'] ?? '') ?></textarea>
+    </div>
+    <?php return ob_get_clean();
+}
+
+function quest_form_fields(?array $q): string {
+    $classes  = ['Code Warlock','Task Paladin','Mind Sage','Systems Architect','Time Chronomancer','Arch Accountant'];
+    $obj_types= ['tasks_completed','focus_minutes','zen_waterings','projects_completed','streak_days'];
+
+    $sel_input = 'background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;';
+
+    ob_start(); ?>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:1rem;">
+        <div>
+            <?= _lore_field('Class *',
+                "<select name=\"quest_class\" style=\"$sel_input\">" . _lore_sel($classes, $q['class'] ?? '') . "</select>") ?>
+            <?= _lore_field('Quest Level *',
+                "<input type=\"number\" name=\"quest_level\" value=\"" . intval($q['level'] ?? 10) . "\" min=\"1\" max=\"100\" required
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            <?= _lore_field('Name *',
+                "<input type=\"text\" name=\"quest_name\" value=\"" . htmlspecialchars($q['name'] ?? '') . "\" required
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            <?= _lore_field('Lore Reward (flavor text)',
+                "<input type=\"text\" name=\"lore_reward\" value=\"" . htmlspecialchars($q['lore_reward'] ?? '') . "\"
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            <?= _lore_field('Reward Lore ID',
+                "<input type=\"text\" name=\"reward_lore_id\" value=\"" . htmlspecialchars($q['reward_lore_id'] ?? '') . "\" placeholder=\"e.g. quest_lore_10\"
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+        </div>
+        <div>
+            <?= _lore_field('Objective Type',
+                "<select name=\"obj_type\" style=\"$sel_input\">" . _lore_sel($obj_types, $q['objective']['type'] ?? '') . "</select>") ?>
+            <?= _lore_field('Objective Target',
+                "<input type=\"number\" name=\"obj_target\" value=\"" . intval($q['objective']['target'] ?? 10) . "\" min=\"1\"
+                 style=\"background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.4rem .6rem;border-radius:4px;font-family:inherit;\">") ?>
+            <div style="display:flex;flex-direction:column;gap:.25rem;margin-bottom:.75rem;margin-top:.5rem;">
+                <label style="font-size:.75rem;color:var(--text-muted)">Description</label>
+                <textarea name="quest_description" rows="7"
+                    style="background:var(--bg);border:1px solid var(--border);color:var(--text);padding:.6rem .8rem;border-radius:4px;font-family:inherit;font-size:.82rem;resize:vertical;"><?= htmlspecialchars($q['description'] ?? '') ?></textarea>
+            </div>
+        </div>
+    </div>
+    <?php return ob_get_clean();
+}
+
+// ── Datos de lore — leídos directamente de los JSON en server/data/ ───────────
+$LORE_FILE   = dirname(__DIR__) . '/data/lore.json';
+$QUESTS_FILE = dirname(__DIR__) . '/data/quests.json';
+
+$lore_entries = [];
+$lore_quests  = [];
+
+if (file_exists($LORE_FILE)) {
+    $raw = file_get_contents($LORE_FILE);
+    $decoded = json_decode($raw, true);
+    $lore_entries = $decoded['entries'] ?? [];
+}
+if (file_exists($QUESTS_FILE)) {
+    $raw = file_get_contents($QUESTS_FILE);
+    $decoded = json_decode($raw, true);
+    $lore_quests = $decoded['quests'] ?? [];
+}
+
+// Parámetros de edición vía GET — para pre-rellenar formularios
+$edit_lore_id    = $_GET['edit_lore']  ?? null;
+$edit_quest_key  = $_GET['edit_quest'] ?? null; // "Class|Level"
+
+$edit_lore_entry = null;
+if ($edit_lore_id) {
+    foreach ($lore_entries as $e) {
+        if ($e['id'] === $edit_lore_id) { $edit_lore_entry = $e; break; }
+    }
+}
+$edit_quest_entry = null;
+if ($edit_quest_key) {
+    [$eq_class, $eq_level] = explode('|', $edit_quest_key, 2) + ['', '0'];
+    foreach ($lore_quests as $q) {
+        if ($q['class'] === $eq_class && (string)$q['level'] === $eq_level) {
+            $edit_quest_entry = $q; break;
+        }
+    }
+}
 
 ?>
 <!DOCTYPE html>
@@ -505,6 +865,44 @@ $webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.use
             font-weight: 600;
             color: #fff;
         }
+
+        /* ── Tab navigation ────────────────────────────────────────────────── */
+        .tab-nav {
+            display: flex;
+            gap: 0.25rem;
+            margin-bottom: 1.5rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0;
+            position: sticky;
+            top: 0;
+            background: var(--bg);
+            z-index: 10;
+            padding-top: 0.75rem;
+        }
+        .tab-btn {
+            background: none;
+            border: none;
+            border-bottom: 2px solid transparent;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            padding: 0.6rem 1.1rem;
+            cursor: pointer;
+            letter-spacing: 0.05em;
+            text-transform: uppercase;
+            transition: color 0.15s, border-color 0.15s;
+            margin-bottom: -1px;
+        }
+        .tab-btn:hover { color: var(--text); }
+        .tab-btn.active {
+            color: var(--warlock);
+            border-bottom-color: var(--warlock);
+        }
+        .tab-btn[data-tab="users"].active    { color: var(--sage);       border-bottom-color: var(--sage); }
+        .tab-btn[data-tab="system"].active   { color: var(--accountant); border-bottom-color: var(--accountant); }
+        .tab-btn[data-tab="lore"].active     { color: var(--chrono);     border-bottom-color: var(--chrono); }
+        .tab-pane { display: none; }
+        .tab-pane.active { display: block; }
     </style>
 </head>
 <body>
@@ -558,6 +956,133 @@ $webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.use
         </div>
     </div>
 
+    <nav class="tab-nav">
+        <button class="tab-btn active" data-tab="access"  onclick="switchTab('access')">🔑 Access</button>
+        <button class="tab-btn"        data-tab="users"   onclick="switchTab('users')">⚔️ Users</button>
+        <button class="tab-btn"        data-tab="system"  onclick="switchTab('system')">🔧 System</button>
+        <button class="tab-btn"        data-tab="lore"    onclick="switchTab('lore')">📜 Lore</button>
+    </nav>
+
+    <!-- ════════════════════════ TAB: ACCESS ════════════════════════ -->
+    <div id="tab-access" class="tab-pane active">
+    <!-- Web App Access — top priority panel -->
+    <div class="panel">
+        <div class="panel-title">Web App Access (webapp.questlinecli.com)</div>
+
+        <!-- Generate code form -->
+        <form method="POST" style="margin-bottom: 1.5rem;">
+            <input type="hidden" name="action" value="generate_access_code">
+            <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+            <div style="display:flex; gap:0.75rem; align-items:flex-end; margin-bottom:0.75rem;">
+                <div style="flex:1;">
+                    <label style="display:block; font-size:0.72rem; color:#666; margin-bottom:0.3rem; letter-spacing:0.1em; text-transform:uppercase;">Label (optional)</label>
+                    <input type="text" name="label" placeholder="e.g. Ko-fi donation 2026-07-15" style="width:100%; background:#050505; border:1px solid #2a2a2a; border-radius:5px; color:#d4d4d4; font-family:inherit; font-size:0.85rem; padding:0.5rem 0.75rem;">
+                </div>
+                <button type="submit" class="btn" style="background:rgba(168,85,247,0.15); border-color:#a855f7; color:#a855f7; white-space:nowrap;">
+                    Generate Code
+                </button>
+            </div>
+            <div>
+                <label style="display:block; font-size:0.72rem; color:#666; margin-bottom:0.3rem; letter-spacing:0.1em; text-transform:uppercase;">Link to CLI Account — Public Key (optional)</label>
+                <input type="text" name="cli_public_key" placeholder="64-char hex public key from donor's CLI (questline identity show)" maxlength="64" style="width:100%; background:#050505; border:1px solid #2a2a2a; border-radius:5px; color:#06b6d4; font-family:inherit; font-size:0.8rem; padding:0.5rem 0.75rem; letter-spacing:0.05em;">
+                <p style="font-size:0.72rem; color:#444; margin-top:0.3rem;">When set, the access code is pre-linked to the donor's existing CLI data. Their tasks and projects will appear when they log into the webapp.</p>
+            </div>
+        </form>
+
+        <!-- Access codes table -->
+        <table style="margin-bottom: 2rem;">
+            <thead>
+                <tr>
+                    <th>Code</th>
+                    <th>Label</th>
+                    <th>Linked</th>
+                    <th>Created</th>
+                    <th>Status</th>
+                    <th>Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (empty($access_codes)): ?>
+                    <tr><td colspan="6" style="text-align:center; color:#444;">No access codes yet.</td></tr>
+                <?php else: ?>
+                    <?php foreach ($access_codes as $ac): ?>
+                        <?php
+                        $redeemed = !empty($ac['redeemed_by_user_id']);
+                        $revoked  = $ac['redeemed_by_user_id'] === 'REVOKED';
+                        $statusLabel = $revoked ? 'Revoked' : ($redeemed ? 'Used' : 'Available');
+                        $statusClass = $revoked ? 'badge-danger' : ($redeemed ? 'badge-info' : 'badge-success');
+                        ?>
+                        <tr>
+                            <td><code style="letter-spacing:0.15em; color:#a855f7;"><?= htmlspecialchars($ac['code']) ?></code></td>
+                            <td style="color:#888;"><?= htmlspecialchars($ac['label'] ?? '—') ?></td>
+                            <td style="color:#06b6d4; font-size:0.78rem;">
+                                <?= !empty($ac['linked_user_id']) ? '<span title="'.htmlspecialchars($ac['linked_user_id']).'">✓ linked</span>' : '<span style="color:#333;">—</span>' ?>
+                            </td>
+                            <td><?= date('Y-m-d', strtotime($ac['created_at'])) ?></td>
+                            <td><span class="badge <?= $statusClass ?>"><?= $statusLabel ?></span></td>
+                            <td style="display:flex; gap:0.4rem;">
+                                <button class="btn btn-sm" data-key="<?= htmlspecialchars($ac['code']) ?>" onclick="copyKey(this)">Copy</button>
+                                <?php if (!$redeemed): ?>
+                                    <form method="POST" style="margin:0;" onsubmit="return confirm('Revoke this code?');">
+                                        <input type="hidden" name="action" value="revoke_access_code">
+                                        <input type="hidden" name="code" value="<?= htmlspecialchars($ac['code']) ?>">
+                                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                                        <button type="submit" class="btn btn-sm btn-warning">Revoke</button>
+                                    </form>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </tbody>
+        </table>
+
+        <!-- Supporters table -->
+        <div style="font-size:0.72rem; color:#555; letter-spacing:0.15em; text-transform:uppercase; margin-bottom:0.75rem;">
+            Current Supporters (<?= count($supporters) ?>)
+        </div>
+        <table>
+            <thead>
+                <tr>
+                    <th>Username</th>
+                    <th>Email</th>
+                    <th>Public Key</th>
+                    <th>Joined</th>
+                    <th>Supporter</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php if (empty($supporters)): ?>
+                    <tr><td colspan="5" style="text-align:center; color:#444;">No supporters yet.</td></tr>
+                <?php else: ?>
+                    <?php foreach ($supporters as $sup): ?>
+                        <tr>
+                            <td><?= htmlspecialchars($sup['username'] ?? '—') ?></td>
+                            <td style="color:#888;"><?= htmlspecialchars($sup['email'] ?? '—') ?></td>
+                            <td>
+                                <button class="btn btn-sm" data-key="<?= htmlspecialchars($sup['public_key']) ?>" onclick="copyKey(this)">Copy Key</button>
+                            </td>
+                            <td><?= date('Y-m-d', strtotime($sup['created_at'])) ?></td>
+                            <td>
+                                <form method="POST" style="margin:0;">
+                                    <input type="hidden" name="action" value="toggle_supporter">
+                                    <input type="hidden" name="user_id" value="<?= htmlspecialchars($sup['id']) ?>">
+                                    <input type="hidden" name="supporter" value="0">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                                    <button type="submit" class="btn btn-sm btn-warning" onclick="return confirm('Revoke supporter access?')">Revoke</button>
+                                </form>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+            </tbody>
+        </table>
+    </div>
+
+    </div><!-- /tab-access -->
+
+    <!-- ════════════════════════ TAB: USERS ════════════════════════ -->
+    <div id="tab-users" class="tab-pane">
     <!-- Directorio de usuarios — ancho completo para que quepa la llave pública -->
     <div class="panel">
         <div class="panel-title">
@@ -693,6 +1218,10 @@ $webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.use
         </div>
     </div>
 
+    </div><!-- /tab-users -->
+
+    <!-- ════════════════════════ TAB: SYSTEM ════════════════════════ -->
+    <div id="tab-system" class="tab-pane">
     <!-- Panel 5: Backups de usuarios — se puede ver el tamaño y borrar si es necesario -->
     <div class="panel">
         <div class="panel-title">Database Backups</div>
@@ -720,61 +1249,6 @@ $webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.use
                                 <form method="POST" style="display:inline;" onsubmit="return confirm('Are you sure you want to delete this backup?');">
                                     <input type="hidden" name="action" value="delete_backup">
                                     <input type="hidden" name="user_id" value="<?= htmlspecialchars($b['user_id']) ?>">
-                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
-                                    <button type="submit" class="btn btn-danger">Delete</button>
-                                </form>
-                            </td>
-                        </tr>
-                    <?php endforeach; ?>
-                <?php endif; ?>
-            </tbody>
-        </table>
-    </div>
-
-    <!-- Panel: Webhooks — configure dynamic updates to Discord, Slack, etc. -->
-    <div class="panel">
-        <div class="panel-title">Webhook Integration Manager</div>
-        <div style="background: rgba(255,255,255,0.03); padding: 1rem; border-radius: 4px; margin-bottom: 1.5rem;">
-            <h4 style="margin-top:0; color:#fff; font-size:0.9rem; margin-bottom:0.5rem;">Add Webhook Integration</h4>
-            <form method="POST" style="display:flex; gap:0.5rem; flex-wrap:wrap; align-items:center;">
-                <input type="hidden" name="action" value="add_webhook">
-                <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
-                
-                <select name="user_id" required style="background:#111; border:1px solid #333; color:#fff; padding:0.4rem; font-family:inherit;">
-                    <option value="" disabled selected>Select Adventurer...</option>
-                    <?php foreach ($users as $u): ?>
-                        <option value="<?= htmlspecialchars($u['id']) ?>"><?= htmlspecialchars($u['username']) ?> (<?= substr($u['id'],0,8) ?>...)</option>
-                    <?php endforeach; ?>
-                </select>
-                
-                <input type="url" name="url" placeholder="https://discord.com/api/webhooks/..." required style="background:#111; border:1px solid #333; color:#fff; padding:0.4rem; flex:1; min-width:250px; font-family:inherit;">
-                
-                <button type="submit" class="btn" style="background:var(--accent-secondary); color:#000; font-weight:bold;">Register Webhook</button>
-            </form>
-        </div>
-        
-        <table>
-            <thead>
-                <tr>
-                    <th>Adventurer</th>
-                    <th>Target URL</th>
-                    <th>Subscribed Events</th>
-                    <th style="text-align: right;">Actions</th>
-                </tr>
-            </thead>
-            <tbody>
-                <?php if (empty($webhooks)): ?>
-                    <tr><td colspan="4" style="text-align: center; color: var(--text-muted)">No webhooks registered.</td></tr>
-                <?php else: ?>
-                    <?php foreach ($webhooks as $wh): ?>
-                        <tr>
-                            <td><strong><?= htmlspecialchars($wh['username']) ?></strong></td>
-                            <td title="<?= htmlspecialchars($wh['url']) ?>" style="color: var(--accent-secondary)"><?= substr($wh['url'], 0, 50) ?>...</td>
-                            <td><code><?= htmlspecialchars($wh['events']) ?></code></td>
-                            <td style="text-align: right;">
-                                <form method="POST" style="display:inline;">
-                                    <input type="hidden" name="action" value="delete_webhook">
-                                    <input type="hidden" name="webhook_id" value="<?= htmlspecialchars($wh['id']) ?>">
                                     <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
                                     <button type="submit" class="btn btn-danger">Delete</button>
                                 </form>
@@ -823,18 +1297,397 @@ $webhooks = $pdo->query("SELECT w.id, w.user_id, w.url, w.events, COALESCE(u.use
             </tbody>
         </table>
     </div>
+    </div><!-- /tab-system -->
+
+    <!-- ════════════════════════ TAB: LORE ════════════════════════ -->
+    <div id="tab-lore" class="tab-pane">
+    <div class="panel" style="margin-top:0;">
+        <div class="panel-title">📜 Lore Library Manager</div>
+
+        <!-- Tab switcher -->
+        <div style="display:flex;gap:.5rem;margin-bottom:1.5rem;">
+            <button class="btn" id="tab-lore-btn"  onclick="switchLoreTab('lore')"  style="background:var(--warlock)">Lore Entries (<?= count($lore_entries) ?>)</button>
+            <button class="btn" id="tab-quest-btn" onclick="switchLoreTab('quest')" style="background:var(--bg-card);border:1px solid var(--border)">Class Quests (<?= count($lore_quests) ?>)</button>
+        </div>
+
+        <!-- ── LORE ENTRIES TAB ─────────────────────────────────────────────── -->
+        <div id="lore-entries">
+
+            <?php if ($edit_lore_entry): ?>
+            <!-- Edit form (shown when ?edit_lore=id) -->
+            <div style="background:var(--bg-card);border:1px solid var(--warlock);border-radius:8px;padding:1.25rem;margin-bottom:1.5rem;">
+                <div style="color:var(--warlock);font-weight:700;margin-bottom:1rem;">Edit Entry: <?= htmlspecialchars($edit_lore_entry['id']) ?></div>
+                <form method="POST">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="action" value="lore_edit">
+                    <?= lore_entry_form_fields($edit_lore_entry) ?>
+                    <div style="display:flex;gap:.5rem;margin-top:1rem;">
+                        <button type="submit" class="btn" style="background:var(--warlock)">Save Changes</button>
+                        <a href="<?= $_SERVER['PHP_SELF'] ?>" class="btn" style="background:var(--bg-card);border:1px solid var(--border)">Cancel</a>
+                    </div>
+                </form>
+            </div>
+            <?php else: ?>
+            <!-- Add new entry form (collapsible) -->
+            <details style="margin-bottom:1.5rem;">
+                <summary class="btn" style="background:var(--bg-card);border:1px solid var(--warlock);cursor:pointer;display:inline-block;padding:.5rem 1rem;border-radius:6px;">+ Add Lore Entry</summary>
+                <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:.75rem;">
+                    <form method="POST">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                        <input type="hidden" name="action" value="lore_add">
+                        <?= lore_entry_form_fields(null) ?>
+                        <button type="submit" class="btn" style="background:var(--warlock);margin-top:1rem;">Add Entry</button>
+                    </form>
+                </div>
+            </details>
+            <?php endif; ?>
+
+            <!-- Category filter -->
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem;" id="lore-cat-filters">
+                <?php foreach (['All','World','Class','Memory','Achievement'] as $cat): ?>
+                    <button class="btn <?= $cat==='All'?'active-cat':'' ?>"
+                            style="padding:.3rem .75rem;font-size:.75rem;background:<?= $cat==='All'?'var(--warlock)':'var(--bg-card)' ?>;border:1px solid var(--border);"
+                            onclick="filterLore('<?= $cat ?>')">
+                        <?= $cat ?>
+                    </button>
+                <?php endforeach; ?>
+            </div>
+            <!-- Class sub-filter (only visible when Class category is active) -->
+            <div id="class-subfilters" style="display:none;gap:.4rem;flex-wrap:wrap;margin-bottom:1rem;padding:.5rem;background:rgba(168,85,247,.07);border:1px solid rgba(168,85,247,.2);border-radius:6px;">
+                <span style="font-size:.7rem;color:var(--text-dim);align-self:center;margin-right:.25rem;">Filter by class:</span>
+                <?php
+                $class_colors_map = [
+                    'Code Warlock'      => 'var(--warlock)',
+                    'Task Paladin'      => 'var(--paladin)',
+                    'Mind Sage'         => 'var(--sage)',
+                    'Systems Architect' => 'var(--architect)',
+                    'Time Chronomancer' => 'var(--chrono)',
+                    'Arch Accountant'   => 'var(--accountant)',
+                ];
+                ?>
+                <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('All')">All</button>
+                <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('shared')">Shared</button>
+                <?php foreach ($class_colors_map as $cls => $col): ?>
+                    <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid <?= $col ?>;color:<?= $col ?>;" onclick="filterLoreClass(<?= json_encode($cls) ?>)">
+                        <?= htmlspecialchars($cls) ?>
+                    </button>
+                <?php endforeach; ?>
+            </div>
+
+            <!-- Entries table -->
+            <div style="overflow-x:auto;">
+            <table id="lore-table">
+                <thead>
+                    <tr>
+                        <th>ID</th>
+                        <th>Cat</th>
+                        <th>Class</th>
+                        <th>Title</th>
+                        <th>Unlock</th>
+                        <th>Rarity</th>
+                        <th>Sort</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php if (empty($lore_entries)): ?>
+                    <tr><td colspan="8" style="text-align:center;color:var(--text-muted)">No lore entries found. Check that server/data/lore.json exists.</td></tr>
+                <?php else: ?>
+                    <?php
+                    $cls_colors_inline = [
+                        'Code Warlock'      => 'var(--warlock)',
+                        'Task Paladin'      => 'var(--paladin)',
+                        'Mind Sage'         => 'var(--sage)',
+                        'Systems Architect' => 'var(--architect)',
+                        'Time Chronomancer' => 'var(--chrono)',
+                        'Arch Accountant'   => 'var(--accountant)',
+                    ];
+                    ?>
+                    <?php foreach ($lore_entries as $entry): ?>
+                    <?php $entry_class = $entry['class_filter'] ?? null; ?>
+                    <tr data-cat="<?= htmlspecialchars($entry['category']) ?>" data-class="<?= htmlspecialchars($entry_class ?? 'shared') ?>">
+                        <td style="font-size:.7rem;color:var(--text-muted)"><?= htmlspecialchars($entry['id']) ?></td>
+                        <td>
+                            <span class="badge badge-info" style="font-size:.65rem;"><?= htmlspecialchars($entry['category']) ?></span>
+                        </td>
+                        <td style="font-size:.75rem;">
+                            <?php if ($entry_class): ?>
+                                <span style="color:<?= $cls_colors_inline[$entry_class] ?? 'var(--text-muted)' ?>;font-weight:600;"><?= htmlspecialchars($entry_class) ?></span>
+                            <?php else: ?>
+                                <span style="color:var(--text-muted)">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td><?= htmlspecialchars($entry['title']) ?></td>
+                        <td style="font-size:.75rem;color:var(--text-muted)">
+                            <?= htmlspecialchars($entry['unlock']['type'] ?? '—') ?>
+                            <?php if (!empty($entry['unlock']['level'])): ?>
+                                <span style="color:var(--accountant)">lv<?= $entry['unlock']['level'] ?></span>
+                            <?php endif; ?>
+                        </td>
+                        <td>
+                            <?php
+                            $r = $entry['rarity'] ?? null;
+                            $rc = $r === 'legendary' ? 'var(--accountant)' : ($r === 'rare' ? 'var(--sage)' : 'var(--text-muted)');
+                            ?>
+                            <?php if ($r): ?>
+                                <span style="color:<?= $rc ?>;font-size:.75rem;"><?= htmlspecialchars($r) ?></span>
+                            <?php else: ?>
+                                <span style="color:var(--text-muted);font-size:.75rem;">—</span>
+                            <?php endif; ?>
+                        </td>
+                        <td style="font-size:.75rem;"><?= $entry['sort_order'] ?? 0 ?></td>
+                        <td>
+                            <div style="display:flex;gap:.4rem;">
+                                <a href="<?= $_SERVER['PHP_SELF'] ?>?edit_lore=<?= urlencode($entry['id']) ?>#tab-lore-btn"
+                                   class="btn" style="padding:.3rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);">Edit</a>
+                                <form method="POST" onsubmit="return confirm('Delete \'<?= htmlspecialchars(addslashes($entry['id'])) ?>\'?')">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                                    <input type="hidden" name="action"   value="lore_delete">
+                                    <input type="hidden" name="entry_id" value="<?= htmlspecialchars($entry['id']) ?>">
+                                    <button type="submit" class="btn" style="padding:.3rem .6rem;font-size:.7rem;background:var(--danger);">Del</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+                </tbody>
+            </table>
+            </div>
+        </div><!-- /lore-entries -->
+
+        <!-- ── CLASS QUESTS TAB ─────────────────────────────────────────────── -->
+        <div id="lore-quests" style="display:none;">
+
+            <?php if ($edit_quest_entry): ?>
+            <div style="background:var(--bg-card);border:1px solid var(--accountant);border-radius:8px;padding:1.25rem;margin-bottom:1.5rem;">
+                <div style="color:var(--accountant);font-weight:700;margin-bottom:1rem;">
+                    Edit Quest: <?= htmlspecialchars($edit_quest_entry['class']) ?> lv<?= $edit_quest_entry['level'] ?>
+                </div>
+                <form method="POST">
+                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                    <input type="hidden" name="action"      value="quest_edit">
+                    <input type="hidden" name="orig_class"  value="<?= htmlspecialchars($edit_quest_entry['class']) ?>">
+                    <input type="hidden" name="orig_level"  value="<?= $edit_quest_entry['level'] ?>">
+                    <?= quest_form_fields($edit_quest_entry) ?>
+                    <div style="display:flex;gap:.5rem;margin-top:1rem;">
+                        <button type="submit" class="btn" style="background:var(--accountant)">Save Changes</button>
+                        <a href="<?= $_SERVER['PHP_SELF'] ?>" class="btn" style="background:var(--bg-card);border:1px solid var(--border)">Cancel</a>
+                    </div>
+                </form>
+            </div>
+            <?php else: ?>
+            <details style="margin-bottom:1.5rem;">
+                <summary class="btn" style="background:var(--bg-card);border:1px solid var(--accountant);cursor:pointer;display:inline-block;padding:.5rem 1rem;border-radius:6px;">+ Add Class Quest</summary>
+                <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-top:.75rem;">
+                    <form method="POST">
+                        <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                        <input type="hidden" name="action" value="quest_add">
+                        <?= quest_form_fields(null) ?>
+                        <button type="submit" class="btn" style="background:var(--accountant);margin-top:1rem;">Add Quest</button>
+                    </form>
+                </div>
+            </details>
+            <?php endif; ?>
+
+            <!-- Class filter -->
+            <?php
+            $all_classes = array_unique(array_column($lore_quests, 'class'));
+            sort($all_classes);
+            ?>
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1rem;" id="quest-class-filters">
+                <button class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--accountant);border:1px solid var(--border);" onclick="filterQuests('All')">All</button>
+                <?php foreach ($all_classes as $cls): ?>
+                    <button class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterQuests('<?= htmlspecialchars($cls) ?>')">
+                        <?= htmlspecialchars($cls) ?>
+                    </button>
+                <?php endforeach; ?>
+            </div>
+
+            <div style="overflow-x:auto;">
+            <table id="quest-table">
+                <thead>
+                    <tr>
+                        <th>Class</th>
+                        <th>Lv</th>
+                        <th>Name</th>
+                        <th>Objective</th>
+                        <th>Reward ID</th>
+                        <th>Actions</th>
+                    </tr>
+                </thead>
+                <tbody>
+                <?php if (empty($lore_quests)): ?>
+                    <tr><td colspan="6" style="text-align:center;color:var(--text-muted)">No quests found. Check server/data/quests.json.</td></tr>
+                <?php else: ?>
+                    <?php foreach ($lore_quests as $q): ?>
+                    <tr data-class="<?= htmlspecialchars($q['class']) ?>">
+                        <td>
+                            <?php
+                            $cls_colors = [
+                                'Code Warlock'      => 'var(--warlock)',
+                                'Task Paladin'      => 'var(--paladin)',
+                                'Mind Sage'         => 'var(--sage)',
+                                'Systems Architect' => 'var(--architect)',
+                                'Time Chronomancer' => 'var(--chrono)',
+                                'Arch Accountant'   => 'var(--accountant)',
+                            ];
+                            $cc = $cls_colors[$q['class']] ?? 'var(--text-muted)';
+                            ?>
+                            <span style="color:<?= $cc ?>;font-size:.75rem;"><?= htmlspecialchars($q['class']) ?></span>
+                        </td>
+                        <td style="font-size:.85rem;"><?= $q['level'] ?></td>
+                        <td><?= htmlspecialchars($q['name']) ?></td>
+                        <td style="font-size:.75rem;color:var(--text-muted);">
+                            <?= htmlspecialchars($q['objective']['type'] ?? '—') ?>
+                            × <?= $q['objective']['target'] ?? 0 ?>
+                        </td>
+                        <td style="font-size:.7rem;color:var(--text-muted);"><?= htmlspecialchars($q['reward_lore_id'] ?? '—') ?></td>
+                        <td>
+                            <div style="display:flex;gap:.4rem;">
+                                <a href="<?= $_SERVER['PHP_SELF'] ?>?edit_quest=<?= urlencode($q['class'].'|'.$q['level']) ?>#tab-quest-btn"
+                                   class="btn" style="padding:.3rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);">Edit</a>
+                                <form method="POST" onsubmit="return confirm('Delete this quest?')">
+                                    <input type="hidden" name="csrf_token" value="<?= htmlspecialchars($csrf_token) ?>">
+                                    <input type="hidden" name="action"      value="quest_delete">
+                                    <input type="hidden" name="quest_class" value="<?= htmlspecialchars($q['class']) ?>">
+                                    <input type="hidden" name="quest_level" value="<?= $q['level'] ?>">
+                                    <button type="submit" class="btn" style="padding:.3rem .6rem;font-size:.7rem;background:var(--danger);">Del</button>
+                                </form>
+                            </div>
+                        </td>
+                    </tr>
+                    <?php endforeach; ?>
+                <?php endif; ?>
+                </tbody>
+            </table>
+            </div>
+        </div><!-- /tab-quest -->
+    </div><!-- /panel Lore Library -->
+
+    </div><!-- /tab-lore -->
+
     <script>
+        // ── Tab switching — persiste en el hash de la URL ─────────────────────
+        function switchTab(name) {
+            document.querySelectorAll('.tab-pane').forEach(p => p.classList.remove('active'));
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.getElementById('tab-' + name).classList.add('active');
+            document.querySelector('.tab-btn[data-tab="' + name + '"]').classList.add('active');
+            history.replaceState(null, '', '#' + name);
+        }
+
+        // Restaura el tab activo desde el hash al cargar
+        (function () {
+            const tab = location.hash.replace('#', '') || 'access';
+            const valid = ['access', 'users', 'system', 'lore'];
+            switchTab(valid.includes(tab) ? tab : 'access');
+        })();
+
         function copyKey(btn) {
             const key = btn.dataset.key;
-            navigator.clipboard.writeText(key).then(() => {
+            const original = btn.textContent;
+
+            function onSuccess() {
                 btn.textContent = 'Copied!';
-                btn.classList.add('copied');
-                setTimeout(() => {
-                    btn.textContent = 'Copy';
-                    btn.classList.remove('copied');
-                }, 1800);
+                setTimeout(() => { btn.textContent = original; }, 1800);
+            }
+
+            function fallback() {
+                // execCommand fallback for HTTP environments
+                const ta = document.createElement('textarea');
+                ta.value = key;
+                ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0';
+                document.body.appendChild(ta);
+                ta.select();
+                const ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+                if (ok) { onSuccess(); } else { prompt('Copy this code:', key); }
+            }
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(key).then(onSuccess).catch(fallback);
+            } else {
+                fallback();
+            }
+        }
+
+        // ── Lore Library tab switching ────────────────────────────────────────
+        function switchLoreTab(tab) {
+            const isLore = tab === 'lore';
+            document.getElementById('lore-entries').style.display = isLore ? '' : 'none';
+            document.getElementById('lore-quests').style.display  = isLore ? 'none' : '';
+            document.getElementById('tab-lore-btn').style.background  = isLore ? 'var(--warlock)' : 'var(--bg-card)';
+            document.getElementById('tab-quest-btn').style.background = isLore ? 'var(--bg-card)' : 'var(--accountant)';
+        }
+
+        let _currentLoreCat = 'All';
+        let _currentLoreClass = 'All';
+
+        function filterLore(cat) {
+            _currentLoreCat = cat;
+            _currentLoreClass = 'All';
+            applyLoreFilters();
+            // Muestra el sub-filtro de clase solo cuando está activo el filtro "Class"
+            const subFilters = document.getElementById('class-subfilters');
+            if (subFilters) subFilters.style.display = (cat === 'Class' || cat === 'All') ? 'flex' : 'none';
+            document.querySelectorAll('#lore-cat-filters .btn').forEach(b => {
+                b.style.background = (b.textContent.trim() === cat) ? 'var(--warlock)' : 'var(--bg-card)';
             });
         }
+
+        function filterLoreClass(cls) {
+            _currentLoreClass = cls;
+            applyLoreFilters();
+            document.querySelectorAll('#class-subfilters .btn').forEach(b => {
+                const active = b.textContent.trim() === cls || (cls === 'All' && b.textContent.trim() === 'All');
+                b.style.fontWeight = active ? '700' : '';
+                b.style.borderWidth = active ? '2px' : '';
+            });
+        }
+
+        function applyLoreFilters() {
+            document.querySelectorAll('#lore-table tbody tr').forEach(tr => {
+                const catMatch = (_currentLoreCat === 'All' || tr.dataset.cat === _currentLoreCat);
+                let classMatch = true;
+                if (_currentLoreClass !== 'All' && tr.dataset.cat === 'Class') {
+                    if (_currentLoreClass === 'shared') {
+                        classMatch = (tr.dataset.class === 'shared');
+                    } else {
+                        classMatch = (tr.dataset.class === _currentLoreClass);
+                    }
+                }
+                tr.style.display = (catMatch && classMatch) ? '' : 'none';
+            });
+        }
+
+        function filterQuests(cls) {
+            document.querySelectorAll('#quest-table tbody tr').forEach(tr => {
+                tr.style.display = (cls === 'All' || tr.dataset.class === cls) ? '' : 'none';
+            });
+            document.querySelectorAll('#quest-class-filters .btn').forEach(b => {
+                const active = b.textContent.trim() === cls;
+                b.style.background = active ? 'var(--accountant)' : 'var(--bg-card)';
+            });
+        }
+
+        // Conditional fields for unlock type in lore form
+        function updateUnlockFields(sel) {
+            const v = sel.value;
+            const show = (id, cond) => {
+                const el = document.getElementById(id);
+                if (el) el.closest('.lore-field-row').style.display = cond ? '' : 'none';
+            };
+            show('unlock_level',       v === 'level' || v === 'class_level');
+            show('unlock_class',       v === 'class_level');
+            show('unlock_milestone_id',v === 'milestone');
+            show('unlock_chapter_id',  v === 'chapter_reward');
+        }
+
+        // Auto-switch to quest tab if URL has edit_quest
+        const _qs = new URLSearchParams(location.search);
+        if (_qs.has('edit_lore') || _qs.has('edit_quest')) switchTab('lore');
+        if (_qs.has('edit_quest')) switchLoreTab('quest');
     </script>
 </body>
 </html>

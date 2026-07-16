@@ -457,215 +457,97 @@ impl Database {
             }
         }
 
-        let count_quests: i32 =
-            conn.query_row("SELECT count(*) FROM class_quests", [], |row| row.get(0))?;
-        if count_quests == 0 {
-            let quests = vec![
-                ("Code Warlock", 10, "The Forgotten Compiler", "Complete 5 tasks to align the compiler parameters and purge syntax anomalies.", "Locked", 0, 5, "Unlocks the lore of the Compiler Wizards."),
-                ("Code Warlock", 25, "The Broken Daemon", "Dedicate 60 minutes of deep focus to debug and stabilize the rogue background daemon.", "Locked", 0, 60, "Unlocks the lore of the Background Daemons."),
-                ("Code Warlock", 50, "The Library of Infinite Scripts", "Water your Zen Tree 3 times to grow script-bearing leaves containing ancient functions.", "Locked", 0, 3, "Unlocks the lore of the Leaf Scripts."),
-                ("Code Warlock", 75, "The Stack Overflow Sigil", "Complete a project to craft the ultimate code architecture of the Keep.", "Locked", 0, 1, "Unlocks the lore of the Architecture Sigils."),
-                ("Code Warlock", 100, "The Simulation Core", "Maintain a 7-day streak to boot up the final cosmic simulation engine.", "Locked", 0, 7, "Unlocks the ultimate lore of the Simulation Core."),
+        Ok(Self { conn })
+    }
 
-                ("Task Paladin", 10, "The Mountain of Unfinished Things", "Complete 5 tasks to clear the pass of procrastination monsters.", "Locked", 0, 5, "Unlocks the lore of the Mountain Pass."),
-                ("Task Paladin", 25, "The Keeper of Deadlines", "Dedicate 60 minutes of deep focus to reinforce the fortress deadlines.", "Locked", 0, 60, "Unlocks the lore of the Deadline Keep."),
-                ("Task Paladin", 50, "The Final Checklist", "Water your Zen Tree 3 times to bless the roots of completion.", "Locked", 0, 3, "Unlocks the lore of the Checklist Tree."),
-                ("Task Paladin", 75, "The Shield of Discipline", "Complete a project to forge the legendary shield of absolute momentum.", "Locked", 0, 1, "Unlocks the lore of the Shield of discipline."),
-                ("Task Paladin", 100, "The Citadel of Completion", "Maintain a 7-day streak to defend the Citadel of Completion against decay.", "Locked", 0, 7, "Unlocks the lore of the Eternal Citadel."),
+    // ── Métodos públicos para sembrar lore desde el LoreManager ──────────────
+    //
+    // Se usan INSERT OR IGNORE para no pisar el estado de desbloqueo del usuario.
+    // Se llaman desde app/mod.rs después de que LoreManager descargó los datos.
 
-                ("Mind Sage", 10, "The Silent Archive", "Complete 5 tasks to index the scrolls in the quiet archive.", "Locked", 0, 5, "Unlocks the lore of the Silent Archive."),
-                ("Mind Sage", 25, "The Crystal of Reflection", "Dedicate 60 minutes of deep focus to charge the crystal of inner sight.", "Locked", 0, 60, "Unlocks the lore of the Reflection Crystal."),
-                ("Mind Sage", 50, "The Hall of Thoughts", "Water your Zen Tree 3 times to nourish the branches of knowledge.", "Locked", 0, 3, "Unlocks the lore of the Hall of Thoughts."),
-                ("Mind Sage", 75, "The Cognitive Cartography", "Complete a project to map the mental node layout of the world.", "Locked", 0, 1, "Unlocks the lore of the Cognitive Map."),
-                ("Mind Sage", 100, "The Singularity of Mind", "Maintain a 7-day streak to achieve total neural alignment.", "Locked", 0, 7, "Unlocks the lore of the Mind Singularity."),
+    pub fn seed_lore_entries(&self, entries: &[crate::services::lore_manager::LoreEntry]) -> Result<()> {
+        // Recolecta los IDs que vienen del servidor para detectar eliminaciones
+        let remote_ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
 
-                ("Systems Architect", 10, "The Blueprint of Babel", "Complete 5 tasks to lay down the base schema of construction.", "Locked", 0, 5, "Unlocks the lore of the Schema Blueprints."),
-                ("Systems Architect", 25, "The Pillars of Order", "Dedicate 60 minutes of deep focus to reinforce the support pillars.", "Locked", 0, 60, "Unlocks the lore of the Pillars of Order."),
-                ("Systems Architect", 50, "The Grand Engine", "Water your Zen Tree 3 times to feed the engine cooling system.", "Locked", 0, 3, "Unlocks the lore of the Grand Engine."),
-                ("Systems Architect", 75, "The Modular Framework", "Complete a project to connect all components of the system.", "Locked", 0, 1, "Unlocks the lore of the Modular Framework."),
-                ("Systems Architect", 100, "The Unified Schema", "Maintain a 7-day streak to compile the universe's ultimate structure.", "Locked", 0, 7, "Unlocks the lore of the Cosmic Schema."),
+        for e in entries {
+            let starts_unlocked = if e.category == "Memory" || e.unlock.unlock_type == "discovery" {
+                0i32
+            } else if e.unlock.unlock_type == "free" {
+                1i32
+            } else {
+                0i32
+            };
 
-                ("Time Chronomancer", 10, "The Broken Hourglass", "Complete 5 tasks to collect the scattered sands of time.", "Locked", 0, 5, "Unlocks the lore of the Hourglass Sands."),
-                ("Time Chronomancer", 25, "The Sands of Yesterday", "Dedicate 60 minutes of deep focus to spin the threads of memory.", "Locked", 0, 60, "Unlocks the lore of the Threads of Memory."),
-                ("Time Chronomancer", 50, "The Infinite Loop", "Water your Zen Tree 3 times to grow the temporal leaves.", "Locked", 0, 3, "Unlocks the lore of the Temporal Leaves."),
-                ("Time Chronomancer", 75, "The Temporal Shield", "Complete a project to deflect the agents of distraction.", "Locked", 0, 1, "Unlocks the lore of the Temporal Shield."),
-                ("Time Chronomancer", 100, "The Eternal Timeline", "Maintain a 7-day streak to lock the timeline in a state of flow.", "Locked", 0, 7, "Unlocks the lore of the Eternal Timeline."),
+            // Inserta si no existe — preserva unlocked/unlocked_at del usuario
+            self.conn.execute(
+                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+                rusqlite::params![e.id, e.category, e.title, e.content, starts_unlocked],
+            )?;
 
-                ("Arch Accountant", 10, "The Ledger of Fate", "Complete 5 tasks to reconcile the local ledger entries.", "Locked", 0, 5, "Unlocks the lore of the Local Ledgers."),
-                ("Arch Accountant", 25, "The Golden Ratio", "Dedicate 60 minutes of deep focus to calculate the perfect balance.", "Locked", 0, 60, "Unlocks the lore of the Perfect Balance."),
-                ("Arch Accountant", 50, "The Final Balance", "Water your Zen Tree 3 times to secure the growth dividend.", "Locked", 0, 3, "Unlocks the lore of the Growth Dividend."),
-                ("Arch Accountant", 75, "The Compound Interest Vault", "Complete a project to vault the assets of the fellowship.", "Locked", 0, 1, "Unlocks the lore of the Fellowship Assets."),
-                ("Arch Accountant", 100, "The Ledger of Eternity", "Maintain a 7-day streak to balance the infinite ledger of time.", "Locked", 0, 7, "Unlocks the lore of the Infinite Ledger."),
-            ];
+            // Actualiza título y contenido en filas existentes — el admin puede editar el texto
+            // sin tocar unlocked ni unlocked_at, que son progreso del usuario
+            self.conn.execute(
+                "UPDATE lore_library SET category = ?2, title = ?3, content = ?4 WHERE id = ?1",
+                rusqlite::params![e.id, e.category, e.title, e.content],
+            )?;
+        }
 
-            for (class, lvl, name, desc, status, prog, target, lore_rew) in quests {
-                conn.execute(
-                    "INSERT INTO class_quests (class_name, unlock_level, quest_name, description, status, progress, target, lore_reward)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                    params![class, lvl, name, desc, status, prog, target, lore_rew],
+        // Elimina entradas que el admin borró del JSON — si el ID ya no está en el servidor, no debe estar aquí
+        // Solo borra las que aún están bloqueadas; si el usuario ya la desbloqueó se conserva como recuerdo
+        if !remote_ids.is_empty() {
+            let placeholders = remote_ids.iter().enumerate()
+                .map(|(i, _)| format!("?{}", i + 1))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "DELETE FROM lore_library WHERE id NOT IN ({}) AND unlocked = 0",
+                placeholders
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            for (i, id) in remote_ids.iter().enumerate() {
+                stmt.raw_bind_parameter(i + 1, id)?;
+            }
+            stmt.raw_execute()?;
+        }
+
+        Ok(())
+    }
+
+    pub fn seed_class_quests(&self, quests: &[crate::services::lore_manager::ClassQuest]) -> Result<()> {
+        let remote_keys: Vec<(String, i32)> = quests.iter()
+            .map(|q| (q.class.clone(), q.level))
+            .collect();
+
+        for q in quests {
+            // Inserta si no existe — preserva status y progress del usuario
+            self.conn.execute(
+                "INSERT OR IGNORE INTO class_quests (class_name, unlock_level, quest_name, description, status, progress, target, lore_reward) VALUES (?1, ?2, ?3, ?4, 'Locked', 0, ?5, ?6)",
+                rusqlite::params![q.class, q.level, q.name, q.description, q.objective.target, q.lore_reward],
+            )?;
+
+            // Actualiza nombre, descripción y target si el admin los editó
+            // No toca status ni progress — eso es progreso del usuario
+            self.conn.execute(
+                "UPDATE class_quests SET quest_name = ?3, description = ?4, target = ?5, lore_reward = ?6 WHERE class_name = ?1 AND unlock_level = ?2",
+                rusqlite::params![q.class, q.level, q.name, q.description, q.objective.target, q.lore_reward],
+            )?;
+        }
+
+        // Elimina quests que el admin borró — solo las que no tienen progreso iniciado
+        for q_existing in self.conn.prepare(
+            "SELECT class_name, unlock_level FROM class_quests WHERE status = 'Locked'"
+        )?.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
+        })?.flatten() {
+            if !remote_keys.iter().any(|(c, l)| c == &q_existing.0 && *l == q_existing.1) {
+                self.conn.execute(
+                    "DELETE FROM class_quests WHERE class_name = ?1 AND unlock_level = ?2 AND status = 'Locked'",
+                    rusqlite::params![q_existing.0, q_existing.1],
                 )?;
             }
         }
 
-        let default_lore: Vec<(&str, &str, &str, &str, i32, Option<String>)> = vec![
-            ("class_six_orders", "Class", "The Six Great Orders", "Though all followers of Questline seek progress, few agree on how it should be achieved.\n\nOver the centuries, six distinct philosophies emerged.\n\nEach became an Order.\n\nEach mastered a different aspect of productivity.\n\nEach insists they are obviously correct.\n\nThe resulting arguments have lasted for generations.", 1, Some(Utc::now().to_rfc3339())),
-            ("world_chapter_1", "World", "Before the First Cursor", "Before there were projects, before there were tasks, before there were notes and chronicles, there was only the Void.\n\nThe Void was not empty.\n\nIt was filled with unfinished intentions.\n\nIdeas that would someday be started.\n\nPlans that would someday be organized.\n\nGoals that would someday be pursued.\n\nYet none of them ever moved beyond possibility.\n\nNothing was recorded.\n\nNothing was completed.\n\nNothing endured.\n\nThis forgotten era became known as The Age of Intention.", 0, None),
-            ("world_chapter_2", "World", "The Age of Open Tabs", "As civilization advanced, the people attempted to impose order upon their lives.\n\nThey created notes.\n\nThey created lists.\n\nThey created plans.\n\nUnfortunately, they created them everywhere.\n\nEntire kingdoms buried themselves beneath scattered notebooks, forgotten documents, abandoned projects, and browser windows numbering in the hundreds.\n\nScholars estimate that some individuals maintained over seventy active tabs simultaneously.\n\nFew survived.\n\nHistorians still debate whether productivity truly existed during this period.", 0, None),
-            ("world_chapter_3", "World", "The Rise of the Great Backlog", "Every unfinished task leaves behind a trace.\n\nA postponed promise.\n\nAn ignored responsibility.\n\nA project that would be completed \"later.\"\n\nFor centuries these fragments accumulated.\n\nEventually they combined into something terrible.\n\nThe Great Backlog.\n\nNo one knows its true form.\n\nSome describe a mountain.\n\nOthers a storm.\n\nStill others claim it resembles an email inbox with twenty-seven thousand unread messages.\n\nWhatever its nature, its influence spread throughout the world.\n\nProjects stalled.\n\nDeadlines collapsed.\n\nEntire organizations vanished beneath the weight of unfinished work.", 0, None),
-            ("world_chapter_4", "World", "The First Cursor", "During the darkest days of the Great Backlog, a lone traveler discovered a blinking light within the Void.\n\nIt appeared as a single cursor.\n\nPatient.\n\nSilent.\n\nWaiting.\n\nThe traveler approached.\n\nThe cursor blinked.\n\nThe traveler blinked.\n\nNeither moved for some time.\n\nEventually the traveler spoke the words:\n\n\"Hello World.\"\n\nLight spread through the darkness.\n\nStructure emerged.\n\nProjects took form.\n\nNotes gained permanence.\n\nTasks acquired purpose.\n\nThe First Cursor had awakened.", 0, None),
-            ("world_chapter_5", "World", "The Founding of Questline", "In the years that followed, the surviving peoples gathered around the teachings of the First Cursor.\n\nThey learned that progress was not achieved through motivation.\n\nProgress was achieved through repetition.\n\nThrough systems.\n\nThrough consistency.\n\nThrough showing up again tomorrow.\n\nThese teachings became known as the Questline.\n\nNot because the path was easy.\n\nBut because every meaningful achievement was composed of smaller quests completed one after another.", 0, None),
-            ("world_chapter_6", "World", "The Six Great Orders", "As Questline spread across the realm, different groups interpreted its teachings in different ways.\n\nSome pursued structure.\n\nOthers sought discipline.\n\nSome mastered knowledge.\n\nOthers mastered time itself.\n\nFrom these philosophies emerged the Six Great Orders.\n\nThe Arch Accountants.\n\nThe Code Warlocks.\n\nThe Mind Sages.\n\nThe Task Paladins.\n\nThe Systems Architects.\n\nThe Time Chronomancers.\n\nThough their methods differed, all sought the same goal:\n\nTo bring order to chaos and purpose to effort.", 0, None),
-            ("world_chapter_7", "World", "The Era of Productivity", "For the first time in history, progress became measurable.\n\nProjects were completed.\n\nGoals were achieved.\n\nKnowledge was preserved.\n\nEntire cities prospered under the guidance of the Orders.\n\nYet success created new challenges.\n\nScope Dragons multiplied.\n\nMeeting Mimics infiltrated institutions.\n\nDeadline Wraiths appeared in increasing numbers.\n\nThe struggle against chaos had entered a new age.", 0, None),
-            ("world_chapter_8", "World", "The Growth of The Evergrowth", "During this period, a mysterious sapling appeared near the center of the realm.\n\nNo one knows who planted it.\n\nNo one knows where it came from.\n\nAttempts to accelerate its growth failed.\n\nAttempts to manipulate it failed.\n\nAttempts to place it in a productivity framework generated seventeen conflicting methodologies and three conference talks.\n\nThe Tree ignored them all.\n\nIt grew only through consistent effort.\n\nA little each day.\n\nNever quickly.\n\nNever dramatically.\n\nYet never stopping.", 0, None),
-            ("world_chapter_9", "World", "The Age of Chronicles", "The greatest weakness of mortals had always been memory.\n\nVictories were forgotten.\n\nProgress went unnoticed.\n\nGrowth became invisible.\n\nTo solve this, the Orders created the Chronicle.\n\nA living record of journeys, achievements, failures, discoveries, and lessons learned.\n\nThe Chronicle does not celebrate perfection.\n\nIt celebrates persistence.\n\nEvery completed task.\n\nEvery finished project.\n\nEvery return after a difficult day.\n\nAll are recorded.", 0, None),
-            ("world_chapter_10", "World", "The Present Age", "The realm now stands in an era unlike any before it.\n\nThe Great Backlog remains beyond the horizon.\n\nDeadline Wraiths continue to roam.\n\nScope Dragons still tempt adventurers with promises of \"just one more feature.\"\n\nYet the people endure.\n\nEvery day new travelers begin their journey.\n\nEvery day new quests are completed.\n\nEvery day another page is added to the Chronicle.\n\nThe story of Questline remains unfinished.\n\nAs all good stories should.", 0, None),
-            ("world_chapter_11", "World", "The Fate of the Notification Sprites", "When the Swarm finally broke, no great battle was recorded.\n\nNo armies marched.\n\nNo ancient relic was activated.\n\nNo chosen hero stood atop a mountain and delivered a dramatic speech.\n\nThe Sprites simply began to vanish.\n\nOne by one.\n\nThen hundreds at a time.\n\nThen thousands.\n\nAcross the Realm, unfinished quests were completed.\n\nScrolls were written.\n\nReflections were recorded.\n\nFocus sessions were honored.\n\nThe Swarm had always fed upon hesitation.\n\nEvery ignored task.\n\nEvery postponed intention.\n\nEvery promise made to \"start tomorrow.\"\n\nThe Notification Sprites themselves were never evil.\n\nMerely hungry.\n\nFor years they had consumed abandoned attention and multiplied beyond control.\n\nBut once the Realm began moving forward again, the food supply disappeared.\n\nThe Sprites weakened.\n\nTheir numbers collapsed.\n\nMany returned to their natural role as harmless messengers.\n\nOthers scattered into forgotten corners of the Realm.\n\nYet as the final Swarm dissolved, the Mind Sages noticed something troubling.\n\nThe Sprites had never created the problem.\n\nThey had only benefited from it.\n\nSomething else had nurtured the conditions that allowed the Swarm to grow.\n\nSomething patient.\n\nSomething ancient.\n\nSomething that preferred heroes distracted.\n\nAt the edge of recorded history, the Chronicle found references to a force long believed dormant.\n\nA force known only as:\n\nThe Great Backlog.\n\nThe horizon darkened.\n\nThe Realm celebrated its victory.\n\nBut the Chronicle quietly turned to the next page.", 0, None),
-
-            ("class_council_orders", "Class", "The Council of Orders", "Though the Orders often disagree, they meet each year at the Hall of Progress.\n\nRepresentatives gather to discuss threats facing the realm.\n\nThe Great Backlog.\n\nScope Dragons.\n\nDeadline Wraiths.\n\nMeeting Mimics.\n\nNotification Sprites.\n\nAnd other horrors.\n\nThe meetings usually begin with noble intentions.\n\nThey usually end with action items.\n\nThe action items are recorded.\n\nAssigned.\n\nPrioritized.\n\nScheduled.\n\nCategorized.\n\nLinked to supporting documentation.\n\nAnd occasionally completed.", 0, None),
-
-            ("class_accountant_5", "Class", "The Order of the Ledger", "The Arch Accountants\n\n\"If it is not recorded, it did not happen.\"\n\nThe Arch Accountants were among the first followers of the Questline.\n\nWhere others sought glory, they sought balance.\n\nWhere others chased inspiration, they chased documentation.\n\nWhere others asked \"Can we afford this?\"\n\nThe Arch Accountants replied:\n\n\"We could have answered that three months ago if someone had updated the spreadsheet.\"", 0, None),
-            ("class_accountant_15", "Class", "Business Purposes", "Their temples are vast halls of ledgers, records, receipts, reports, and financial histories stretching back centuries.\n\nEvery transaction is preserved.\n\nEvery expense is categorized.\n\nEvery discrepancy is investigated.\n\nEspecially the suspicious charge labeled:\n\n\"Business Purposes.\"\n\nNo one has ever successfully explained a Business Purposes expense to an Arch Accountant.", 0, None),
-            ("class_accountant_20", "Class", "Traditions", "New initiates must perform the Rite of Reconciliation.\n\nA sacred ceremony in which a financial statement refuses to balance by exactly $0.03.\n\nThe ritual continues until the discrepancy is found.\n\nSome initiates emerge wiser.\n\nOthers emerge with eye twitches.", 0, None),
-            ("class_accountant_30", "Class", "Rivalries", "Arch Accountants maintain a long-standing rivalry with Code Warlocks.\n\nThe Accountants claim developers spend money recklessly.\n\nThe Warlocks claim budgets are imaginary.\n\nBoth sides are technically correct.", 0, None),
-
-            ("class_warlock_5", "Class", "The Terminal Covenant", "The Code Warlocks\n\n\"It worked on my machine.\"\n\nNo one knows exactly how the Code Warlocks began.\n\nTheir own records are incomplete.\n\nMostly because they forgot to back them up.\n\nAccording to legend, the first Code Warlock discovered an ancient terminal hidden beneath the ruins of a forgotten data center.\n\nWithin it were the Sacred Commands.\n\nMany were dangerous.\n\nSeveral were undocumented.\n\nOne simply read:\n\nsudo trust_me\n\nHistory records that this was a mistake.", 0, None),
-            ("class_warlock_15", "Class", "The Great Forking", "The most famous event in Warlock history was The Great Forking.\n\nA disagreement regarding indentation escalated into a civil war.\n\nEntire repositories split apart.\n\nFriendships ended.\n\nThree documentation teams disappeared.\n\nTo this day no one remembers the original argument.\n\nOnly that it was important.", 0, None),
-            ("class_warlock_20", "Class", "Traditions", "Code Warlocks consume sacred caffeinated beverages before performing major rituals.\n\nThe stronger the coffee, the more powerful the magic.\n\nThis belief remains scientifically unchallenged.", 0, None),
-            ("class_warlock_30", "Class", "Rivalries", "Code Warlocks and Systems Architects have argued for centuries.\n\nWarlocks believe systems should emerge naturally.\n\nArchitects believe systems should be designed beforehand.\n\nThe resulting meetings are responsible for approximately 14% of all productivity losses in recorded history.", 0, None),
-
-            ("class_sage_5", "Class", "The Silent Archive", "The Mind Sages\n\n\"That reminds me of a note I took six years ago.\"\n\nThe Mind Sages dedicate themselves to preserving knowledge.\n\nNothing is too small to record.\n\nNothing is too obscure to catalog.\n\nNothing is too ridiculous to link to three related concepts.\n\nTheir archives contain billions of interconnected ideas.\n\nMany visitors become permanently lost.\n\nFortunately, the Sages have detailed maps explaining how to escape.\n\nUnfortunately, those maps require reading seventeen prerequisite notes.", 0, None),
-            ("class_sage_15", "Class", "The Great Linking", "A legendary Sage once connected every note in the Archive to every other note.\n\nThe resulting structure became so complex that it achieved sentience.\n\nThe Archive still occasionally recommends books no one remembers writing.", 0, None),
-            ("class_sage_20", "Class", "Traditions", "Initiates are given a single blank page.\n\nTheir task is simple:\n\nWrite something worth remembering.\n\nMost spend years preparing.\n\nSome never begin.\n\nA few immediately write:\n\n\"Don't overthink this.\"\n\nThese individuals are usually promoted.", 0, None),
-            ("class_sage_30", "Class", "Rivalries", "Mind Sages secretly believe everyone else's systems would improve if they simply took better notes.\n\nEveryone else secretly fears they may be right.", 0, None),
-
-            ("class_paladin_5", "Class", "The Sacred Checklist", "The Task Paladins\n\n\"Finish what you start.\"\n\nThe Task Paladins are the defenders of execution.\n\nWhile others debate.\n\nWhile others plan.\n\nWhile others research.\n\nTask Paladins complete things.\n\nThey maintain that motivation is unreliable.\n\nDiscipline is dependable.\n\nAnd checking a box feels incredible.", 0, None),
-            ("class_paladin_15", "Class", "The Endless List", "At the center of their Order lies a stone tablet known as The Endless List.\n\nEvery unfinished task in existence is said to appear upon its surface.\n\nFortunately, the tablet is several kilometers tall.\n\nOtherwise morale would suffer considerably.", 0, None),
-            ("class_paladin_20", "Class", "Traditions", "Young Paladins swear the Oath of Completion.\n\nThe oath is simple:\n\n\"I will stop creating new projects before finishing old ones.\"\n\nVery few survive their first year.", 0, None),
-            ("class_paladin_30", "Class", "Rivalries", "Task Paladins view Scope Dragons as their natural enemies.\n\nUnfortunately, Scope Dragons often disguise themselves as exciting opportunities.\n\nThis has resulted in numerous tragic incidents.", 0, None),
-
-            ("class_architect_5", "Class", "The Builders of Order", "The Systems Architects\n\n\"Let's step back and look at the bigger picture.\"\n\nNo phrase has ever inspired more hope and fear simultaneously.\n\nSystems Architects see patterns where others see chaos.\n\nProcesses where others see confusion.\n\nStructure where others see piles of unrelated documents.\n\nThey possess an almost supernatural ability to create organization.\n\nMany are capable of producing folder hierarchies before understanding the project itself.", 0, None),
-            ("class_architect_15", "Class", "The Great Refactoring", "One Architect famously reorganized an entire kingdom.\n\nRoads were rerouted.\n\nGuilds were restructured.\n\nDepartments were merged.\n\nEverything became dramatically more efficient.\n\nNo one could find anything for six months.", 0, None),
-            ("class_architect_20", "Class", "Traditions", "Architects spend years studying the Sacred Frameworks.\n\nEvery generation eventually invents a new framework.\n\nEvery generation claims it solves all previous problems.\n\nHistory suggests otherwise.", 0, None),
-            ("class_architect_30", "Class", "Rivalries", "Architects often clash with Task Paladins.\n\nPaladins want action.\n\nArchitects want planning.\n\nTogether they accidentally create functional organizations.", 0, None),
-
-            ("class_chronomancer_5", "Class", "The Keepers of Hours", "The Time Chronomancers\n\n\"That meeting could have been an email.\"\n\nThe Time Chronomancers study the most precious resource in existence:\n\nTime.\n\nUnlike gold, time cannot be earned.\n\nUnlike knowledge, time cannot be stored.\n\nUnlike tasks, time refuses to wait.\n\nChronomancers dedicate their lives to understanding where it goes.\n\nMost discoveries are deeply unsettling.", 0, None),
-            ("class_chronomancer_15", "Class", "The Lost Afternoon", "Among their greatest mysteries is The Lost Afternoon.\n\nA temporal anomaly affecting productivity across the realm.\n\nVictims sit down for five minutes.\n\nThree hours vanish.\n\nNo explanation has ever been found.\n\nResearchers suspect social media.", 0, None),
-            ("class_chronomancer_20", "Class", "Traditions", "Chronomancer apprentices carry hourglasses at all times.\n\nNot because they are useful.\n\nBecause it looks extremely impressive.", 0, None),
-            ("class_chronomancer_30", "Class", "Rivalries", "Chronomancers frequently argue with Mind Sages.\n\nChronomancers believe notes should be brief.\n\nMind Sages believe brevity is reckless.\n\nThese debates often last several hours.\n\nWhich greatly annoys the Chronomancers.", 0, None),
-        ];
-
-        // INSERT OR IGNORE: preserva el estado unlocked del usuario — no borramos ni reemplazamos filas existentes
-        for (id, cat, title, content, unlocked, unlocked_at) in default_lore {
-            let unlocked_at_str = unlocked_at;
-            conn.execute(
-                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![id, cat, title, content, unlocked, unlocked_at_str],
-            )?;
-        }
-
-        // Limpia fragmentos placeholder del pre-release — no manches, esos IDs genéricos ya no sirven
-        conn.execute(
-            "DELETE FROM lore_library WHERE id IN ('mem_1', 'mem_2', 'mem_3', 'mem_4', 'mem_5')",
-            [],
-        )?;
-
-        // Todos los fragmentos de memoria arrancan bloqueados; OR IGNORE respeta los ya descubiertos
-        let memory_fragments: &[(&str, &str, &str)] = &[
-            ("memory_001", "Fragment #001 \u{2014} Sir Aldric the Hesitant",
-             "Recovered from the Third Age of Checklists\n\n\"I kept postponing the task because I wanted to do it perfectly.\n\nThree months later I realized doing it badly would have been sufficient.\"\n\n\u{2014} Sir Aldric the Hesitant\nTask Paladin, Level 63\n\nStatus: Eventually completed."),
-            ("memory_002", "Fragment #002 \u{2014} Warlock Bryn of Forty-Seven Tabs",
-             "Recovered from a damaged project archive\n\n\"Today I spent six hours building a system to save five minutes.\n\nTomorrow I shall spend another six improving it.\"\n\n\u{2014} Warlock Bryn of Forty-Seven Tabs\n\nStatus: Project still active."),
-            ("memory_003", "Fragment #003 \u{2014} Accountant General Harlan",
-             "Recovered from the Great Backlog War\n\n\"The dragon was terrifying.\n\nThe budget meeting was worse.\"\n\n\u{2014} Accountant General Harlan\n\nStatus: Unknown."),
-            ("memory_004", "Fragment #004 \u{2014} Systems Architect Vexa",
-             "Recovered from an abandoned notebook\n\n\"If you have reorganized the same folder four times,\nyou are no longer organizing.\n\nYou are decorating.\"\n\n\u{2014} Systems Architect Vexa\n\nStatus: Folder renamed twice more."),
-            ("memory_005", "Fragment #005 \u{2014} Chronomancer Elian",
-             "Recovered from the Hall of Clocks\n\n\"The deadline was visible from the beginning.\n\nI simply believed I was special.\"\n\n\u{2014} Chronomancer Elian\n\nStatus: Deadline victorious."),
-            ("memory_006", "Fragment #006 \u{2014} Unknown Hero",
-             "Recovered from a damaged coffee-stained scroll\n\n\"The task took twenty minutes.\n\nAvoiding the task took three weeks.\"\n\n\u{2014} Unknown Hero\n\nStatus: Classic."),
-            ("memory_007", "Fragment #007 \u{2014} Sage Corvin",
-             "Recovered from the Archives of the Mind Sages\n\n\"I took excellent notes.\n\nUnfortunately they were spread across seven notebooks,\nthree applications,\nand one napkin.\"\n\n\u{2014} Sage Corvin\n\nStatus: Information technically preserved."),
-            ("memory_008", "Fragment #008 \u{2014} Chronicle Entry 11,204",
-             "Recovered from the Chronicle\n\n\"The hero requested motivation.\n\nThe Chronicle provided a deadline.\"\n\n\u{2014} Chronicle Entry 11,204"),
-            ("memory_009", "Fragment #009 \u{2014} Fellowship Log #382",
-             "Recovered from an ancient project board\n\n\"Halfway through the project,\nwe realized nobody remembered why we started.\"\n\n\u{2014} Fellowship Log #382"),
-            ("memory_010", "Fragment #010 \u{2014} The Last Finisher",
-             "Recovered from a sealed vault\n\n\"The greatest productivity technique I ever discovered\nwas beginning.\"\n\n\u{2014} The Last Finisher\n\nStatus: Confirmed."),
-            ("memory_077", "Fragment #077 \u{2014} The Sixth Chronicle [Rare]",
-             "Recovered from a forbidden archive\n\n\"The Great Backlog can never be destroyed.\n\nOnly managed.\"\n\n\u{2014} The Sixth Chronicle\n\n[ Rare Fragment ]"),
-            ("memory_112", "Fragment #112 \u{2014} Rootkeeper Sol [Rare]",
-             "Recovered from the roots of The Evergrowth\n\n\"Heroes ask how long the tree takes to grow.\n\nThe tree asks how long they plan to remain.\"\n\n\u{2014} Rootkeeper Sol\n\n[ Rare Fragment ]"),
-            ("memory_144", "Fragment #144 \u{2014} Future You [Rare]",
-             "Recovered from the Future\n\n\"Everything worked out.\n\nNow stop worrying and finish the task.\"\n\n\u{2014} Future You\n\n[ Rare Fragment ]"),
-            ("memory_188", "Fragment #188 \u{2014} Chronomancer Voss [Rare]",
-             "Recovered from a corrupted timeline\n\n\"I finally reached Inbox Zero.\n\nNobody was there to witness it.\"\n\n\u{2014} Chronomancer Voss\n\nStatus: Scholars debate authenticity.\n\n[ Rare Fragment ]"),
-            ("memory_999", "Fragment #999 \u{2014} Unknown [Legendary]",
-             "Recovered from the deepest vault beneath the Chronicle\n\n\"There was never a chosen one.\n\nThere were only people who continued showing up.\n\nAgain.\n\nAnd again.\n\nAnd again.\"\n\n\u{2014} Unknown\n\nThe remainder of the fragment has been lost.\n\n[ Legendary Fragment ]"),
-            ("memory_ch1_001", "Fragment #CH1-001 \u{2014} The Last Quiet Morning [Chapter Reward]",
-             "Recovered from the Early Chronicle\n\n\"I remember the morning after the Swarm vanished.\n\nNo pings.\n\nNo banners.\n\nNo red circles demanding attention.\n\nFor the first time in years, the Realm was silent.\n\nThe silence was unsettling.\n\nMany heroes believed something was wrong.\n\nSeveral Task Paladins spent hours refreshing things that no longer needed refreshing.\n\nOne Code Warlock claimed the silence was suspicious and restarted three perfectly functioning systems.\n\nThe Mind Sages simply smiled.\n\nIt took several days before the Realm remembered what silence felt like.\n\nMost agreed it was pleasant.\n\nA few admitted they missed the chaos.\n\nThe Chronicle records both opinions.\"\n\n\u{2014} Unknown Hero\n\n[ Chapter One Reward Fragment ]"),
-        ];
-        for &(fid, ftitle, fcontent) in memory_fragments {
-            conn.execute(
-                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, 'Memory', ?2, ?3, 0, NULL)",
-                params![fid, ftitle, fcontent],
-            )?;
-        }
-
-        let achievement_lore: &[(&str, &str, &str)] = &[
-            (
-                "milestone_first_quest",
-                "Reluctant Hero",
-                "Tier I — Initiate Milestone: First Quest\n\nYou completed a task, wrote a note, and acknowledged the project existed for at least one day.\n\nThe bar was on the floor.\n\nYou found it.\n\n\"Every legend begins somewhere. Some begin more enthusiastically than others.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_chronicle_keeper",
-                "Amateur Historian",
-                "Tier I — Initiate Milestone: Chronicle Keeper\n\nYou showed up on two different days and wrote about it.\n\nFuture archaeologists will be politely unimpressed.\n\nHistory is indeed written by those who show up — just not always read by anyone.\n\n\"The chronicle does not judge. It simply records. Unlike historians, who absolutely judge.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_focused_adventurer",
-                "Accidental Monk",
-                "Tier I — Initiate Milestone: Focused Adventurer\n\nThree focus sessions without rage-quitting.\n\nYour attention span has outlasted most relationships and several national governments.\n\nThis was not the plan. It worked anyway.\n\n\"Silence is the loudest productivity tool. You have now heard it three times.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_realm_builder",
-                "Management Material",
-                "Tier II — Veteran Milestone: Realm Builder\n\nTen tasks completed. Seven days of project age. Five days of actual presence.\n\nYou have officially done more structured follow-through than most people accomplish in a calendar quarter.\n\nThis is now a personality trait.\n\nAccept it.\n\n\"A realm worth building takes time. You have now proven this through evidence.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_keeper_of_chronicle",
-                "Unnecessary Biographer",
-                "Tier II — Veteran Milestone: Keeper of the Chronicle\n\nFifteen tasks. Five journal entries. Seven active days over at least a week.\n\nYou have documented a project that probably no one asked about with the dedication of someone who absolutely did not need to ask.\n\nThorough. Possibly alarming.\n\n\"The chronicle awaits further deeds. It has been waiting a while. It is patient.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_steady_hero",
-                "Creature of Habit",
-                "Tier II — Veteran Milestone: Steady Hero\n\nA seven-day streak. Twenty completed tasks. Ten daily adventures.\n\nYou are either genuinely productive or you have confused discipline for a coping mechanism.\n\nBoth explanations are statistically consistent with the evidence.\n\n\"Heroes are forged through daily discipline. You have now been forged. Try not to rust.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_master_of_realms",
-                "Probably Fine",
-                "Tier III — Legendary Milestone: Master of Realms\n\nFifty tasks. Twenty notes. Twenty active days. Thirty days of project age.\n\nYou have built something large enough that you can no longer remember where it started.\n\nThe paperwork is, however, immaculate.\n\nCarry on.\n\n\"Mastery is the sum of ten thousand small victories. You have achieved at least fifty of them.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_legend_of_chronicle",
-                "Unsolicited Archivist",
-                "Tier III — Legendary Milestone: Legend of the Chronicle\n\nOne hundred tasks. Twenty-five journal entries. Thirty active days on a project at least thirty days old.\n\nYou have documented your productivity so thoroughly that your documentation now has its own subtext.\n\nFuture scholars will cite you.\n\nThey will not know why.\n\n\"Your story is now legend. Whether anyone reads it is a separate question entirely.\"\n\n— Questline Archives",
-            ),
-            (
-                "milestone_avatar_of_completion",
-                "The Myth. The Legend. The Problem.",
-                "Tier III — Legendary Milestone: Avatar of Completion\n\nOne hundred tasks. Twenty-five daily adventures. A thirty-day streak.\n\nThis is either exceptional discipline or a warning sign.\n\nEither way, the backlog has stopped trying to intimidate you.\n\nIt now simply respects you from a cautious distance.\n\n\"You have become the hero the world needed. The world did not ask for this. It is grateful anyway.\"\n\n— Questline Archives",
-            ),
-        ];
-        for &(id, title, content) in achievement_lore {
-            conn.execute(
-                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, 'Achievement', ?2, ?3, 0, NULL)",
-                params![id, title, content],
-            )?;
-        }
-
-        Ok(Self { conn })
+        Ok(())
     }
 
     pub fn get_user(&self) -> Result<Option<User>> {
@@ -3426,16 +3308,23 @@ impl Database {
                     .unwrap_or(999);
                 a_num.cmp(&b_num)
             } else if a.1 == "Class" {
-                let get_level = |id: &str| -> usize {
-                    if id == "class_six_orders" {
-                        1
-                    } else if id == "class_council_orders" {
-                        40
-                    } else {
-                        id.split('_').last().and_then(|s| s.parse::<usize>().ok()).unwrap_or(999)
-                    }
+                // Ordena por clase primero (shared al inicio y al final), luego por nivel
+                let class_sort_key = |id: &str| -> (usize, usize) {
+                    if id == "class_six_orders" { return (0, 0); }
+                    if id == "class_council_orders" { return (99, 0); }
+                    let class_order = if id.starts_with("class_warlock_") { 1 }
+                        else if id.starts_with("class_paladin_") { 2 }
+                        else if id.starts_with("class_sage_") { 3 }
+                        else if id.starts_with("class_architect_") { 4 }
+                        else if id.starts_with("class_chronomancer_") { 5 }
+                        else if id.starts_with("class_accountant_") { 6 }
+                        else { 50 };
+                    let level = id.split('_').last()
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    (class_order, level)
                 };
-                get_level(&a.0).cmp(&get_level(&b.0))
+                class_sort_key(&a.0).cmp(&class_sort_key(&b.0))
             } else {
                 let title_cmp = a.2.cmp(&b.2);
                 if title_cmp == std::cmp::Ordering::Equal {

@@ -49,7 +49,7 @@ pub fn draw(
     // si no hay proyectos activos muestra un mensaje con la instrucción — no lo dejes en blanco cuate
     let list_items: Vec<ListItem> = if active_projects.is_empty() {
         vec![ListItem::new(
-            "  No active projects. Press [n] to create one.",
+            "  No active campaigns. Press [n] to create one.",
         )]
     } else {
         active_projects
@@ -75,7 +75,7 @@ pub fn draw(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(list_border_style)
-            .title(" Active Realms "),
+            .title(" Active Campaigns"),
     );
     f.render_widget(list_widget, body_chunks[0]);
 
@@ -83,7 +83,7 @@ pub fn draw(
     // también formatea la fecha con timezone local — chrono haciendo su magia
     let details_border_style = Style::default().fg(theme.border);
     let details_p = if active_projects.is_empty() || selected_idx >= active_projects.len() {
-        Paragraph::new("\n  Select a realm from the list to view chronicles.").block(
+        Paragraph::new("\n  Select a campaign from the list to view chronicles.").block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -98,7 +98,7 @@ pub fn draw(
         let mut text = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Realm:     ", Style::default().fg(theme.muted)),
+                Span::styled("  Campaign:  ", Style::default().fg(theme.muted)),
                 Span::styled(
                     &p.name,
                     Style::default()
@@ -147,7 +147,7 @@ pub fn draw(
 
     // 3. Footer Help bar
     let footer_text = vec![Line::from(vec![
-        Span::styled(" Projects |  ", Style::default().fg(accent_color)),
+        Span::styled(" Campaigns | ", Style::default().fg(accent_color)),
         Span::styled(
             "↑↓",
             Style::default()
@@ -215,7 +215,7 @@ pub fn draw(
             desc_cursor,
             focus_idx,
         } => {
-            draw_project_modal(f, " New Realm Quest ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
+            draw_project_modal(f, " New Campaign ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
         }
         ModalType::EditProject {
             name,
@@ -225,7 +225,7 @@ pub fn draw(
             focus_idx,
             ..
         } => {
-            draw_project_modal(f, " Edit Realm Quest ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
+            draw_project_modal(f, " Edit Campaign ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
         }
         _ => {}
     }

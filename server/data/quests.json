@@ -1,0 +1,284 @@
+{
+  "version": "1.0",
+  "schema": {
+    "objective.type": "tasks_completed | focus_minutes | zen_waterings | projects_completed | streak_days",
+    "reward_lore_id": "ID inserted into lore_library when quest is completed (quest_lore_{level})"
+  },
+  "quests": [
+    {
+      "class": "Code Warlock",
+      "level": 10,
+      "name": "The Forgotten Compiler",
+      "description": "Complete 5 tasks to align the compiler parameters and purge syntax anomalies.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Compiler Wizards.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Code Warlock",
+      "level": 25,
+      "name": "The Broken Daemon",
+      "description": "Dedicate 60 minutes of deep focus to debug and stabilize the rogue background daemon.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Background Daemons.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Code Warlock",
+      "level": 50,
+      "name": "The Library of Infinite Scripts",
+      "description": "Water your Zen Tree 3 times to grow script-bearing leaves containing ancient functions.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Leaf Scripts.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Code Warlock",
+      "level": 75,
+      "name": "The Stack Overflow Sigil",
+      "description": "Complete a project to craft the ultimate code architecture of the Keep.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Architecture Sigils.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Code Warlock",
+      "level": 100,
+      "name": "The Simulation Core",
+      "description": "Maintain a 7-day streak to boot up the final cosmic simulation engine.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the ultimate lore of the Simulation Core.",
+      "reward_lore_id": "quest_lore_100"
+    },
+
+    {
+      "class": "Task Paladin",
+      "level": 10,
+      "name": "The Mountain of Unfinished Things",
+      "description": "Complete 5 tasks to clear the pass of procrastination monsters.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Mountain Pass.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Task Paladin",
+      "level": 25,
+      "name": "The Keeper of Deadlines",
+      "description": "Dedicate 60 minutes of deep focus to reinforce the fortress deadlines.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Deadline Keep.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Task Paladin",
+      "level": 50,
+      "name": "The Final Checklist",
+      "description": "Water your Zen Tree 3 times to bless the roots of completion.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Checklist Tree.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Task Paladin",
+      "level": 75,
+      "name": "The Shield of Discipline",
+      "description": "Complete a project to forge the legendary shield of absolute momentum.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Shield of Discipline.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Task Paladin",
+      "level": 100,
+      "name": "The Citadel of Completion",
+      "description": "Maintain a 7-day streak to defend the Citadel of Completion against decay.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the lore of the Eternal Citadel.",
+      "reward_lore_id": "quest_lore_100"
+    },
+
+    {
+      "class": "Mind Sage",
+      "level": 10,
+      "name": "The Silent Archive",
+      "description": "Complete 5 tasks to index the scrolls in the quiet archive.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Silent Archive.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Mind Sage",
+      "level": 25,
+      "name": "The Crystal of Reflection",
+      "description": "Dedicate 60 minutes of deep focus to charge the crystal of inner sight.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Reflection Crystal.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Mind Sage",
+      "level": 50,
+      "name": "The Hall of Thoughts",
+      "description": "Water your Zen Tree 3 times to nourish the branches of knowledge.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Hall of Thoughts.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Mind Sage",
+      "level": 75,
+      "name": "The Cognitive Cartography",
+      "description": "Complete a project to map the mental node layout of the world.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Cognitive Map.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Mind Sage",
+      "level": 100,
+      "name": "The Singularity of Mind",
+      "description": "Maintain a 7-day streak to achieve total neural alignment.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the lore of the Mind Singularity.",
+      "reward_lore_id": "quest_lore_100"
+    },
+
+    {
+      "class": "Systems Architect",
+      "level": 10,
+      "name": "The Blueprint of Babel",
+      "description": "Complete 5 tasks to lay down the base schema of construction.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Schema Blueprints.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Systems Architect",
+      "level": 25,
+      "name": "The Pillars of Order",
+      "description": "Dedicate 60 minutes of deep focus to reinforce the support pillars.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Pillars of Order.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Systems Architect",
+      "level": 50,
+      "name": "The Grand Engine",
+      "description": "Water your Zen Tree 3 times to feed the engine cooling system.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Grand Engine.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Systems Architect",
+      "level": 75,
+      "name": "The Modular Framework",
+      "description": "Complete a project to connect all components of the system.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Modular Framework.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Systems Architect",
+      "level": 100,
+      "name": "The Unified Schema",
+      "description": "Maintain a 7-day streak to compile the universe's ultimate structure.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the lore of the Cosmic Schema.",
+      "reward_lore_id": "quest_lore_100"
+    },
+
+    {
+      "class": "Time Chronomancer",
+      "level": 10,
+      "name": "The Broken Hourglass",
+      "description": "Complete 5 tasks to collect the scattered sands of time.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Hourglass Sands.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Time Chronomancer",
+      "level": 25,
+      "name": "The Sands of Yesterday",
+      "description": "Dedicate 60 minutes of deep focus to spin the threads of memory.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Threads of Memory.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Time Chronomancer",
+      "level": 50,
+      "name": "The Infinite Loop",
+      "description": "Water your Zen Tree 3 times to grow the temporal leaves.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Temporal Leaves.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Time Chronomancer",
+      "level": 75,
+      "name": "The Temporal Shield",
+      "description": "Complete a project to deflect the agents of distraction.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Temporal Shield.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Time Chronomancer",
+      "level": 100,
+      "name": "The Eternal Timeline",
+      "description": "Maintain a 7-day streak to lock the timeline in a state of flow.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the lore of the Eternal Timeline.",
+      "reward_lore_id": "quest_lore_100"
+    },
+
+    {
+      "class": "Arch Accountant",
+      "level": 10,
+      "name": "The Ledger of Fate",
+      "description": "Complete 5 tasks to reconcile the local ledger entries.",
+      "objective": { "type": "tasks_completed", "target": 5 },
+      "lore_reward": "Unlocks the lore of the Local Ledgers.",
+      "reward_lore_id": "quest_lore_10"
+    },
+    {
+      "class": "Arch Accountant",
+      "level": 25,
+      "name": "The Golden Ratio",
+      "description": "Dedicate 60 minutes of deep focus to calculate the perfect balance.",
+      "objective": { "type": "focus_minutes", "target": 60 },
+      "lore_reward": "Unlocks the lore of the Perfect Balance.",
+      "reward_lore_id": "quest_lore_25"
+    },
+    {
+      "class": "Arch Accountant",
+      "level": 50,
+      "name": "The Final Balance",
+      "description": "Water your Zen Tree 3 times to secure the growth dividend.",
+      "objective": { "type": "zen_waterings", "target": 3 },
+      "lore_reward": "Unlocks the lore of the Growth Dividend.",
+      "reward_lore_id": "quest_lore_50"
+    },
+    {
+      "class": "Arch Accountant",
+      "level": 75,
+      "name": "The Compound Interest Vault",
+      "description": "Complete a project to vault the assets of the fellowship.",
+      "objective": { "type": "projects_completed", "target": 1 },
+      "lore_reward": "Unlocks the lore of the Fellowship Assets.",
+      "reward_lore_id": "quest_lore_75"
+    },
+    {
+      "class": "Arch Accountant",
+      "level": 100,
+      "name": "The Ledger of Eternity",
+      "description": "Maintain a 7-day streak to balance the infinite ledger of time.",
+      "objective": { "type": "streak_days", "target": 7 },
+      "lore_reward": "Unlocks the lore of the Infinite Ledger.",
+      "reward_lore_id": "quest_lore_100"
+    }
+  ]
+}

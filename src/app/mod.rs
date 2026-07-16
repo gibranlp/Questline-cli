@@ -59,8 +59,8 @@ pub enum SearchResultType {
 impl SearchResultType {
     pub fn label(&self) -> &'static str {
         match self {
-            SearchResultType::Project => "Project",
-            SearchResultType::Task => "Task",
+            SearchResultType::Project => "Campaign",
+            SearchResultType::Task => "Quest",
             SearchResultType::Step => "Step",
             SearchResultType::Note => "Note",
             SearchResultType::JournalEntry => "Journal",
@@ -1192,6 +1192,13 @@ impl App {
     // Inicializa toda la app: DB, identidad, config, quote, audio, sync — pues aquí empieza todo
     pub fn new(db_path: &Path) -> Result<Self> {
         let db = Database::new(db_path)?;
+
+        // Carga el lore desde questlinecli.com (o del caché local si es reciente).
+        // Siempre usa INSERT OR IGNORE, así que el progreso del usuario nunca se pierde.
+        let lore_mgr = crate::services::lore_manager::LoreManager::load();
+        let _ = db.seed_lore_entries(&lore_mgr.lore);
+        let _ = db.seed_class_quests(&lore_mgr.quests);
+
         let mut user = db.get_user()?;
 
         let existing_user_id = user.as_ref().map(|u| u.id);
@@ -2252,9 +2259,9 @@ impl App {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         match self.db.prune_completed_tasks(d) {
                             Ok(pruned) => {
-                                self.sync_status_msg = format!("Pruned {} completed task(s) older than {} days.", pruned, d);
+                                self.sync_status_msg = format!("Pruned {} completed quest(s) older than {} days.", pruned, d);
                                 self.notifications.push(Notification::info(
-                                    format!("{} old completed tasks pruned from the Chronicle.", pruned)
+                                    format!("{} old completed quests pruned from the Chronicle.", pruned)
                                 ));
                                 self.reload_data()?;
                             }
@@ -3219,7 +3226,7 @@ impl App {
                                     self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'mentor' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()])?;
                                 }
                             } else {
-                                self.notifications.push(Notification::warning("No project selected for invitation!"));
+                                self.notifications.push(Notification::warning("No campaign selected for invitation!"));
                             }
                             self.mark_dirty();
                             self.modal_state = ModalType::None;
@@ -3500,9 +3507,9 @@ impl App {
                                     if member.0 != self.identity.public_key {
                                         self.db.create_notification(
                                             "task_assignment",
-                                            "Task Assigned",
+                                            "Quest Assigned",
                                             &format!(
-                                                "You have been assigned to task: {}",
+                                                "You have been assigned to quest: {}",
                                                 task.title
                                             ),
                                             Some(&proj_id.to_string()),
@@ -3546,7 +3553,7 @@ impl App {
                         };
                     }
                     KeyCode::Enter => {
-                        let vis_options = ["Private", "Project Visible", "Fellowship Visible"];
+                        let vis_options = ["Private", "Campaign Visible", "Fellowship Visible"];
                         let selected_vis = vis_options[idx].to_string();
                         self.db.conn.execute(
                             "UPDATE journal_entries SET visibility = ?1 WHERE id = ?2",
@@ -5020,6 +5027,8 @@ impl App {
             KeyCode::Char('4') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Library;
                 self.active_tab_idx = 4;
+                // Comprueba desbloqueos por nivel al abrir la biblioteca — retroactivo para usuarios que ya superaron el nivel
+                let _ = self.check_stage6_unlocks();
             }
             KeyCode::Char('5') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Soundscapes;
@@ -5809,7 +5818,7 @@ impl App {
                             if !already_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let val = if is_high { 50 } else { 25 };
-                                let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
                                 self.grant_xp(title, val)?;
                                 let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
                                 self.apply_class_passive(passive_trigger, 0)?;
@@ -6994,7 +7003,7 @@ impl App {
                                 if !task.xp_awarded {
                                     let is_high = t.priority == TaskPriority::High;
                                     let val = if is_high { 50 } else { 25 };
-                                    let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                    let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
                                     self.grant_xp(title, val)?;
                                     let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
                                     self.apply_class_passive(passive_trigger, 0)?;
@@ -8018,7 +8027,7 @@ impl App {
                         self.audio_player.play_task_creation();
 
                         // Grant +5 XP on Create Task / Step
-                        let xp_label = if is_step { "Spawn Step Quest" } else { "Spawn Task Quest" };
+                        let xp_label = if is_step { "Spawn Step" } else { "Spawn Quest" };
                         if let Some(ref mut u) = self.user {
                             xp_service.grant_xp(u, xp_label, 5)?;
                         }
@@ -8930,16 +8939,22 @@ impl App {
                             true,
                         );
                     }
+                } else {
+                    // notif_key set but entry may still be locked (e.g. backup restore) — silently repair
+                    let _ = self.db.unlock_lore_entry(&class_key);
                 }
             }
         }
 
         if user_ref.level >= 40 {
-            if self.db.get_setting("lore_notified_class_council_orders")?.is_none()
-                && self.db.unlock_lore_entry("class_council_orders")?
-            {
-                let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
-                self.notifications.push(Notification::info("The Council of Orders Unlocked in Library!".to_string()));
+            if self.db.get_setting("lore_notified_class_council_orders")?.is_none() {
+                if self.db.unlock_lore_entry("class_council_orders")? {
+                    let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
+                    self.notifications.push(Notification::info("The Council of Orders Unlocked in Library!".to_string()));
+                }
+            } else {
+                // notif_key set but entry may still be locked (e.g. backup restore) — silently repair
+                let _ = self.db.unlock_lore_entry("class_council_orders");
             }
         }
 
@@ -8958,6 +8973,9 @@ impl App {
                             true,
                         );
                     }
+                } else {
+                    // notif_key set but entry may still be locked — silently repair
+                    let _ = self.db.unlock_lore_entry(&world_key);
                 }
             }
         }
@@ -9086,7 +9104,7 @@ impl App {
                         scored.push((s, SearchResult {
                             result_type: SearchResultType::Step,
                             title: t.title.clone(),
-                            details: format!("{} · subtask", proj),
+                            details: format!("{} · subquest", proj),
                             project_id: t.project_id,
                             item_id: t.id.to_string(),
                         }));
@@ -9471,8 +9489,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "open_dashboard",
             },
             CommandAction {
-                name: "Open Projects",
-                description: "Navigate to Projects list",
+                name: "Open Campaigns",
+                description: "Navigate to Campaigns list",
                 shortcut: "2",
                 id: "open_projects",
             },
@@ -9515,7 +9533,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Focus",
                 description: "Navigate to Focus screen",
-                shortcut: "F (from Projects)",
+                shortcut: "F (from Campaigns)",
                 id: "open_focus",
             },
             CommandAction {
@@ -9527,7 +9545,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Archive",
                 description: "Navigate to Archive screen",
-                shortcut: "A (from Projects)",
+                shortcut: "A (from Campaigns)",
                 id: "open_archive",
             },
             CommandAction {
@@ -9537,26 +9555,26 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "search_integration",
             },
             CommandAction {
-                name: "Create Task",
-                description: "Create a new task, with project picker if needed",
+                name: "Create Quest",
+                description: "Create a new quest, with campaign picker if needed",
                 shortcut: "Ctrl+T",
                 id: "create_task",
             },
             CommandAction {
                 name: "Create Note",
-                description: "Create a new note, with project picker if needed",
+                description: "Create a new note, with campaign picker if needed",
                 shortcut: "Ctrl+N",
                 id: "create_note",
             },
             CommandAction {
                 name: "Start Focus Session",
                 description: "Begin a pomodoro focus session to gain XP",
-                shortcut: "F (from Projects)",
+                shortcut: "F (from Campaigns)",
                 id: "start_focus",
             },
             CommandAction {
-                name: "Open Project",
-                description: "Browse and open your active projects list",
+                name: "Open Campaign",
+                description: "Browse and open your active campaigns list",
                 shortcut: "2",
                 id: "open_project",
             },
@@ -9666,6 +9684,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             "open_library" => {
                 self.active_screen = ActiveScreen::Library;
                 self.active_tab_idx = 4;
+                let _ = self.check_stage6_unlocks();
             }
             "open_archive" => {
                 self.active_screen = ActiveScreen::Archive;
@@ -10106,7 +10125,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             if self.db.get_setting(key)?.is_none() {
                 self.db.set_setting(key, "true")?;
                 self.trigger_celebration(
-                    "1,000 TASKS PURIFIED!",
+                    "1,000 QUESTS PURIFIED!",
                     "Your relentless crusade against procrastination has resolved 1,000 quests.\nThe realm is forever in your debt.",
                     "SUCCESS"
                 );
@@ -11457,7 +11476,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if !unlocked.contains(&trait_id.to_string()) {
             self.db.unlock_trait(trait_id)?;
             let display_name = match trait_id {
-                "task_slayer" => "Task Slayer",
+                "task_slayer" => "Quest Slayer",
                 "scholar" => "Scholar",
                 "historian" => "Historian",
                 "gardener" => "Gardener",
@@ -11508,7 +11527,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     pub fn toggle_milestone(&mut self, milestone_id: Uuid) -> Result<()> {
         let p_id = self
             .active_project_id
-            .ok_or_else(|| anyhow::anyhow!("No active project"))?;
+            .ok_or_else(|| anyhow::anyhow!("No active campaign"))?;
         let mut milestones = self.db.get_milestones_for_project(p_id)?;
         if let Some(m) = milestones.iter_mut().find(|ms| ms.id == milestone_id) {
             if m.completed {
@@ -11533,7 +11552,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     .count();
                 if completed_tasks < 3 {
                     self.notifications.push(Notification::info(format!(
-                            "Need {} more completed quest(s) in this project first.",
+                            "Need {} more completed quest(s) in this campaign first.",
                             3 - completed_tasks
                         )));
                     return Ok(());
@@ -11544,7 +11563,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     .filter(|j| j.project_id == p_id)
                     .count();
                 if project_journals < 1 {
-                    self.notifications.push(Notification::warning("Write at least 1 Chronicle entry for this project first."));
+                    self.notifications.push(Notification::warning("Write at least 1 Chronicle entry for this campaign first."));
                     return Ok(());
                 }
                 true
@@ -11628,7 +11647,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.trigger_ambient_particles();
 
                 let proj_name = existing.name.clone();
-                self.grant_xp(&format!("Complete Project: {}", proj_name), 200)?;
+                self.grant_xp(&format!("Complete Campaign: {}", proj_name), 200)?;
 
                 // Stage 6: increment Level 75 quest progress
                 self.increment_quest_progress(75, 1)?;
@@ -11637,20 +11656,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
                     self.db.add_chronicle_entry(
                         day_number,
-                        &format!("Completed Project: {}.", proj_name),
+                        &format!("Completed Campaign: {}.", proj_name),
                     )?;
                 }
 
                 self.trigger_celebration(
                     &format!("PROJECT COMPLETED: {}", proj_name),
-                    &format!("You have completed the grand project '{}'!\nOrder has been restored to this workspace.", proj_name),
+                    &format!("You have conquered the campaign '{}'!\nOrder has been restored to this workspace.", proj_name),
                     "SUCCESS"
                 );
 
                 self.grow_tree(20)?;
 
                 self.notifications.push(Notification::info(format!(
-                        "Project Completed: {}! (+200 XP, +20 Growth)",
+                        "Campaign Conquered: {}! (+200 XP, +20 Growth)",
                         existing.name
                     )));
 
@@ -11990,7 +12009,7 @@ mod app_tests {
         let t = Task {
             id: task_id,
             project_id: Some(proj.id),
-            title: "Task Quest".to_string(),
+            title: "Quest".to_string(),
             description: None,
             priority: TaskPriority::Medium,
             due_date: None,
