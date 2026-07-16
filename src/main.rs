@@ -432,7 +432,7 @@ async fn main() -> Result<()> {
                     // Tabs de navegación: activo muestra nombre completo con color de clase
                     let nav_tabs: &[(&str, ActiveScreen)] = &[
                         ("Dashboard",  ActiveScreen::Dashboard),
-                        ("Projects",   ActiveScreen::Projects),
+                        ("Campaigns",   ActiveScreen::Projects),
                         ("Hero",       ActiveScreen::Character),
                         ("Library",    ActiveScreen::Library),
                         ("Music",      ActiveScreen::Soundscapes),

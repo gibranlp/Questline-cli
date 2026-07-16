@@ -178,7 +178,7 @@ fn draw_main_quest(
                 Style::default().fg(theme.muted),
             )),
             Line::from(Span::styled(
-                "  Add tasks to your projects to begin the adventure.",
+                "  Add quests to your campaigns to begin the adventure.",
                 Style::default().fg(theme.disabled),
             )),
         ];

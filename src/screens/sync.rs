@@ -148,7 +148,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity | [p] Prune Old Tasks",
+            "   [i] Restore Identity | [p] Prune Old Quests",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -197,7 +197,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "   Quests (Tasks) Solved:  ",
+                "   Quests Solved:          ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -236,7 +236,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "   Realms (Projects) Begun: ",
+                "   Campaigns Begun:         ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -249,7 +249,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "   Realms Fully Conquered:   ",
+                "   Campaigns Conquered:      ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -262,7 +262,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "   Project Milestones Met:   ",
+                "   Campaign Milestones Met:  ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -531,7 +531,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
-                format!("{:.1} Tasks/day", stats.avg_tasks_per_day),
+                format!("{:.1} Quests/day", stats.avg_tasks_per_day),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),

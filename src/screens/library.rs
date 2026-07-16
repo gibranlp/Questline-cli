@@ -7,7 +7,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Gauge, List, ListItem, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState},
     Frame,
 };
 
@@ -152,8 +152,8 @@ pub fn draw(
         LibraryCategory::MemoryFragments => "Memory",
     };
 
-    // Convierte el nombre de clase a su key en los IDs del lore — qué rollo si agregan más clases
-    let class_key = match user_class {
+    // Convierte el nombre de clase a su key en los IDs del lore
+    let user_class_key = match user_class {
         "Code Warlock" => "warlock",
         "Task Paladin" => "paladin",
         "Mind Sage" => "sage",
@@ -163,7 +163,7 @@ pub fn draw(
         _ => "",
     };
 
-    // ClassStories muestra lore compartido (six_orders, council) + lore específico de la clase
+    // ClassStories muestra lore compartido (six_orders, council) + lore específico de la clase del usuario
     let filtered_lore_entries: Vec<&(String, String, String, String, bool, Option<String>)> = if cur_cat == LibraryCategory::ClassStories {
         lore_entries
             .iter()
@@ -171,11 +171,23 @@ pub fn draw(
                 e.1 == "Class"
                     && (e.0 == "class_six_orders"
                         || e.0 == "class_council_orders"
-                        || (!class_key.is_empty() && e.0.starts_with(&format!("class_{}_", class_key))))
+                        || (!user_class_key.is_empty()
+                            && e.0.starts_with(&format!("class_{}_", user_class_key))))
             })
             .collect()
     } else {
         lore_entries.iter().filter(|e| e.1 == cat_str).collect()
+    };
+
+    // Helper: extrae la clase corta del ID de la entrada (e.g. "class_warlock_5" → "Warlock")
+    let class_label_from_id = |id: &str| -> Option<(&str, Color)> {
+        if id.starts_with("class_warlock_")     { Some(("Warlock",     Color::Magenta)) }
+        else if id.starts_with("class_paladin_")      { Some(("Paladin",     Color::LightRed)) }
+        else if id.starts_with("class_sage_")         { Some(("Sage",        Color::Cyan)) }
+        else if id.starts_with("class_architect_")    { Some(("Architect",   Color::LightBlue)) }
+        else if id.starts_with("class_chronomancer_") { Some(("Chrono",      Color::LightYellow)) }
+        else if id.starts_with("class_accountant_")   { Some(("Accountant",  Color::Yellow)) }
+        else { None }
     };
 
     // Render Column 1: items de la categoría activa
@@ -189,6 +201,12 @@ pub fn draw(
                 items_unlocked.push(q.4 != "Locked");
             }
         }
+        LibraryCategory::ClassStories => {
+            for entry in &filtered_lore_entries {
+                items_lines.push(entry.2.clone());
+                items_unlocked.push(entry.4);
+            }
+        }
         _ => {
             for entry in &filtered_lore_entries {
                 items_lines.push(entry.2.clone());
@@ -200,6 +218,13 @@ pub fn draw(
     // IDs paralelos a items_lines — solo para MemoryFragments; el resto usa None
     let fragment_ids: Vec<Option<String>> = if cur_cat == LibraryCategory::MemoryFragments {
         filtered_lore_entries.iter().map(|e| Some(e.0.clone())).collect()
+    } else {
+        vec![None; items_lines.len()]
+    };
+
+    // Colores de clase para ClassStories — cada entrada lleva su color
+    let class_colors: Vec<Option<Color>> = if cur_cat == LibraryCategory::ClassStories {
+        filtered_lore_entries.iter().map(|e| class_label_from_id(&e.0).map(|(_, c)| c)).collect()
     } else {
         vec![None; items_lines.len()]
     };
@@ -223,7 +248,12 @@ pub fn draw(
                     _ => theme.muted,
                 });
 
-                let base_color = rarity_color.unwrap_or(theme.muted);
+                // Para ClassStories: color de clase si no está seleccionado
+                let class_color = class_colors.get(idx).and_then(|c| *c);
+
+                let base_color = rarity_color
+                    .or(class_color)
+                    .unwrap_or(theme.muted);
 
                 let style = if is_active {
                     Style::default()
@@ -250,14 +280,22 @@ pub fn draw(
             .collect()
     };
 
-    // El título de la columna de items muestra cuántos fragmentos encontró el user
+    // El título de la columna de items — fragmentos y class stories tienen títulos especiales
     let found_count = if cur_cat == LibraryCategory::MemoryFragments {
         filtered_lore_entries.iter().filter(|e| e.4).count()
     } else {
         0
     };
+    let unlocked_class_count = if cur_cat == LibraryCategory::ClassStories {
+        // Excluye las shared (six_orders / council_orders) del conteo de desbloqueadas por clase
+        filtered_lore_entries.iter().filter(|e| e.4 && e.0 != "class_six_orders" && e.0 != "class_council_orders").count()
+    } else {
+        0
+    };
     let items_title = if cur_cat == LibraryCategory::MemoryFragments {
         format!(" Memory Fragments | Found: {}/15 ", found_count)
+    } else if cur_cat == LibraryCategory::ClassStories {
+        format!(" Class Stories | Unlocked: {} ", unlocked_class_count)
     } else {
         format!(" {} ", cur_cat.name())
     };
@@ -441,6 +479,22 @@ pub fn draw(
 
         if !entry.4 {
             // Entrada bloqueada — ni modo, hay que ganársela primero
+            // Para Class Stories de otra clase, el mensaje explica que solo ese orden puede leerla
+            let lock_reason = if cur_cat == LibraryCategory::ClassStories {
+                if let Some((cls_name, _)) = class_label_from_id(&entry.0) {
+                    let is_user_class = !user_class_key.is_empty()
+                        && entry.0.starts_with(&format!("class_{}_", user_class_key));
+                    if is_user_class {
+                        format!("Advance in your class to unlock '{}'", entry.2)
+                    } else {
+                        format!("This chronicle belongs to the {} Order. Only members of that Order may read it.", cls_name)
+                    }
+                } else {
+                    format!("Requirement: Unlock the milestone related to '{}'", entry.2)
+                }
+            } else {
+                format!("Requirement: Unlock the milestone related to '{}'", entry.2)
+            };
             let locked_text = vec![
                 Line::from(""),
                 Line::from(Span::styled(
@@ -454,7 +508,7 @@ pub fn draw(
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    format!("Requirement: Unlock the milestone related to '{}'", entry.2),
+                    lock_reason,
                     Style::default().fg(theme.muted),
                 )),
             ];
@@ -477,6 +531,13 @@ pub fn draw(
                 None
             };
 
+            // Para ClassStories: extrae el nombre de la clase y su color del ID
+            let entry_class_info = if cur_cat == LibraryCategory::ClassStories {
+                class_label_from_id(&entry.0)
+            } else {
+                None
+            };
+
             let mut text = vec![
                 Line::from(vec![
                     Span::styled(" TITLE: ", Style::default().fg(theme.muted)),
@@ -492,6 +553,18 @@ pub fn draw(
                     Span::styled(cur_cat.name(), Style::default().fg(accent_color)),
                 ]),
             ];
+            if let Some((class_name, class_color)) = entry_class_info {
+                let is_user_class = !user_class_key.is_empty()
+                    && entry.0.starts_with(&format!("class_{}_", user_class_key));
+                let class_marker = if is_user_class { " (Your Class)" } else { "" };
+                text.push(Line::from(vec![
+                    Span::styled(" CLASS: ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        format!("{}{}", class_name, class_marker),
+                        Style::default().fg(class_color).add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+            }
             if let Some((rarity_label, rarity_color)) = frag_rarity {
                 text.push(Line::from(vec![
                     Span::styled(" RARITY:", Style::default().fg(theme.muted)),
@@ -532,11 +605,35 @@ pub fn draw(
                     Style::default().fg(Color::White),
                 )));
             }
+            // Línea vacía al final para que el último párrafo no quede pegado al borde
+            text.push(Line::from(""));
+
+            // Estima cuántas filas visuales ocupa el contenido con wrap, para el scrollbar
+            let panel_width = detail_inner.width.saturating_sub(4) as usize;
+            let total_visual_rows: usize = text.iter().map(|line| {
+                let len: usize = line.spans.iter().map(|s| s.content.len()).sum();
+                if len == 0 || panel_width == 0 { 1 } else { len.div_ceil(panel_width) }
+            }).sum();
 
             let p = Paragraph::new(text)
-                .wrap(ratatui::widgets::Wrap { trim: true })
+                .wrap(ratatui::widgets::Wrap { trim: false })
                 .scroll((scroll_offset, 0));
             f.render_widget(p, detail_inner);
+
+            // Scrollbar vertical — renderiza sobre el borde derecho del bloque de detalles
+            let scrollbar_color = if active_col == 2 { accent_color } else { theme.muted };
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("▲"))
+                .end_symbol(Some("▼"))
+                .thumb_symbol("█")
+                .thumb_style(Style::default().fg(scrollbar_color))
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(theme.muted));
+            let viewport_height = detail_inner.height as usize;
+            let scrollable = total_visual_rows.saturating_sub(viewport_height);
+            let mut scrollbar_state = ScrollbarState::new(scrollable)
+                .position(scroll_offset as usize);
+            f.render_stateful_widget(scrollbar, col_chunks[2], &mut scrollbar_state);
         }
         }
     }
@@ -545,9 +642,9 @@ pub fn draw(
     let inst_text = if active_col == 0 {
         "Press [Right Arrow] or [Tab] to browse entries | [Esc] back"
     } else if active_col == 1 {
-        "Press [Left Arrow] to select categories | [Right Arrow] to view details | [Space] to act on quest"
+        "Press [Left Arrow] to select categories | [Right Arrow] to read details | [Space] to act on quest"
     } else {
-        "Press [Left Arrow] to return to entries | [Up/Down Arrow] to scroll content"
+        "[Up/Down] scroll content | [Left Arrow] return to entries"
     };
     let footer_p = Paragraph::new(Span::styled(
         format!("  Keys: {}  ", inst_text),

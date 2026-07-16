@@ -112,7 +112,7 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             .iter()
             .find(|p| p.id == p_id)
             .map(|p| p.name.as_str())
-            .unwrap_or("Unknown Project")
+            .unwrap_or("Unknown Campaign")
     } else {
         "None (General Focus)"
     };
@@ -161,7 +161,7 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled(" Realm: ", Style::default().fg(theme.muted)),
+            Span::styled(" Campaign: ", Style::default().fg(theme.muted)),
             Span::styled(project_name, Style::default().fg(Color::White)),
             Span::styled("  |  Quest: ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -467,7 +467,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style_1)
-                .title(" 2. Bound Project "),
+                .title(" 2. Bound Campaign"),
         )
         .alignment(Alignment::Center);
     f.render_widget(card_1, picker_chunks[1]);
@@ -513,7 +513,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(border_style_2)
-                .title(" 3. Focused Task/Quest "),
+                .title(" 3. Focused Quest "),
         )
         .alignment(Alignment::Center);
     f.render_widget(card_2, picker_chunks[2]);
@@ -602,7 +602,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("   • Target Realm: ", Style::default().fg(theme.muted)),
+            Span::styled("   • Target Campaign: ", Style::default().fg(theme.muted)),
             Span::styled(project_str, Style::default().fg(Color::White)),
             Span::styled("  |  Active Quest: ", Style::default().fg(theme.muted)),
             Span::styled(task_str, Style::default().fg(theme.primary)),
