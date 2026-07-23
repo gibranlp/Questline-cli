@@ -835,6 +835,24 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         );
     }
 
+    // ── Full Sync Progress modal ──────────────────────────────────────────────
+    if let ModalType::SyncProgress { step, message } = &app.modal_state {
+        draw_cloud_progress_modal(
+            f,
+            app,
+            theme,
+            size,
+            accent_color,
+            *step,
+            message,
+            ["Preparing state", "Syncing devices", "Done"],
+            " Sync Failed ",
+            " Sync Complete ",
+            " Full Synchronization — Chronicle of the Æther ",
+            [20, 70, 100],
+        );
+    }
+
     // ── Cloud Restore Progress modal ──────────────────────────────────────────
     if let ModalType::CloudRestoreProgress { step, message } = &app.modal_state {
         draw_cloud_progress_modal(

@@ -204,6 +204,11 @@ pub enum ModalType {
         step: u8,
         message: String,
     },
+    SyncProgress {
+        // 0 = preparing, 1 = syncing, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
     CloudRestoreProgress {
         // 0 = downloading, 1 = importing, 2 = complete, 3 = failed
         step: u8,
@@ -1389,6 +1394,7 @@ impl App {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
                     if db.import_from_json(&decoded).is_ok() {
+                        let _ = App::set_pull_cursor_to_remote_head(&db, &client);
                         user = db.get_user()?;
                     }
                 }
@@ -2786,6 +2792,7 @@ impl App {
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
+                                                let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string()
                                                 ));
@@ -2829,6 +2836,7 @@ impl App {
                 Ok(true)
             }
             ModalType::CloudBackupProgress { step, .. }
+            | ModalType::SyncProgress { step, .. }
             | ModalType::CloudRestoreProgress { step, .. } => {
                 let s = step;
                 // Only let the user close when done (step 2) or failed (step 3)
@@ -4273,6 +4281,7 @@ impl App {
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
+                                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
                                             if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
@@ -10644,12 +10653,14 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_auto_sync(&mut self) -> Result<()> {
-        if !self.auto_sync {
-            return Ok(());
-        }
-
         // Apply result from completed background sync
         if self.sync_in_progress {
+            if let ModalType::SyncProgress { ref mut step, ref mut message } = self.modal_state {
+                if *step == 0 && self.intro_ticks % 12 == 0 {
+                    *step = 1;
+                    *message = "Publishing full local state and pulling new changes...".to_string();
+                }
+            }
             let result = self.sync_result.try_lock().ok().and_then(|mut g| g.take());
             if let Some(bg) = result {
                 self.sync_in_progress = false;
@@ -10657,6 +10668,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     Some(e) => {
                         self.sync_failure_count = self.sync_failure_count.saturating_add(1);
                         self.sync_status_msg = format!("Sync failed: {}", e);
+                        self.modal_state = ModalType::SyncProgress {
+                            step: 3,
+                            message: self.sync_status_msg.clone(),
+                        };
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         let _ = self.reload_data();
                     }
@@ -10671,6 +10686,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         }
                         self.last_sync_warlock_xp = 0;
                         self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
+                        self.modal_state = ModalType::SyncProgress {
+                            step: 2,
+                            message: format!("Full sync complete. {}", self.sync_status_msg),
+                        };
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         self.apply_class_passive("sync_complete", 0)?;
                         self.reload_data()?;
@@ -10680,6 +10699,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     }
                 }
             }
+            return Ok(());
+        }
+
+        if !self.auto_sync {
             return Ok(());
         }
 
@@ -10785,6 +10808,18 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
+    fn set_pull_cursor_to_remote_head(
+        db: &crate::database::Database,
+        client: &crate::services::api_client::ApiClient,
+    ) -> Result<()> {
+        let resp = client.send_request("GET", "sync/head", "")?;
+        let val: serde_json::Value = serde_json::from_str(&resp)?;
+        let seq = val["seq"].as_i64().unwrap_or(0);
+        db.set_setting("last_pull_seq", &seq.to_string())?;
+        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+        Ok(())
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -10837,15 +10872,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 };
                 match self.db.import_from_json(&decoded_json) {
                     Ok(_) => {
+                        let client = crate::services::api_client::ApiClient::new(
+                            &self.server_url,
+                            self.identity.clone(),
+                            &self.device_id,
+                        );
+                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                         self.reload_data()?;
                         self.notifications.push(Notification::info("Chronicle restored from cloud!".to_string()));
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
-                            message: "Restore complete! Pulling recent events...".to_string(),
+                            message: "Restore complete! Future sync starts from the current cloud state.".to_string(),
                         };
-                        // Pull all events since the backup — import_from_json already reset
-                        // last_pull_seq to 0 and cleared processed_remote_events, so the drain
-                        // loop in do_background_sync will catch the app up to server HEAD.
+                        // Backup restore is a full snapshot. Set the cursor to server HEAD first
+                        // so old event-log history cannot replay over the restored database.
                         self.start_background_sync();
                     }
                     Err(e) => {
@@ -11065,6 +11105,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
         self.sync_status_msg = "Syncing...".to_string();
+        self.modal_state = ModalType::SyncProgress {
+            step: 0,
+            message: "Preparing full synchronization...".to_string(),
+        };
         self.do_background_sync(true);
     }
 
