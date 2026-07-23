@@ -320,35 +320,24 @@ export async function catchupFromQuestline(webappApi, identity, onProgress = nul
 }
 
 // ── Background polling ────────────────────────────────────────────────────────
-// Runs two loops:
-//   - pullSync every 30s  — reads from webapp DB (fast, picks up webhook events)
-//   - catchupFromQuestline every 60s — pulls any CLI events that missed the webhook
+// Pulls from the webapp DB every 30s — picks up webhook-delivered CLI events
+// and any changes made in other browser tabs.
+// CLI catchup (catchupFromQuestline) is manual-only via Settings.
 
-export function startBackgroundSync(api, identity = null) {
-  let pullTimer    = null;
-  let catchupTimer = null;
-  let catchupRunning = false;
+export function startBackgroundSync(api) {
+  let pullTimer = null;
 
   const poll = async () => {
     try { await pullSync(api); } catch { /* retry next tick */ }
   };
 
-  const catchup = async () => {
-    if (catchupRunning || !identity) return;
-    catchupRunning = true;
-    try { await catchupFromQuestline(api, identity); } catch { /* retry next tick */ }
-    finally { catchupRunning = false; }
-  };
-
   const start = () => {
     poll();
-    pullTimer    = setInterval(poll,    30_000);
-    catchupTimer = setInterval(catchup, 60_000);
+    pullTimer = setInterval(poll, 30_000);
   };
 
   const stop = () => {
-    if (pullTimer)    { clearInterval(pullTimer);    pullTimer    = null; }
-    if (catchupTimer) { clearInterval(catchupTimer); catchupTimer = null; }
+    if (pullTimer) { clearInterval(pullTimer); pullTimer = null; }
   };
 
   const handleVisibility = () => {

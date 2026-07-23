@@ -269,10 +269,9 @@ fn draw_daily_quests(
     let total = daily_adventures.len();
 
     let rituals = app.db.get_rituals().unwrap_or_default();
-    let completed_rituals = app
-        .db
-        .get_ritual_history_for_date(chrono::Local::now().date_naive())
-        .unwrap_or_default();
+    let today = chrono::Local::now().date_naive();
+    let ritual_day_counts = app.db.get_ritual_day_counts(today).unwrap_or_default();
+    let ritual_streaks = app.db.get_all_ritual_streaks().unwrap_or_default();
 
     let mut items: Vec<ListItem> = Vec::new();
 
@@ -299,19 +298,15 @@ fn draw_daily_quests(
         ))));
 
         for (idx, r) in rituals.iter().enumerate() {
-            let is_done = completed_rituals.contains(&r.id);
+            let (count, target) = ritual_day_counts.get(&r.id).copied().unwrap_or((0, r.daily_target));
+            let is_done = count >= target;
             let is_sel = idx == app.selected_ritual_idx && !app.dashboard_task_focus;
-            let check = if is_done { "[x]" } else { "[ ]" };
             let cursor = if is_sel { "> " } else { "  " };
 
             let (cursor_style, text_style) = if is_sel {
                 (
-                    Style::default()
-                        .fg(theme.primary)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
                 )
             } else {
                 (
@@ -320,21 +315,49 @@ fn draw_daily_quests(
                 )
             };
 
+            // Check indicator: [x] when done, [N/M] when partial multi-target, [ ] when untouched
+            let (check_str, check_style) = if is_done {
+                ("[x]".to_string(), Style::default().fg(theme.success))
+            } else if target > 1 && count > 0 {
+                (format!("[{}/{}]", count, target), Style::default().fg(theme.warning))
+            } else {
+                ("[ ]".to_string(), Style::default())
+            };
+
+            let streak = *ritual_streaks.get(&r.id).unwrap_or(&0);
+            let streak_badge = if streak > 0 {
+                let milestone_marker = match streak {
+                    s if s >= 90 => " *90d*",
+                    s if s >= 85 => " *85d*",
+                    s if s >= 60 => " *60d*",
+                    s if s >= 45 => " *45d*",
+                    s if s >= 30 => " *30d*",
+                    s if s >= 15 => " *15d*",
+                    s if s >= 7  => " *7d*",
+                    s if s >= 3  => " *3d*",
+                    _            => "",
+                };
+                format!(" ~{}d{}", streak, milestone_marker)
+            } else {
+                String::new()
+            };
+
+            let streak_color = match streak {
+                s if s >= 30 => Color::Yellow,
+                s if s >= 7  => theme.warning,
+                s if s > 0   => Color::Cyan,
+                _            => theme.muted,
+            };
+
             items.push(ListItem::new(Line::from(vec![
                 Span::styled(cursor, cursor_style),
-                Span::styled(
-                    format!("{} ", check),
-                    if is_done {
-                        Style::default().fg(theme.success)
-                    } else {
-                        Style::default()
-                    },
-                ),
+                Span::styled(format!("{} ", check_str), check_style),
                 Span::styled(r.name.as_str(), text_style),
                 Span::styled(
                     format!(" (+{} XP)", r.reward_xp),
                     Style::default().fg(theme.muted),
                 ),
+                Span::styled(streak_badge, Style::default().fg(streak_color)),
             ])));
         }
     }
@@ -1032,6 +1055,97 @@ fn draw_fellowship_panel(
     f.render_widget(p, area);
 }
 
+// ─── Hydration widget ─────────────────────────────────────────────────────────
+
+fn draw_hydration_widget(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
+    if !app.hydration_enabled {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "The Well awaits,",
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(Span::styled(
+                "Adventurer.",
+                Style::default().fg(theme.muted),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[h]", Style::default().fg(theme.primary)),
+                Span::styled(" Awaken it", Style::default().fg(theme.muted)),
+            ]),
+        ];
+        let p = Paragraph::new(lines)
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(theme.muted))
+                    .title(Span::styled(
+                        " Hydration ",
+                        Style::default().fg(theme.muted),
+                    )),
+            );
+        f.render_widget(p, area);
+        return;
+    }
+
+    let glasses = app.hydration_glasses;
+    let target = app.hydration_target;
+    let bar_width = (area.width as usize).saturating_sub(4).min(20);
+    let filled = if target > 0 { (glasses * bar_width as i32 / target).min(bar_width as i32) as usize } else { 0 };
+    let progress = render_progress_bar(filled, bar_width, bar_width);
+
+    let next_str = if let Some(at) = app.hydration_next_reminder_at {
+        let secs = at.saturating_duration_since(std::time::Instant::now()).as_secs();
+        if secs == 0 {
+            "Now".to_string()
+        } else {
+            format!("{}m {:02}s", secs / 60, secs % 60)
+        }
+    } else {
+        "--".to_string()
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Next  ", Style::default().fg(theme.muted)),
+            Span::styled(next_str, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("Today ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}/{}", glasses, target),
+                Style::default().fg(if glasses >= target { theme.success } else { Color::White })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            format!("[{}]", progress),
+            Style::default().fg(if glasses >= target { theme.success } else { theme.primary }),
+        )]),
+        Line::from(vec![
+            Span::styled("[d]", Style::default().fg(theme.primary)),
+            Span::styled(" Drink  ", Style::default().fg(theme.muted)),
+            Span::styled("[h]", Style::default().fg(theme.primary)),
+            Span::styled(" Config", Style::default().fg(theme.muted)),
+        ]),
+    ];
+
+    let p = Paragraph::new(lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.secondary))
+            .title(Span::styled(
+                " Hydration ",
+                Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+            )),
+    );
+    f.render_widget(p, area);
+}
+
 // ─── Función principal de renderizado ────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
@@ -1106,7 +1220,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .split(main_cols[1]);
 
     draw_campaign_header(f, app, theme, right_rows[0], &plan);
-    draw_main_quest(f, theme, right_rows[1], plan.main_quest.as_ref());
+
+    // Always split the main-quest row — show hydration widget whether enabled or not
+    let quest_row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .split(right_rows[1]);
+    draw_main_quest(f, theme, quest_row[0], plan.main_quest.as_ref());
+    draw_hydration_widget(f, app, theme, quest_row[1]);
 
     // Fila de siguiente quest y quests diarias
     let mid_row = Layout::default()
@@ -1248,7 +1369,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                     Style::default().fg(theme.muted)
                 }
             };
-            let freqs = ["Daily", "Weekdays", "Weekly", "Monthly", "Custom"];
+            let freqs = ["Daily", "2x Daily", "3x Daily", "5x Daily", "Weekdays", "Weekly", "Monthly"];
             let freq_str = format!("<  {}  >", freqs[*frequency_idx]);
 
             f.render_widget(
@@ -1293,6 +1414,150 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                 ))
                 .alignment(Alignment::Center),
                 content[5],
+            );
+        }
+        ModalType::HydrationReminder => {
+            let modal_area = centered_rect(40, 35, area);
+            f.render_widget(Clear, modal_area);
+            f.render_widget(Block::default().style(Style::default().bg(theme.background)), modal_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(theme.secondary))
+                .title(Span::styled(
+                    " Hydration Reminder ",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+            let inner = block.inner(modal_area);
+            f.render_widget(block, modal_area);
+            let content = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            f.render_widget(Paragraph::new(""), content[0]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    "  Time to drink some water!",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                )),
+                content[1],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  Today: {}/{} glasses", app.hydration_glasses, app.hydration_target),
+                    Style::default().fg(theme.muted),
+                )),
+                content[2],
+            );
+            let bar_w = inner.width.saturating_sub(4) as usize;
+            let filled = if app.hydration_target > 0 {
+                (app.hydration_glasses * bar_w as i32 / app.hydration_target).min(bar_w as i32) as usize
+            } else { 0 };
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    format!("  [{}]", render_progress_bar(filled, bar_w, bar_w)),
+                    Style::default().fg(theme.secondary),
+                )),
+                content[3],
+            );
+            f.render_widget(Paragraph::new(""), content[4]);
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " [d] Drink  [s] Snooze 15m  [x] Dismiss ",
+                    Style::default().fg(theme.muted),
+                ))
+                .alignment(Alignment::Center),
+                content[5],
+            );
+        }
+        ModalType::HydrationSettings {
+            interval_idx,
+            from_hour,
+            to_hour,
+            target,
+            pause_focus,
+            focus_idx,
+        } => {
+            let modal_area = centered_rect(52, 55, area);
+            f.render_widget(Clear, modal_area);
+            f.render_widget(Block::default().style(Style::default().bg(theme.background)), modal_area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(theme.secondary))
+                .title(Span::styled(
+                    " Hydration Settings ",
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+            let content = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Length(3), // interval
+                    Constraint::Length(3), // from
+                    Constraint::Length(3), // to
+                    Constraint::Length(3), // target
+                    Constraint::Length(3), // pause focus
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
+                .split(block.inner(modal_area));
+            f.render_widget(block, modal_area);
+
+            let border = |idx: usize| {
+                if *focus_idx == idx {
+                    Style::default().fg(theme.primary)
+                } else {
+                    Style::default().fg(theme.muted)
+                }
+            };
+
+            let intervals = [30i32, 45, 60, 90, 120];
+            let interval_str = format!("<  {} min  >", intervals[*interval_idx]);
+            f.render_widget(
+                Paragraph::new(interval_str)
+                    .alignment(Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(border(0)).title(" 1. Reminder Interval ")),
+                content[1],
+            );
+            f.render_widget(
+                Paragraph::new(format!("<  {:02}:00  >", from_hour))
+                    .alignment(Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(border(1)).title(" 2. Active From (hour) ")),
+                content[2],
+            );
+            f.render_widget(
+                Paragraph::new(format!("<  {:02}:00  >", to_hour))
+                    .alignment(Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(border(2)).title(" 3. Active To (hour) ")),
+                content[3],
+            );
+            f.render_widget(
+                Paragraph::new(format!("<  {}  glasses  >", target))
+                    .alignment(Alignment::Center)
+                    .block(Block::default().borders(Borders::ALL).border_style(border(3)).title(" 4. Daily Target ")),
+                content[4],
+            );
+            let pause_str = if *pause_focus { "[x] Pause during focus sessions" } else { "[ ] Pause during focus sessions" };
+            f.render_widget(
+                Paragraph::new(pause_str)
+                    .block(Block::default().borders(Borders::ALL).border_style(border(4)).title(" 5. Focus Pause ")),
+                content[5],
+            );
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    " [Tab] switch  |  [<->] adjust  |  [Enter] save  |  [x] Disable  |  [Esc] cancel ",
+                    Style::default().fg(theme.muted),
+                ))
+                .alignment(Alignment::Center),
+                content[7],
             );
         }
         _ => {}

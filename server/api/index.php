@@ -466,6 +466,35 @@ if ($route === 'webapp/register') {
     exit;
 }
 
+// ── Webapp check-code — validates an access code without consuming it ──────────
+if ($route === 'webapp/check-code') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+        exit;
+    }
+    $rawBody = file_get_contents('php://input');
+    $data = json_decode($rawBody, true);
+    $code = trim($data['access_code'] ?? '');
+
+    if (empty($code)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Access code required"]);
+        exit;
+    }
+
+    $stmt = $pdo->prepare("SELECT linked_user_id FROM access_codes WHERE code = ? AND (redeemed_by_user_id IS NULL OR redeemed_by_user_id = '')");
+    $stmt->execute([$code]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        echo json_encode(["valid" => false]);
+    } else {
+        echo json_encode(["valid" => true, "linked" => !empty($row['linked_user_id'])]);
+    }
+    exit;
+}
+
 // ── Webapp login — ruta pública, devuelve el blob cifrado del key ──────────────
 if ($route === 'webapp/login') {
     if ($_SERVER['REQUEST_METHOD'] !== 'POST') {

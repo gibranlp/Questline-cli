@@ -330,7 +330,7 @@
   .library-page {
     padding: 2rem 2.5rem;
     max-width: 1600px;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
   }
 
   .page-header {
@@ -536,7 +536,7 @@
   }
 
   .detail-content {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
     font-size: 0.82rem;
     color: #d4d4d4;
     line-height: 1.75;

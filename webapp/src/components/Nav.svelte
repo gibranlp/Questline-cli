@@ -118,9 +118,13 @@
 
 <style>
   .sidebar {
-    width: 220px;
+    width: 300px;
     min-height: 100vh;
-    background: rgba(0,0,0,0.8);
+    background-color: #0a0a0a;
+    background-image: var(--menu-bg);
+    background-position: top center;
+    background-size: cover;
+    background-repeat: no-repeat;
     border-right: 1px solid #1c1c1c;
     display: flex;
     flex-direction: column;

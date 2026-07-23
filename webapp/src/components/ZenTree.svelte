@@ -62,7 +62,7 @@
 
 <style>
   .zen-tree {
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
     text-align: center;
   }
 

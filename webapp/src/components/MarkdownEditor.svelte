@@ -103,7 +103,7 @@
     border: 1px solid #1c1c1c;
     border-radius: 6px;
     color: #d4d4d4;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
     font-size: 0.88rem;
     line-height: 1.7;
     padding: 1rem;

@@ -312,10 +312,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
             }
         }
 
-        header("Location: " . $_SERVER['PHP_SELF'] . "?msg=" . urlencode($success_msg));
+        $return_suffix = '';
+        if (in_array($action, ['lore_add','lore_edit','lore_delete'])) {
+            $return_suffix = '&lore_sub=lore#lore';
+        } elseif (in_array($action, ['quest_add','quest_edit','quest_delete'])) {
+            $return_suffix = '&lore_sub=quest#lore';
+        }
+        header("Location: " . $_SERVER['PHP_SELF'] . "?msg=" . urlencode($success_msg) . $return_suffix);
         exit;
     } catch (Exception $e) {
-        header("Location: " . $_SERVER['PHP_SELF'] . "?err=" . urlencode("Action failed: " . $e->getMessage()));
+        $return_suffix = '';
+        if (in_array($action, ['lore_add','lore_edit','lore_delete'])) {
+            $return_suffix = '&lore_sub=lore#lore';
+        } elseif (in_array($action, ['quest_add','quest_edit','quest_delete'])) {
+            $return_suffix = '&lore_sub=quest#lore';
+        }
+        header("Location: " . $_SERVER['PHP_SELF'] . "?err=" . urlencode("Action failed: " . $e->getMessage()) . $return_suffix);
         exit;
     }
 }
@@ -579,7 +591,9 @@ if ($edit_quest_key) {
             --bg-border:  #1c1c1c;
             --text:       #d4d4d4;
             --text-dim:   #999;
+            --text-muted: #999;
             --text-dimmer:#2a2a2a;
+            --border:     #1c1c1c;
 
             --success:    #10b981;
             --warning:    var(--accountant);
@@ -1306,8 +1320,8 @@ if ($edit_quest_key) {
 
         <!-- Tab switcher -->
         <div style="display:flex;gap:.5rem;margin-bottom:1.5rem;">
-            <button class="btn" id="tab-lore-btn"  onclick="switchLoreTab('lore')"  style="background:var(--warlock)">Lore Entries (<?= count($lore_entries) ?>)</button>
-            <button class="btn" id="tab-quest-btn" onclick="switchLoreTab('quest')" style="background:var(--bg-card);border:1px solid var(--border)">Class Quests (<?= count($lore_quests) ?>)</button>
+            <button type="button" class="btn" id="tab-lore-btn"  onclick="switchLoreTab('lore')"  style="background:var(--warlock)">Lore Entries (<?= count($lore_entries) ?>)</button>
+            <button type="button" class="btn" id="tab-quest-btn" onclick="switchLoreTab('quest')" style="background:var(--bg-card);border:1px solid var(--border)">Class Quests (<?= count($lore_quests) ?>)</button>
         </div>
 
         <!-- ── LORE ENTRIES TAB ─────────────────────────────────────────────── -->
@@ -1343,14 +1357,16 @@ if ($edit_quest_key) {
             <?php endif; ?>
 
             <!-- Category filter -->
-            <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:.5rem;" id="lore-cat-filters">
+            <div style="display:flex;gap:.5rem;flex-wrap:wrap;align-items:center;margin-bottom:.5rem;" id="lore-cat-filters">
                 <?php foreach (['All','World','Class','Memory','Achievement'] as $cat): ?>
-                    <button class="btn <?= $cat==='All'?'active-cat':'' ?>"
+                    <button type="button" class="btn <?= $cat==='All'?'active-cat':'' ?>"
+                            data-cat="<?= $cat ?>"
                             style="padding:.3rem .75rem;font-size:.75rem;background:<?= $cat==='All'?'var(--warlock)':'var(--bg-card)' ?>;border:1px solid var(--border);"
                             onclick="filterLore('<?= $cat ?>')">
                         <?= $cat ?>
                     </button>
                 <?php endforeach; ?>
+                <span id="lore-filter-count" style="font-size:.72rem;color:var(--chrono);margin-left:.5rem;"></span>
             </div>
             <!-- Class sub-filter (only visible when Class category is active) -->
             <div id="class-subfilters" style="display:none;gap:.4rem;flex-wrap:wrap;margin-bottom:1rem;padding:.5rem;background:rgba(168,85,247,.07);border:1px solid rgba(168,85,247,.2);border-radius:6px;">
@@ -1365,10 +1381,10 @@ if ($edit_quest_key) {
                     'Arch Accountant'   => 'var(--accountant)',
                 ];
                 ?>
-                <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('All')">All</button>
-                <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('shared')">Shared</button>
+                <button type="button" class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('All')">All</button>
+                <button type="button" class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterLoreClass('shared')">Shared</button>
                 <?php foreach ($class_colors_map as $cls => $col): ?>
-                    <button class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid <?= $col ?>;color:<?= $col ?>;" onclick="filterLoreClass(<?= json_encode($cls) ?>)">
+                    <button type="button" class="btn" style="padding:.25rem .6rem;font-size:.7rem;background:var(--bg-card);border:1px solid <?= $col ?>;color:<?= $col ?>;" onclick="filterLoreClass(<?= json_encode($cls) ?>)">
                         <?= htmlspecialchars($cls) ?>
                     </button>
                 <?php endforeach; ?>
@@ -1496,9 +1512,9 @@ if ($edit_quest_key) {
             sort($all_classes);
             ?>
             <div style="display:flex;gap:.5rem;flex-wrap:wrap;margin-bottom:1rem;" id="quest-class-filters">
-                <button class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--accountant);border:1px solid var(--border);" onclick="filterQuests('All')">All</button>
+                <button type="button" class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--accountant);border:1px solid var(--border);" onclick="filterQuests('All')">All</button>
                 <?php foreach ($all_classes as $cls): ?>
-                    <button class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterQuests('<?= htmlspecialchars($cls) ?>')">
+                    <button type="button" class="btn" style="padding:.3rem .75rem;font-size:.75rem;background:var(--bg-card);border:1px solid var(--border);" onclick="filterQuests('<?= htmlspecialchars($cls) ?>')">
                         <?= htmlspecialchars($cls) ?>
                     </button>
                 <?php endforeach; ?>
@@ -1581,7 +1597,16 @@ if ($edit_quest_key) {
         (function () {
             const tab = location.hash.replace('#', '') || 'access';
             const valid = ['access', 'users', 'system', 'lore'];
-            switchTab(valid.includes(tab) ? tab : 'access');
+            const activeTab = valid.includes(tab) ? tab : 'access';
+            switchTab(activeTab);
+            if (activeTab === 'lore') {
+                try {
+                    const savedLoreTab = sessionStorage.getItem('loreMgrTab') || 'lore';
+                    switchLoreTab(savedLoreTab);
+                    const savedLoreCat = sessionStorage.getItem('loreCat') || 'All';
+                    if (savedLoreCat !== 'All') filterLore(savedLoreCat);
+                } catch(e) {}
+            }
         })();
 
         function copyKey(btn) {
@@ -1614,6 +1639,7 @@ if ($edit_quest_key) {
 
         // ── Lore Library tab switching ────────────────────────────────────────
         function switchLoreTab(tab) {
+            try { sessionStorage.setItem('loreMgrTab', tab); } catch(e) {}
             const isLore = tab === 'lore';
             document.getElementById('lore-entries').style.display = isLore ? '' : 'none';
             document.getElementById('lore-quests').style.display  = isLore ? 'none' : '';
@@ -1625,14 +1651,15 @@ if ($edit_quest_key) {
         let _currentLoreClass = 'All';
 
         function filterLore(cat) {
+            console.log('[Lore filter] filterLore called with cat =', cat);
+            try { sessionStorage.setItem('loreCat', cat); } catch(e) {}
             _currentLoreCat = cat;
             _currentLoreClass = 'All';
             applyLoreFilters();
-            // Muestra el sub-filtro de clase solo cuando está activo el filtro "Class"
             const subFilters = document.getElementById('class-subfilters');
             if (subFilters) subFilters.style.display = (cat === 'Class' || cat === 'All') ? 'flex' : 'none';
             document.querySelectorAll('#lore-cat-filters .btn').forEach(b => {
-                b.style.background = (b.textContent.trim() === cat) ? 'var(--warlock)' : 'var(--bg-card)';
+                b.style.background = (b.dataset.cat === cat) ? 'var(--warlock)' : 'var(--bg-card)';
             });
         }
 
@@ -1647,23 +1674,28 @@ if ($edit_quest_key) {
         }
 
         function applyLoreFilters() {
-            document.querySelectorAll('#lore-table tbody tr').forEach(tr => {
-                const catMatch = (_currentLoreCat === 'All' || tr.dataset.cat === _currentLoreCat);
+            const rows = document.querySelectorAll('#lore-table tbody tr');
+            console.log('[Lore filter] applyLoreFilters — rows found:', rows.length, '| cat filter:', _currentLoreCat);
+            let visible = 0;
+            rows.forEach(tr => {
+                const rowCat = tr.getAttribute('data-cat');
+                const catMatch = (_currentLoreCat === 'All' || rowCat === _currentLoreCat);
                 let classMatch = true;
-                if (_currentLoreClass !== 'All' && tr.dataset.cat === 'Class') {
-                    if (_currentLoreClass === 'shared') {
-                        classMatch = (tr.dataset.class === 'shared');
-                    } else {
-                        classMatch = (tr.dataset.class === _currentLoreClass);
-                    }
+                if (_currentLoreClass !== 'All' && rowCat === 'Class') {
+                    classMatch = (tr.getAttribute('data-class') === (_currentLoreClass === 'shared' ? 'shared' : _currentLoreClass));
                 }
-                tr.style.display = (catMatch && classMatch) ? '' : 'none';
+                const show = catMatch && classMatch;
+                tr.style.display = show ? '' : 'none';
+                if (show) visible++;
             });
+            console.log('[Lore filter] visible rows after filter:', visible);
+            const badge = document.getElementById('lore-filter-count');
+            if (badge) badge.textContent = _currentLoreCat === 'All' ? '' : visible + ' shown';
         }
 
         function filterQuests(cls) {
             document.querySelectorAll('#quest-table tbody tr').forEach(tr => {
-                tr.style.display = (cls === 'All' || tr.dataset.class === cls) ? '' : 'none';
+                tr.style.display = (cls === 'All' || tr.getAttribute('data-class') === cls) ? '' : 'none';
             });
             document.querySelectorAll('#quest-class-filters .btn').forEach(b => {
                 const active = b.textContent.trim() === cls;
@@ -1684,10 +1716,17 @@ if ($edit_quest_key) {
             show('unlock_chapter_id',  v === 'chapter_reward');
         }
 
-        // Auto-switch to quest tab if URL has edit_quest
+        // Auto-switch to lore tab on edit or post-save redirect
         const _qs = new URLSearchParams(location.search);
-        if (_qs.has('edit_lore') || _qs.has('edit_quest')) switchTab('lore');
-        if (_qs.has('edit_quest')) switchLoreTab('quest');
+        if (_qs.has('edit_lore') || _qs.has('edit_quest') || _qs.has('lore_sub')) {
+            switchTab('lore');
+            const targetLoreTab = (_qs.has('edit_quest') || _qs.get('lore_sub') === 'quest') ? 'quest' : 'lore';
+            switchLoreTab(targetLoreTab);
+            if (targetLoreTab === 'lore') {
+                const savedLoreCat = sessionStorage.getItem('loreCat') || 'All';
+                if (savedLoreCat !== 'All') filterLore(savedLoreCat);
+            }
+        }
     </script>
 </body>
 </html>

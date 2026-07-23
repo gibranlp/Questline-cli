@@ -135,6 +135,18 @@ impl AudioPlayer {
         self.play_effect_bytes(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
     }
 
+    pub fn play_notification(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/notification.wav"));
+    }
+
+    pub fn play_water_alert(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/water-alert.wav"));
+    }
+
+    pub fn play_focus_end(&self) {
+        self.play_effect_bytes(include_bytes!("../../assets/sounds/focus-end.wav"));
+    }
+
     pub fn play_open_tasks(&self) {
         self.play_effect_bytes(include_bytes!("../../assets/sounds/OpenTasks.wav"));
     }
@@ -725,5 +737,14 @@ mod tests {
 
         let cursor5 = std::io::Cursor::new(include_bytes!("../../assets/sounds/OpenTasks.wav"));
         let _decoder5 = rodio::Decoder::new(cursor5).expect("Failed to decode OpenTasks.wav");
+
+        let cursor6 = std::io::Cursor::new(include_bytes!("../../assets/sounds/notification.wav"));
+        let _decoder6 = rodio::Decoder::new(cursor6).expect("Failed to decode notification.wav");
+
+        let cursor7 = std::io::Cursor::new(include_bytes!("../../assets/sounds/water-alert.wav"));
+        let _decoder7 = rodio::Decoder::new(cursor7).expect("Failed to decode water-alert.wav");
+
+        let cursor8 = std::io::Cursor::new(include_bytes!("../../assets/sounds/focus-end.wav"));
+        let _decoder8 = rodio::Decoder::new(cursor8).expect("Failed to decode focus-end.wav");
     }
 }
