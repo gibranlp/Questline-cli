@@ -961,6 +961,15 @@ try {
             $events = $stmt->fetchAll();
             echo json_encode($events);
             break;
+
+        case 'sync/head':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            $stmt = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_events WHERE user_id = ?");
+            $stmt->execute([$userId]);
+            echo json_encode(["seq" => (int)$stmt->fetchColumn()]);
+            break;
             
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
         case 'invite':
