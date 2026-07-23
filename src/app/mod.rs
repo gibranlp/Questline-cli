@@ -198,6 +198,12 @@ pub enum ModalType {
     RestoreIdentity {
         input: String,
     },
+    // Progreso de backup/restore en la nube — se actualiza desde el hilo de fondo
+    CloudRestoreProgress {
+        // 0 = downloading, 1 = importing, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
     LocalMusicFolder {
         input: String,
         suggestions: Vec<String>,
@@ -662,6 +668,8 @@ pub struct App {
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
     // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
     pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    // El restore desde la nube también corre en hilo aparte — comunica pasos al hilo principal
+    pub cloud_restore_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
@@ -1461,6 +1469,7 @@ impl App {
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cloud_restore_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
             last_chat_poll: std::time::Instant::now()
@@ -2720,6 +2729,17 @@ impl App {
                                 self.sync_status_msg = "Invalid transfer code: not valid base64".to_string();
                             }
                         }
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::CloudRestoreProgress { step, .. } => {
+                let s = step;
+                // Only let the user close when done (step 2) or failed (step 3)
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') if s >= 2 => {
+                        self.modal_state = ModalType::None;
                     }
                     _ => {}
                 }
@@ -5081,45 +5101,37 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     if self.config.sync_enabled {
-                        self.sync_status_msg = "Restoring Backup...".to_string();
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
-                            &self.device_id,
-                        );
-                        match client.send_request("GET", "recovery/latest", "") {
-                            Ok(json) => {
-                                if !json.trim().is_empty() {
-                                    let decoded_json = if let Ok(decoded_bytes) = {
-                                        use base64::{
-                                            engine::general_purpose::STANDARD, Engine as _,
-                                        };
-                                        STANDARD.decode(json.trim())
-                                    } {
-                                        String::from_utf8(decoded_bytes)
-                                            .unwrap_or_else(|_| json.clone())
-                                    } else {
-                                        json.clone()
-                                    };
-
-                                    match self.db.import_from_json(&decoded_json) { Ok(_) => {
-                                        self.sync_status_msg =
-                                            "Cloud Restore Complete! Reloading...".to_string();
-                                        self.reload_data()?;
-                                        self.notifications.push(Notification::info("Database Restored from Cloud!".to_string()));
-                                    } _ => {
-                                        self.sync_status_msg =
-                                            "Restore Failed: Invalid data structure".to_string();
-                                    }}
-                                } else {
-                                    self.sync_status_msg =
-                                        "Restore Failed: Empty backup content".to_string();
+                        // Show progress modal immediately and run the restore in the background
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 0,
+                            message: "Contacting the Æther...".to_string(),
+                        };
+                        let result_slot = std::sync::Arc::clone(&self.cloud_restore_result);
+                        let server_url = self.server_url.clone();
+                        let identity = self.identity.clone();
+                        let device_id = self.device_id.clone();
+                        std::thread::spawn(move || {
+                            let outcome: Result<String, String> = (|| {
+                                let client = crate::services::api_client::ApiClient::new(
+                                    &server_url, identity, &device_id,
+                                );
+                                let json = client.send_request("GET", "recovery/latest", "")
+                                    .map_err(|e| {
+                                        if e.to_string().contains("404") {
+                                            "No backup found for this identity. On a new device, use [i] Restore Identity first, then [r].".to_string()
+                                        } else {
+                                            format!("Download failed: {}", e)
+                                        }
+                                    })?;
+                                if json.trim().is_empty() {
+                                    return Err("Backup content is empty".to_string());
                                 }
+                                Ok(json)
+                            })();
+                            if let Ok(mut slot) = result_slot.lock() {
+                                *slot = Some(outcome);
                             }
-                            Err(e) => {
-                                self.sync_status_msg = format!("Restore Failed: {}", e);
-                            }
-                        }
+                        });
                     } else {
                         self.sync_status_msg = "Restore requires Cloud Sync enabled".to_string();
                     }
@@ -10646,6 +10658,64 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
+    /// Polls the cloud restore background thread and advances the progress modal through steps.
+    pub fn tick_cloud_restore(&mut self) -> Result<()> {
+        // Only drive this if the progress modal is showing in downloading state
+        let is_downloading = matches!(
+            &self.modal_state,
+            ModalType::CloudRestoreProgress { step: 0, .. }
+        );
+        if !is_downloading {
+            return Ok(());
+        }
+        let outcome = if let Ok(mut slot) = self.cloud_restore_result.lock() {
+            slot.take()
+        } else {
+            return Ok(());
+        };
+        let Some(result) = outcome else { return Ok(()); };
+
+        match result {
+            Err(msg) => {
+                self.modal_state = ModalType::CloudRestoreProgress {
+                    step: 3,
+                    message: msg,
+                };
+            }
+            Ok(json) => {
+                // Step 1: importing
+                self.modal_state = ModalType::CloudRestoreProgress {
+                    step: 1,
+                    message: "Importing chronicle data...".to_string(),
+                };
+                let decoded_json = {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    STANDARD.decode(json.trim())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or(json)
+                };
+                match self.db.import_from_json(&decoded_json) {
+                    Ok(_) => {
+                        self.reload_data()?;
+                        self.notifications.push(Notification::info("Chronicle restored from cloud!".to_string()));
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 2,
+                            message: "Restore complete! Press [Esc] to close.".to_string(),
+                        };
+                    }
+                    Err(e) => {
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 3,
+                            message: format!("Import failed: {}", e),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn tick_chat_poll(&mut self) -> Result<()> {
         if !self.config.sync_enabled {
             return Ok(());
@@ -10877,7 +10947,22 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
                     &db, &identity, &device_id, Some(server_url.as_str()),
                 )?;
-                let (pushed, pulled, conflicts) = sync_engine.sync()?;
+                let (pushed, first_pulled, mut conflicts) = sync_engine.sync()?;
+                // Drain: a pull returns up to 500 events per call. If exactly 500 came back
+                // there are likely more waiting — keep pulling until the batch is smaller.
+                // This matters after a restore when last_pull_seq resets to 0 and the device
+                // must catch up on thousands of events instead of waiting 30s per batch.
+                let mut total_pulled = first_pulled;
+                let mut last_batch = first_pulled;
+                let mut drain_iters = 0;
+                while last_batch >= 500 && drain_iters < 100 {
+                    let (_, more, more_conflicts) = sync_engine.sync()?;
+                    conflicts.extend(more_conflicts);
+                    total_pulled += more;
+                    last_batch = more;
+                    drain_iters += 1;
+                }
+                let pulled = total_pulled;
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);
@@ -11021,6 +11106,29 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if !conflicts.is_empty() {
                     let conflict_count = db.get_setting("conflict_count")?.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                     let _ = db.set_setting("conflict_count", &(conflict_count + conflicts.len() as i32).to_string());
+                }
+
+                // Auto-backup once every 24 h so [r] Restore always has something to fetch.
+                // Without this the server only has a backup if the user manually pressed [e].
+                let should_backup = {
+                    let last_ts = db.get_setting("last_auto_backup")?.unwrap_or_default();
+                    if last_ts.is_empty() {
+                        true
+                    } else {
+                        chrono::DateTime::parse_from_rfc3339(&last_ts)
+                            .map(|t| {
+                                let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+                                age > chrono::Duration::hours(24)
+                            })
+                            .unwrap_or(true)
+                    }
+                };
+                if should_backup {
+                    if let Ok(json) = db.export_to_json() {
+                        if client.send_request("POST", "recovery", &json).is_ok() {
+                            let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                        }
+                    }
                 }
 
                 Ok((pushed, pulled, conflicts))
