@@ -13,7 +13,8 @@ function load_env() {
         __DIR__ . '/.env',
         dirname(__DIR__) . '/.env',
         __DIR__ . '/api/.env',
-        __DIR__ . '/admin/.env'
+        __DIR__ . '/admin/.env',
+        __DIR__ . '/webapp-api/.env',
     ];
     
     $envPath = null;

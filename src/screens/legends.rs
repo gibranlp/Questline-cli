@@ -120,7 +120,7 @@ pub fn draw(
         ]),
         Line::from(vec![
             Span::styled(
-                "  Tasks Completed:       ",
+                "  Quests Completed:      ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
@@ -130,11 +130,11 @@ pub fn draw(
         ]),
         Line::from(vec![
             Span::styled(
-                "  Projects Completed:    ",
+                "  Campaigns Completed:  ",
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
-                format!("{} Projects", stats.projects_completed),
+                format!("{} Campaigns", stats.projects_completed),
                 Style::default().fg(Color::Magenta),
             ),
         ]),

@@ -228,7 +228,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         .split(size);
 
     // 1. Header (Project Name)
-    let header_text = format!("Realm War Room: {}", project.name);
+    let header_text = format!("Campaign War Room: {}", project.name);
     let header = Paragraph::new(header_text)
         .style(
             Style::default()
@@ -472,7 +472,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             recurrence,
         } => {
             let is_step = parent_task_id.is_some();
-            let modal_title = if is_step { " Create Step Quest " } else { " Create Task Quest " };
+            let modal_title = if is_step { " Create Step " } else { " Create Quest " };
             draw_task_modal(
                 f,
                 modal_title,
@@ -510,7 +510,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             let steps_opt = if *is_step { None } else { Some(steps.as_slice()) };
             draw_task_modal(
                 f,
-                " Edit Task Quest ",
+                " Edit Quest ",
                 title,
                 desc,
                 *desc_cursor,
@@ -583,7 +583,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     } = overlay
     {
         let is_step = parent_task_id.is_some();
-        let modal_title = if is_step { " Create Step Quest " } else { " Create Task Quest " };
+        let modal_title = if is_step { " Create Step " } else { " Create Quest " };
         draw_task_modal(
             f,
             modal_title,
@@ -676,7 +676,7 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         Line::from(vec![k("  m"), d("           New milestone")]),
         Line::from(vec![k("  Space"), d("       Toggle milestone")]),
         Line::from(vec![k("  Delete"), d("      Remove milestone")]),
-        Line::from(vec![k("  c"), d("           Conquer project")]),
+        Line::from(vec![k("  c"), d("           Conquer campaign")]),
         Line::from(vec![]),
         Line::from(vec![h("  SORT OPTIONS  "), m("(press s to cycle)")]),
         Line::from(vec![m("  Created Date → Due Date → Priority → A→Z")]),
@@ -1072,7 +1072,7 @@ fn draw_tasks_tab(
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border))
-                .title(" Task Ledger "),
+                .title(" Quest Ledger "),
         )
     } else {
         let t = tasks[selected_idx];
@@ -1088,7 +1088,7 @@ fn draw_tasks_tab(
         let mut text = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Task Title:  ", Style::default().fg(theme.muted)),
+                Span::styled("  Quest Title: ", Style::default().fg(theme.muted)),
                 Span::styled(
                     &t.title,
                     Style::default()
@@ -1193,7 +1193,7 @@ fn draw_tasks_tab(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.border))
-                    .title(" Task Ledger "),
+                    .title(" Quest Ledger "),
             )
             .wrap(ratatui::widgets::Wrap { trim: true })
     };
@@ -1510,7 +1510,7 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
     let scroll_padding = (visible_height / 2).max(1);
 
     let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {
-        vec![ListItem::new("  No project scrolls. Press [n] to write.")]
+        vec![ListItem::new("  No campaign scrolls. Press [n] to write.")]
     } else if flat_list.is_empty() {
         // No codices — plain note list
         notes.iter().enumerate().map(|(i, n)| {
@@ -1552,7 +1552,7 @@ fn draw_notes_tab(f: &mut Frame, area: Rect, notes: &[&Note], selected_flat_idx:
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(content_border))
-                .title(" Project Scrolls "),
+                .title(" Campaign Scrolls"),
         )
         .scroll_padding(scroll_padding);
 
@@ -1709,7 +1709,7 @@ fn draw_journal_tab(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(content_border))
-            .title(" Project Chronicles "),
+            .title(" Campaign Chronicles"),
     );
     f.render_widget(list_widget, area);
 }
@@ -1997,7 +1997,7 @@ fn draw_overview_tab(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(content_border))
-            .title(" Project Milestones — [Space] Toggle | [Delete] Slay | [m] New "),
+            .title(" Campaign Milestones — [Space] Toggle | [Delete] Slay | [m] New"),
     );
     f.render_widget(mil_list, bottom_split[1]);
 
@@ -2155,7 +2155,7 @@ fn draw_task_modal(
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(title_border_style)
-            .title(" Task Title "),
+            .title(" Quest Title "),
     );
     f.render_widget(title_p, chunks[0]);
 
@@ -2231,7 +2231,7 @@ fn draw_task_modal(
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(desc_border_style)
-                    .title(" Task Description "),
+                    .title(" Quest Description "),
             );
         f.render_widget(desc_p, chunks[1]);
     }
@@ -2734,7 +2734,7 @@ fn draw_assign_task_modal(f: &mut Frame, app: &App, selected_member_idx: usize, 
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
-            " Assign Task to Companion ",
+            " Assign Quest to Companion ",
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -2754,7 +2754,7 @@ fn draw_assign_task_modal(f: &mut Frame, app: &App, selected_member_idx: usize, 
     let mut list_lines = Vec::new();
     if members.is_empty() {
         list_lines.push(Line::from(
-            "  No companions in this project's fellowship yet.",
+            "  No companions in this campaign's fellowship yet.",
         ));
     } else {
         for (idx, m) in members.iter().enumerate() {
@@ -2847,7 +2847,7 @@ fn draw_journal_visibility_modal(f: &mut Frame, visibility_idx: usize, theme: &T
     f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
 
     let accent_color = theme.primary;
-    let options = ["Private", "Project Visible", "Fellowship Visible"];
+    let options = ["Private", "Campaign Visible", "Fellowship Visible"];
 
     let block = Block::default()
         .borders(Borders::ALL)

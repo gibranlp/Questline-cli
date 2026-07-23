@@ -218,7 +218,7 @@ impl ClassType {
             ClassType::TaskPaladin =>
                 "+5 XP per task  |  +10 XP high priority  |  +15 XP full daily chain",
             ClassType::CodeWarlock =>
-                "+5 XP per note  |  +15 XP new project  |  +10 XP on sync",
+                "+5 XP per note  |  +15 XP new project  |  +3 XP on sync",
             ClassType::MindSage =>
                 "+10 XP long notes  |  +5 XP journals  |  +10% fragment chance  |  +5 XP per fragment",
             ClassType::SystemsArchitect =>

@@ -47,7 +47,7 @@ impl ZenTree {
 pub struct DailyAdventure {
     pub id: Uuid,
     pub title: String,
-    pub quest_type: String, // valores posibles: "complete_tasks", "write_note", "write_journal", "water_tree", "complete_high_priority_task"
+    pub quest_type: String,
     pub target_count: i32,
     pub current_count: i32,
     pub completed: bool,
@@ -61,19 +61,31 @@ impl DailyAdventure {
 
         let mut pool = vec![
             ("Complete 3 Tasks", "complete_tasks", 3),
+            ("Complete 5 Tasks", "complete_tasks", 5),
             ("Write 1 Scroll", "write_note", 1),
+            ("Write 2 Scrolls", "write_note", 2),
             ("Write 1 Journal Entry", "write_journal", 1),
             ("Water Your Tree", "water_tree", 1),
+            ("Complete 1 Focus Session", "complete_focus_session", 1),
+            ("Complete 2 Focus Sessions", "complete_focus_session", 2),
+            ("Hydrate Fully", "hydrate_fully", 1),
+            ("Complete 1 Sidequest", "complete_sidequests", 1),
+            ("Complete 3 Sidequests", "complete_sidequests", 3),
             (
                 "Complete 1 High Priority Quest",
                 "complete_high_priority_task",
                 1,
             ),
+            (
+                "Complete 2 High Priority Quests",
+                "complete_high_priority_task",
+                2,
+            ),
         ];
 
         pool.shuffle(&mut rng);
         pool.into_iter()
-            .take(3)
+            .take(5)
             .map(|(title, quest_type, target_count)| DailyAdventure {
                 id: Uuid::new_v4(),
                 title: title.to_string(),
@@ -284,6 +296,7 @@ pub struct Ritual {
     pub description: Option<String>,
     pub frequency: String,
     pub reward_xp: i32,
+    pub daily_target: i32,
     pub created_at: DateTime<Utc>,
 }
 

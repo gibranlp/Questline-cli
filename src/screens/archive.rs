@@ -16,7 +16,8 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
     let size = f.size();
     let accent_color = theme.primary;
 
-    let archived_projects: Vec<&Project> = projects.iter().filter(|p| p.archived).collect();
+    // archived=true OR completed=true — cacha proyectos huérfanos (e.g. conquered en versión anterior y restaurados a medias)
+    let archived_projects: Vec<&Project> = projects.iter().filter(|p| p.archived || p.completed).collect();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -31,9 +32,9 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(chunks[0]);
 
-    // 1. Archived Projects List
+    // 1. Archived CampaignsList
     let list_items: Vec<ListItem> = if archived_projects.is_empty() {
-        vec![ListItem::new("  No archived projects found in database.")]
+        vec![ListItem::new("  No archived campaigns found in database.")]
     } else {
         archived_projects
             .iter()
@@ -57,13 +58,13 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(theme.border))
-            .title(" Archived Projects "),
+            .title(" Archived Campaigns"),
     );
     f.render_widget(list_widget, body_chunks[0]);
 
     // 2. Archived Details Panel
     let details_p = if archived_projects.is_empty() || selected_idx >= archived_projects.len() {
-        Paragraph::new("\n  No archived project selected.").block(
+        Paragraph::new("\n  No archived campaign selected.").block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
@@ -81,7 +82,7 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
         let text = vec![
             Line::from(""),
             Line::from(vec![
-                Span::styled("  Project:     ", Style::default().fg(theme.muted)),
+                Span::styled("  Campaign:   ", Style::default().fg(theme.muted)),
                 Span::styled(
                     &p.name,
                     Style::default()
@@ -136,7 +137,7 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
                 .fg(theme.success)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" Restore Project | ", Style::default().fg(theme.muted)),
+        Span::styled(" Restore Campaign | ", Style::default().fg(theme.muted)),
         Span::styled(
             "Delete",
             Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),

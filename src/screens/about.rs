@@ -203,6 +203,20 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v1.1.1", "Jul 23, 2026",
+            "The World Before the Swarm",
+            &[
+                "Massive World Lore expansion — roughly 200 pages of unlockable Questline history",
+                "The pre-Swarm era is now documented; the Notification Swarm begins Book Two",
+                "Hydration system: daily target, reminders, glass logging, and XP reward",
+                "Daily Adventures expanded to five per day with focus, hydration, and sidequests",
+                "Cloud backup / restore progress is steadier and easier to read",
+                "Manual sync now performs fuller state reconciliation for multi-PC profiles",
+                "Fellowship shared-project sync backfills project history for new companions",
+                "Supporter webapp work is underway; release comes later",
+            ],
+        ),
+        (
             "v1.1.0", "Jul 14, 2026",
             "The Nodes Remember",
             &[
