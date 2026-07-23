@@ -2639,6 +2639,16 @@ impl Database {
             .as_object()
             .ok_or_else(|| anyhow::anyhow!("Invalid export format: root must be an object"))?;
 
+        // Capture this machine's device_id before the import wipes settings.
+        // The backup's device_id belongs to the source machine and must never replace ours —
+        // if it did, the server pull filter (device_id != ?) would silently drop all of the
+        // source machine's events on this device after the next restart.
+        let pre_import_device_id: Option<String> = self.conn.query_row(
+            "SELECT value FROM settings WHERE key = 'device_id'",
+            [],
+            |r| r.get(0),
+        ).ok();
+
         // FK off para importar sin importar el orden de tablas — se reactiva al final pase lo que pase
         self.conn.execute("PRAGMA foreign_keys = OFF;", [])?;
 
@@ -2731,6 +2741,37 @@ impl Database {
                     self.conn.execute(&sql, params.as_slice())?;
                 }
             }
+            // Restore this machine's own device_id — the import just overwrote settings with the
+            // backup source's values. If we kept the source's device_id, the server pull filter
+            // (device_id != ?) would hide all of the source device's events from this machine,
+            // making sync silently diverge after the first restart post-restore.
+            match pre_import_device_id {
+                Some(ref id) => {
+                    let _ = self.conn.execute(
+                        "INSERT OR REPLACE INTO settings (key, value) VALUES ('device_id', ?1)",
+                        params![id],
+                    );
+                }
+                None => {
+                    // This machine had no device_id before the import either; let App::new()
+                    // generate a fresh one on next launch.
+                    let _ = self.conn.execute(
+                        "DELETE FROM settings WHERE key = 'device_id'",
+                        [],
+                    );
+                }
+            }
+            // Reset the pull cursor — the restored machine must pull the full event history
+            // so it reaches the same state as the backup source.
+            let _ = self.conn.execute(
+                "DELETE FROM settings WHERE key = 'last_pull_seq'",
+                [],
+            );
+            // Clear dedup IDs from the backup source — they belong to a different device's
+            // view of the event stream and would cause this machine to skip events it has
+            // never actually applied.
+            let _ = self.conn.execute("DELETE FROM processed_remote_events", []);
+
             Ok(())
         })();
 
