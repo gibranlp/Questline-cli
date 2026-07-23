@@ -199,6 +199,11 @@ pub enum ModalType {
         input: String,
     },
     // Progreso de backup/restore en la nube — se actualiza desde el hilo de fondo
+    CloudBackupProgress {
+        // 0 = exporting, 1 = uploading, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
     CloudRestoreProgress {
         // 0 = downloading, 1 = importing, 2 = complete, 3 = failed
         step: u8,
@@ -361,6 +366,16 @@ const SPRITE_MSG_USELESS: &[&str] = &[
     "A banner would like to discuss another banner.",
     "The unread counter feels lonely.",
     "Several notifications are currently notifying one another.",
+    "A red badge has appeared to announce the continued existence of red badges.",
+    "This alert contains no instruction, but insists it is time-sensitive.",
+    "The Swarm has detected silence and filed a complaint.",
+    "A minor status indicator has promoted itself to urgent.",
+    "Your attention has been selected for routine inspection.",
+    "A reminder about nothing in particular has reached maturity.",
+    "The notification queue would like you to admire its length.",
+    "An alert has arrived early to remind you not to forget the later alert.",
+    "A banner crossed the Realm carrying no message, only confidence.",
+    "The unread counter has grown by one for ceremonial reasons.",
 ];
 const SPRITE_MSG_SATIRE: &[&str] = &[
     "Someone somewhere organized their folders. You may now continue.",
@@ -372,6 +387,16 @@ const SPRITE_MSG_SATIRE: &[&str] = &[
     "The Great Backlog likes where this is going.",
     "Tomorrow has submitted another extension request.",
     "The deadline remains unconvinced.",
+    "A committee has formed to rename the committee.",
+    "Your future plan has requested a planning session.",
+    "A low-priority matter has entered wearing high-priority robes.",
+    "The calendar has opened a new slot for worrying.",
+    "Someone reacted to a message you did not need to read.",
+    "A task adjacent to your real task requests representation.",
+    "The backlog has discovered subcategories.",
+    "A new tab has volunteered to solve the old tab.",
+    "The inbox has produced a side quest with no reward.",
+    "A draft titled Final Final Revised has been sighted.",
 ];
 const SPRITE_MSG_CLASS_LORE: &[&str] = &[
     "A Task Paladin completed something they started. The Realm is confused.",
@@ -382,6 +407,14 @@ const SPRITE_MSG_CLASS_LORE: &[&str] = &[
     "A Systems Architect created a folder for future folders.",
     "A Mind Sage has categorized a thought under \"Probably Important.\"",
     "An Architect has introduced a framework for organizing frameworks.",
+    "A Time Chronomancer snoozed a reminder into a more dramatic era.",
+    "A Code Warlock summoned a build log and called it prophecy.",
+    "A Task Paladin raised a shield against a badge count.",
+    "An Arch Accountant reconciled three alerts and found no value.",
+    "A Mind Sage labeled this interruption \"external noise.\"",
+    "A Systems Architect diagrammed the Swarm and accidentally gave it structure.",
+    "A Chronomancer borrowed five minutes from tomorrow. Tomorrow objected.",
+    "A Code Warlock closed one terminal. Two more opened in mourning.",
 ];
 const SPRITE_MSG_SPEAKING: &[&str] = &[
     "Hello. We noticed you were focusing. We have come to help.",
@@ -393,6 +426,16 @@ const SPRITE_MSG_SPEAKING: &[&str] = &[
     "We are trying our best to distract you.",
     "Please return to scrolling.",
     "You were almost finished. We could not allow that.",
+    "We brought urgency. The reason is still loading.",
+    "Your focus looked unattended, so we entered.",
+    "Do not be alarmed. Be interrupted.",
+    "We only need a second. Then another second.",
+    "You may dismiss us, but we have relatives.",
+    "We have marked this interruption as essential for internal reasons.",
+    "Your attention is required to confirm your attention is required.",
+    "We sensed momentum and deployed a banner.",
+    "This is not important, which is why it must be repeated.",
+    "We request permission to become your next excuse.",
 ];
 const SPRITE_MSG_TASK_COMPLETE: &[&str] = &[
     "The Swarm loses influence.",
@@ -403,6 +446,14 @@ const SPRITE_MSG_TASK_COMPLETE: &[&str] = &[
     "Productivity has been reported to the authorities.",
     "The Swarm is visibly uncomfortable.",
     "Progress detected. Dispatching fewer Sprites.",
+    "A red badge flickers and goes dark.",
+    "One interruption forgets what it came to say.",
+    "The Swarm retreats to draft a follow-up.",
+    "A Sprite drops its banner and pretends it was decorative.",
+    "Meaningful work has pierced the noise.",
+    "The unread counter shrinks in fear.",
+    "Another small silence returns to the Realm.",
+    "The Swarm files a grievance against completed work.",
 ];
 const SPRITE_MSG_RARE_CHRONICLE: &[&str] = &[
     "The Chronicle is watching. Keep going.",
@@ -668,6 +719,7 @@ pub struct App {
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
     // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
     pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    pub cloud_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     // El restore desde la nube también corre en hilo aparte — comunica pasos al hilo principal
     pub cloud_restore_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
@@ -1505,6 +1557,7 @@ impl App {
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cloud_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cloud_restore_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
@@ -2775,7 +2828,8 @@ impl App {
                 }
                 Ok(true)
             }
-            ModalType::CloudRestoreProgress { step, .. } => {
+            ModalType::CloudBackupProgress { step, .. }
+            | ModalType::CloudRestoreProgress { step, .. } => {
                 let s = step;
                 // Only let the user close when done (step 2) or failed (step 3)
                 match key.code {
@@ -5120,21 +5174,35 @@ impl App {
                 KeyCode::Char('b') => {
                     if self.config.sync_enabled {
                         self.sync_status_msg = "Creating Backup...".to_string();
-                        let json = self.db.export_to_json()?;
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
-                            &self.device_id,
-                        );
-                        match client.send_request("POST", "recovery", &json) {
-                            Ok(_) => {
-                                self.sync_status_msg = "Cloud Backup Successful!".to_string();
-                                self.notifications.push(Notification::info("Cloud Backup Saved!".to_string()));
+                        self.modal_state = ModalType::CloudBackupProgress {
+                            step: 0,
+                            message: "Preparing chronicle backup...".to_string(),
+                        };
+                        let result_slot = std::sync::Arc::clone(&self.cloud_backup_result);
+                        let server_url = self.server_url.clone();
+                        let identity = self.identity.clone();
+                        let device_id = self.device_id.clone();
+                        std::thread::spawn(move || {
+                            let outcome: Result<String, String> = (|| {
+                                let storage_dir = crate::storage::get_storage_dir()
+                                    .map_err(|e| format!("Storage error: {}", e))?;
+                                let db_path = storage_dir.join("questline.db");
+                                let db = crate::database::Database::new(&db_path)
+                                    .map_err(|e| format!("Database error: {}", e))?;
+                                let json = db.export_to_json()
+                                    .map_err(|e| format!("Export failed: {}", e))?;
+                                let client = crate::services::api_client::ApiClient::new(
+                                    &server_url, identity, &device_id,
+                                );
+                                client.send_request("POST", "recovery", &json)
+                                    .map_err(|e| format!("Upload failed: {}", e))?;
+                                let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                                Ok("Cloud Backup Successful!".to_string())
+                            })();
+                            if let Ok(mut slot) = result_slot.lock() {
+                                *slot = Some(outcome);
                             }
-                            Err(e) => {
-                                self.sync_status_msg = format!("Backup Failed: {}", e);
-                            }
-                        }
+                        });
                     } else {
                         self.sync_status_msg = "Backup requires Cloud Sync enabled".to_string();
                     }
@@ -5175,18 +5243,6 @@ impl App {
                         });
                     } else {
                         self.sync_status_msg = "Restore requires Cloud Sync enabled".to_string();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Char('c') => {
-                    match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
-                        Ok(_) => {
-                            self.sync_status_msg = "Copied Share Key to Clipboard!".to_string();
-                            self.notifications.push(Notification::info("Share Key copied to clipboard!".to_string()));
-                        }
-                        Err(e) => {
-                            self.sync_status_msg = format!("Copy Failed: {}", e);
-                        }
                     }
                     return Ok(());
                 }
@@ -10686,6 +10742,49 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
+    /// Revisa si el backup manual terminó y actualiza el modal de progreso.
+    pub fn tick_cloud_backup(&mut self) {
+        let is_active = matches!(
+            &self.modal_state,
+            ModalType::CloudBackupProgress { step: 0 | 1, .. }
+        );
+        if !is_active {
+            return;
+        }
+
+        if let ModalType::CloudBackupProgress { ref mut step, ref mut message } = self.modal_state {
+            if *step == 0 && self.intro_ticks % 12 == 0 {
+                *step = 1;
+                *message = "Uploading backup to cloud...".to_string();
+            }
+        }
+
+        let outcome = if let Ok(mut slot) = self.cloud_backup_result.lock() {
+            slot.take()
+        } else {
+            return;
+        };
+        let Some(result) = outcome else { return; };
+
+        match result {
+            Ok(msg) => {
+                self.sync_status_msg = msg.clone();
+                self.notifications.push(Notification::info("Cloud Backup Saved!".to_string()));
+                self.modal_state = ModalType::CloudBackupProgress {
+                    step: 2,
+                    message: msg,
+                };
+            }
+            Err(msg) => {
+                self.sync_status_msg = msg.clone();
+                self.modal_state = ModalType::CloudBackupProgress {
+                    step: 3,
+                    message: msg,
+                };
+            }
+        }
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -10992,6 +11091,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
                     &db, &identity, &device_id, Some(server_url.as_str()),
                 )?;
+                if include_contributions {
+                    let _ = db.queue_full_state_sync();
+                }
                 let (pushed, first_pulled, mut conflicts) = sync_engine.sync()?;
                 // Drain: a pull returns up to 500 events per call. If exactly 500 came back
                 // there are likely more waiting — keep pulling until the batch is smaller.
@@ -11157,7 +11259,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 // Without this the server only has a backup if the user manually pressed [e].
                 let should_backup = {
                     let last_ts = db.get_setting("last_auto_backup")?.unwrap_or_default();
-                    if last_ts.is_empty() {
+                    if include_contributions || last_ts.is_empty() {
                         true
                     } else {
                         chrono::DateTime::parse_from_rfc3339(&last_ts)

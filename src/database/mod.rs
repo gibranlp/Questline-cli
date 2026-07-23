@@ -2461,6 +2461,113 @@ impl Database {
         Ok(deleted)
     }
 
+    /// Queues a full local-state snapshot for the next push.
+    ///
+    /// Normal sync is delta-based and only sends `sync_log.synced = 0`. If an older
+    /// install marked/cleaned logs before the server actually had every entity, a
+    /// second PC can pull forever and never receive those existing tasks/steps.
+    /// A forced/manual sync uses this to reseed the server from the current DB.
+    pub fn queue_full_state_sync(&self) -> Result<usize> {
+        let mut queued = 0usize;
+
+        if let Ok(Some(user)) = self.get_user() {
+            self.log_change("user", &user.id.to_string(), "upsert")?;
+            queued += 1;
+        }
+
+        let simple_tables = [
+            ("project", "projects", "id"),
+            ("task", "tasks", "id"),
+            ("note", "notes", "id"),
+            ("journal_entry", "journal_entries", "id"),
+            ("milestone", "milestones", "id"),
+            ("achievement", "achievements", "id"),
+            ("ritual", "rituals", "id"),
+            ("focus_session", "focus_sessions", "id"),
+            ("codex", "codices", "id"),
+            ("chronicle_message", "chronicle_messages", "id"),
+        ];
+
+        for (entity_type, table, id_col) in simple_tables {
+            let mut stmt = self.conn.prepare(&format!("SELECT {} FROM {}", id_col, table))?;
+            let ids = stmt
+                .query_map([], |row| row.get::<_, String>(0))?
+                .filter_map(|row| row.ok())
+                .collect::<Vec<_>>();
+            for id in ids {
+                self.log_change(entity_type, &id, "upsert")?;
+                queued += 1;
+            }
+        }
+
+        let mut lore_stmt = self
+            .conn
+            .prepare("SELECT id FROM lore_library WHERE unlocked = 1")?;
+        let lore_ids = lore_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in lore_ids {
+            self.log_change("lore_unlock", &id, "unlock")?;
+            queued += 1;
+        }
+
+        let mut ritual_history_stmt = self
+            .conn
+            .prepare("SELECT ritual_id, completed_date FROM ritual_history")?;
+        let ritual_history_ids = ritual_history_stmt
+            .query_map([], |row| {
+                let ritual_id: String = row.get(0)?;
+                let completed_date: String = row.get(1)?;
+                Ok(format!("{}__{}", ritual_id, completed_date))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in ritual_history_ids {
+            self.log_change("ritual_history", &id, "upsert")?;
+            queued += 1;
+        }
+
+        let mut assignment_stmt = self
+            .conn
+            .prepare("SELECT task_id, user_identity FROM task_assignments")?;
+        let assignment_ids = assignment_stmt
+            .query_map([], |row| {
+                let task_id: String = row.get(0)?;
+                let user_identity: String = row.get(1)?;
+                Ok(format!("{}__{}", task_id, user_identity))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in assignment_ids {
+            self.log_change("task_assignment", &id, "assign")?;
+            queued += 1;
+        }
+
+        let mut member_stmt = self
+            .conn
+            .prepare("SELECT project_id, user_identity FROM project_members")?;
+        let member_ids = member_stmt
+            .query_map([], |row| {
+                let project_id: String = row.get(0)?;
+                let user_identity: String = row.get(1)?;
+                Ok(format!("{}__{}", project_id, user_identity))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in member_ids {
+            self.log_change("project_member", &id, "upsert")?;
+            queued += 1;
+        }
+
+        if let Ok(tree) = self.get_zen_tree() {
+            self.log_change("zen_tree", &tree.id.to_string(), "upsert")?;
+            queued += 1;
+        }
+
+        Ok(queued)
+    }
+
     pub fn count_prunable_tasks(&self, days: i64) -> Result<usize> {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         let count: i64 = self.conn.query_row(
