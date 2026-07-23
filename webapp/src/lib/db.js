@@ -1,13 +1,14 @@
 // IndexedDB local cache — decrypted entity state, populated by the sync engine
 
 const DB_NAME = 'questline_local_v1';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 // Regular entity stores — keyed by entity UUID
 const ENTITY_STORES = [
   'projects', 'tasks', 'notes', 'codices',
   'journal_entries', 'milestones', 'achievements',
-  'rituals', 'focus_sessions',
+  'rituals', 'focus_sessions', 'lore_unlocks',
+  'chronicle_messages',
 ];
 // Singleton stores — keyed by the fixed string 'singleton'
 const SINGLETON_STORES = ['user_stats', 'zen_tree', 'streaks'];

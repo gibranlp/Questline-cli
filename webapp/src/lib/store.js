@@ -100,6 +100,27 @@ export function applySyncEvent(event) {
     loreUnlocks.update(m => { const n = new Map(m); n.set(entity_id, { id: entity_id, ...payload }); return n; });
     return;
   }
+  if (entity_type === 'chronicle_message' && entity_id) {
+    chronicleMessages.update(m => {
+      const next = new Map(m);
+      if (operation === 'delete') {
+        for (const [projectId, messages] of next.entries()) {
+          const filtered = messages.filter(msg => msg.id !== entity_id);
+          if (filtered.length === 0) next.delete(projectId);
+          else next.set(projectId, filtered);
+        }
+        return next;
+      }
+      if (!payload?.project_id) return next;
+      const message = { ...payload, id: entity_id };
+      const messages = (next.get(payload.project_id) || []).filter(msg => msg.id !== entity_id);
+      messages.push(message);
+      messages.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+      next.set(payload.project_id, messages);
+      return next;
+    });
+    return;
+  }
 
   const store = storeMap[entity_type];
   if (!store) return;

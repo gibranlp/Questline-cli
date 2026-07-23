@@ -71,6 +71,7 @@ export function loadIdentity() {
 export function clearIdentity() {
   localStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem('questline_sync_seq');
+  localStorage.removeItem('questline_cli_seq');
   sessionStorage.removeItem('questline_data_key');
 }
 
