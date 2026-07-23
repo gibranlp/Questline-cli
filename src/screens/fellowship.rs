@@ -29,7 +29,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let mut proj_lines = vec![Line::from("")];
     if shared_projects.is_empty() {
-        proj_lines.push(Line::from(" No shared projects yet."));
+        proj_lines.push(Line::from(" No shared campaigns yet."));
         proj_lines.push(Line::from(" Invite a companion and "));
         proj_lines.push(Line::from(" share your adventure [v]"));
     } else {
@@ -77,7 +77,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(left_border_color))
             .title(Span::styled(
-                " Shared Fellowship Projects ",
+                " Shared Fellowship Campaigns",
                 Style::default()
                     .fg(if left_focused { theme.warning } else { Color::Gray })
                     .add_modifier(Modifier::BOLD),
@@ -141,7 +141,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     ])
                     .split(right_chunks[1]);
 
-                let desc_p = Paragraph::new("\n   Select or join a shared project to view its Chronicle.")
+                let desc_p = Paragraph::new("\n   Select or join a shared campaign to view its Chronicle.")
                     .style(Style::default().fg(theme.text));
                 f.render_widget(desc_p, sub_chunks[0]);
 
@@ -516,7 +516,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let mut comp_lines = vec![Line::from("")];
 
             if members.is_empty() {
-                comp_lines.push(Line::from("   No companions in this project yet."));
+                comp_lines.push(Line::from("   No companions in this campaign yet."));
                 comp_lines.push(Line::from("   Invite members with [i] to see them here."));
             } else {
                 let online_n = members.iter().filter(|m| m.3).count();
@@ -728,11 +728,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             if shared_projects.is_empty() {
                 " [Enter] Mark as Read  |  [a] Mark All as Read  |  [Esc] back"
             } else if app.fellowship_focus_left {
-                " [↑↓] select project  |  [Enter/→] open chat  |  [v] invite  |  [Esc] back"
+                " [↑↓] select campaign  |  [Enter/→] open chat  |  [v] invite  |  [Esc] back"
             } else if app.fellowship_composing {
                 " Type your message  |  [Enter] send  |  [Esc] cancel compose"
             } else {
-                " [Enter] compose  |  [↑↓] browse msgs  |  [←/Esc] projects  |  [v] invite  |  [j] toggle sharing  |  [c/i/p/a] tabs"
+                " [Enter] compose  |  [↑↓] browse msgs  |  [←/Esc] campaigns  |  [v] invite  |  [j] toggle sharing  |  [c/i/p/a] tabs"
             }
         }
         1 => " [Enter] accept invitation  |  [d] decline invitation  |  [Esc] back",
@@ -852,7 +852,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .border_type(BorderType::Double)
             .border_style(Style::default().fg(theme.warning))
             .title(Span::styled(
-                " Toggle Project Sharing Status ",
+                " Toggle Campaign Sharing Status",
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),

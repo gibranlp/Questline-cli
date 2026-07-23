@@ -54,13 +54,14 @@ pub enum SearchResultType {
     Lore,
     ChronicleEntry,
     Milestone,
+    Ritual,
 }
 
 impl SearchResultType {
     pub fn label(&self) -> &'static str {
         match self {
-            SearchResultType::Project => "Project",
-            SearchResultType::Task => "Task",
+            SearchResultType::Project => "Campaign",
+            SearchResultType::Task => "Quest",
             SearchResultType::Step => "Step",
             SearchResultType::Note => "Note",
             SearchResultType::JournalEntry => "Journal",
@@ -68,6 +69,7 @@ impl SearchResultType {
             SearchResultType::Lore => "Lore",
             SearchResultType::ChronicleEntry => "Chronicle",
             SearchResultType::Milestone => "Milestone",
+            SearchResultType::Ritual => "Sidequest",
         }
     }
 }
@@ -196,6 +198,22 @@ pub enum ModalType {
     RestoreIdentity {
         input: String,
     },
+    // Progreso de backup/restore en la nube — se actualiza desde el hilo de fondo
+    CloudBackupProgress {
+        // 0 = exporting, 1 = uploading, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
+    SyncProgress {
+        // 0 = preparing, 1 = syncing, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
+    CloudRestoreProgress {
+        // 0 = downloading, 1 = importing, 2 = complete, 3 = failed
+        step: u8,
+        message: String,
+    },
     LocalMusicFolder {
         input: String,
         suggestions: Vec<String>,
@@ -275,6 +293,10 @@ pub enum ModalType {
         project_id: Uuid,
         project_name: String,
     },
+    ConfirmConquerProject {
+        project_id: Uuid,
+        project_name: String,
+    },
     ConfirmDeleteCodex {
         codex_id: Uuid,
         codex_name: String,
@@ -289,6 +311,17 @@ pub enum ModalType {
     },
     UpdateAvailable {
         latest_version: String,
+    },
+    // Popup que aparece cuando expira el intervalo de hidratación
+    HydrationReminder,
+    // Settings de hidratación — intervalo, horario activo, objetivo diario
+    HydrationSettings {
+        interval_idx: usize,   // 0=30 1=45 2=60 3=90 4=120 mins
+        from_hour: u32,
+        to_hour: u32,
+        target: i32,
+        pause_focus: bool,
+        focus_idx: usize,
     },
 }
 
@@ -338,6 +371,16 @@ const SPRITE_MSG_USELESS: &[&str] = &[
     "A banner would like to discuss another banner.",
     "The unread counter feels lonely.",
     "Several notifications are currently notifying one another.",
+    "A red badge has appeared to announce the continued existence of red badges.",
+    "This alert contains no instruction, but insists it is time-sensitive.",
+    "The Swarm has detected silence and filed a complaint.",
+    "A minor status indicator has promoted itself to urgent.",
+    "Your attention has been selected for routine inspection.",
+    "A reminder about nothing in particular has reached maturity.",
+    "The notification queue would like you to admire its length.",
+    "An alert has arrived early to remind you not to forget the later alert.",
+    "A banner crossed the Realm carrying no message, only confidence.",
+    "The unread counter has grown by one for ceremonial reasons.",
 ];
 const SPRITE_MSG_SATIRE: &[&str] = &[
     "Someone somewhere organized their folders. You may now continue.",
@@ -349,6 +392,16 @@ const SPRITE_MSG_SATIRE: &[&str] = &[
     "The Great Backlog likes where this is going.",
     "Tomorrow has submitted another extension request.",
     "The deadline remains unconvinced.",
+    "A committee has formed to rename the committee.",
+    "Your future plan has requested a planning session.",
+    "A low-priority matter has entered wearing high-priority robes.",
+    "The calendar has opened a new slot for worrying.",
+    "Someone reacted to a message you did not need to read.",
+    "A task adjacent to your real task requests representation.",
+    "The backlog has discovered subcategories.",
+    "A new tab has volunteered to solve the old tab.",
+    "The inbox has produced a side quest with no reward.",
+    "A draft titled Final Final Revised has been sighted.",
 ];
 const SPRITE_MSG_CLASS_LORE: &[&str] = &[
     "A Task Paladin completed something they started. The Realm is confused.",
@@ -359,6 +412,14 @@ const SPRITE_MSG_CLASS_LORE: &[&str] = &[
     "A Systems Architect created a folder for future folders.",
     "A Mind Sage has categorized a thought under \"Probably Important.\"",
     "An Architect has introduced a framework for organizing frameworks.",
+    "A Time Chronomancer snoozed a reminder into a more dramatic era.",
+    "A Code Warlock summoned a build log and called it prophecy.",
+    "A Task Paladin raised a shield against a badge count.",
+    "An Arch Accountant reconciled three alerts and found no value.",
+    "A Mind Sage labeled this interruption \"external noise.\"",
+    "A Systems Architect diagrammed the Swarm and accidentally gave it structure.",
+    "A Chronomancer borrowed five minutes from tomorrow. Tomorrow objected.",
+    "A Code Warlock closed one terminal. Two more opened in mourning.",
 ];
 const SPRITE_MSG_SPEAKING: &[&str] = &[
     "Hello. We noticed you were focusing. We have come to help.",
@@ -370,6 +431,16 @@ const SPRITE_MSG_SPEAKING: &[&str] = &[
     "We are trying our best to distract you.",
     "Please return to scrolling.",
     "You were almost finished. We could not allow that.",
+    "We brought urgency. The reason is still loading.",
+    "Your focus looked unattended, so we entered.",
+    "Do not be alarmed. Be interrupted.",
+    "We only need a second. Then another second.",
+    "You may dismiss us, but we have relatives.",
+    "We have marked this interruption as essential for internal reasons.",
+    "Your attention is required to confirm your attention is required.",
+    "We sensed momentum and deployed a banner.",
+    "This is not important, which is why it must be repeated.",
+    "We request permission to become your next excuse.",
 ];
 const SPRITE_MSG_TASK_COMPLETE: &[&str] = &[
     "The Swarm loses influence.",
@@ -380,6 +451,14 @@ const SPRITE_MSG_TASK_COMPLETE: &[&str] = &[
     "Productivity has been reported to the authorities.",
     "The Swarm is visibly uncomfortable.",
     "Progress detected. Dispatching fewer Sprites.",
+    "A red badge flickers and goes dark.",
+    "One interruption forgets what it came to say.",
+    "The Swarm retreats to draft a follow-up.",
+    "A Sprite drops its banner and pretends it was decorative.",
+    "Meaningful work has pierced the noise.",
+    "The unread counter shrinks in fear.",
+    "Another small silence returns to the Realm.",
+    "The Swarm files a grievance against completed work.",
 ];
 const SPRITE_MSG_RARE_CHRONICLE: &[&str] = &[
     "The Chronicle is watching. Keep going.",
@@ -519,6 +598,7 @@ pub struct App {
     pub quitting_after_sync: bool,
 
     pub selected_project_idx: usize,
+    pub projects_all_selected: bool,
     pub active_project_id: Option<Uuid>,
     pub workspace_tab_idx: usize,
     pub workspace_sidebar_focused: bool,
@@ -570,6 +650,7 @@ pub struct App {
 
     pub server_url: String,
     pub auto_sync: bool,
+    pub external_notifications: bool,
     pub sync_status_msg: String,
     pub sync_conflicts: Vec<String>,
     pub sync_failure_count: u32,
@@ -643,6 +724,9 @@ pub struct App {
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
     // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
     pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    pub cloud_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
+    // El restore desde la nube también corre en hilo aparte — comunica pasos al hilo principal
+    pub cloud_restore_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
@@ -681,6 +765,17 @@ pub struct App {
     pub restore_error: Option<String>,
     // bandera para saber si el onboarding vino del Gateway — define qué pantalla sigue al terminar
     pub onboarding_from_gateway: bool,
+
+    // ── Hydration Reminder ──────────────────────────────────────────────────
+    pub hydration_enabled: bool,
+    pub hydration_glasses: i32,
+    pub hydration_target: i32,
+    pub hydration_interval_mins: i32,
+    pub hydration_active_from: u32,  // inclusive start hour (0-23)
+    pub hydration_active_to: u32,    // exclusive end hour (1-24)
+    pub hydration_pause_focus: bool,
+    pub hydration_reward_xp: i32,
+    pub hydration_next_reminder_at: Option<std::time::Instant>,
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
@@ -1192,6 +1287,13 @@ impl App {
     // Inicializa toda la app: DB, identidad, config, quote, audio, sync — pues aquí empieza todo
     pub fn new(db_path: &Path) -> Result<Self> {
         let db = Database::new(db_path)?;
+
+        // Carga el lore desde questlinecli.com (o del caché local si es reciente).
+        // Siempre usa INSERT OR IGNORE, así que el progreso del usuario nunca se pierde.
+        let lore_mgr = crate::services::lore_manager::LoreManager::load();
+        let _ = db.seed_lore_entries(&lore_mgr.lore);
+        let _ = db.seed_class_quests(&lore_mgr.quests);
+
         let mut user = db.get_user()?;
 
         let existing_user_id = user.as_ref().map(|u| u.id);
@@ -1205,16 +1307,52 @@ impl App {
 
         let identity = crate::services::identity::Identity::load_or_create(existing_user_id)?;
 
-        // Genera un device_id único si no existe — se persiste en la DB para identificar la máquina
+        let device_name = crate::services::identity::get_local_device_name();
+
+        // Genera un device_id único si no existe — se persiste en la DB para identificar la máquina.
+        // If a full Questline DB folder is copied to another PC, it carries the old device_id too.
+        // The server filters pulls with `device_id != current_device`, so cloned IDs make both PCs
+        // hide each other's events. Bind the id to the first hostname that used it and repair copies.
         let device_id = match db.get_setting("device_id")? {
-            Some(id) => id,
+            Some(id) => {
+                match db.get_setting("device_bound_name")? {
+                    Some(bound_name) if bound_name != device_name => {
+                        let new_id = Uuid::new_v4().to_string();
+                        db.set_setting("device_id", &new_id)?;
+                        db.set_setting("device_bound_name", &device_name)?;
+                        let _ = db.set_setting("last_pull_seq", "0");
+                        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                        new_id
+                    }
+                    Some(_) => id,
+                    None => {
+                        let stored_device_name = db.conn.query_row(
+                            "SELECT device_name FROM devices WHERE device_id = ?1",
+                            params![id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        ).ok();
+
+                        if stored_device_name.as_deref().is_some_and(|name| name != device_name) {
+                            let new_id = Uuid::new_v4().to_string();
+                            db.set_setting("device_id", &new_id)?;
+                            db.set_setting("device_bound_name", &device_name)?;
+                            let _ = db.set_setting("last_pull_seq", "0");
+                            let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                            new_id
+                        } else {
+                            db.set_setting("device_bound_name", &device_name)?;
+                            id
+                        }
+                    }
+                }
+            }
             None => {
                 let id = Uuid::new_v4().to_string();
                 db.set_setting("device_id", &id)?;
+                db.set_setting("device_bound_name", &device_name)?;
                 id
             }
         };
-        let device_name = crate::services::identity::get_local_device_name();
         db.register_device(&device_id, &device_name)?;
 
         // La config tiene prioridad sobre los settings de la DB — archivo > DB
@@ -1232,6 +1370,9 @@ impl App {
                 .map(|s| s == "true")
                 .unwrap_or(false)
         };
+        let external_notifications = db.get_setting("external_notifications")?
+            .map(|s| s == "true")
+            .unwrap_or(true);
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -1253,6 +1394,7 @@ impl App {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
                     if db.import_from_json(&decoded).is_ok() {
+                        let _ = App::set_pull_cursor_to_remote_head(&db, &client);
                         user = db.get_user()?;
                     }
                 }
@@ -1324,6 +1466,7 @@ impl App {
             quitting_after_sync: false,
 
             selected_project_idx: 0,
+            projects_all_selected: true,
             active_project_id: None,
             workspace_tab_idx: 0,
             workspace_sidebar_focused: true,
@@ -1365,6 +1508,7 @@ impl App {
 
             server_url,
             auto_sync,
+            external_notifications,
             sync_status_msg: "Idle".to_string(),
             sync_conflicts: Vec::new(),
             sync_failure_count: 0,
@@ -1419,6 +1563,8 @@ impl App {
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cloud_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            cloud_restore_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
             last_chat_poll: std::time::Instant::now()
@@ -1454,9 +1600,20 @@ impl App {
 
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
+
+            hydration_enabled: false,
+            hydration_glasses: 0,
+            hydration_target: 8,
+            hydration_interval_mins: 60,
+            hydration_active_from: 9,
+            hydration_active_to: 18,
+            hydration_pause_focus: false,
+            hydration_reward_xp: 20,
+            hydration_next_reminder_at: None,
         };
 
         app.reload_data()?;
+        app.reload_hydration_config();
         if app.user.is_some() {
             app.check_new_day()?;
             let _ = app.check_action_achievements();
@@ -1792,10 +1949,13 @@ impl App {
             return Ok(());
         }
 
-        // Ctrl+S sincroniza en cualquier pantalla excepto el editor (ahí guarda la nota)
+        // Ctrl+S sincroniza en cualquier pantalla excepto el editor y los modales de task/step (ahí guarda)
+        let task_modal_open = matches!(self.modal_state, ModalType::NewTask { .. } | ModalType::EditTask { .. })
+            || matches!(self.overlay_modal, ModalType::NewTask { .. });
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
             && self.active_screen != ActiveScreen::Editor
+            && !task_modal_open
         {
             if self.config.sync_enabled {
                 self.start_forced_sync();
@@ -1974,11 +2134,12 @@ impl App {
                         crate::audio::mpris_player::next_track();
                         return Ok(());
                     }
-                    // 'n' en Dashboard/Projects/Workspace/Fellowship ya está tomado para otras acciones
+                    // 'n' en Dashboard/Projects/Workspace/Fellowship/SyncSettings ya está tomado para otras acciones
                     if self.active_screen != ActiveScreen::Dashboard
                         && self.active_screen != ActiveScreen::Projects
                         && self.active_screen != ActiveScreen::Workspace
                         && self.active_screen != ActiveScreen::Fellowship
+                        && self.active_screen != ActiveScreen::SyncSettings
                     {
                         let current = self.audio_player.get_state().current_soundscape;
                         let idx = SOUNDSCAPES
@@ -2151,6 +2312,135 @@ impl App {
 
         match self.modal_state {
             ModalType::None => Ok(false),
+            ModalType::HydrationReminder => {
+                match key.code {
+                    // d = drink and dismiss
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        self.modal_state = ModalType::None;
+                        if let Ok(new_count) = self.db.hydration_drink() {
+                            self.audio_player.play_task_complete();
+                            self.hydration_glasses = new_count;
+                            if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
+                                if let Ok((_, reward_given)) = self.db.hydration_get_today() {
+                                    if !reward_given {
+                                        let _ = self.db.hydration_mark_reward_given();
+                                        let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                        let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
+                                        self.notifications.push(Notification::info(
+                                            format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
+                                        ));
+                                    }
+                                }
+                            } else {
+                                self.notifications.push(Notification::info(
+                                    format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+                                ));
+                            }
+                        }
+                        // Rearm reminder
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
+                    }
+                    // s = snooze 15 min
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        self.modal_state = ModalType::None;
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(15 * 60)
+                        );
+                    }
+                    // x / Esc = dismiss without snooze (rearms at full interval)
+                    KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::HydrationSettings { .. } => {
+                if let ModalType::HydrationSettings {
+                    ref mut interval_idx,
+                    ref mut from_hour,
+                    ref mut to_hour,
+                    ref mut target,
+                    ref mut pause_focus,
+                    ref mut focus_idx,
+                } = self.modal_state {
+                    match key.code {
+                        KeyCode::Tab => {
+                            *focus_idx = (*focus_idx + 1) % 6;
+                        }
+                        KeyCode::BackTab => {
+                            *focus_idx = focus_idx.saturating_sub(1);
+                        }
+                        KeyCode::Left => match *focus_idx {
+                            0 => { *interval_idx = interval_idx.saturating_sub(1); }
+                            1 => { if *from_hour > 0 { *from_hour -= 1; } }
+                            2 => { if *to_hour > 1 { *to_hour -= 1; } }
+                            3 => { if *target > 1 { *target -= 1; } }
+                            _ => {}
+                        },
+                        KeyCode::Right => match *focus_idx {
+                            0 => { if *interval_idx < 4 { *interval_idx += 1; } }
+                            1 => { if *from_hour < 23 { *from_hour += 1; } }
+                            2 => { if *to_hour < 24 { *to_hour += 1; } }
+                            3 => { *target += 1; }
+                            _ => {}
+                        },
+                        KeyCode::Char(' ') if *focus_idx == 4 => {
+                            *pause_focus = !*pause_focus;
+                        }
+                        KeyCode::Enter => {
+                            let intervals = [30i32, 45, 60, 90, 120];
+                            let chosen_interval = intervals[*interval_idx];
+                            let chosen_from = *from_hour;
+                            let chosen_to = *to_hour;
+                            let chosen_target = *target;
+                            let chosen_pause = *pause_focus;
+
+                            self.hydration_enabled = true;
+                            self.hydration_interval_mins = chosen_interval;
+                            self.hydration_active_from = chosen_from;
+                            self.hydration_active_to = chosen_to;
+                            self.hydration_target = chosen_target;
+                            self.hydration_pause_focus = chosen_pause;
+
+                            let _ = self.db.set_setting("hydration_enabled", "true");
+                            let _ = self.db.set_setting("hydration_interval_mins", &chosen_interval.to_string());
+                            let _ = self.db.set_setting("hydration_active_from", &chosen_from.to_string());
+                            let _ = self.db.set_setting("hydration_active_to", &chosen_to.to_string());
+                            let _ = self.db.set_setting("hydration_target", &chosen_target.to_string());
+                            let _ = self.db.set_setting("hydration_pause_focus", if chosen_pause { "true" } else { "false" });
+
+                            // Arm first reminder
+                            self.hydration_next_reminder_at = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(chosen_interval as u64 * 60)
+                            );
+                            self.modal_state = ModalType::None;
+                            self.notifications.push(Notification::info("Hydration reminders enabled!"));
+                        }
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            // Disable hydration
+                            self.hydration_enabled = false;
+                            self.hydration_next_reminder_at = None;
+                            let _ = self.db.set_setting("hydration_enabled", "false");
+                            self.modal_state = ModalType::None;
+                            self.notifications.push(Notification::info("Hydration reminders disabled."));
+                        }
+                        KeyCode::Esc => {
+                            self.modal_state = ModalType::None;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(true)
+            }
             ModalType::QuitConfirm { .. } => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -2227,6 +2517,23 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::ConfirmConquerProject { project_id, .. } => {
+                let pid = project_id;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.modal_state = ModalType::None;
+                        self.complete_project(pid)?;
+                        self.active_project_id = None;
+                        self.active_screen = ActiveScreen::Projects;
+                        self.projects_all_selected = true;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::ConfirmDeleteCodex { codex_id, .. } => {
                 let cid = codex_id;
                 match key.code {
@@ -2252,9 +2559,9 @@ impl App {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         match self.db.prune_completed_tasks(d) {
                             Ok(pruned) => {
-                                self.sync_status_msg = format!("Pruned {} completed task(s) older than {} days.", pruned, d);
+                                self.sync_status_msg = format!("Pruned {} completed quest(s) older than {} days.", pruned, d);
                                 self.notifications.push(Notification::info(
-                                    format!("{} old completed tasks pruned from the Chronicle.", pruned)
+                                    format!("{} old completed quests pruned from the Chronicle.", pruned)
                                 ));
                                 self.reload_data()?;
                             }
@@ -2486,6 +2793,7 @@ impl App {
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
+                                                let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string()
                                                 ));
@@ -2502,13 +2810,12 @@ impl App {
                                         }
                                     }
                                 }
-                                // Reset del cursor de pull y del contador de conflictos — el nuevo nodo arranca limpio
-                                let _ = self.db.set_setting("last_pull_seq", "0");
+                                // Reset conflict counter only. If a cloud backup was imported, the pull
+                                // cursor was moved to server HEAD so stale history cannot replay over it.
                                 let _ = self.db.set_setting("conflict_count", "0");
                                 self.modal_state = ModalType::None;
-                                self.sync_status_msg = "Identity restored! Syncing now...".to_string();
+                                self.sync_status_msg = "Identity restored.".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
-                                let _ = self.trigger_sync();
                                 self.reload_data()?;
                             }
                             Ok(_) => {
@@ -2518,6 +2825,19 @@ impl App {
                                 self.sync_status_msg = "Invalid transfer code: not valid base64".to_string();
                             }
                         }
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::CloudBackupProgress { step, .. }
+            | ModalType::SyncProgress { step, .. }
+            | ModalType::CloudRestoreProgress { step, .. } => {
+                let s = step;
+                // Only let the user close when done (step 2) or failed (step 3)
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') if s >= 2 => {
+                        self.modal_state = ModalType::None;
                     }
                     _ => {}
                 }
@@ -2768,9 +3088,9 @@ impl App {
                     KeyCode::Left | KeyCode::Right => {
                         if idx == 2 {
                             if key.code == KeyCode::Left {
-                                freq_idx = if freq_idx > 0 { freq_idx - 1 } else { 4 };
+                                freq_idx = if freq_idx > 0 { freq_idx - 1 } else { 6 };
                             } else {
-                                freq_idx = (freq_idx + 1) % 5;
+                                freq_idx = (freq_idx + 1) % 7;
                             }
                             self.modal_state = ModalType::NewRitual {
                                 name: r_name,
@@ -2792,7 +3112,7 @@ impl App {
                             }
                         } else if idx == 2 {
                             if c == ' ' {
-                                freq_idx = (freq_idx + 1) % 5;
+                                freq_idx = (freq_idx + 1) % 7;
                             }
                         } else if idx == 3 && c.is_ascii_digit() && xp_str.len() < 4 {
                             xp_str.push(c);
@@ -2833,8 +3153,14 @@ impl App {
                             };
                         } else {
                             if !r_name.trim().is_empty() {
-                                let freqs = ["Daily", "Weekdays", "Weekly", "Monthly", "Custom"];
+                                let freqs = ["Daily", "2x Daily", "3x Daily", "5x Daily", "Weekdays", "Weekly", "Monthly"];
                                 let freq = freqs[freq_idx].to_string();
+                                let daily_target = match freq.as_str() {
+                                    "2x Daily" => 2,
+                                    "3x Daily" => 3,
+                                    "5x Daily" => 5,
+                                    _ => 1,
+                                };
                                 let xp_val = xp_str.parse::<i32>().unwrap_or(20);
                                 if xp_val > 100 {
                                     self.notifications.push(Notification::warning("Sidequest reward cannot exceed 100 XP!"));
@@ -2849,6 +3175,7 @@ impl App {
                                         },
                                         frequency: freq,
                                         reward_xp: xp_val,
+                                        daily_target,
                                         created_at: Utc::now(),
                                     };
                                     self.db.insert_ritual(&rit)?;
@@ -3219,7 +3546,7 @@ impl App {
                                     self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'mentor' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()])?;
                                 }
                             } else {
-                                self.notifications.push(Notification::warning("No project selected for invitation!"));
+                                self.notifications.push(Notification::warning("No campaign selected for invitation!"));
                             }
                             self.mark_dirty();
                             self.modal_state = ModalType::None;
@@ -3491,6 +3818,8 @@ impl App {
                                     .unwrap_or_default();
                                 if existing.iter().any(|a| a.0 == member.0) {
                                     self.db.conn.execute("DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2", params![task_id.to_string(), member.0])?;
+                                    let compound_id = format!("{}__{}", task_id, member.0);
+                                    let _ = self.db.log_change("task_assignment", &compound_id, "delete");
                                 } else {
                                     self.db.assign_task(
                                         &task_id.to_string(),
@@ -3500,9 +3829,9 @@ impl App {
                                     if member.0 != self.identity.public_key {
                                         self.db.create_notification(
                                             "task_assignment",
-                                            "Task Assigned",
+                                            "Quest Assigned",
                                             &format!(
-                                                "You have been assigned to task: {}",
+                                                "You have been assigned to quest: {}",
                                                 task.title
                                             ),
                                             Some(&proj_id.to_string()),
@@ -3546,7 +3875,7 @@ impl App {
                         };
                     }
                     KeyCode::Enter => {
-                        let vis_options = ["Private", "Project Visible", "Fellowship Visible"];
+                        let vis_options = ["Private", "Campaign Visible", "Fellowship Visible"];
                         let selected_vis = vis_options[idx].to_string();
                         self.db.conn.execute(
                             "UPDATE journal_entries SET visibility = ?1 WHERE id = ?2",
@@ -3935,6 +4264,7 @@ impl App {
                         }
                         self.identity = new_identity;
 
+                        let mut restored_from_cloud = false;
                         if self.config.sync_enabled {
                             let client = crate::services::api_client::ApiClient::new(
                                 &self.server_url,
@@ -3949,6 +4279,8 @@ impl App {
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
+                                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                                        restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
                                             if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
@@ -3960,13 +4292,14 @@ impl App {
                             }
                         }
 
-                        let _ = self.db.set_setting("last_pull_seq", "0");
                         let _ = self.db.set_setting("conflict_count", "0");
-                        let _ = self.trigger_sync();
                         self.reload_data()?;
-                        self.notifications.push(Notification::info(
-                            "Welcome back! Your chronicle has been restored from exile.".to_string(),
-                        ));
+                        let message = if restored_from_cloud {
+                            "Welcome back! Your chronicle has been restored from cloud backup."
+                        } else {
+                            "Identity restored. No cloud backup was found; sync will only pull future changes."
+                        };
+                        self.notifications.push(Notification::info(message.to_string()));
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
                     }
@@ -4825,12 +5158,37 @@ impl App {
                         .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
                     self.sync_status_msg = format!(
                         "Auto Sync {}",
-                        if self.auto_sync {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
+                        if self.auto_sync { "Enabled" } else { "Disabled" }
                     );
+                    return Ok(());
+                }
+                KeyCode::Char('n') => {
+                    self.external_notifications = !self.external_notifications;
+                    let _ = self.db.set_setting(
+                        "external_notifications",
+                        if self.external_notifications { "true" } else { "false" },
+                    );
+                    self.sync_status_msg = format!(
+                        "System Notifications {}",
+                        if self.external_notifications { "Enabled" } else { "Disabled" }
+                    );
+                    return Ok(());
+                }
+                KeyCode::Char('c') => {
+                    match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
+                        Ok(_) => {
+                            self.sync_status_msg = "Share Key copied to clipboard!".to_string();
+                            self.notifications.push(Notification::info(
+                                "Share Key copied to clipboard.".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            self.sync_status_msg = format!("Failed to copy Share Key: {}", e);
+                            self.notifications.push(Notification::warning(
+                                "Could not copy Share Key. Clipboard utility missing.".to_string(),
+                            ));
+                        }
+                    }
                     return Ok(());
                 }
                 KeyCode::Char('u') => {
@@ -4842,21 +5200,35 @@ impl App {
                 KeyCode::Char('b') => {
                     if self.config.sync_enabled {
                         self.sync_status_msg = "Creating Backup...".to_string();
-                        let json = self.db.export_to_json()?;
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
-                            &self.device_id,
-                        );
-                        match client.send_request("POST", "recovery", &json) {
-                            Ok(_) => {
-                                self.sync_status_msg = "Cloud Backup Successful!".to_string();
-                                self.notifications.push(Notification::info("Cloud Backup Saved!".to_string()));
+                        self.modal_state = ModalType::CloudBackupProgress {
+                            step: 0,
+                            message: "Preparing chronicle backup...".to_string(),
+                        };
+                        let result_slot = std::sync::Arc::clone(&self.cloud_backup_result);
+                        let server_url = self.server_url.clone();
+                        let identity = self.identity.clone();
+                        let device_id = self.device_id.clone();
+                        std::thread::spawn(move || {
+                            let outcome: Result<String, String> = (|| {
+                                let storage_dir = crate::storage::get_storage_dir()
+                                    .map_err(|e| format!("Storage error: {}", e))?;
+                                let db_path = storage_dir.join("questline.db");
+                                let db = crate::database::Database::new(&db_path)
+                                    .map_err(|e| format!("Database error: {}", e))?;
+                                let json = db.export_to_json()
+                                    .map_err(|e| format!("Export failed: {}", e))?;
+                                let client = crate::services::api_client::ApiClient::new(
+                                    &server_url, identity, &device_id,
+                                );
+                                client.send_request("POST", "recovery", &json)
+                                    .map_err(|e| format!("Upload failed: {}", e))?;
+                                let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                                Ok("Cloud Backup Successful!".to_string())
+                            })();
+                            if let Ok(mut slot) = result_slot.lock() {
+                                *slot = Some(outcome);
                             }
-                            Err(e) => {
-                                self.sync_status_msg = format!("Backup Failed: {}", e);
-                            }
-                        }
+                        });
                     } else {
                         self.sync_status_msg = "Backup requires Cloud Sync enabled".to_string();
                     }
@@ -4864,59 +5236,39 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     if self.config.sync_enabled {
-                        self.sync_status_msg = "Restoring Backup...".to_string();
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
-                            &self.device_id,
-                        );
-                        match client.send_request("GET", "recovery/latest", "") {
-                            Ok(json) => {
-                                if !json.trim().is_empty() {
-                                    let decoded_json = if let Ok(decoded_bytes) = {
-                                        use base64::{
-                                            engine::general_purpose::STANDARD, Engine as _,
-                                        };
-                                        STANDARD.decode(json.trim())
-                                    } {
-                                        String::from_utf8(decoded_bytes)
-                                            .unwrap_or_else(|_| json.clone())
-                                    } else {
-                                        json.clone()
-                                    };
-
-                                    match self.db.import_from_json(&decoded_json) { Ok(_) => {
-                                        self.sync_status_msg =
-                                            "Cloud Restore Complete! Reloading...".to_string();
-                                        self.reload_data()?;
-                                        self.notifications.push(Notification::info("Database Restored from Cloud!".to_string()));
-                                    } _ => {
-                                        self.sync_status_msg =
-                                            "Restore Failed: Invalid data structure".to_string();
-                                    }}
-                                } else {
-                                    self.sync_status_msg =
-                                        "Restore Failed: Empty backup content".to_string();
+                        // Show progress modal immediately and run the restore in the background
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 0,
+                            message: "Contacting the Æther...".to_string(),
+                        };
+                        let result_slot = std::sync::Arc::clone(&self.cloud_restore_result);
+                        let server_url = self.server_url.clone();
+                        let identity = self.identity.clone();
+                        let device_id = self.device_id.clone();
+                        std::thread::spawn(move || {
+                            let outcome: Result<String, String> = (|| {
+                                let client = crate::services::api_client::ApiClient::new(
+                                    &server_url, identity, &device_id,
+                                );
+                                let json = client.send_request("GET", "recovery/latest", "")
+                                    .map_err(|e| {
+                                        if e.to_string().contains("404") {
+                                            "No backup found for this identity. On a new device, use [i] Restore Identity first, then [r].".to_string()
+                                        } else {
+                                            format!("Download failed: {}", e)
+                                        }
+                                    })?;
+                                if json.trim().is_empty() {
+                                    return Err("Backup content is empty".to_string());
                                 }
+                                Ok(json)
+                            })();
+                            if let Ok(mut slot) = result_slot.lock() {
+                                *slot = Some(outcome);
                             }
-                            Err(e) => {
-                                self.sync_status_msg = format!("Restore Failed: {}", e);
-                            }
-                        }
+                        });
                     } else {
                         self.sync_status_msg = "Restore requires Cloud Sync enabled".to_string();
-                    }
-                    return Ok(());
-                }
-                KeyCode::Char('c') => {
-                    match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
-                        Ok(_) => {
-                            self.sync_status_msg = "Copied Share Key to Clipboard!".to_string();
-                            self.notifications.push(Notification::info("Share Key copied to clipboard!".to_string()));
-                        }
-                        Err(e) => {
-                            self.sync_status_msg = format!("Copy Failed: {}", e);
-                        }
                     }
                     return Ok(());
                 }
@@ -5011,6 +5363,7 @@ impl App {
             }
             KeyCode::Char('2') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             KeyCode::Char('3') if self.active_screen != ActiveScreen::Workspace => {
@@ -5020,6 +5373,8 @@ impl App {
             KeyCode::Char('4') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Library;
                 self.active_tab_idx = 4;
+                // Comprueba desbloqueos por nivel al abrir la biblioteca — retroactivo para usuarios que ya superaron el nivel
+                let _ = self.check_stage6_unlocks();
             }
             KeyCode::Char('5') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Soundscapes;
@@ -5053,7 +5408,7 @@ impl App {
                 self.active_tab_idx = 12;
             }
             KeyCode::Char('d') => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5087,6 +5442,34 @@ impl App {
                             self.notifications.push(Notification::info(format!("Declined invitation to '{}'", invite.2)));
                             self.reload_data()?;
                         }
+                    }
+                } else if self.active_screen == ActiveScreen::Dashboard
+                    && matches!(self.modal_state, ModalType::None)
+                    && self.hydration_enabled
+                {
+                    if let Ok(new_count) = self.db.hydration_drink() {
+                        self.audio_player.play_task_complete();
+                        self.hydration_glasses = new_count;
+                        if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
+                            if let Ok((_, reward_given)) = self.db.hydration_get_today() {
+                                if !reward_given {
+                                    let _ = self.db.hydration_mark_reward_given();
+                                    let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                    let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
+                                    self.notifications.push(Notification::info(
+                                        format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.notifications.push(Notification::info(
+                                format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+                            ));
+                        }
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
                     }
                 }
             }
@@ -5122,6 +5505,24 @@ impl App {
                 if self.active_screen == ActiveScreen::Dashboard {
                     self.water_tree()?;
                 }
+            }
+            // Hydration: open settings modal
+            KeyCode::Char('h') | KeyCode::Char('H')
+                if self.active_screen == ActiveScreen::Dashboard
+                    && matches!(self.modal_state, ModalType::None) =>
+            {
+                let intervals = [30i32, 45, 60, 90, 120];
+                let interval_idx = intervals.iter()
+                    .position(|&m| m == self.hydration_interval_mins)
+                    .unwrap_or(2);
+                self.modal_state = ModalType::HydrationSettings {
+                    interval_idx,
+                    from_hour: self.hydration_active_from,
+                    to_hour: self.hydration_active_to,
+                    target: self.hydration_target,
+                    pause_focus: self.hydration_pause_focus,
+                    focus_idx: 0,
+                };
             }
             // Abre la quest principal directamente en su workspace desde el dashboard
             KeyCode::Char('o') | KeyCode::Char('O')
@@ -5259,7 +5660,7 @@ impl App {
                             };
                         }
                     }
-                } else if self.active_screen == ActiveScreen::Projects {
+                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5351,15 +5752,18 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = self.projects.iter().filter(|p| !p.archived).count();
-                    if active_len > 0 {
-                        if self.selected_project_idx > 0 {
-                            self.selected_project_idx -= 1;
-                        } else {
-                            self.selected_project_idx = active_len - 1;
-                        }
+                    if self.projects_all_selected {
+                        // wrap from "All" to last real project
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = active_len.saturating_sub(1);
+                    } else if self.selected_project_idx > 0 {
+                        self.selected_project_idx -= 1;
+                    } else {
+                        // wrap from first project up to "All"
+                        self.projects_all_selected = true;
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived).count();
+                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
                     if archive_len > 0 {
                         if self.selected_archive_idx > 0 {
                             self.selected_archive_idx -= 1;
@@ -5521,15 +5925,20 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = self.projects.iter().filter(|p| !p.archived).count();
-                    if active_len > 0 {
+                    if self.projects_all_selected {
+                        // move from "All" into first real project
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = 0;
+                    } else if active_len > 0 {
                         if self.selected_project_idx < active_len - 1 {
                             self.selected_project_idx += 1;
                         } else {
-                            self.selected_project_idx = 0;
+                            // wrap from last project back to "All"
+                            self.projects_all_selected = true;
                         }
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived).count();
+                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
                     if archive_len > 0 {
                         if self.selected_archive_idx < archive_len - 1 {
                             self.selected_archive_idx += 1;
@@ -5645,7 +6054,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5809,7 +6218,7 @@ impl App {
                             if !already_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let val = if is_high { 50 } else { 25 };
-                                let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
                                 self.grant_xp(title, val)?;
                                 let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
                                 self.apply_class_passive(passive_trigger, 0)?;
@@ -5954,10 +6363,11 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
                     let archived: Vec<&Project> =
-                        self.projects.iter().filter(|p| p.archived).collect();
+                        self.projects.iter().filter(|p| p.archived || p.completed).collect();
                     if !archived.is_empty() && self.selected_archive_idx < archived.len() {
                         let mut p = archived[self.selected_archive_idx].clone();
                         p.archived = false;
+                        p.completed = false;
                         self.db.update_project(&p)?;
                         self.mark_dirty();
                         self.apply_class_passive("project_restore", 0)?;
@@ -5998,7 +6408,7 @@ impl App {
                 }
             }
             KeyCode::Char('e') => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -6083,7 +6493,7 @@ impl App {
                         let p = shared_projects[self.selected_fellowship_project_idx];
                         self.modal_state = ModalType::ProjectSharing { project_id: p.id };
                     }
-                } else if self.active_screen == ActiveScreen::Projects {
+                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -6580,6 +6990,7 @@ impl App {
             id
         } else {
             self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
             return Ok(());
         };
 
@@ -6754,6 +7165,7 @@ impl App {
                 } else {
                     self.active_project_id = None;
                     self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                     self.workspace_sidebar_focused = false;
                     self.reload_data()?;
                 }
@@ -6994,7 +7406,7 @@ impl App {
                                 if !task.xp_awarded {
                                     let is_high = t.priority == TaskPriority::High;
                                     let val = if is_high { 50 } else { 25 };
-                                    let title = if is_high { "Resolve Hero Task Quest" } else { "Complete Task Quest" };
+                                    let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
                                     self.grant_xp(title, val)?;
                                     let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
                                     self.apply_class_passive(passive_trigger, 0)?;
@@ -7359,11 +7771,14 @@ impl App {
                     };
                 }
             }
-            // c: complete project
+            // c: complete project — muestra confirmación primero, no vaya a ser un gordo error
             KeyCode::Char('c') if self.workspace_tab_idx == 3 => {
-                self.complete_project(p_id)?;
-                self.active_project_id = None;
-                self.active_screen = ActiveScreen::Projects;
+                if let Some(proj) = self.projects.iter().find(|p| p.id == p_id) {
+                    self.modal_state = ModalType::ConfirmConquerProject {
+                        project_id: p_id,
+                        project_name: proj.name.clone(),
+                    };
+                }
                 return Ok(());
             }
             KeyCode::Char('?') => {
@@ -7678,6 +8093,82 @@ impl App {
         let prev_focus = |idx: usize| -> usize {
             if idx > 0 { idx - 1 } else { max_fields }
         };
+        // Ctrl+S — guarda y cierra desde cualquier campo, igual que Enter pero sin reabrir el form de steps
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            if !title.trim().is_empty() {
+                let task_desc = if desc.trim().is_empty() { None } else { Some(desc.trim().to_string()) };
+                let due_str = match due_date_type {
+                    DueDateType::None => String::new(),
+                    DueDateType::Today => "today".to_string(),
+                    DueDateType::Tomorrow => "tomorrow".to_string(),
+                    DueDateType::InDays => format!("in {} days", due_date_val.trim()),
+                    DueDateType::Specific => due_date_val.trim().to_string(),
+                };
+                let due_parsed = self.parse_due_date_input(&due_str);
+                if due_date_type != DueDateType::None && due_parsed.is_none() {
+                    return Ok(());
+                }
+                let xp_service = XPService::new(&self.db);
+                if let Some(id) = task_id {
+                    let mut t = Task {
+                        id,
+                        project_id: Some(project_id),
+                        title: title.trim().to_string(),
+                        description: task_desc,
+                        due_date: due_parsed,
+                        completed: false,
+                        priority,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        owner_identity: Some(self.identity.public_key.clone()),
+                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        parent_task_id: None,
+                        xp_awarded: false,
+                        recurrence,
+                    };
+                    if let Ok(ts) = self.db.get_tasks() {
+                        if let Some(orig) = ts.iter().find(|o| o.id == id) {
+                            t.completed = orig.completed;
+                            t.created_at = orig.created_at;
+                            t.owner_identity = orig.owner_identity.clone();
+                            t.owner_username = orig.owner_username.clone();
+                            t.parent_task_id = orig.parent_task_id;
+                            t.xp_awarded = orig.xp_awarded;
+                        }
+                    }
+                    self.db.update_task(&t)?;
+                } else {
+                    let is_step_new = parent_task_id.is_some();
+                    let t = Task {
+                        id: Uuid::new_v4(),
+                        project_id: Some(project_id),
+                        title: title.trim().to_string(),
+                        description: task_desc,
+                        due_date: due_parsed,
+                        completed: false,
+                        priority,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        owner_identity: Some(self.identity.public_key.clone()),
+                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        parent_task_id,
+                        xp_awarded: false,
+                        recurrence: if is_step_new { None } else { recurrence },
+                    };
+                    self.db.insert_task(&t)?;
+                    self.audio_player.play_task_creation();
+                    let xp_label = if is_step_new { "Spawn Step" } else { "Spawn Quest" };
+                    if let Some(ref mut u) = self.user {
+                        xp_service.grant_xp(u, xp_label, 5)?;
+                    }
+                }
+                self.mark_dirty();
+                self.reload_data()?;
+                self.modal_state = ModalType::None;
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
@@ -8018,7 +8509,7 @@ impl App {
                         self.audio_player.play_task_creation();
 
                         // Grant +5 XP on Create Task / Step
-                        let xp_label = if is_step { "Spawn Step Quest" } else { "Spawn Task Quest" };
+                        let xp_label = if is_step { "Spawn Step" } else { "Spawn Quest" };
                         if let Some(ref mut u) = self.user {
                             xp_service.grant_xp(u, xp_label, 5)?;
                         }
@@ -8283,6 +8774,22 @@ impl App {
                 }
             }
             self.db.update_zen_tree(&tree)?;
+        } else if existing_adventures.len() < 5 {
+            let mut existing_titles: std::collections::HashSet<String> = existing_adventures
+                .iter()
+                .map(|a| a.title.clone())
+                .collect();
+            let missing = 5 - existing_adventures.len();
+            let mut added = 0;
+            for q in DailyAdventure::generate_daily_quests(today) {
+                if added >= missing {
+                    break;
+                }
+                if existing_titles.insert(q.title.clone()) {
+                    self.db.insert_daily_adventure(&q)?;
+                    added += 1;
+                }
+            }
         }
 
         Ok(())
@@ -8355,6 +8862,7 @@ impl App {
         self.db.update_zen_tree(&tree)?;
         self.push_great_chronicle_async("TreeWatering", "watered The Evergrowth.", true);
 
+        self.complete_productive_action()?;
         self.update_daily_adventure_progress("water_tree", 1)?;
 
         // Stage 6 quest progress increment
@@ -8930,16 +9438,22 @@ impl App {
                             true,
                         );
                     }
+                } else {
+                    // notif_key set but entry may still be locked (e.g. backup restore) — silently repair
+                    let _ = self.db.unlock_lore_entry(&class_key);
                 }
             }
         }
 
         if user_ref.level >= 40 {
-            if self.db.get_setting("lore_notified_class_council_orders")?.is_none()
-                && self.db.unlock_lore_entry("class_council_orders")?
-            {
-                let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
-                self.notifications.push(Notification::info("The Council of Orders Unlocked in Library!".to_string()));
+            if self.db.get_setting("lore_notified_class_council_orders")?.is_none() {
+                if self.db.unlock_lore_entry("class_council_orders")? {
+                    let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
+                    self.notifications.push(Notification::info("The Council of Orders Unlocked in Library!".to_string()));
+                }
+            } else {
+                // notif_key set but entry may still be locked (e.g. backup restore) — silently repair
+                let _ = self.db.unlock_lore_entry("class_council_orders");
             }
         }
 
@@ -8958,6 +9472,9 @@ impl App {
                             true,
                         );
                     }
+                } else {
+                    // notif_key set but entry may still be locked — silently repair
+                    let _ = self.db.unlock_lore_entry(&world_key);
                 }
             }
         }
@@ -9086,7 +9603,7 @@ impl App {
                         scored.push((s, SearchResult {
                             result_type: SearchResultType::Step,
                             title: t.title.clone(),
-                            details: format!("{} · subtask", proj),
+                            details: format!("{} · subquest", proj),
                             project_id: t.project_id,
                             item_id: t.id.to_string(),
                         }));
@@ -9191,6 +9708,24 @@ impl App {
                         details: e.2.clone(),
                         project_id: None,
                         item_id: e.0.clone(),
+                    }));
+                }
+            }
+        }
+
+        // 9. Rituales / Sidequests
+        if let Ok(rituals) = self.db.get_rituals() {
+            let streaks = self.db.get_all_ritual_streaks().unwrap_or_default();
+            for r in &rituals {
+                if let Some(s) = score_match(&r.name, r.description.as_deref()) {
+                    let streak = streaks.get(&r.id).copied().unwrap_or(0);
+                    let desc = r.description.clone().unwrap_or_else(|| r.frequency.clone());
+                    scored.push((s, SearchResult {
+                        result_type: SearchResultType::Ritual,
+                        title: r.name.clone(),
+                        details: format!("{} · {} XP · {} day streak", desc, r.reward_xp, streak),
+                        project_id: None,
+                        item_id: r.id.clone(),
                     }));
                 }
             }
@@ -9371,6 +9906,14 @@ impl App {
                     }
                 }
             }
+            SearchResultType::Ritual => {
+                self.active_screen = ActiveScreen::Dashboard;
+                if let Ok(rituals) = self.db.get_rituals() {
+                    if let Some(pos) = rituals.iter().position(|r| r.id == result.item_id) {
+                        self.selected_ritual_idx = pos;
+                    }
+                }
+            }
         }
         if self.active_screen == ActiveScreen::Workspace {
             self.reload_data()?;
@@ -9471,8 +10014,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "open_dashboard",
             },
             CommandAction {
-                name: "Open Projects",
-                description: "Navigate to Projects list",
+                name: "Open Campaigns",
+                description: "Navigate to Campaigns list",
                 shortcut: "2",
                 id: "open_projects",
             },
@@ -9515,7 +10058,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Focus",
                 description: "Navigate to Focus screen",
-                shortcut: "F (from Projects)",
+                shortcut: "F (from Campaigns)",
                 id: "open_focus",
             },
             CommandAction {
@@ -9527,7 +10070,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             CommandAction {
                 name: "Open Archive",
                 description: "Navigate to Archive screen",
-                shortcut: "A (from Projects)",
+                shortcut: "A (from Campaigns)",
                 id: "open_archive",
             },
             CommandAction {
@@ -9537,26 +10080,26 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 id: "search_integration",
             },
             CommandAction {
-                name: "Create Task",
-                description: "Create a new task, with project picker if needed",
+                name: "Create Quest",
+                description: "Create a new quest, with campaign picker if needed",
                 shortcut: "Ctrl+T",
                 id: "create_task",
             },
             CommandAction {
                 name: "Create Note",
-                description: "Create a new note, with project picker if needed",
+                description: "Create a new note, with campaign picker if needed",
                 shortcut: "Ctrl+N",
                 id: "create_note",
             },
             CommandAction {
                 name: "Start Focus Session",
                 description: "Begin a pomodoro focus session to gain XP",
-                shortcut: "F (from Projects)",
+                shortcut: "F (from Campaigns)",
                 id: "start_focus",
             },
             CommandAction {
-                name: "Open Project",
-                description: "Browse and open your active projects list",
+                name: "Open Campaign",
+                description: "Browse and open your active campaigns list",
                 shortcut: "2",
                 id: "open_project",
             },
@@ -9625,6 +10168,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
             "open_projects" => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             "open_character" => {
@@ -9666,6 +10210,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             "open_library" => {
                 self.active_screen = ActiveScreen::Library;
                 self.active_tab_idx = 4;
+                let _ = self.check_stage6_unlocks();
             }
             "open_archive" => {
                 self.active_screen = ActiveScreen::Archive;
@@ -9719,6 +10264,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
             "open_project" => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             "water_tree" => {
@@ -9789,7 +10335,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             (ClassType::CodeWarlock, "note_create") => (5, "Passive: Warlock Scroll Conjured"),
             (ClassType::CodeWarlock, "note_edit") => (5, "Passive: Warlock Arcane Edit"),
             (ClassType::CodeWarlock, "project_create") => (15, "Passive: Warlock System Summoned"),
-            (ClassType::CodeWarlock, "sync_complete") => (2, "Passive: Warlock Daemon Sync"),
+            (ClassType::CodeWarlock, "sync_complete") => (3, "Passive: Warlock Daemon Sync"),
 
             // Mind Sage
             (ClassType::MindSage, "note_create") if word_count > 500 => (10, "Passive: Sage Deep Knowledge"),
@@ -10106,7 +10652,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             if self.db.get_setting(key)?.is_none() {
                 self.db.set_setting(key, "true")?;
                 self.trigger_celebration(
-                    "1,000 TASKS PURIFIED!",
+                    "1,000 QUESTS PURIFIED!",
                     "Your relentless crusade against procrastination has resolved 1,000 quests.\nThe realm is forever in your debt.",
                     "SUCCESS"
                 );
@@ -10141,12 +10687,14 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_auto_sync(&mut self) -> Result<()> {
-        if !self.auto_sync {
-            return Ok(());
-        }
-
         // Apply result from completed background sync
         if self.sync_in_progress {
+            if let ModalType::SyncProgress { ref mut step, ref mut message } = self.modal_state {
+                if *step == 0 && self.intro_ticks % 12 == 0 {
+                    *step = 1;
+                    *message = "Publishing full local state and pulling new changes...".to_string();
+                }
+            }
             let result = self.sync_result.try_lock().ok().and_then(|mut g| g.take());
             if let Some(bg) = result {
                 self.sync_in_progress = false;
@@ -10154,6 +10702,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     Some(e) => {
                         self.sync_failure_count = self.sync_failure_count.saturating_add(1);
                         self.sync_status_msg = format!("Sync failed: {}", e);
+                        if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
+                            self.modal_state = ModalType::SyncProgress {
+                                step: 3,
+                                message: self.sync_status_msg.clone(),
+                            };
+                        }
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         let _ = self.reload_data();
                     }
@@ -10168,6 +10722,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         }
                         self.last_sync_warlock_xp = 0;
                         self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
+                        if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
+                            self.modal_state = ModalType::SyncProgress {
+                                step: 2,
+                                message: format!("Full sync complete. {}", self.sync_status_msg),
+                            };
+                        }
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         self.apply_class_passive("sync_complete", 0)?;
                         self.reload_data()?;
@@ -10177,6 +10737,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     }
                 }
             }
+            return Ok(());
+        }
+
+        if !self.auto_sync {
             return Ok(());
         }
 
@@ -10239,6 +10803,61 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
+    /// Revisa si el backup manual terminó y actualiza el modal de progreso.
+    pub fn tick_cloud_backup(&mut self) {
+        let is_active = matches!(
+            &self.modal_state,
+            ModalType::CloudBackupProgress { step: 0 | 1, .. }
+        );
+        if !is_active {
+            return;
+        }
+
+        if let ModalType::CloudBackupProgress { ref mut step, ref mut message } = self.modal_state {
+            if *step == 0 && self.intro_ticks % 12 == 0 {
+                *step = 1;
+                *message = "Uploading backup to cloud...".to_string();
+            }
+        }
+
+        let outcome = if let Ok(mut slot) = self.cloud_backup_result.lock() {
+            slot.take()
+        } else {
+            return;
+        };
+        let Some(result) = outcome else { return; };
+
+        match result {
+            Ok(msg) => {
+                self.sync_status_msg = msg.clone();
+                self.notifications.push(Notification::info("Cloud Backup Saved!".to_string()));
+                self.modal_state = ModalType::CloudBackupProgress {
+                    step: 2,
+                    message: msg,
+                };
+            }
+            Err(msg) => {
+                self.sync_status_msg = msg.clone();
+                self.modal_state = ModalType::CloudBackupProgress {
+                    step: 3,
+                    message: msg,
+                };
+            }
+        }
+    }
+
+    fn set_pull_cursor_to_remote_head(
+        db: &crate::database::Database,
+        client: &crate::services::api_client::ApiClient,
+    ) -> Result<()> {
+        let resp = client.send_request("GET", "sync/head", "")?;
+        let val: serde_json::Value = serde_json::from_str(&resp)?;
+        let seq = val["seq"].as_i64().unwrap_or(0);
+        db.set_setting("last_pull_seq", &seq.to_string())?;
+        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+        Ok(())
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -10250,6 +10869,73 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             self.mpris_last_poll = std::time::Instant::now();
             self.mpris_now_playing = crate::audio::mpris_player::get_now_playing();
         }
+    }
+
+    /// Polls the cloud restore background thread and advances the progress modal through steps.
+    pub fn tick_cloud_restore(&mut self) -> Result<()> {
+        // Only drive this if the progress modal is showing in downloading state
+        let is_downloading = matches!(
+            &self.modal_state,
+            ModalType::CloudRestoreProgress { step: 0, .. }
+        );
+        if !is_downloading {
+            return Ok(());
+        }
+        let outcome = if let Ok(mut slot) = self.cloud_restore_result.lock() {
+            slot.take()
+        } else {
+            return Ok(());
+        };
+        let Some(result) = outcome else { return Ok(()); };
+
+        match result {
+            Err(msg) => {
+                self.modal_state = ModalType::CloudRestoreProgress {
+                    step: 3,
+                    message: msg,
+                };
+            }
+            Ok(json) => {
+                // Step 1: importing
+                self.modal_state = ModalType::CloudRestoreProgress {
+                    step: 1,
+                    message: "Importing chronicle data...".to_string(),
+                };
+                let decoded_json = {
+                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    STANDARD.decode(json.trim())
+                        .ok()
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .unwrap_or(json)
+                };
+                match self.db.import_from_json(&decoded_json) {
+                    Ok(_) => {
+                        let client = crate::services::api_client::ApiClient::new(
+                            &self.server_url,
+                            self.identity.clone(),
+                            &self.device_id,
+                        );
+                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                        self.reload_data()?;
+                        self.notifications.push(Notification::info("Chronicle restored from cloud!".to_string()));
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 2,
+                            message: "Restore complete! Future sync starts from the current cloud state.".to_string(),
+                        };
+                        // Backup restore is a full snapshot. Set the cursor to server HEAD first
+                        // so old event-log history cannot replay over the restored database.
+                        self.start_background_sync();
+                    }
+                    Err(e) => {
+                        self.modal_state = ModalType::CloudRestoreProgress {
+                            step: 3,
+                            message: format!("Import failed: {}", e),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub fn tick_chat_poll(&mut self) -> Result<()> {
@@ -10457,6 +11143,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
         self.sync_status_msg = "Syncing...".to_string();
+        self.modal_state = ModalType::SyncProgress {
+            step: 0,
+            message: "Preparing full synchronization...".to_string(),
+        };
         self.do_background_sync(true);
     }
 
@@ -10483,7 +11173,25 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
                     &db, &identity, &device_id, Some(server_url.as_str()),
                 )?;
-                let (pushed, pulled, conflicts) = sync_engine.sync()?;
+                if include_contributions {
+                    let _ = db.queue_full_state_sync();
+                }
+                let (pushed, first_pulled, mut conflicts) = sync_engine.sync()?;
+                // Drain: a pull returns up to 500 events per call. If exactly 500 came back
+                // there are likely more waiting — keep pulling until the batch is smaller.
+                // This matters after a restore when last_pull_seq resets to 0 and the device
+                // must catch up on thousands of events instead of waiting 30s per batch.
+                let mut total_pulled = first_pulled;
+                let mut last_batch = first_pulled;
+                let mut drain_iters = 0;
+                while last_batch >= 500 && drain_iters < 100 {
+                    let (_, more, more_conflicts) = sync_engine.sync()?;
+                    conflicts.extend(more_conflicts);
+                    total_pulled += more;
+                    last_batch = more;
+                    drain_iters += 1;
+                }
+                let pulled = total_pulled;
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);
@@ -10627,6 +11335,29 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if !conflicts.is_empty() {
                     let conflict_count = db.get_setting("conflict_count")?.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
                     let _ = db.set_setting("conflict_count", &(conflict_count + conflicts.len() as i32).to_string());
+                }
+
+                // Auto-backup once every 24 h so [r] Restore always has something to fetch.
+                // Without this the server only has a backup if the user manually pressed [e].
+                let should_backup = {
+                    let last_ts = db.get_setting("last_auto_backup")?.unwrap_or_default();
+                    if include_contributions || last_ts.is_empty() {
+                        true
+                    } else {
+                        chrono::DateTime::parse_from_rfc3339(&last_ts)
+                            .map(|t| {
+                                let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+                                age > chrono::Duration::hours(24)
+                            })
+                            .unwrap_or(true)
+                    }
+                };
+                if should_backup {
+                    if let Ok(json) = db.export_to_json() {
+                        if client.send_request("POST", "recovery", &json).is_ok() {
+                            let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                        }
+                    }
                 }
 
                 Ok((pushed, pulled, conflicts))
@@ -11143,7 +11874,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             let elapsed_seconds = (Utc::now() - active.start_time).num_seconds();
             let remaining = total_seconds - elapsed_seconds;
             if remaining <= 0 {
-                self.audio_player.play_task_complete();
+                self.audio_player.play_focus_end();
+                if self.external_notifications {
+                    let duration = active.duration_mins;
+                    crate::services::notifications::send_system_notification(
+                        "Focus Session Complete",
+                        &format!("{} min session complete. Great work!", duration),
+                        false,
+                    );
+                }
                 // Focus session completes!
                 let duration = active.duration_mins;
                 let active_soundscape = active.soundscape.clone();
@@ -11187,6 +11926,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     owner_identity: Some(self.identity.public_key.clone()),
                 };
                 self.db.insert_focus_session(&sess)?;
+                self.update_daily_adventure_progress("complete_focus_session", 1)?;
                 self.mark_dirty();
                 self.push_great_chronicle_async(
                     "FocusSession",
@@ -11457,7 +12197,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if !unlocked.contains(&trait_id.to_string()) {
             self.db.unlock_trait(trait_id)?;
             let display_name = match trait_id {
-                "task_slayer" => "Task Slayer",
+                "task_slayer" => "Quest Slayer",
                 "scholar" => "Scholar",
                 "historian" => "Historian",
                 "gardener" => "Gardener",
@@ -11471,36 +12211,88 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     pub fn complete_ritual(&mut self, ritual_id: &str) -> Result<()> {
         let date = chrono::Local::now().date_naive();
-        let completed_today = self.db.get_ritual_history_for_date(date)?;
-        if !completed_today.contains(&ritual_id.to_string()) {
-            self.audio_player.play_task_complete();
-            self.db.complete_ritual(ritual_id, date)?;
-            self.mark_dirty();
-            self.trigger_ambient_particles();
 
-            let rituals = self.db.get_rituals()?;
-            if let Some(r) = rituals.iter().find(|rit| rit.id == ritual_id) {
-                let xp = r.reward_xp;
-                let ritual_name = r.name.clone();
-                self.grant_xp("Sidequest Completed", xp)?;
-                self.push_great_chronicle_async(
-                    "SidequestComplete",
-                    "fulfilled a sidequest.",
-                    true,
-                );
-                self.notifications.push(Notification::info(format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)));
+        match self.db.complete_ritual(ritual_id, date)? {
+            None => {
+                // Already hit the daily target — nothing to do
+                let rituals = self.db.get_rituals()?;
+                let target = rituals.iter()
+                    .find(|r| r.id == ritual_id)
+                    .map(|r| r.daily_target)
+                    .unwrap_or(1);
+                if target > 1 {
+                    self.notifications.push(Notification::info(
+                        format!("Already completed all {} times today!", target)
+                    ));
+                } else {
+                    self.notifications.push(Notification::info("Already completed today!".to_string()));
+                }
             }
+            Some((count, target)) => {
+                self.audio_player.play_task_complete();
+                self.mark_dirty();
+                self.trigger_ambient_particles();
 
-            let mut tree = self.db.get_zen_tree()?;
-            if tree.health < 100 {
-                tree.health = (tree.health + 1).min(100);
-                self.db.update_zen_tree(&tree)?;
-                self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
+                let rituals = self.db.get_rituals()?;
+                if let Some(r) = rituals.iter().find(|rit| rit.id == ritual_id) {
+                    let xp = r.reward_xp;
+                    let ritual_name = r.name.clone();
+                    self.grant_xp("Sidequest Completed", xp)?;
+
+                    if count < target {
+                        // Partial — show progress, no streak check yet
+                        self.notifications.push(Notification::info(
+                            format!("Sidequest Progress: {} ({}/{}) +{} XP", ritual_name, count, target, xp)
+                        ));
+                    } else {
+                        // Fully completed for the day
+                        self.push_great_chronicle_async("SidequestComplete", "fulfilled a sidequest.", true);
+                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
+                        if target > 1 {
+                            self.notifications.push(Notification::info(
+                                format!("Sidequest Complete: {} (all {}) +{} XP", ritual_name, target, xp)
+                            ));
+                        } else {
+                            self.notifications.push(Notification::info(
+                                format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)
+                            ));
+                        }
+
+                        // Streak milestone — only on full daily completion
+                        let streak = self.db.get_ritual_streak(ritual_id).unwrap_or(0);
+                        let milestone = match streak {
+                            3  => Some((3,  15,  "3-Day Initiate")),
+                            7  => Some((7,  25,  "7-Day Seeker")),
+                            15 => Some((15, 50,  "15-Day Devoted")),
+                            30 => Some((30, 100, "30-Day Champion")),
+                            45 => Some((45, 150, "45-Day Veteran")),
+                            60 => Some((60, 200, "60-Day Warlord")),
+                            85 => Some((85, 300, "85-Day Legendary")),
+                            90 => Some((90, 400, "90-Day Ascendant")),
+                            _  => None,
+                        };
+                        if let Some((days, bonus_xp, title)) = milestone {
+                            self.grant_xp(&format!("Streak Milestone: {} ({})", title, ritual_name), bonus_xp)?;
+                            self.trigger_celebration(
+                                &format!("STREAK MILESTONE: {} DAYS", days),
+                                &format!("{}\nYou have maintained '{}' for {} consecutive days!\n(+{} Bonus XP)", title, ritual_name, days, bonus_xp),
+                                "SUCCESS",
+                            );
+                        }
+
+                        let mut tree = self.db.get_zen_tree()?;
+                        if tree.health < 100 {
+                            tree.health = (tree.health + 1).min(100);
+                            self.db.update_zen_tree(&tree)?;
+                            self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
+                        }
+
+                        self.complete_productive_action()?;
+                        self.check_traits()?;
+                    }
+                }
+                self.reload_data()?;
             }
-
-            self.complete_productive_action()?;
-            self.check_traits()?;
-            self.reload_data()?;
         }
         Ok(())
     }
@@ -11508,7 +12300,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     pub fn toggle_milestone(&mut self, milestone_id: Uuid) -> Result<()> {
         let p_id = self
             .active_project_id
-            .ok_or_else(|| anyhow::anyhow!("No active project"))?;
+            .ok_or_else(|| anyhow::anyhow!("No active campaign"))?;
         let mut milestones = self.db.get_milestones_for_project(p_id)?;
         if let Some(m) = milestones.iter_mut().find(|ms| ms.id == milestone_id) {
             if m.completed {
@@ -11533,7 +12325,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     .count();
                 if completed_tasks < 3 {
                     self.notifications.push(Notification::info(format!(
-                            "Need {} more completed quest(s) in this project first.",
+                            "Need {} more completed quest(s) in this campaign first.",
                             3 - completed_tasks
                         )));
                     return Ok(());
@@ -11544,7 +12336,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     .filter(|j| j.project_id == p_id)
                     .count();
                 if project_journals < 1 {
-                    self.notifications.push(Notification::warning("Write at least 1 Chronicle entry for this project first."));
+                    self.notifications.push(Notification::warning("Write at least 1 Chronicle entry for this campaign first."));
                     return Ok(());
                 }
                 true
@@ -11628,7 +12420,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.trigger_ambient_particles();
 
                 let proj_name = existing.name.clone();
-                self.grant_xp(&format!("Complete Project: {}", proj_name), 200)?;
+                self.grant_xp(&format!("Complete Campaign: {}", proj_name), 200)?;
 
                 // Stage 6: increment Level 75 quest progress
                 self.increment_quest_progress(75, 1)?;
@@ -11637,20 +12429,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
                     self.db.add_chronicle_entry(
                         day_number,
-                        &format!("Completed Project: {}.", proj_name),
+                        &format!("Completed Campaign: {}.", proj_name),
                     )?;
                 }
 
                 self.trigger_celebration(
                     &format!("PROJECT COMPLETED: {}", proj_name),
-                    &format!("You have completed the grand project '{}'!\nOrder has been restored to this workspace.", proj_name),
+                    &format!("You have conquered the campaign '{}'!\nOrder has been restored to this workspace.", proj_name),
                     "SUCCESS"
                 );
 
                 self.grow_tree(20)?;
 
                 self.notifications.push(Notification::info(format!(
-                        "Project Completed: {}! (+200 XP, +20 Growth)",
+                        "Campaign Conquered: {}! (+200 XP, +20 Growth)",
                         existing.name
                     )));
 
@@ -11767,6 +12559,96 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             Err(e) => {
                 if let Some(m) = self.bug_report_modal.as_mut() {
                     m.status = Some(format!("Failed to send: {e}"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Hydration ──────────────────────────────────────────────────────────────
+
+    pub fn reload_hydration_config(&mut self) {
+        let db = &self.db;
+        self.hydration_enabled = db.get_setting("hydration_enabled")
+            .ok().flatten().as_deref() == Some("true");
+        self.hydration_target = db.get_setting("hydration_target")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(8);
+        self.hydration_interval_mins = db.get_setting("hydration_interval_mins")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(60);
+        self.hydration_active_from = db.get_setting("hydration_active_from")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(9);
+        self.hydration_active_to = db.get_setting("hydration_active_to")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(18);
+        self.hydration_pause_focus = db.get_setting("hydration_pause_focus")
+            .ok().flatten().as_deref() == Some("true");
+        self.hydration_reward_xp = 20;
+
+        if let Ok((count, _)) = self.db.hydration_get_today() {
+            self.hydration_glasses = count;
+        }
+
+        // Arm the first reminder from now if hydration is enabled and timer isn't set
+        if self.hydration_enabled && self.hydration_next_reminder_at.is_none() {
+            self.hydration_next_reminder_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+            );
+        }
+    }
+
+    pub fn tick_hydration(&mut self) -> Result<()> {
+        if !self.hydration_enabled {
+            return Ok(());
+        }
+
+        // Refresh today's count (handles midnight rollover)
+        if let Ok((count, _)) = self.db.hydration_get_today() {
+            self.hydration_glasses = count;
+        }
+
+        let now = chrono::Local::now();
+        let hour = now.hour();
+        let in_active_hours = hour >= self.hydration_active_from && hour < self.hydration_active_to;
+
+        if !in_active_hours {
+            // Outside active window — clear any pending timer so it rearms when active hours resume
+            self.hydration_next_reminder_at = None;
+            return Ok(());
+        }
+
+        // Arm timer if not set (e.g., just entered active hours)
+        if self.hydration_next_reminder_at.is_none() {
+            self.hydration_next_reminder_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+            );
+        }
+
+        // Skip when in a focus session and pause-during-focus is on
+        if self.hydration_pause_focus && self.active_focus_session.is_some() {
+            return Ok(());
+        }
+
+        // Check if reminder is already showing
+        if matches!(self.modal_state, ModalType::HydrationReminder) {
+            return Ok(());
+        }
+
+        // Fire popup if timer elapsed
+        if let Some(at) = self.hydration_next_reminder_at {
+            if std::time::Instant::now() >= at {
+                self.hydration_next_reminder_at = None; // cleared until dismissed
+                if matches!(self.modal_state, ModalType::None) {
+                    self.audio_player.play_water_alert();
+                    if self.external_notifications {
+                        crate::services::notifications::send_system_notification(
+                            "Hydration Reminder",
+                            "Time to drink a glass of water!",
+                            false,
+                        );
+                    }
+                    self.modal_state = ModalType::HydrationReminder;
                 }
             }
         }
@@ -11990,7 +12872,7 @@ mod app_tests {
         let t = Task {
             id: task_id,
             project_id: Some(proj.id),
-            title: "Task Quest".to_string(),
+            title: "Quest".to_string(),
             description: None,
             priority: TaskPriority::Medium,
             due_date: None,

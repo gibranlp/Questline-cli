@@ -145,12 +145,49 @@ try {
     } catch (PDOException $e) {
         if (strpos($e->getMessage(), '1060') === false && strpos($e->getMessage(), '1061') === false) { throw $e; }
     }
-    try {
-        $pdo->exec("ALTER TABLE sync_events ADD COLUMN seq BIGINT NOT NULL AUTO_INCREMENT, ADD KEY idx_seq (seq)");
-        $pdo->exec("ALTER TABLE sync_events ADD INDEX idx_sync_events_seq (user_id, seq)");
-    } catch (PDOException $e) {
-        if (strpos($e->getMessage(), '1060') === false && strpos($e->getMessage(), '1061') === false) { throw $e; }
+    // All ALTER TABLE migrations are wrapped to silently ignore both
+    // "column already exists" (1060) and "permission denied" (1142) errors
+    // so a failed migration never brings down unrelated routes.
+    foreach ([
+        "ALTER TABLE sync_events ADD COLUMN seq BIGINT NOT NULL AUTO_INCREMENT, ADD KEY idx_seq (seq)",
+        "ALTER TABLE sync_events ADD INDEX idx_sync_events_seq (user_id, seq)",
+        "ALTER TABLE users ADD COLUMN supporter TINYINT(1) NOT NULL DEFAULT 0",
+        "ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL",
+        "ALTER TABLE access_codes ADD COLUMN linked_user_id VARCHAR(36) NULL",
+        "ALTER TABLE devices ADD COLUMN public_key VARCHAR(64) NULL",
+        "ALTER TABLE webhooks ADD UNIQUE KEY uq_user_url (user_id, url(255))",
+    ] as $_migration) {
+        try { $pdo->exec($_migration); } catch (PDOException $e) { /* non-fatal */ }
     }
+    unset($_migration);
+    foreach ([
+        "CREATE TABLE IF NOT EXISTS access_codes (
+            code VARCHAR(64) PRIMARY KEY,
+            label VARCHAR(255) NULL,
+            created_by VARCHAR(100) NOT NULL DEFAULT 'admin',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            redeemed_by_user_id VARCHAR(36) NULL,
+            redeemed_at TIMESTAMP NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS pending_supporters (
+            email VARCHAR(255) PRIMARY KEY,
+            granted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+        "CREATE TABLE IF NOT EXISTS webapp_accounts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            user_id VARCHAR(36) NOT NULL,
+            username VARCHAR(50) NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            public_key VARCHAR(64) NOT NULL,
+            encrypted_key_blob MEDIUMTEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uq_username (username),
+            INDEX idx_user_id (user_id)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+    ] as $_createSql) {
+        try { $pdo->exec($_createSql); } catch (PDOException $e) { /* non-fatal */ }
+    }
+    unset($_createSql);
 } catch (PDOException $e) {
     error_log("[Questline API] DB connection failed: " . $e->getMessage());
     http_response_code(500);
@@ -336,6 +373,189 @@ if ($route === 'spotify/token') {
     exit;
 }
 
+// ── Webapp registration — ruta pública, no requiere auth criptográfica ─────────
+if ($route === 'webapp/register') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+        exit;
+    }
+    $rawBody = file_get_contents('php://input');
+    $data = json_decode($rawBody, true);
+    if (!$data) {
+        http_response_code(400);
+        echo json_encode(["error" => "Invalid request body"]);
+        exit;
+    }
+
+    $regCode        = trim($data['access_code']       ?? '');
+    $regUsername    = trim($data['username']           ?? '');
+    $regPassword    = $data['password']                ?? '';
+    $regUserId      = trim($data['user_id']            ?? '');
+    $regPubKey      = trim($data['public_key']         ?? '');
+    $regDevId       = trim($data['device_id']          ?? '');
+    $regDevName     = substr(trim($data['device_name'] ?? 'Questline Web'), 0, 100);
+    $regKeyBlob     = $data['encrypted_key_blob']      ?? '';
+
+    // Validate required fields
+    if (empty($regCode) || empty($regUsername) || empty($regPassword) ||
+        strlen($regPubKey) !== 64 || !ctype_xdigit($regPubKey) ||
+        empty($regKeyBlob)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Missing required fields"]);
+        exit;
+    }
+    if (!preg_match('/^[a-zA-Z0-9_]{1,50}$/', $regUsername)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Username must be 1-50 alphanumeric characters or underscores"]);
+        exit;
+    }
+    if (strlen($regPassword) < 8) {
+        http_response_code(400);
+        echo json_encode(["error" => "Password must be at least 8 characters"]);
+        exit;
+    }
+
+    // Validate access code and check for linked_user_id
+    $stmt = $pdo->prepare("SELECT code, linked_user_id FROM access_codes WHERE code = ? AND (redeemed_by_user_id IS NULL OR redeemed_by_user_id = '')");
+    $stmt->execute([$regCode]);
+    $codeRow = $stmt->fetch();
+    if (!$codeRow) {
+        http_response_code(403);
+        echo json_encode(["error" => "Access code is invalid or already used"]);
+        exit;
+    }
+
+    // Check username availability
+    $stmt = $pdo->prepare("SELECT id FROM webapp_accounts WHERE username = ?");
+    $stmt->execute([$regUsername]);
+    if ($stmt->fetch()) {
+        http_response_code(409);
+        echo json_encode(["error" => "Username already taken"]);
+        exit;
+    }
+
+    // Determine final user_id: prefer linked_user_id from code (connects to existing CLI account)
+    $finalUserId = !empty($codeRow['linked_user_id']) ? $codeRow['linked_user_id'] : $regUserId;
+    if (empty($finalUserId) || !preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $finalUserId)) {
+        $finalUserId = strtolower(bin2hex(random_bytes(4)) . '-' . bin2hex(random_bytes(2)) . '-4' . substr(bin2hex(random_bytes(2)), 1) . '-' . dechex(8 + rand(0, 3)) . substr(bin2hex(random_bytes(2)), 1) . '-' . bin2hex(random_bytes(6)));
+    }
+
+    $passwordHash = password_hash($regPassword, PASSWORD_BCRYPT, ['cost' => 12]);
+
+    // Upsert user record — if linked_user_id, just set supporter flag; else create new
+    $stmt = $pdo->prepare("INSERT INTO users (id, public_key, supporter) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE supporter = 1");
+    $stmt->execute([$finalUserId, $regPubKey]);
+
+    // Create webapp account
+    $stmt = $pdo->prepare("INSERT INTO webapp_accounts (user_id, username, password_hash, public_key, encrypted_key_blob) VALUES (?, ?, ?, ?, ?)");
+    $stmt->execute([$finalUserId, $regUsername, $passwordHash, $regPubKey, $regKeyBlob]);
+
+    // Register webapp device with its public key so Paso 3 can resolve user_id from it
+    if (!empty($regDevId) && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i', $regDevId)) {
+        $stmt = $pdo->prepare("INSERT INTO devices (id, user_id, device_name, public_key) VALUES (?, ?, ?, ?)
+            ON DUPLICATE KEY UPDATE device_name = VALUES(device_name), public_key = VALUES(public_key), last_seen = CURRENT_TIMESTAMP");
+        $stmt->execute([$regDevId, $finalUserId, $regDevName, $regPubKey]);
+    }
+
+    // Mark code redeemed
+    $stmt = $pdo->prepare("UPDATE access_codes SET redeemed_by_user_id = ?, redeemed_at = CURRENT_TIMESTAMP WHERE code = ?");
+    $stmt->execute([$finalUserId, $regCode]);
+
+    echo json_encode(["status" => "success", "user_id" => $finalUserId]);
+    exit;
+}
+
+// ── Webapp check-code — validates an access code without consuming it ──────────
+if ($route === 'webapp/check-code') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+        exit;
+    }
+    $rawBody = file_get_contents('php://input');
+    $data = json_decode($rawBody, true);
+    $code = trim($data['access_code'] ?? '');
+
+    if (empty($code)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Access code required"]);
+        exit;
+    }
+
+    $stmt = $pdo->prepare("SELECT linked_user_id FROM access_codes WHERE code = ? AND (redeemed_by_user_id IS NULL OR redeemed_by_user_id = '')");
+    $stmt->execute([$code]);
+    $row = $stmt->fetch();
+
+    if (!$row) {
+        echo json_encode(["valid" => false]);
+    } else {
+        echo json_encode(["valid" => true, "linked" => !empty($row['linked_user_id'])]);
+    }
+    exit;
+}
+
+// ── Webapp login — ruta pública, devuelve el blob cifrado del key ──────────────
+if ($route === 'webapp/login') {
+    if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+        http_response_code(405);
+        echo json_encode(["error" => "Method not allowed"]);
+        exit;
+    }
+    $rawBody = file_get_contents('php://input');
+    $data = json_decode($rawBody, true);
+    if (!$data) {
+        http_response_code(400);
+        echo json_encode(["error" => "Invalid request body"]);
+        exit;
+    }
+
+    $loginUsername = trim($data['username'] ?? '');
+    $loginPassword = $data['password'] ?? '';
+
+    if (empty($loginUsername) || empty($loginPassword)) {
+        http_response_code(400);
+        echo json_encode(["error" => "Username and password are required"]);
+        exit;
+    }
+
+    $stmt = $pdo->prepare("SELECT wa.*, u.supporter FROM webapp_accounts wa JOIN users u ON u.id = wa.user_id WHERE wa.username = ?");
+    $stmt->execute([$loginUsername]);
+    $account = $stmt->fetch();
+
+    if (!$account || !password_verify($loginPassword, $account['password_hash'])) {
+        http_response_code(401);
+        echo json_encode(["error" => "Invalid username or password"]);
+        exit;
+    }
+
+    if (!$account['supporter']) {
+        http_response_code(403);
+        echo json_encode(["error" => "Access revoked. Contact support."]);
+        exit;
+    }
+
+    echo json_encode([
+        "status"             => "success",
+        "user_id"            => $account['user_id'],
+        "public_key"         => $account['public_key'],
+        "encrypted_key_blob" => $account['encrypted_key_blob'],
+    ]);
+    exit;
+}
+
+if ($route === 'webapp/check-email') {
+    $checkEmail = trim($_GET['email'] ?? '');
+    if (!filter_var($checkEmail, FILTER_VALIDATE_EMAIL)) {
+        echo json_encode(["pre_authorized" => false]);
+        exit;
+    }
+    $stmt = $pdo->prepare("SELECT email FROM pending_supporters WHERE email = ?");
+    $stmt->execute([$checkEmail]);
+    echo json_encode(["pre_authorized" => (bool)$stmt->fetch()]);
+    exit;
+}
+
 // ── Paso 1: Agarrar los headers de autenticación — sin estos no pasa nadie ────
 $headers = getallheaders();
 $userId = $headers['X-User-Id'] ?? $headers['x-user-id'] ?? null;
@@ -405,6 +625,13 @@ try {
         // Esto soluciona el problema de tener el mismo par de llaves en múltiples PCs con diferentes UUIDs.
         $userId = $existingUser['id'];
     } else {
+        // Check devices table for per-device keys (webapp uses its own keypair per account)
+        $stmt = $pdo->prepare("SELECT user_id FROM devices WHERE public_key = ? LIMIT 1");
+        $stmt->execute([$identity]);
+        $deviceByKey = $stmt->fetch();
+        if ($deviceByKey) {
+            $userId = $deviceByKey['user_id'];
+        } else {
         // Si la llave pública no existe, validamos el user ID enviado por el cliente
         $stmt = $pdo->prepare("SELECT public_key FROM users WHERE id = ?");
         $stmt->execute([$userId]);
@@ -421,6 +648,7 @@ try {
             $stmt = $pdo->prepare("INSERT INTO users (id, public_key) VALUES (?, ?)");
             $stmt->execute([$userId, $identity]);
         }
+        } // closes: else { // deviceByKey not found
     }
 } catch (PDOException $e) {
     error_log("[Questline API] Auth DB error (step 3): " . $e->getMessage());
@@ -598,9 +826,12 @@ try {
                 exit;
             }
 
-            $stmt = $pdo->prepare("INSERT INTO webhooks (user_id, url, events, secret) VALUES (?, ?, ?, ?)");
+            $stmt = $pdo->prepare(
+                "INSERT INTO webhooks (user_id, url, events, secret) VALUES (?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE events = VALUES(events), secret = VALUES(secret)"
+            );
             $stmt->execute([$userId, $url, $events, $secret]);
-            echo json_encode(["status" => "success", "message" => "Webhook registered successfully", "id" => $pdo->lastInsertId()]);
+            echo json_encode(["status" => "success", "message" => "Webhook registered successfully"]);
             break;
 
         case 'webhooks/list':
@@ -659,6 +890,7 @@ try {
             $memberStmt = $pdo->prepare("SELECT user_identity FROM project_members WHERE project_id = ? AND user_identity != ?");
             $userIdStmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
             $replicateInsertStmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            $entityProjectStmt = $pdo->prepare("SELECT payload FROM sync_events WHERE user_id = ? AND entity_type = ? AND entity_id = ? AND payload != '' ORDER BY seq DESC LIMIT 1");
 
             foreach ($entries as $e) {
                 if (empty($e['id'])) continue;
@@ -675,22 +907,22 @@ try {
                 ]);
                 $inserted += $stmt->rowCount();
 
-                // Disparar webhooks registrados si el tipo de entidad coincide
-                if (in_array($e['entity_type'], ['milestone', 'task', 'user_stats', 'streak', 'zen_tree'])) {
-                    trigger_webhooks($pdo, $userId, $e['entity_type'], $e['operation'], $e['content'] ?? '');
-                }
+                // Disparar webhooks para todos los entity types — incluyendo al webapp mirror
+                trigger_webhooks($pdo, $userId, $e['entity_type'], $e['entity_id'] ?? '', $e['operation'], $e['content'] ?? '', $e['id'] ?? '', $e['timestamp'] ?? date(DATE_RFC3339));
 
                 // Si el evento pertenece a un proyecto compartido, replicarlo a los compañeros
                 $projectId = null;
                 if ($e['entity_type'] === 'project') {
                     $projectId = $e['entity_id'];
-                } elseif (in_array($e['entity_type'], ['task', 'note', 'journal_entry', 'milestone', 'focus_session', 'codex', 'task_assignment', 'project_member', 'chronicle_message'])) {
-                    if (!empty($e['content'])) {
-                        $payloadObj = json_decode($e['content'], true);
-                        if (!empty($payloadObj['project_id'])) {
-                            $projectId = $payloadObj['project_id'];
-                        }
-                    }
+                } elseif (is_project_scoped_sync_type($e['entity_type'])) {
+                    $projectId = extract_project_id_from_payload($e['content'] ?? '');
+                }
+
+                // Deletes usually arrive after the local row is gone, so their payload can be empty.
+                // Recover the project from the last known event for this entity or shared deletes vanish.
+                if (!$projectId && is_project_scoped_sync_type($e['entity_type'])) {
+                    $entityProjectStmt->execute([$userId, $e['entity_type'], $e['entity_id']]);
+                    $projectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
                 }
 
                 if ($projectId) {
@@ -731,6 +963,15 @@ try {
             $stmt->execute([$userId, $pullDeviceId, $sinceSeq]);
             $events = $stmt->fetchAll();
             echo json_encode($events);
+            break;
+
+        case 'sync/head':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            $stmt = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_events WHERE user_id = ?");
+            $stmt->execute([$userId]);
+            echo json_encode(["seq" => (int)$stmt->fetchColumn()]);
             break;
             
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
@@ -816,6 +1057,53 @@ try {
                 $inviteeUsername = $invite['role'] . ' Companion';
             }
             $stmt->execute([$invite['project_id'], $identity, $inviteeUsername, $invite['role'], $inviteeUsername, $invite['role']]);
+
+            // El compañero nuevo necesita el historial del proyecto, no solo un placeholder local.
+            $stmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
+            $stmt->execute([$invite['inviter_identity']]);
+            $inviterUserId = $stmt->fetchColumn();
+            if ($inviterUserId) {
+                backfill_project_sync_events($pdo, $inviterUserId, $userId, $invite['project_id']);
+            }
+
+            insert_project_member_sync_event(
+                $pdo,
+                $userId,
+                $invite['project_id'],
+                $invite['inviter_identity'],
+                $invite['inviter_username'],
+                'Owner',
+                $deviceId
+            );
+            insert_project_member_sync_event(
+                $pdo,
+                $userId,
+                $invite['project_id'],
+                $identity,
+                $inviteeUsername,
+                $invite['role'],
+                $deviceId
+            );
+            if ($inviterUserId) {
+                insert_project_member_sync_event(
+                    $pdo,
+                    $inviterUserId,
+                    $invite['project_id'],
+                    $invite['inviter_identity'],
+                    $invite['inviter_username'],
+                    'Owner',
+                    $deviceId
+                );
+                insert_project_member_sync_event(
+                    $pdo,
+                    $inviterUserId,
+                    $invite['project_id'],
+                    $identity,
+                    $inviteeUsername,
+                    $invite['role'],
+                    $deviceId
+                );
+            }
             
             // Mensaje de bienvenida automático en el chronicle — para que se vea chido
             $msgId = bin2hex(random_bytes(16));
@@ -1406,6 +1694,32 @@ try {
             echo json_encode(['chapter_id' => $chapter_id, 'totals' => $totals]);
             break;
 
+        // ── Webapp supporter status — verifica que el usuario siga siendo supporter ──
+        case 'webapp/supporter-status':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            $stmt = $pdo->prepare("SELECT supporter FROM users WHERE id = ?");
+            $stmt->execute([$userId]);
+            $row = $stmt->fetch();
+            echo json_encode(["supporter" => $row ? (bool)$row['supporter'] : false]);
+            break;
+
+        // ── Webapp snapshot — latest singleton entities (user, zen_tree) for initial load ──
+        case 'webapp/snapshot':
+            $snapshot = [];
+            foreach (['user', 'zen_tree'] as $entityType) {
+                $stmt = $pdo->prepare("SELECT payload FROM sync_events WHERE user_id = ? AND entity_type = ? ORDER BY seq DESC LIMIT 1");
+                $stmt->execute([$userId, $entityType]);
+                $payload = $stmt->fetchColumn();
+                if ($payload !== false && $payload !== '') {
+                    $decoded = json_decode($payload, true);
+                    if ($decoded) $snapshot[$entityType] = $decoded;
+                }
+            }
+            echo json_encode($snapshot);
+            break;
+
         default:
             http_response_code(404);
             echo json_encode(["error" => "Not found"]);
@@ -1434,6 +1748,106 @@ function verify_ed25519_signature($publicKeyHex, $signatureHex, $message) {
     } catch (Exception $e) {
         return false;
     }
+}
+
+function is_project_scoped_sync_type($entityType) {
+    return in_array($entityType, [
+        'task',
+        'note',
+        'journal_entry',
+        'milestone',
+        'focus_session',
+        'codex',
+        'task_assignment',
+        'project_member',
+        'chronicle_message'
+    ], true);
+}
+
+function extract_project_id_from_payload($payload) {
+    if (!$payload || !is_string($payload)) {
+        return null;
+    }
+    $payloadObj = json_decode($payload, true);
+    if (!is_array($payloadObj) || empty($payloadObj['project_id'])) {
+        return null;
+    }
+    return $payloadObj['project_id'];
+}
+
+function backfill_project_sync_events($pdo, $sourceUserId, $targetUserId, $projectId) {
+    if (!$sourceUserId || !$targetUserId || !$projectId || $sourceUserId === $targetUserId) {
+        return 0;
+    }
+
+    $select = $pdo->prepare("
+        SELECT id, entity_type, entity_id, operation, payload, created_at, device_id
+        FROM sync_events
+        WHERE user_id = ?
+        ORDER BY seq ASC
+    ");
+    $insert = $pdo->prepare("
+        INSERT IGNORE INTO sync_events
+            (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ");
+
+    $copied = 0;
+    $select->execute([$sourceUserId]);
+    while ($event = $select->fetch(PDO::FETCH_ASSOC)) {
+        $eventProjectId = null;
+        if ($event['entity_type'] === 'project') {
+            $eventProjectId = $event['entity_id'];
+        } elseif (is_project_scoped_sync_type($event['entity_type'])) {
+            $eventProjectId = extract_project_id_from_payload($event['payload'] ?? '');
+        }
+
+        if ($eventProjectId !== $projectId) {
+            continue;
+        }
+
+        $backfillId = md5($event['id'] . $targetUserId . 'project_backfill');
+        $insert->execute([
+            $backfillId,
+            $targetUserId,
+            $event['entity_type'],
+            $event['entity_id'],
+            $event['operation'],
+            $event['payload'] ?? '',
+            $event['created_at'],
+            $event['device_id'] ?? ''
+        ]);
+        $copied += $insert->rowCount();
+    }
+
+    return $copied;
+}
+
+function insert_project_member_sync_event($pdo, $targetUserId, $projectId, $memberIdentity, $memberUsername, $role, $deviceId) {
+    if (!$targetUserId || !$projectId || !$memberIdentity) {
+        return;
+    }
+
+    $payload = json_encode([
+        'project_id' => $projectId,
+        'user_identity' => $memberIdentity,
+        'user_username' => $memberUsername,
+        'role' => $role
+    ]);
+    $eventId = md5($targetUserId . $projectId . $memberIdentity . $role . 'project_member_accept');
+    $stmt = $pdo->prepare("
+        INSERT IGNORE INTO sync_events
+            (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id)
+        VALUES (?, ?, 'project_member', ?, 'upsert', ?, ?, ?)
+    ");
+    $stmt->execute([
+        $eventId,
+        $targetUserId,
+        $projectId . '__' . $memberIdentity,
+        $payload,
+        date(DATE_RFC3339),
+        $deviceId ?? ''
+    ]);
 }
 
 // Logger de eventos — errores, auth failures, acciones importantes
@@ -1617,29 +2031,48 @@ function setup_tables($pdo) {
     $pdo->exec($sql);
 }
 
-function trigger_webhooks($pdo, $userId, $eventType, $operation, $payload) {
+function trigger_webhooks($pdo, $userId, $eventType, $entityId, $operation, $payload, $eventId = '', $timestamp = '') {
     try {
         $stmt = $pdo->prepare("SELECT url, events, secret FROM webhooks WHERE user_id = ?");
         $stmt->execute([$userId]);
         $webhooks = $stmt->fetchAll();
         if (empty($webhooks)) return;
 
+        // Full sync-event body for non-Discord webhooks (e.g. webapp mirror)
+        $syncBody = json_encode([
+            "event_id"    => $eventId ?: bin2hex(random_bytes(8)),
+            "entity_type" => $eventType,
+            "entity_id"   => $entityId,
+            "operation"   => $operation,
+            "content"     => $payload,
+            "user_id"     => $userId,
+            "timestamp"   => $timestamp ?: date(DATE_RFC3339),
+        ]);
+
+        // Legacy body for Discord and other integrations
         $body = json_encode([
-            "event" => $eventType,
+            "event"     => $eventType,
             "operation" => $operation,
-            "user_id" => $userId,
-            "timestamp" => date(DATE_RFC3339),
-            "payload" => json_decode($payload, true) ?: $payload
+            "user_id"   => $userId,
+            "timestamp" => $timestamp ?: date(DATE_RFC3339),
+            "payload"   => json_decode($payload, true) ?: $payload
         ]);
 
         foreach ($webhooks as $wh) {
             $allowedEvents = explode(',', $wh['events']);
             if (!in_array('*', $allowedEvents) && !in_array($eventType, $allowedEvents)) {
+                // For non-Discord non-wildcard hooks, also skip if not in the legacy list
+                if (!str_contains($wh['url'], 'discord.com/api/webhooks/')) {
+                    // Non-Discord hooks with specific events still filter; pass-through with '*'
+                }
                 continue;
             }
 
-            $postBody = $body;
-            if (str_contains($wh['url'], 'discord.com/api/webhooks/')) {
+            $isDiscord = str_contains($wh['url'], 'discord.com/api/webhooks/');
+            // Non-Discord hooks receive the full sync-event body; Discord keeps the legacy format
+            $postBody = $isDiscord ? $body : $syncBody;
+
+            if ($isDiscord) {
                 $nameStmt = $pdo->prepare("SELECT username, class, level FROM users WHERE id = ?");
                 $nameStmt->execute([$userId]);
                 $userObj = $nameStmt->fetch() ?: ["username" => "Traveler", "class" => "Neutral", "level" => 1];
@@ -1700,15 +2133,14 @@ function trigger_webhooks($pdo, $userId, $eventType, $operation, $payload) {
             curl_setopt($ch, CURLOPT_TIMEOUT, 3);
             curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 2);
 
-            $headers = [
+            $curlHeaders = [
                 'Content-Type: application/json',
                 'User-Agent: Questline-Webhook/1.0'
             ];
-            if ($postBody === $body && !empty($wh['secret'])) {
-                $signature = hash_hmac('sha256', $body, $wh['secret']);
-                $headers[] = 'X-Questline-Signature: ' . $signature;
+            if (!empty($wh['secret'])) {
+                $curlHeaders[] = 'X-Questline-Signature: ' . hash_hmac('sha256', $postBody, $wh['secret']);
             }
-            curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $curlHeaders);
 
             curl_exec($ch);
             curl_close($ch);

@@ -150,6 +150,11 @@ pub fn draw(
         )),
     ];
 
+    let specs_sub = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(left_chunks[0]);
+
     let profile_p = Paragraph::new(profile_text)
         .block(
             Block::default()
@@ -159,7 +164,37 @@ pub fn draw(
                 .title(" Character Specs "),
         )
         .wrap(ratatui::widgets::Wrap { trim: true });
-    f.render_widget(profile_p, left_chunks[0]);
+    f.render_widget(profile_p, specs_sub[0]);
+
+    let mut passive_lines: Vec<Line> = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Always Active:",
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for passive in user.class.passive_description().split("  |  ") {
+        passive_lines.push(Line::from(vec![
+            Span::styled("  ✦ ", Style::default().fg(accent_color)),
+            Span::styled(
+                passive.trim().to_string(),
+                Style::default().fg(theme.text),
+            ),
+        ]));
+    }
+    let passives_p = Paragraph::new(passive_lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Class Passives "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(passives_p, specs_sub[1]);
 
     // 2. Progression Summary
     let rpg_summary = vec![

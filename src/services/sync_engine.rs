@@ -290,7 +290,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 "ritual" => {
                     let mut stmt = self.db.conn.prepare(
-                        "SELECT id, name, description, frequency, reward_xp, created_at FROM rituals WHERE id = ?1",
+                        "SELECT id, name, description, frequency, reward_xp, created_at, daily_target FROM rituals WHERE id = ?1",
                     )?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
@@ -299,6 +299,7 @@ impl<'a> SyncEngine<'a> {
                         let freq: String = row.get(3)?;
                         let xp: i32 = row.get(4)?;
                         let created: String = row.get(5)?;
+                        let daily_target: i32 = row.get(6)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "name": name,
@@ -306,6 +307,7 @@ impl<'a> SyncEngine<'a> {
                             "frequency": freq,
                             "reward_xp": xp,
                             "created_at": created,
+                            "daily_target": daily_target,
                         })
                         .to_string())
                     })
@@ -556,6 +558,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 // Notas: mismo juego que tasks — timestamp gana, pero guardamos la versión local si hay conflicto
                 "note" => {
+                    if log.operation == "delete" { true } else {
                     match self.db.get_note_by_id(ent_uuid) { Ok(local_note) => {
                         let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                             .map(|d| d.with_timezone(&Utc))
@@ -588,25 +591,10 @@ impl<'a> SyncEngine<'a> {
                         }
                     } _ => {
                         true
-                    }}
+                    }}}
                 }
-                // Proyectos: si ya existe localmente, solo tocamos is_shared — el nombre/descripción local manda
-                "project" => {
-                    if log.operation == "delete" { true } else {
-                    let local_projects = self.db.get_projects().unwrap_or_default();
-                    let local_proj = local_projects.iter().find(|p| p.id == ent_uuid);
-                    match local_proj {
-                        None => true,
-                        Some(lp) => {
-                            if lp.is_shared { false } else {
-                                log.content.as_ref()
-                                    .and_then(|c| serde_json::from_str::<serde_json::Value>(c).ok())
-                                    .map(|v| v["is_shared"].as_bool().unwrap_or(false))
-                                    .unwrap_or(false)
-                            }
-                        }
-                    }}
-                }
+                // Proyectos: siempre aplicamos — INSERT OR REPLACE propaga renombres, archivado, etc.
+                "project" => true,
                 // Entradas de journal: siempre aceptamos — INSERT OR REPLACE en el pull maneja el upsert
                 "journal_entry" => true,
                 // Logros: solo se sincronizan si no están ya desbloqueados — no se revierten
@@ -636,13 +624,8 @@ impl<'a> SyncEngine<'a> {
                         false
                     }
                 }
-                "codex" => {
-                    if log.operation == "delete" {
-                        true
-                    } else {
-                        self.db.get_codex_by_id(&log.entity_id).is_err()
-                    }
-                }
+                // Codex: siempre aplicamos — INSERT OR REPLACE propaga renombres y cambios de parent
+                "codex" => true,
                 // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
                     self.db.conn.query_row(
@@ -652,24 +635,10 @@ impl<'a> SyncEngine<'a> {
                     ).unwrap_or(0) == 0
                 }
                 "task_assignment" => {
-                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
-                    if parts.len() == 2 {
-                        self.db.conn.query_row(
-                            "SELECT count(*) FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
-                            params![parts[0], parts[1]],
-                            |row| row.get::<_, i32>(0),
-                        ).unwrap_or(0) == 0
-                    } else { false }
+                    true
                 }
                 "project_member" => {
-                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
-                    if parts.len() == 2 {
-                        self.db.conn.query_row(
-                            "SELECT count(*) FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
-                            params![parts[0], parts[1]],
-                            |row| row.get::<_, i32>(0),
-                        ).unwrap_or(0) == 0
-                    } else { false }
+                    true
                 }
                 // Los mensajes de la crónica son inmutables — nunca se editan, solo se insertan
                 "chronicle_message" => {
@@ -705,6 +674,8 @@ impl<'a> SyncEngine<'a> {
                         Err(_) => true,
                     }
                 }
+                // Milestones: siempre aplicamos — INSERT OR REPLACE maneja create y update
+                "milestone" => true,
                 // Dispositivos: siempre aplicamos — upsert idempotente
                 "device" => true,
                 _ => false,
@@ -785,7 +756,13 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "note" => {
-                            if let Ok(n) = serde_json::from_str::<Note>(content) {
+                            if log.operation == "delete" {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM notes WHERE id = ?1",
+                                    params![log.entity_id],
+                                );
+                                pulled_count += 1;
+                            } else if let Ok(n) = serde_json::from_str::<Note>(content) {
                                 let _ = self.db.conn.execute(
                                     "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                                     params![
@@ -811,52 +788,34 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             } else if let Ok(p) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = p["id"].as_str().unwrap_or_default();
+                                let name = p["name"].as_str().unwrap_or_default();
+                                let desc = p["description"].as_str();
+                                let created = p["created_at"].as_str().unwrap_or_default();
+                                let archived = p["archived"].as_bool().unwrap_or(false);
+                                let completed = p["completed"].as_bool().unwrap_or(false);
+                                let owner_id = p["owner_identity"].as_str();
+                                let owner_name = p["owner_username"].as_str();
                                 let is_shared = p["is_shared"].as_bool().unwrap_or(false);
-
-                                let already_exists = self.db.get_projects()
-                                    .map(|list| list.iter().any(|proj| proj.id.to_string() == id))
-                                    .unwrap_or(false);
-
-                                if already_exists {
-                                    // Solo actualizamos is_shared — el resto de datos locales no se tocan
-                                    let _ = self.db.conn.execute(
-                                        "UPDATE projects SET is_shared = ?1 WHERE id = ?2",
-                                        params![if is_shared { 1 } else { 0 }, id],
-                                    );
-                                    // Al marcar como compartido hay que garantizar que el owner aparezca en project_members
-                                    if is_shared {
-                                        let owner_id = p["owner_identity"].as_str().unwrap_or_default();
-                                        let owner_name = p["owner_username"].as_str().unwrap_or_default();
-                                        if !owner_id.is_empty() {
-                                            let _ = self.db.conn.execute(
-                                                "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, 'Owner')",
-                                                params![id, owner_id, owner_name],
-                                            );
-                                        }
-                                        // También auto-agregamos al dispositivo receptor como miembro
+                                let _ = self.db.conn.execute(
+                                    "INSERT OR REPLACE INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    params![
+                                        id, name, desc, created,
+                                        if archived { 1 } else { 0 },
+                                        if completed { 1 } else { 0 },
+                                        owner_id, owner_name,
+                                        if is_shared { 1 } else { 0 }
+                                    ],
+                                );
+                                // When a project is shared, ensure owner appears in project_members
+                                if is_shared {
+                                    let owner_id_str = p["owner_identity"].as_str().unwrap_or_default();
+                                    let owner_name_str = p["owner_username"].as_str().unwrap_or_default();
+                                    if !owner_id_str.is_empty() {
                                         let _ = self.db.conn.execute(
-                                            "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, 'Member', 'Member')",
-                                            params![id, self.identity.public_key],
+                                            "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, 'Owner')",
+                                            params![id, owner_id_str, owner_name_str],
                                         );
                                     }
-                                } else {
-                                    let name = p["name"].as_str().unwrap_or_default();
-                                    let desc = p["description"].as_str();
-                                    let created = p["created_at"].as_str().unwrap_or_default();
-                                    let archived = p["archived"].as_bool().unwrap_or(false);
-                                    let completed = p["completed"].as_bool().unwrap_or(false);
-                                    let owner_id = p["owner_identity"].as_str();
-                                    let owner_name = p["owner_username"].as_str();
-                                    let _ = self.db.conn.execute(
-                                        "INSERT OR REPLACE INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                        params![
-                                            id, name, desc, created,
-                                            if archived { 1 } else { 0 },
-                                            if completed { 1 } else { 0 },
-                                            owner_id, owner_name,
-                                            if is_shared { 1 } else { 0 }
-                                        ],
-                                    );
                                 }
                                 pulled_count += 1;
                             }
@@ -879,7 +838,13 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "milestone" => {
-                            if let Ok(m) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM milestones WHERE id = ?1",
+                                    params![log.entity_id],
+                                );
+                                pulled_count += 1;
+                            } else if let Ok(m) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = m["id"].as_str().unwrap_or_default();
                                 let pid = m["project_id"].as_str().unwrap_or_default();
                                 let name = m["name"].as_str().unwrap_or_default();
@@ -932,9 +897,10 @@ impl<'a> SyncEngine<'a> {
                                 let freq = r["frequency"].as_str().unwrap_or("Daily");
                                 let xp = r["reward_xp"].as_i64().unwrap_or(0) as i32;
                                 let created = r["created_at"].as_str().unwrap_or_default();
+                                let daily_target = r["daily_target"].as_i64().unwrap_or(1) as i32;
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO rituals (id, name, description, frequency, reward_xp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                    params![id, name, desc, freq, xp, created],
+                                    "INSERT OR REPLACE INTO rituals (id, name, description, frequency, reward_xp, created_at, daily_target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    params![id, name, desc, freq, xp, created, daily_target],
                                 );
                                 pulled_count += 1;
                             }
@@ -989,25 +955,43 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "task_assignment" => {
-                            if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                                if parts.len() == 2 {
+                                    let _ = self.db.conn.execute(
+                                        "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                                        params![parts[0], parts[1]],
+                                    );
+                                    pulled_count += 1;
+                                }
+                            } else if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
                                 let task_id = ta["task_id"].as_str().unwrap_or_default();
                                 let identity = ta["user_identity"].as_str().unwrap_or_default();
                                 let username = ta["user_username"].as_str().unwrap_or_default();
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
+                                    "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
                                     params![task_id, identity, username],
                                 );
                                 pulled_count += 1;
                             }
                         }
                         "project_member" => {
-                            if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                                if parts.len() == 2 {
+                                    let _ = self.db.conn.execute(
+                                        "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                                        params![parts[0], parts[1]],
+                                    );
+                                    pulled_count += 1;
+                                }
+                            } else if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
                                 let project_id = pm["project_id"].as_str().unwrap_or_default();
                                 let identity = pm["user_identity"].as_str().unwrap_or_default();
                                 let username = pm["user_username"].as_str().unwrap_or_default();
                                 let role = pm["role"].as_str().unwrap_or("Member");
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
+                                    "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
                                     params![project_id, identity, username, role],
                                 );
                                 pulled_count += 1;

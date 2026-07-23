@@ -151,7 +151,7 @@ pub fn draw(
         .next()
         .unwrap_or((1, "None", ""));
 
-    let details_text = vec![
+    let mut details_text = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("~ {} ~", highlighted_class.order()),
@@ -207,11 +207,13 @@ pub fn draw(
                 .fg(class_theme.warning)
                 .add_modifier(Modifier::UNDERLINED),
         )),
-        Line::from(Span::styled(
-            format!("  {}", highlighted_class.passive_description()),
-            Style::default().fg(highlight_color),
-        )),
     ];
+    for passive in highlighted_class.passive_description().split("  |  ") {
+        details_text.push(Line::from(vec![
+            Span::styled("  ✦ ", Style::default().fg(highlight_color)),
+            Span::styled(passive.trim(), Style::default().fg(Color::White)),
+        ]));
+    }
 
     let details_p = Paragraph::new(details_text)
         .block(details_block)
