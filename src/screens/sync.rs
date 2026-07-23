@@ -90,6 +90,20 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
             Span::styled("  [a] toggle", Style::default().fg(theme.muted)),
         ]),
+        Line::from(vec![
+            Span::styled("   OS Alerts:  ", Style::default().fg(theme.muted)),
+            Span::styled(
+                if app.external_notifications { "Enabled" } else { "Disabled" },
+                Style::default()
+                    .fg(if app.external_notifications {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  [n] toggle", Style::default().fg(theme.muted)),
+        ]),
         Line::from(""),
         Line::from(vec![Span::styled(
             "   === Chronicle Sync State ===",
@@ -148,7 +162,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity | [p] Prune Old Quests",
+            "   [i] Restore Identity | [p] Prune Old Quests | [n] OS Alerts",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -186,7 +200,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(22), Constraint::Min(8)])
+        .constraints([Constraint::Length(24), Constraint::Min(8)])
         .split(chunks[0]);
 
     f.render_widget(left_panel, left_chunks[0]);

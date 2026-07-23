@@ -4,8 +4,8 @@
   import { loadIdentity, clearIdentity, loadKeyHexFromSession, clearSessionKey } from './lib/auth.js';
   import { importKeyHex } from './lib/crypto.js';
   import { ApiClient } from './lib/api.js';
-  import { identity as identityStore, apiClient as apiStore, dataKey as dataKeyStore, addToast } from './lib/store.js';
-  import { pullSync, startBackgroundSync, loadLocalCache } from './lib/sync.js';
+  import { identity as identityStore, apiClient as apiStore, dataKey as dataKeyStore, addToast, userStats } from './lib/store.js';
+  import { startBackgroundSync, loadLocalCache } from './lib/sync.js';
   import { clearLocalDatabase } from './lib/db.js';
 
   import Nav from './components/Nav.svelte';
@@ -58,7 +58,7 @@
       if (status.needs_import) {
         navigate('/settings');
         if (stopSync) stopSync();
-        stopSync = startBackgroundSync(client, $identityStore);
+        stopSync = startBackgroundSync(client);
         return;
       }
     } catch {
@@ -69,9 +69,11 @@
       navigate('/dashboard');
     }
 
+    // Load local cache for fresh logins (page-reload already did this in onMount)
+    await loadLocalCache();
+
     if (stopSync) stopSync();
-    pullSync(client).catch(() => {});
-    stopSync = startBackgroundSync(client, $identityStore);
+    stopSync = startBackgroundSync(client);
   }
 
   onMount(async () => {
@@ -100,6 +102,69 @@
     }
     ready = true;
   });
+
+  // Normalize class name → slug.
+  // Handles both serde variant names ("CodeWarlock") and display names ("Code Warlock").
+  const CLASS_BG = {
+    'codewarlock':      'warlock',
+    'taskpaladin':      'paladin',
+    'mindsage':         'mindsage',
+    'systemsarchitect': 'systemarchitect',
+    'timechronomancer': 'timechronomancer',
+    'archaccountant':   'archaccountant',
+  };
+
+  // Per-class accent colors — used across the whole UI for glows, borders, highlights
+  const CLASS_COLORS = {
+    warlock:          { accent: '#a855f7', accentDim: '#7c3aed', glow: 'rgba(168,85,247,0.25)' },
+    paladin:          { accent: '#f59e0b', accentDim: '#b45309', glow: 'rgba(245,158,11,0.25)'  },
+    mindsage:         { accent: '#06b6d4', accentDim: '#0e7490', glow: 'rgba(6,182,212,0.25)'   },
+    systemarchitect:  { accent: '#3b82f6', accentDim: '#1d4ed8', glow: 'rgba(59,130,246,0.25)'  },
+    timechronomancer: { accent: '#10b981', accentDim: '#047857', glow: 'rgba(16,185,129,0.25)'  },
+    archaccountant:   { accent: '#d97706', accentDim: '#92400e', glow: 'rgba(217,119,6,0.25)'   },
+  };
+
+  // UI asset filenames — same names expected inside each class folder
+  const UI_ASSETS = [
+    'gf-tlc', 'gf-trc', 'gf-blc', 'gf-brc',
+    'gf-et',  'gf-eb',  'gf-el',  'gf-er',
+    'gf-gemt', 'gf-gemb',
+    'i-n', 'i-a', 'i-e',
+    'gc-n', 'gc-h', 'gc-p',
+  ];
+
+  $: classSlug = $userStats?.class
+    ? (CLASS_BG[$userStats.class.toLowerCase().replace(/\s+/g, '')] ?? null)
+    : null;
+
+  $: {
+    if (classSlug) {
+      // Backgrounds
+      document.documentElement.style.setProperty('--menu-bg', `url('/assets/backgrounds/${classSlug}-menu-background.png')`);
+      document.documentElement.style.setProperty('--main-bg',  `url('/assets/backgrounds/${classSlug}-background.png')`);
+
+      // UI asset paths — components use var(--ui-gf-tlc) etc. with fallback to default
+      const uiBase = `/assets/ui/${classSlug}`;
+      for (const asset of UI_ASSETS) {
+        document.documentElement.style.setProperty(`--ui-${asset}`, `url('${uiBase}/${asset}.webp')`);
+      }
+
+      // Accent colors
+      const colors = CLASS_COLORS[classSlug];
+      document.documentElement.style.setProperty('--accent',     colors.accent);
+      document.documentElement.style.setProperty('--accent-dim', colors.accentDim);
+      document.documentElement.style.setProperty('--accent-glow',colors.glow);
+    } else {
+      document.documentElement.style.removeProperty('--menu-bg');
+      document.documentElement.style.removeProperty('--main-bg');
+      for (const asset of UI_ASSETS) {
+        document.documentElement.style.removeProperty(`--ui-${asset}`);
+      }
+      document.documentElement.style.removeProperty('--accent');
+      document.documentElement.style.removeProperty('--accent-dim');
+      document.documentElement.style.removeProperty('--accent-glow');
+    }
+  }
 
   // Parse route into segments
   $: segments = $route.split('/').filter(Boolean);
@@ -163,7 +228,7 @@
   :global(body) {
     background: #080808;
     color: #d4d4d4;
-    font-family: 'JetBrains Mono', 'Courier New', monospace;
+    font-family: 'Pixelify Sans', sans-serif;
     line-height: 1.6;
     overflow-x: hidden;
   }
@@ -184,10 +249,14 @@
   .main-content {
     min-height: 100vh;
     transition: padding-left 0.2s;
+    background-image: var(--main-bg);
+    background-attachment: fixed;
+    background-position: center;
+    background-size: cover;
   }
 
   .main-content.with-nav {
-    padding-left: 220px;
+    padding-left: 300px;
   }
 
   .boot-screen {

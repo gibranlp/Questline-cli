@@ -137,7 +137,7 @@
   .settings-page {
     padding: 2rem 2.5rem;
     max-width: 680px;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
   }
 
   .page-header { margin-bottom: 2rem; }

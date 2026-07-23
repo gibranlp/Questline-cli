@@ -16,7 +16,8 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
     let size = f.size();
     let accent_color = theme.primary;
 
-    let archived_projects: Vec<&Project> = projects.iter().filter(|p| p.archived).collect();
+    // archived=true OR completed=true — cacha proyectos huérfanos (e.g. conquered en versión anterior y restaurados a medias)
+    let archived_projects: Vec<&Project> = projects.iter().filter(|p| p.archived || p.completed).collect();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)

@@ -54,6 +54,7 @@ pub enum SearchResultType {
     Lore,
     ChronicleEntry,
     Milestone,
+    Ritual,
 }
 
 impl SearchResultType {
@@ -68,6 +69,7 @@ impl SearchResultType {
             SearchResultType::Lore => "Lore",
             SearchResultType::ChronicleEntry => "Chronicle",
             SearchResultType::Milestone => "Milestone",
+            SearchResultType::Ritual => "Sidequest",
         }
     }
 }
@@ -275,6 +277,10 @@ pub enum ModalType {
         project_id: Uuid,
         project_name: String,
     },
+    ConfirmConquerProject {
+        project_id: Uuid,
+        project_name: String,
+    },
     ConfirmDeleteCodex {
         codex_id: Uuid,
         codex_name: String,
@@ -289,6 +295,17 @@ pub enum ModalType {
     },
     UpdateAvailable {
         latest_version: String,
+    },
+    // Popup que aparece cuando expira el intervalo de hidratación
+    HydrationReminder,
+    // Settings de hidratación — intervalo, horario activo, objetivo diario
+    HydrationSettings {
+        interval_idx: usize,   // 0=30 1=45 2=60 3=90 4=120 mins
+        from_hour: u32,
+        to_hour: u32,
+        target: i32,
+        pause_focus: bool,
+        focus_idx: usize,
     },
 }
 
@@ -519,6 +536,7 @@ pub struct App {
     pub quitting_after_sync: bool,
 
     pub selected_project_idx: usize,
+    pub projects_all_selected: bool,
     pub active_project_id: Option<Uuid>,
     pub workspace_tab_idx: usize,
     pub workspace_sidebar_focused: bool,
@@ -570,6 +588,7 @@ pub struct App {
 
     pub server_url: String,
     pub auto_sync: bool,
+    pub external_notifications: bool,
     pub sync_status_msg: String,
     pub sync_conflicts: Vec<String>,
     pub sync_failure_count: u32,
@@ -681,6 +700,17 @@ pub struct App {
     pub restore_error: Option<String>,
     // bandera para saber si el onboarding vino del Gateway — define qué pantalla sigue al terminar
     pub onboarding_from_gateway: bool,
+
+    // ── Hydration Reminder ──────────────────────────────────────────────────
+    pub hydration_enabled: bool,
+    pub hydration_glasses: i32,
+    pub hydration_target: i32,
+    pub hydration_interval_mins: i32,
+    pub hydration_active_from: u32,  // inclusive start hour (0-23)
+    pub hydration_active_to: u32,    // exclusive end hour (1-24)
+    pub hydration_pause_focus: bool,
+    pub hydration_reward_xp: i32,
+    pub hydration_next_reminder_at: Option<std::time::Instant>,
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
@@ -1239,6 +1269,9 @@ impl App {
                 .map(|s| s == "true")
                 .unwrap_or(false)
         };
+        let external_notifications = db.get_setting("external_notifications")?
+            .map(|s| s == "true")
+            .unwrap_or(true);
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -1331,6 +1364,7 @@ impl App {
             quitting_after_sync: false,
 
             selected_project_idx: 0,
+            projects_all_selected: true,
             active_project_id: None,
             workspace_tab_idx: 0,
             workspace_sidebar_focused: true,
@@ -1372,6 +1406,7 @@ impl App {
 
             server_url,
             auto_sync,
+            external_notifications,
             sync_status_msg: "Idle".to_string(),
             sync_conflicts: Vec::new(),
             sync_failure_count: 0,
@@ -1461,9 +1496,20 @@ impl App {
 
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
+
+            hydration_enabled: false,
+            hydration_glasses: 0,
+            hydration_target: 8,
+            hydration_interval_mins: 60,
+            hydration_active_from: 9,
+            hydration_active_to: 18,
+            hydration_pause_focus: false,
+            hydration_reward_xp: 20,
+            hydration_next_reminder_at: None,
         };
 
         app.reload_data()?;
+        app.reload_hydration_config();
         if app.user.is_some() {
             app.check_new_day()?;
             let _ = app.check_action_achievements();
@@ -1799,10 +1845,13 @@ impl App {
             return Ok(());
         }
 
-        // Ctrl+S sincroniza en cualquier pantalla excepto el editor (ahí guarda la nota)
+        // Ctrl+S sincroniza en cualquier pantalla excepto el editor y los modales de task/step (ahí guarda)
+        let task_modal_open = matches!(self.modal_state, ModalType::NewTask { .. } | ModalType::EditTask { .. })
+            || matches!(self.overlay_modal, ModalType::NewTask { .. });
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
             && self.active_screen != ActiveScreen::Editor
+            && !task_modal_open
         {
             if self.config.sync_enabled {
                 self.start_forced_sync();
@@ -1981,11 +2030,12 @@ impl App {
                         crate::audio::mpris_player::next_track();
                         return Ok(());
                     }
-                    // 'n' en Dashboard/Projects/Workspace/Fellowship ya está tomado para otras acciones
+                    // 'n' en Dashboard/Projects/Workspace/Fellowship/SyncSettings ya está tomado para otras acciones
                     if self.active_screen != ActiveScreen::Dashboard
                         && self.active_screen != ActiveScreen::Projects
                         && self.active_screen != ActiveScreen::Workspace
                         && self.active_screen != ActiveScreen::Fellowship
+                        && self.active_screen != ActiveScreen::SyncSettings
                     {
                         let current = self.audio_player.get_state().current_soundscape;
                         let idx = SOUNDSCAPES
@@ -2158,6 +2208,134 @@ impl App {
 
         match self.modal_state {
             ModalType::None => Ok(false),
+            ModalType::HydrationReminder => {
+                match key.code {
+                    // d = drink and dismiss
+                    KeyCode::Char('d') | KeyCode::Char('D') => {
+                        self.modal_state = ModalType::None;
+                        if let Ok(new_count) = self.db.hydration_drink() {
+                            self.audio_player.play_task_complete();
+                            self.hydration_glasses = new_count;
+                            if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
+                                if let Ok((_, reward_given)) = self.db.hydration_get_today() {
+                                    if !reward_given {
+                                        let _ = self.db.hydration_mark_reward_given();
+                                        let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                        self.notifications.push(Notification::info(
+                                            format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
+                                        ));
+                                    }
+                                }
+                            } else {
+                                self.notifications.push(Notification::info(
+                                    format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+                                ));
+                            }
+                        }
+                        // Rearm reminder
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
+                    }
+                    // s = snooze 15 min
+                    KeyCode::Char('s') | KeyCode::Char('S') => {
+                        self.modal_state = ModalType::None;
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(15 * 60)
+                        );
+                    }
+                    // x / Esc = dismiss without snooze (rearms at full interval)
+                    KeyCode::Char('x') | KeyCode::Char('X') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::HydrationSettings { .. } => {
+                if let ModalType::HydrationSettings {
+                    ref mut interval_idx,
+                    ref mut from_hour,
+                    ref mut to_hour,
+                    ref mut target,
+                    ref mut pause_focus,
+                    ref mut focus_idx,
+                } = self.modal_state {
+                    match key.code {
+                        KeyCode::Tab => {
+                            *focus_idx = (*focus_idx + 1) % 6;
+                        }
+                        KeyCode::BackTab => {
+                            *focus_idx = focus_idx.saturating_sub(1);
+                        }
+                        KeyCode::Left => match *focus_idx {
+                            0 => { *interval_idx = interval_idx.saturating_sub(1); }
+                            1 => { if *from_hour > 0 { *from_hour -= 1; } }
+                            2 => { if *to_hour > 1 { *to_hour -= 1; } }
+                            3 => { if *target > 1 { *target -= 1; } }
+                            _ => {}
+                        },
+                        KeyCode::Right => match *focus_idx {
+                            0 => { if *interval_idx < 4 { *interval_idx += 1; } }
+                            1 => { if *from_hour < 23 { *from_hour += 1; } }
+                            2 => { if *to_hour < 24 { *to_hour += 1; } }
+                            3 => { *target += 1; }
+                            _ => {}
+                        },
+                        KeyCode::Char(' ') if *focus_idx == 4 => {
+                            *pause_focus = !*pause_focus;
+                        }
+                        KeyCode::Enter => {
+                            let intervals = [30i32, 45, 60, 90, 120];
+                            let chosen_interval = intervals[*interval_idx];
+                            let chosen_from = *from_hour;
+                            let chosen_to = *to_hour;
+                            let chosen_target = *target;
+                            let chosen_pause = *pause_focus;
+
+                            self.hydration_enabled = true;
+                            self.hydration_interval_mins = chosen_interval;
+                            self.hydration_active_from = chosen_from;
+                            self.hydration_active_to = chosen_to;
+                            self.hydration_target = chosen_target;
+                            self.hydration_pause_focus = chosen_pause;
+
+                            let _ = self.db.set_setting("hydration_enabled", "true");
+                            let _ = self.db.set_setting("hydration_interval_mins", &chosen_interval.to_string());
+                            let _ = self.db.set_setting("hydration_active_from", &chosen_from.to_string());
+                            let _ = self.db.set_setting("hydration_active_to", &chosen_to.to_string());
+                            let _ = self.db.set_setting("hydration_target", &chosen_target.to_string());
+                            let _ = self.db.set_setting("hydration_pause_focus", if chosen_pause { "true" } else { "false" });
+
+                            // Arm first reminder
+                            self.hydration_next_reminder_at = Some(
+                                std::time::Instant::now()
+                                    + std::time::Duration::from_secs(chosen_interval as u64 * 60)
+                            );
+                            self.modal_state = ModalType::None;
+                            self.notifications.push(Notification::info("Hydration reminders enabled!"));
+                        }
+                        KeyCode::Char('x') | KeyCode::Char('X') => {
+                            // Disable hydration
+                            self.hydration_enabled = false;
+                            self.hydration_next_reminder_at = None;
+                            let _ = self.db.set_setting("hydration_enabled", "false");
+                            self.modal_state = ModalType::None;
+                            self.notifications.push(Notification::info("Hydration reminders disabled."));
+                        }
+                        KeyCode::Esc => {
+                            self.modal_state = ModalType::None;
+                        }
+                        _ => {}
+                    }
+                }
+                Ok(true)
+            }
             ModalType::QuitConfirm { .. } => {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Char('Q') => {
@@ -2226,6 +2404,23 @@ impl App {
                         self.selected_archive_idx = 0;
                         self.reload_data()?;
                         self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::ConfirmConquerProject { project_id, .. } => {
+                let pid = project_id;
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.modal_state = ModalType::None;
+                        self.complete_project(pid)?;
+                        self.active_project_id = None;
+                        self.active_screen = ActiveScreen::Projects;
+                        self.projects_all_selected = true;
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.modal_state = ModalType::None;
@@ -2775,9 +2970,9 @@ impl App {
                     KeyCode::Left | KeyCode::Right => {
                         if idx == 2 {
                             if key.code == KeyCode::Left {
-                                freq_idx = if freq_idx > 0 { freq_idx - 1 } else { 4 };
+                                freq_idx = if freq_idx > 0 { freq_idx - 1 } else { 6 };
                             } else {
-                                freq_idx = (freq_idx + 1) % 5;
+                                freq_idx = (freq_idx + 1) % 7;
                             }
                             self.modal_state = ModalType::NewRitual {
                                 name: r_name,
@@ -2799,7 +2994,7 @@ impl App {
                             }
                         } else if idx == 2 {
                             if c == ' ' {
-                                freq_idx = (freq_idx + 1) % 5;
+                                freq_idx = (freq_idx + 1) % 7;
                             }
                         } else if idx == 3 && c.is_ascii_digit() && xp_str.len() < 4 {
                             xp_str.push(c);
@@ -2840,8 +3035,14 @@ impl App {
                             };
                         } else {
                             if !r_name.trim().is_empty() {
-                                let freqs = ["Daily", "Weekdays", "Weekly", "Monthly", "Custom"];
+                                let freqs = ["Daily", "2x Daily", "3x Daily", "5x Daily", "Weekdays", "Weekly", "Monthly"];
                                 let freq = freqs[freq_idx].to_string();
+                                let daily_target = match freq.as_str() {
+                                    "2x Daily" => 2,
+                                    "3x Daily" => 3,
+                                    "5x Daily" => 5,
+                                    _ => 1,
+                                };
                                 let xp_val = xp_str.parse::<i32>().unwrap_or(20);
                                 if xp_val > 100 {
                                     self.notifications.push(Notification::warning("Sidequest reward cannot exceed 100 XP!"));
@@ -2856,6 +3057,7 @@ impl App {
                                         },
                                         frequency: freq,
                                         reward_xp: xp_val,
+                                        daily_target,
                                         created_at: Utc::now(),
                                     };
                                     self.db.insert_ritual(&rit)?;
@@ -4832,11 +5034,19 @@ impl App {
                         .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
                     self.sync_status_msg = format!(
                         "Auto Sync {}",
-                        if self.auto_sync {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
+                        if self.auto_sync { "Enabled" } else { "Disabled" }
+                    );
+                    return Ok(());
+                }
+                KeyCode::Char('n') => {
+                    self.external_notifications = !self.external_notifications;
+                    let _ = self.db.set_setting(
+                        "external_notifications",
+                        if self.external_notifications { "true" } else { "false" },
+                    );
+                    self.sync_status_msg = format!(
+                        "System Notifications {}",
+                        if self.external_notifications { "Enabled" } else { "Disabled" }
                     );
                     return Ok(());
                 }
@@ -5018,6 +5228,7 @@ impl App {
             }
             KeyCode::Char('2') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             KeyCode::Char('3') if self.active_screen != ActiveScreen::Workspace => {
@@ -5062,7 +5273,7 @@ impl App {
                 self.active_tab_idx = 12;
             }
             KeyCode::Char('d') => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5096,6 +5307,33 @@ impl App {
                             self.notifications.push(Notification::info(format!("Declined invitation to '{}'", invite.2)));
                             self.reload_data()?;
                         }
+                    }
+                } else if self.active_screen == ActiveScreen::Dashboard
+                    && matches!(self.modal_state, ModalType::None)
+                    && self.hydration_enabled
+                {
+                    if let Ok(new_count) = self.db.hydration_drink() {
+                        self.audio_player.play_task_complete();
+                        self.hydration_glasses = new_count;
+                        if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
+                            if let Ok((_, reward_given)) = self.db.hydration_get_today() {
+                                if !reward_given {
+                                    let _ = self.db.hydration_mark_reward_given();
+                                    let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                    self.notifications.push(Notification::info(
+                                        format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.notifications.push(Notification::info(
+                                format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+                            ));
+                        }
+                        self.hydration_next_reminder_at = Some(
+                            std::time::Instant::now()
+                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                        );
                     }
                 }
             }
@@ -5131,6 +5369,24 @@ impl App {
                 if self.active_screen == ActiveScreen::Dashboard {
                     self.water_tree()?;
                 }
+            }
+            // Hydration: open settings modal
+            KeyCode::Char('h') | KeyCode::Char('H')
+                if self.active_screen == ActiveScreen::Dashboard
+                    && matches!(self.modal_state, ModalType::None) =>
+            {
+                let intervals = [30i32, 45, 60, 90, 120];
+                let interval_idx = intervals.iter()
+                    .position(|&m| m == self.hydration_interval_mins)
+                    .unwrap_or(2);
+                self.modal_state = ModalType::HydrationSettings {
+                    interval_idx,
+                    from_hour: self.hydration_active_from,
+                    to_hour: self.hydration_active_to,
+                    target: self.hydration_target,
+                    pause_focus: self.hydration_pause_focus,
+                    focus_idx: 0,
+                };
             }
             // Abre la quest principal directamente en su workspace desde el dashboard
             KeyCode::Char('o') | KeyCode::Char('O')
@@ -5268,7 +5524,7 @@ impl App {
                             };
                         }
                     }
-                } else if self.active_screen == ActiveScreen::Projects {
+                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5360,15 +5616,18 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = self.projects.iter().filter(|p| !p.archived).count();
-                    if active_len > 0 {
-                        if self.selected_project_idx > 0 {
-                            self.selected_project_idx -= 1;
-                        } else {
-                            self.selected_project_idx = active_len - 1;
-                        }
+                    if self.projects_all_selected {
+                        // wrap from "All" to last real project
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = active_len.saturating_sub(1);
+                    } else if self.selected_project_idx > 0 {
+                        self.selected_project_idx -= 1;
+                    } else {
+                        // wrap from first project up to "All"
+                        self.projects_all_selected = true;
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived).count();
+                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
                     if archive_len > 0 {
                         if self.selected_archive_idx > 0 {
                             self.selected_archive_idx -= 1;
@@ -5530,15 +5789,20 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = self.projects.iter().filter(|p| !p.archived).count();
-                    if active_len > 0 {
+                    if self.projects_all_selected {
+                        // move from "All" into first real project
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = 0;
+                    } else if active_len > 0 {
                         if self.selected_project_idx < active_len - 1 {
                             self.selected_project_idx += 1;
                         } else {
-                            self.selected_project_idx = 0;
+                            // wrap from last project back to "All"
+                            self.projects_all_selected = true;
                         }
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived).count();
+                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
                     if archive_len > 0 {
                         if self.selected_archive_idx < archive_len - 1 {
                             self.selected_archive_idx += 1;
@@ -5654,7 +5918,7 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5963,10 +6227,11 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
                     let archived: Vec<&Project> =
-                        self.projects.iter().filter(|p| p.archived).collect();
+                        self.projects.iter().filter(|p| p.archived || p.completed).collect();
                     if !archived.is_empty() && self.selected_archive_idx < archived.len() {
                         let mut p = archived[self.selected_archive_idx].clone();
                         p.archived = false;
+                        p.completed = false;
                         self.db.update_project(&p)?;
                         self.mark_dirty();
                         self.apply_class_passive("project_restore", 0)?;
@@ -6007,7 +6272,7 @@ impl App {
                 }
             }
             KeyCode::Char('e') => {
-                if self.active_screen == ActiveScreen::Projects {
+                if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -6092,7 +6357,7 @@ impl App {
                         let p = shared_projects[self.selected_fellowship_project_idx];
                         self.modal_state = ModalType::ProjectSharing { project_id: p.id };
                     }
-                } else if self.active_screen == ActiveScreen::Projects {
+                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -6589,6 +6854,7 @@ impl App {
             id
         } else {
             self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
             return Ok(());
         };
 
@@ -6763,6 +7029,7 @@ impl App {
                 } else {
                     self.active_project_id = None;
                     self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                     self.workspace_sidebar_focused = false;
                     self.reload_data()?;
                 }
@@ -7368,11 +7635,14 @@ impl App {
                     };
                 }
             }
-            // c: complete project
+            // c: complete project — muestra confirmación primero, no vaya a ser un gordo error
             KeyCode::Char('c') if self.workspace_tab_idx == 3 => {
-                self.complete_project(p_id)?;
-                self.active_project_id = None;
-                self.active_screen = ActiveScreen::Projects;
+                if let Some(proj) = self.projects.iter().find(|p| p.id == p_id) {
+                    self.modal_state = ModalType::ConfirmConquerProject {
+                        project_id: p_id,
+                        project_name: proj.name.clone(),
+                    };
+                }
                 return Ok(());
             }
             KeyCode::Char('?') => {
@@ -7687,6 +7957,82 @@ impl App {
         let prev_focus = |idx: usize| -> usize {
             if idx > 0 { idx - 1 } else { max_fields }
         };
+        // Ctrl+S — guarda y cierra desde cualquier campo, igual que Enter pero sin reabrir el form de steps
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            if !title.trim().is_empty() {
+                let task_desc = if desc.trim().is_empty() { None } else { Some(desc.trim().to_string()) };
+                let due_str = match due_date_type {
+                    DueDateType::None => String::new(),
+                    DueDateType::Today => "today".to_string(),
+                    DueDateType::Tomorrow => "tomorrow".to_string(),
+                    DueDateType::InDays => format!("in {} days", due_date_val.trim()),
+                    DueDateType::Specific => due_date_val.trim().to_string(),
+                };
+                let due_parsed = self.parse_due_date_input(&due_str);
+                if due_date_type != DueDateType::None && due_parsed.is_none() {
+                    return Ok(());
+                }
+                let xp_service = XPService::new(&self.db);
+                if let Some(id) = task_id {
+                    let mut t = Task {
+                        id,
+                        project_id: Some(project_id),
+                        title: title.trim().to_string(),
+                        description: task_desc,
+                        due_date: due_parsed,
+                        completed: false,
+                        priority,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        owner_identity: Some(self.identity.public_key.clone()),
+                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        parent_task_id: None,
+                        xp_awarded: false,
+                        recurrence,
+                    };
+                    if let Ok(ts) = self.db.get_tasks() {
+                        if let Some(orig) = ts.iter().find(|o| o.id == id) {
+                            t.completed = orig.completed;
+                            t.created_at = orig.created_at;
+                            t.owner_identity = orig.owner_identity.clone();
+                            t.owner_username = orig.owner_username.clone();
+                            t.parent_task_id = orig.parent_task_id;
+                            t.xp_awarded = orig.xp_awarded;
+                        }
+                    }
+                    self.db.update_task(&t)?;
+                } else {
+                    let is_step_new = parent_task_id.is_some();
+                    let t = Task {
+                        id: Uuid::new_v4(),
+                        project_id: Some(project_id),
+                        title: title.trim().to_string(),
+                        description: task_desc,
+                        due_date: due_parsed,
+                        completed: false,
+                        priority,
+                        created_at: Utc::now(),
+                        updated_at: Utc::now(),
+                        owner_identity: Some(self.identity.public_key.clone()),
+                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        parent_task_id,
+                        xp_awarded: false,
+                        recurrence: if is_step_new { None } else { recurrence },
+                    };
+                    self.db.insert_task(&t)?;
+                    self.audio_player.play_task_creation();
+                    let xp_label = if is_step_new { "Spawn Step" } else { "Spawn Quest" };
+                    if let Some(ref mut u) = self.user {
+                        xp_service.grant_xp(u, xp_label, 5)?;
+                    }
+                }
+                self.mark_dirty();
+                self.reload_data()?;
+                self.modal_state = ModalType::None;
+            }
+            return Ok(());
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
@@ -8364,6 +8710,7 @@ impl App {
         self.db.update_zen_tree(&tree)?;
         self.push_great_chronicle_async("TreeWatering", "watered The Evergrowth.", true);
 
+        self.complete_productive_action()?;
         self.update_daily_adventure_progress("water_tree", 1)?;
 
         // Stage 6 quest progress increment
@@ -9214,6 +9561,24 @@ impl App {
             }
         }
 
+        // 9. Rituales / Sidequests
+        if let Ok(rituals) = self.db.get_rituals() {
+            let streaks = self.db.get_all_ritual_streaks().unwrap_or_default();
+            for r in &rituals {
+                if let Some(s) = score_match(&r.name, r.description.as_deref()) {
+                    let streak = streaks.get(&r.id).copied().unwrap_or(0);
+                    let desc = r.description.clone().unwrap_or_else(|| r.frequency.clone());
+                    scored.push((s, SearchResult {
+                        result_type: SearchResultType::Ritual,
+                        title: r.name.clone(),
+                        details: format!("{} · {} XP · {} day streak", desc, r.reward_xp, streak),
+                        project_id: None,
+                        item_id: r.id.clone(),
+                    }));
+                }
+            }
+        }
+
         // Ordena por puntaje y limita a 40 resultados
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, r)| r).take(40).collect()
@@ -9386,6 +9751,14 @@ impl App {
                 if let Ok(entries) = self.db.get_chronicle_entries() {
                     if let Some(pos) = entries.iter().position(|e| e.0 == result.item_id) {
                         self.selected_chronicle_idx = pos;
+                    }
+                }
+            }
+            SearchResultType::Ritual => {
+                self.active_screen = ActiveScreen::Dashboard;
+                if let Ok(rituals) = self.db.get_rituals() {
+                    if let Some(pos) = rituals.iter().position(|r| r.id == result.item_id) {
+                        self.selected_ritual_idx = pos;
                     }
                 }
             }
@@ -9643,6 +10016,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
             "open_projects" => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             "open_character" => {
@@ -9738,6 +10112,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
             "open_project" => {
                 self.active_screen = ActiveScreen::Projects;
+                self.projects_all_selected = true;
                 self.active_tab_idx = 1;
             }
             "water_tree" => {
@@ -9808,7 +10183,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             (ClassType::CodeWarlock, "note_create") => (5, "Passive: Warlock Scroll Conjured"),
             (ClassType::CodeWarlock, "note_edit") => (5, "Passive: Warlock Arcane Edit"),
             (ClassType::CodeWarlock, "project_create") => (15, "Passive: Warlock System Summoned"),
-            (ClassType::CodeWarlock, "sync_complete") => (2, "Passive: Warlock Daemon Sync"),
+            (ClassType::CodeWarlock, "sync_complete") => (3, "Passive: Warlock Daemon Sync"),
 
             // Mind Sage
             (ClassType::MindSage, "note_create") if word_count > 500 => (10, "Passive: Sage Deep Knowledge"),
@@ -11162,7 +11537,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             let elapsed_seconds = (Utc::now() - active.start_time).num_seconds();
             let remaining = total_seconds - elapsed_seconds;
             if remaining <= 0 {
-                self.audio_player.play_task_complete();
+                self.audio_player.play_focus_end();
+                if self.external_notifications {
+                    let duration = active.duration_mins;
+                    crate::services::notifications::send_system_notification(
+                        "Focus Session Complete",
+                        &format!("{} min session complete. Great work!", duration),
+                        false,
+                    );
+                }
                 // Focus session completes!
                 let duration = active.duration_mins;
                 let active_soundscape = active.soundscape.clone();
@@ -11490,36 +11873,87 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     pub fn complete_ritual(&mut self, ritual_id: &str) -> Result<()> {
         let date = chrono::Local::now().date_naive();
-        let completed_today = self.db.get_ritual_history_for_date(date)?;
-        if !completed_today.contains(&ritual_id.to_string()) {
-            self.audio_player.play_task_complete();
-            self.db.complete_ritual(ritual_id, date)?;
-            self.mark_dirty();
-            self.trigger_ambient_particles();
 
-            let rituals = self.db.get_rituals()?;
-            if let Some(r) = rituals.iter().find(|rit| rit.id == ritual_id) {
-                let xp = r.reward_xp;
-                let ritual_name = r.name.clone();
-                self.grant_xp("Sidequest Completed", xp)?;
-                self.push_great_chronicle_async(
-                    "SidequestComplete",
-                    "fulfilled a sidequest.",
-                    true,
-                );
-                self.notifications.push(Notification::info(format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)));
+        match self.db.complete_ritual(ritual_id, date)? {
+            None => {
+                // Already hit the daily target — nothing to do
+                let rituals = self.db.get_rituals()?;
+                let target = rituals.iter()
+                    .find(|r| r.id == ritual_id)
+                    .map(|r| r.daily_target)
+                    .unwrap_or(1);
+                if target > 1 {
+                    self.notifications.push(Notification::info(
+                        format!("Already completed all {} times today!", target)
+                    ));
+                } else {
+                    self.notifications.push(Notification::info("Already completed today!".to_string()));
+                }
             }
+            Some((count, target)) => {
+                self.audio_player.play_task_complete();
+                self.mark_dirty();
+                self.trigger_ambient_particles();
 
-            let mut tree = self.db.get_zen_tree()?;
-            if tree.health < 100 {
-                tree.health = (tree.health + 1).min(100);
-                self.db.update_zen_tree(&tree)?;
-                self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
+                let rituals = self.db.get_rituals()?;
+                if let Some(r) = rituals.iter().find(|rit| rit.id == ritual_id) {
+                    let xp = r.reward_xp;
+                    let ritual_name = r.name.clone();
+                    self.grant_xp("Sidequest Completed", xp)?;
+
+                    if count < target {
+                        // Partial — show progress, no streak check yet
+                        self.notifications.push(Notification::info(
+                            format!("Sidequest Progress: {} ({}/{}) +{} XP", ritual_name, count, target, xp)
+                        ));
+                    } else {
+                        // Fully completed for the day
+                        self.push_great_chronicle_async("SidequestComplete", "fulfilled a sidequest.", true);
+                        if target > 1 {
+                            self.notifications.push(Notification::info(
+                                format!("Sidequest Complete: {} (all {}) +{} XP", ritual_name, target, xp)
+                            ));
+                        } else {
+                            self.notifications.push(Notification::info(
+                                format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)
+                            ));
+                        }
+
+                        // Streak milestone — only on full daily completion
+                        let streak = self.db.get_ritual_streak(ritual_id).unwrap_or(0);
+                        let milestone = match streak {
+                            3  => Some((3,  15,  "3-Day Initiate")),
+                            7  => Some((7,  25,  "7-Day Seeker")),
+                            15 => Some((15, 50,  "15-Day Devoted")),
+                            30 => Some((30, 100, "30-Day Champion")),
+                            45 => Some((45, 150, "45-Day Veteran")),
+                            60 => Some((60, 200, "60-Day Warlord")),
+                            85 => Some((85, 300, "85-Day Legendary")),
+                            90 => Some((90, 400, "90-Day Ascendant")),
+                            _  => None,
+                        };
+                        if let Some((days, bonus_xp, title)) = milestone {
+                            self.grant_xp(&format!("Streak Milestone: {} ({})", title, ritual_name), bonus_xp)?;
+                            self.trigger_celebration(
+                                &format!("STREAK MILESTONE: {} DAYS", days),
+                                &format!("{}\nYou have maintained '{}' for {} consecutive days!\n(+{} Bonus XP)", title, ritual_name, days, bonus_xp),
+                                "SUCCESS",
+                            );
+                        }
+
+                        let mut tree = self.db.get_zen_tree()?;
+                        if tree.health < 100 {
+                            tree.health = (tree.health + 1).min(100);
+                            self.db.update_zen_tree(&tree)?;
+                            self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
+                        }
+
+                        self.complete_productive_action()?;
+                        self.check_traits()?;
+                    }
+                }
+                self.reload_data()?;
             }
-
-            self.complete_productive_action()?;
-            self.check_traits()?;
-            self.reload_data()?;
         }
         Ok(())
     }
@@ -11786,6 +12220,96 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             Err(e) => {
                 if let Some(m) = self.bug_report_modal.as_mut() {
                     m.status = Some(format!("Failed to send: {e}"));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ── Hydration ──────────────────────────────────────────────────────────────
+
+    pub fn reload_hydration_config(&mut self) {
+        let db = &self.db;
+        self.hydration_enabled = db.get_setting("hydration_enabled")
+            .ok().flatten().as_deref() == Some("true");
+        self.hydration_target = db.get_setting("hydration_target")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(8);
+        self.hydration_interval_mins = db.get_setting("hydration_interval_mins")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(60);
+        self.hydration_active_from = db.get_setting("hydration_active_from")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(9);
+        self.hydration_active_to = db.get_setting("hydration_active_to")
+            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(18);
+        self.hydration_pause_focus = db.get_setting("hydration_pause_focus")
+            .ok().flatten().as_deref() == Some("true");
+        self.hydration_reward_xp = 20;
+
+        if let Ok((count, _)) = self.db.hydration_get_today() {
+            self.hydration_glasses = count;
+        }
+
+        // Arm the first reminder from now if hydration is enabled and timer isn't set
+        if self.hydration_enabled && self.hydration_next_reminder_at.is_none() {
+            self.hydration_next_reminder_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+            );
+        }
+    }
+
+    pub fn tick_hydration(&mut self) -> Result<()> {
+        if !self.hydration_enabled {
+            return Ok(());
+        }
+
+        // Refresh today's count (handles midnight rollover)
+        if let Ok((count, _)) = self.db.hydration_get_today() {
+            self.hydration_glasses = count;
+        }
+
+        let now = chrono::Local::now();
+        let hour = now.hour();
+        let in_active_hours = hour >= self.hydration_active_from && hour < self.hydration_active_to;
+
+        if !in_active_hours {
+            // Outside active window — clear any pending timer so it rearms when active hours resume
+            self.hydration_next_reminder_at = None;
+            return Ok(());
+        }
+
+        // Arm timer if not set (e.g., just entered active hours)
+        if self.hydration_next_reminder_at.is_none() {
+            self.hydration_next_reminder_at = Some(
+                std::time::Instant::now()
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+            );
+        }
+
+        // Skip when in a focus session and pause-during-focus is on
+        if self.hydration_pause_focus && self.active_focus_session.is_some() {
+            return Ok(());
+        }
+
+        // Check if reminder is already showing
+        if matches!(self.modal_state, ModalType::HydrationReminder) {
+            return Ok(());
+        }
+
+        // Fire popup if timer elapsed
+        if let Some(at) = self.hydration_next_reminder_at {
+            if std::time::Instant::now() >= at {
+                self.hydration_next_reminder_at = None; // cleared until dismissed
+                if matches!(self.modal_state, ModalType::None) {
+                    self.audio_player.play_water_alert();
+                    if self.external_notifications {
+                        crate::services::notifications::send_system_notification(
+                            "Hydration Reminder",
+                            "Time to drink a glass of water!",
+                            false,
+                        );
+                    }
+                    self.modal_state = ModalType::HydrationReminder;
                 }
             }
         }

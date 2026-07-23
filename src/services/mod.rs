@@ -7,6 +7,7 @@ pub mod config;
 pub mod identity;
 pub mod logger;
 pub mod lore_manager;
+pub mod notifications;
 pub mod planner;
 pub mod sync_engine;
 pub mod theme;

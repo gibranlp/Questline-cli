@@ -1,11 +1,31 @@
 <script>
   import { generateIdentity, saveIdentity } from '../lib/auth.js';
-  import { registerWithCredentials } from '../lib/api.js';
+  import { registerWithCredentials, checkAccessCode } from '../lib/api.js';
   import { encryptSecretKey } from '../lib/crypto.js';
   import { identity as identityStore } from '../lib/store.js';
   import { navigate } from '../lib/router.js';
 
   const secureContext = window.isSecureContext && crypto?.subtle != null;
+
+  let imagesReady = false;
+
+  const UI_IMAGES = [
+    '/assets/ui/gc-n.webp', '/assets/ui/gc-h.webp', '/assets/ui/gc-p.webp',
+    '/assets/ui/i-n.webp', '/assets/ui/i-a.webp', '/assets/ui/i-e.webp',
+    '/assets/ui/gf-tlc.webp', '/assets/ui/gf-trc.webp',
+    '/assets/ui/gf-blc.webp', '/assets/ui/gf-brc.webp',
+    '/assets/ui/gf-et.webp',  '/assets/ui/gf-eb.webp',
+    '/assets/ui/gf-el.webp',  '/assets/ui/gf-er.webp',
+    '/assets/ui/gf-gemt.webp', '/assets/ui/gf-gemb.webp',
+  ];
+
+  Promise.all(
+    UI_IMAGES.map(src => new Promise(resolve => {
+      const img = new Image();
+      img.onload = img.onerror = resolve;
+      img.src = src;
+    }))
+  ).then(() => { imagesReady = true; });
 
   let step = 'code'; // code | credentials | generating | done
   let accessCode = '';
@@ -13,11 +33,24 @@
   let password = '';
   let passwordConfirm = '';
   let errorMsg = '';
+  let checkingCode = false;
 
-  function goToCredentials() {
+  async function goToCredentials() {
     errorMsg = '';
     if (!accessCode.trim()) return;
-    step = 'credentials';
+    checkingCode = true;
+    try {
+      const result = await checkAccessCode(accessCode.trim());
+      if (!result.valid) {
+        errorMsg = 'Invalid access code';
+        return;
+      }
+      step = 'credentials';
+    } catch {
+      errorMsg = 'Invalid access code';
+    } finally {
+      checkingCode = false;
+    }
   }
 
   async function register() {
@@ -67,6 +100,18 @@
   </div>
 
   <div class="register-card">
+    <div class="gf-border" aria-hidden="true">
+      <div class="gf-corner gf-tlc"></div>
+      <div class="gf-corner gf-trc"></div>
+      <div class="gf-corner gf-blc"></div>
+      <div class="gf-corner gf-brc"></div>
+      <div class="gf-edge gf-et"></div>
+      <div class="gf-edge gf-eb"></div>
+      <div class="gf-edge gf-el"></div>
+      <div class="gf-edge gf-er"></div>
+      <div class="gf-gem gf-gemt"></div>
+      <div class="gf-gem gf-gemb"></div>
+    </div>
 
     {#if !secureContext}
       <div class="no-https">
@@ -74,22 +119,30 @@
         <p>This app requires a secure connection. Visit <code>https://webapp.questlinecli.com</code></p>
       </div>
 
+    {:else if !imagesReady}
+      <div class="loading">
+        <div class="spinner"></div>
+      </div>
+
     {:else if step === 'code'}
       <form on:submit|preventDefault={goToCredentials} class="form">
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="code">Access Code</label>
           <input
             id="code"
             type="text"
             bind:value={accessCode}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="XXXX-XXXX-XXXX-XXXX"
             autocomplete="off"
             spellcheck="false"
           />
         </div>
-        <button type="submit" class="btn-primary" disabled={!accessCode.trim()}>
-          Continue →
-        </button>
+        {#if errorMsg}
+          <div class="error">{errorMsg}</div>
+        {/if}
+        <button type="submit" class="btn-primary" disabled={!accessCode.trim() || checkingCode} aria-label="Continue"></button>
         <p class="hint">
           Access codes are issued to supporters via Ko-fi.
           <a href="https://ko-fi.com/questlinecli" target="_blank" rel="noopener">
@@ -106,12 +159,14 @@
       <form on:submit|preventDefault={register} class="form">
         <p class="step-note">Code accepted. Set your login credentials.</p>
 
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="username">Username</label>
           <input
             id="username"
             type="text"
             bind:value={username}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="your_username"
             autocomplete="username"
             spellcheck="false"
@@ -119,23 +174,27 @@
           />
         </div>
 
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="password">Password</label>
           <input
             id="password"
             type="password"
             bind:value={password}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="at least 8 characters"
             autocomplete="new-password"
           />
         </div>
 
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="passwordConfirm">Confirm Password</label>
           <input
             id="passwordConfirm"
             type="password"
             bind:value={passwordConfirm}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="repeat password"
             autocomplete="new-password"
           />
@@ -145,9 +204,7 @@
           <div class="error">{errorMsg}</div>
         {/if}
 
-        <button type="submit" class="btn-primary" disabled={!username.trim() || !password || !passwordConfirm}>
-          Forge Identity
-        </button>
+        <button type="submit" class="btn-primary" disabled={!username.trim() || !password || !passwordConfirm} aria-label="Forge Identity"></button>
 
         <p class="hint" style="margin-top:0.75rem;">
           <a href="#back" on:click|preventDefault={() => { step = 'code'; errorMsg = ''; }}>← Back</a>
@@ -180,7 +237,7 @@
     justify-content: center;
     padding: 3rem 1rem;
     gap: 2rem;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
     position: relative;
     background:
       linear-gradient(to bottom, rgba(8,8,8,0.72) 0%, rgba(8,8,8,0.48) 50%, rgba(8,8,8,0.78) 100%),
@@ -199,7 +256,6 @@
     z-index: 0;
   }
 
-  /* ── Logo — outside card, large, matches index.html #logo-img ── */
   .logo-wrap {
     position: relative;
     z-index: 1;
@@ -231,14 +287,75 @@
     z-index: 1;
     width: 100%;
     max-width: 400px;
-    background: rgba(8,8,8,0.88);
-    border: 1px solid #1c1c1c;
-    border-radius: 14px;
+    background: rgba(8, 8, 8, 0.88);
+    border: none;
+    border-radius: 0;
     padding: 2rem 2.5rem;
-    text-align: center;
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
+    text-align: center;
     box-shadow: 0 0 60px rgba(0,0,0,0.6);
+  }
+
+  /* ── Golden Frame Border ── */
+  .gf-border {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 10;
+    overflow: visible;
+  }
+
+  .gf-corner {
+    position: absolute;
+    width: 32px;
+    height: 42px;
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+  }
+  .gf-tlc { top: 0; left: 0;     background-image: url('/assets/ui/gf-tlc.webp'); }
+  .gf-trc { top: 0; right: 0;    background-image: url('/assets/ui/gf-trc.webp'); }
+  .gf-blc { bottom: 0; left: 0;  background-image: url('/assets/ui/gf-blc.webp'); }
+  .gf-brc { bottom: 0; right: 0; background-image: url('/assets/ui/gf-brc.webp'); }
+
+  .gf-et, .gf-eb {
+    position: absolute;
+    left: 32px; right: 32px;
+    height: 3px;
+    background-size: auto 100%;
+    background-repeat: repeat-x;
+  }
+  .gf-et { top: 0;    background-image: url('/assets/ui/gf-et.webp'); }
+  .gf-eb { bottom: 0; background-image: url('/assets/ui/gf-eb.webp'); }
+
+  .gf-el, .gf-er {
+    position: absolute;
+    top: 42px; bottom: 42px;
+    width: 3px;
+    background-size: 100% auto;
+    background-repeat: repeat-y;
+  }
+  .gf-el { left: 0;  background-image: url('/assets/ui/gf-el.webp'); }
+  .gf-er { right: 0; background-image: url('/assets/ui/gf-er.webp'); }
+
+  .gf-gem {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+  }
+  .gf-gemt {
+    top: -21px;
+    width: 86px;
+    height: 45px;
+    background-image: url('/assets/ui/gf-gemt.webp');
+  }
+  .gf-gemb {
+    bottom: -11px;
+    width: 58px;
+    height: 25px;
+    background-image: url('/assets/ui/gf-gemb.webp');
   }
 
   .step-note {
@@ -254,30 +371,36 @@
 
   label {
     display: block;
-    font-size: 0.75rem;
-    color: #666;
-    letter-spacing: 0.1em;
+    font-size: 0.72rem;
+    color: #555;
+    letter-spacing: 0.12em;
     text-transform: uppercase;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.45rem;
   }
 
   input {
     width: 100%;
-    background: #050505;
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
+    background: url('/assets/ui/i-n.webp') center / 100% 100% no-repeat;
+    border: none;
+    border-radius: 0;
     color: #d4d4d4;
     font-family: inherit;
     font-size: 0.9rem;
     padding: 0.65rem 0.9rem;
     outline: none;
-    letter-spacing: 0.1em;
-    transition: border-color 0.15s;
   }
 
   input:focus {
-    border-color: #a855f7;
-    box-shadow: 0 0 0 3px rgba(168,85,247,0.1);
+    background-image: url('/assets/ui/i-a.webp');
+  }
+
+  input.err,
+  input.err:focus {
+    background-image: url('/assets/ui/i-e.webp');
+  }
+
+  .field.err label {
+    color: #ef4444;
   }
 
   .error {
@@ -291,28 +414,26 @@
   }
 
   .btn-primary {
-    width: 100%;
-    background: rgba(168,85,247,0.15);
-    border: 1px solid #a855f7;
-    border-radius: 6px;
-    color: #a855f7;
-    font-family: inherit;
-    font-size: 0.85rem;
-    font-weight: 600;
-    letter-spacing: 0.1em;
-    padding: 0.75rem;
+    display: block;
+    width: 158px;
+    height: 63px;
+    margin: 0 auto;
+    background: url('/assets/ui/gc-n.webp') center / 100% 100% no-repeat;
+    border: none;
+    border-radius: 0;
+    padding: 0;
     cursor: pointer;
-    text-transform: uppercase;
-    transition: background 0.15s, color 0.15s;
   }
 
   .btn-primary:hover:not(:disabled) {
-    background: rgba(168,85,247,0.28);
-    color: #c084fc;
-    box-shadow: 0 0 16px rgba(168,85,247,0.2);
+    background-image: url('/assets/ui/gc-h.webp');
   }
 
-  .btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary:active:not(:disabled) {
+    background-image: url('/assets/ui/gc-p.webp');
+  }
+
+  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
 
   .hint {
     text-align: center;
@@ -328,12 +449,13 @@
   .loading, .success {
     padding: 1rem 0;
     color: #888;
+    text-align: center;
   }
 
   .spinner {
     width: 32px;
     height: 32px;
-    border: 2px solid #2a2a2a;
+    border: 2px solid #1c1c1c;
     border-top-color: #a855f7;
     border-radius: 50%;
     margin: 0 auto 1rem;

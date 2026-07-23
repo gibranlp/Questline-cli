@@ -7,6 +7,26 @@
 
   const secureContext = window.isSecureContext && crypto?.subtle != null;
 
+  let imagesReady = false;
+
+  const UI_IMAGES = [
+    '/assets/ui/gc-n.webp', '/assets/ui/gc-h.webp', '/assets/ui/gc-p.webp',
+    '/assets/ui/i-n.webp',  '/assets/ui/i-a.webp',  '/assets/ui/i-e.webp',
+    '/assets/ui/gf-tlc.webp', '/assets/ui/gf-trc.webp',
+    '/assets/ui/gf-blc.webp', '/assets/ui/gf-brc.webp',
+    '/assets/ui/gf-et.webp',  '/assets/ui/gf-eb.webp',
+    '/assets/ui/gf-el.webp',  '/assets/ui/gf-er.webp',
+    '/assets/ui/gf-gemt.webp', '/assets/ui/gf-gemb.webp',
+  ];
+
+  Promise.all(
+    UI_IMAGES.map(src => new Promise(resolve => {
+      const img = new Image();
+      img.onload = img.onerror = resolve;
+      img.src = src;
+    }))
+  ).then(() => { imagesReady = true; });
+
   let username = '';
   let password = '';
   let errorMsg = '';
@@ -51,10 +71,27 @@
   </div>
 
   <div class="login-card">
+    <div class="gf-border" aria-hidden="true">
+      <div class="gf-corner gf-tlc"></div>
+      <div class="gf-corner gf-trc"></div>
+      <div class="gf-corner gf-blc"></div>
+      <div class="gf-corner gf-brc"></div>
+      <div class="gf-edge gf-et"></div>
+      <div class="gf-edge gf-eb"></div>
+      <div class="gf-edge gf-el"></div>
+      <div class="gf-edge gf-er"></div>
+      <div class="gf-gem gf-gemt"></div>
+      <div class="gf-gem gf-gemb"></div>
+    </div>
     {#if !secureContext}
       <div class="no-https">
         <strong>HTTPS required</strong>
         <p>Visit <code>https://webapp.questlinecli.com</code></p>
+      </div>
+
+    {:else if !imagesReady}
+      <div class="loading">
+        <div class="spinner"></div>
       </div>
 
     {:else if loading}
@@ -65,24 +102,28 @@
 
     {:else}
       <form on:submit|preventDefault={login} class="form">
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="username">Username</label>
           <input
             id="username"
             type="text"
             bind:value={username}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="your_username"
             autocomplete="username"
             spellcheck="false"
           />
         </div>
 
-        <div class="field">
+        <div class="field" class:err={!!errorMsg}>
           <label for="password">Password</label>
           <input
             id="password"
             type="password"
             bind:value={password}
+            class:err={!!errorMsg}
+            on:input={() => { if (errorMsg) errorMsg = ''; }}
             placeholder="••••••••"
             autocomplete="current-password"
           />
@@ -92,9 +133,7 @@
           <div class="error">{errorMsg}</div>
         {/if}
 
-        <button type="submit" class="btn-primary" disabled={!username.trim() || !password}>
-          Enter the Realm
-        </button>
+        <button type="submit" class="btn-primary" aria-label="Enter the Realm"></button>
 
         <p class="hint">
           New supporter?
@@ -114,7 +153,7 @@
     justify-content: center;
     padding: 3rem 1rem;
     gap: 2rem;
-    font-family: 'JetBrains Mono', monospace;
+    font-family: inherit;
     position: relative;
     background:
       linear-gradient(to bottom, rgba(8,8,8,0.72) 0%, rgba(8,8,8,0.48) 50%, rgba(8,8,8,0.78) 100%),
@@ -169,7 +208,7 @@
     max-width: 400px;
     background: rgba(8, 8, 8, 0.88);
     border: none;
-    border-radius: 14px;
+    border-radius: 0;
     padding: 2rem 2.5rem;
     backdrop-filter: blur(12px);
     -webkit-backdrop-filter: blur(12px);
@@ -177,13 +216,69 @@
     box-shadow: 0 0 60px rgba(0,0,0,0.6);
   }
 
-  .login-card::after {
-    content: '';
+  /* ── Golden Frame Border ── */
+  .gf-border {
     position: absolute;
-    inset: -44px;
-    background: url('/assets/ui/bfg.png') center / 100% 100% no-repeat;
+    inset: 0;
     pointer-events: none;
     z-index: 10;
+    overflow: visible;
+  }
+
+  /* corners: flush with card corners, overlap inward so no gap with background */
+  .gf-corner {
+    position: absolute;
+    width: 32px;
+    height: 42px;
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+  }
+  .gf-tlc { top: 0; left: 0;    background-image: url('/assets/ui/gf-tlc.webp'); }
+  .gf-trc { top: 0; right: 0;   background-image: url('/assets/ui/gf-trc.webp'); }
+  .gf-blc { bottom: 0; left: 0;  background-image: url('/assets/ui/gf-blc.webp'); }
+  .gf-brc { bottom: 0; right: 0; background-image: url('/assets/ui/gf-brc.webp'); }
+
+  /* top/bottom edges: 3px, run between corners along the card boundary */
+  .gf-et, .gf-eb {
+    position: absolute;
+    left: 32px; right: 32px;
+    height: 3px;
+    background-size: auto 100%;
+    background-repeat: repeat-x;
+  }
+  .gf-et { top: 0;    background-image: url('/assets/ui/gf-et.webp'); }
+  .gf-eb { bottom: 0; background-image: url('/assets/ui/gf-eb.webp'); }
+
+  /* left/right edges: 3px, run between corners along the card boundary */
+  .gf-el, .gf-er {
+    position: absolute;
+    top: 42px; bottom: 42px;
+    width: 3px;
+    background-size: 100% auto;
+    background-repeat: repeat-y;
+  }
+  .gf-el { left: 0;  background-image: url('/assets/ui/gf-el.webp'); }
+  .gf-er { right: 0; background-image: url('/assets/ui/gf-er.webp'); }
+
+  /* gems: centered on the top/bottom edge line (top:0 / bottom:0) */
+  .gf-gem {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    background-size: 100% 100%;
+    background-repeat: no-repeat;
+  }
+  .gf-gemt {
+    top: -21px;
+    width: 86px;
+    height: 45px;
+    background-image: url('/assets/ui/gf-gemt.webp');
+  }
+  .gf-gemb {
+    bottom: -11px;
+    width: 58px;
+    height: 25px;
+    background-image: url('/assets/ui/gf-gemb.webp');
   }
 
   .form { text-align: left; }
@@ -200,20 +295,27 @@
 
   input {
     width: 100%;
-    background: rgba(0,0,0,0.5);
-    border: 1px solid #2a2a2a;
-    border-radius: 6px;
+    background: url('/assets/ui/i-n.webp') center / 100% 100% no-repeat;
+    border: none;
+    border-radius: 0;
     color: #d4d4d4;
     font-family: inherit;
     font-size: 0.9rem;
     padding: 0.65rem 0.9rem;
     outline: none;
-    transition: border-color 0.15s, box-shadow 0.15s;
   }
 
   input:focus {
-    border-color: #a855f7;
-    box-shadow: 0 0 0 3px rgba(168,85,247,0.1);
+    background-image: url('/assets/ui/i-a.webp');
+  }
+
+  input.err,
+  input.err:focus {
+    background-image: url('/assets/ui/i-e.webp');
+  }
+
+  .field.err label {
+    color: #ef4444;
   }
 
   .error {
@@ -227,28 +329,24 @@
   }
 
   .btn-primary {
-    width: 100%;
-    background: rgba(168,85,247,0.15);
-    border: 1px solid #a855f7;
-    border-radius: 6px;
-    color: #a855f7;
-    font-family: inherit;
-    font-size: 0.85rem;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    padding: 0.75rem;
+    display: block;
+    width: 158px;
+    height: 63px;
+    margin: 0 auto;
+    background: url('/assets/ui/gc-n.webp') center / 100% 100% no-repeat;
+    border: none;
+    border-radius: 0;
+    padding: 0;
     cursor: pointer;
-    text-transform: uppercase;
-    transition: background 0.15s, color 0.15s, box-shadow 0.15s;
   }
 
-  .btn-primary:hover:not(:disabled) {
-    background: rgba(168,85,247,0.28);
-    color: #c084fc;
-    box-shadow: 0 0 16px rgba(168,85,247,0.2);
+  .btn-primary:hover {
+    background-image: url('/assets/ui/gc-h.webp');
   }
 
-  .btn-primary:disabled { opacity: 0.35; cursor: not-allowed; }
+  .btn-primary:active {
+    background-image: url('/assets/ui/gc-p.webp');
+  }
 
   .hint {
     text-align: center;

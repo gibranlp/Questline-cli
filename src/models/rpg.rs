@@ -284,6 +284,7 @@ pub struct Ritual {
     pub description: Option<String>,
     pub frequency: String,
     pub reward_xp: i32,
+    pub daily_target: i32,
     pub created_at: DateTime<Utc>,
 }
 

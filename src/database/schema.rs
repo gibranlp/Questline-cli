@@ -148,12 +148,14 @@ CREATE TABLE IF NOT EXISTS rituals (
     description TEXT,
     frequency TEXT NOT NULL,
     reward_xp INTEGER NOT NULL,
+    daily_target INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS ritual_history (
     ritual_id TEXT NOT NULL,
     completed_date TEXT NOT NULL,
+    completion_count INTEGER NOT NULL DEFAULT 1,
     PRIMARY KEY(ritual_id, completed_date),
     FOREIGN KEY(ritual_id) REFERENCES rituals(id) ON DELETE CASCADE
 );
@@ -354,6 +356,12 @@ CREATE TABLE IF NOT EXISTS chapter_contribution_log (
 CREATE TABLE IF NOT EXISTS processed_remote_events (
     id TEXT PRIMARY KEY,
     processed_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hydration_log (
+    log_date TEXT PRIMARY KEY,
+    count INTEGER NOT NULL DEFAULT 0,
+    reward_given INTEGER NOT NULL DEFAULT 0
 );
 
 -- índices base — presentes desde el inicio

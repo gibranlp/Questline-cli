@@ -195,6 +195,7 @@ async fn main() -> Result<()> {
 
     // Loop principal — 50ms por tick = ~20fps, primero input luego render para reducir latencia
     let tick_rate = std::time::Duration::from_millis(50);
+    let mut last_notification_time: Option<std::time::Instant> = None;
     loop {
         // Primero checar si hay tecla presionada antes de dibujar — así el input se siente más rápido
         if event::poll(tick_rate)? {
@@ -225,6 +226,7 @@ async fn main() -> Result<()> {
         app.tick_update_check();
         app.tick_chapter_progress();
         app.tick_sprite_notifications();
+        let _ = app.tick_hydration();
         app.quit_confirm_ticks = app.quit_confirm_ticks.wrapping_add(1);
         app.intro_ticks = app.intro_ticks.wrapping_add(1);
         app.music_scroll_ticks = app.music_scroll_ticks.wrapping_add(1);
@@ -329,7 +331,7 @@ async fn main() -> Result<()> {
                             screens::focus::draw(f, &app, &theme);
                         },
                         ActiveScreen::Projects => {
-                            screens::projects::draw(f, &app.projects, app.selected_project_idx, &app.modal_state, &theme, chunks[0]);
+                            screens::projects::draw(f, &app.projects, &app.all_tasks, app.selected_project_idx, app.projects_all_selected, &app.modal_state, &theme, chunks[0]);
                         }
 
                         ActiveScreen::Character => {
@@ -561,6 +563,26 @@ async fn main() -> Result<()> {
 
             // Limpia notificaciones viejas cada frame — solo duran 4 segundos y bye
             app.notifications.retain(|n| n.unlocked_at.elapsed().as_secs() < 4);
+
+            // Suena el efecto y dispara OS alert para notificaciones nuevas
+            if let Some(notif) = app.notifications.last() {
+                use questline::app::NotificationKind;
+                let is_new = last_notification_time.map_or(true, |t| notif.unlocked_at > t);
+                if is_new {
+                    if !matches!(notif.kind, NotificationKind::Swarm) {
+                        app.audio_player.play_notification();
+                    }
+                    if app.external_notifications {
+                        let urgent = matches!(notif.kind, NotificationKind::Swarm);
+                        questline::services::notifications::send_system_notification(
+                            &notif.title,
+                            &notif.message,
+                            urgent,
+                        );
+                    }
+                    last_notification_time = Some(notif.unlocked_at);
+                }
+            }
 
             // Overlay de notificación flotante — aparece sobre cualquier pantalla de gameplay
             if app.active_screen != ActiveScreen::Intro
@@ -1557,6 +1579,49 @@ async fn main() -> Result<()> {
                     Line::from(Span::styled(
                         "  Slay this realm forever?  [Y] Yes   [N] No / Esc",
                         Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                    )),
+                ];
+
+                let p = Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(p, overlay_area);
+            }
+
+            // Confirm de conquistar campaña — acción irreversible pero gloriosa
+            if let questline::app::ModalType::ConfirmConquerProject { ref project_name, .. } = app.modal_state {
+                let overlay_area = centered_rect_fixed_height(58, 11, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(
+                        " Conquer Campaign ",
+                        Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD),
+                    ));
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("  Campaign: ", Style::default().fg(Color::Rgb(140, 140, 140))),
+                        Span::styled(project_name.clone(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  This campaign will be marked as complete and archived.",
+                        Style::default().fg(Color::Rgb(200, 200, 200)),
+                    )),
+                    Line::from(Span::styled(
+                        "  You will earn 200 XP and +20 Tree Growth.",
+                        Style::default().fg(Color::Rgb(56, 189, 248)),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Conquer this campaign?  [Y] Yes   [N] No / Esc",
+                        Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD),
                     )),
                 ];
 

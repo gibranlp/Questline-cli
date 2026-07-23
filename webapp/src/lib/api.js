@@ -74,6 +74,20 @@ export class ApiClient {
   }
 }
 
+// Validate an access code without consuming it — public route
+export async function checkAccessCode(code) {
+  const url = new URL(API_BASE);
+  url.searchParams.set('route', 'webapp/check-code');
+  const res = await fetch(url.toString(), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ access_code: code }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+  return data; // { valid: boolean, linked: boolean }
+}
+
 // Register with access code — creates a webapp account with username/password
 // Body is plain JSON (not base64-signed) since this is a public route
 export async function registerWithCredentials({ accessCode, username, password, identity, encryptedKeyBlob }) {

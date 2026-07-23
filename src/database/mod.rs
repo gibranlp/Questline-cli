@@ -320,6 +320,32 @@ impl Database {
             conn.execute("ALTER TABLE codices ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0;", [])?;
         }
 
+        let has_ritual_daily_target: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('rituals') WHERE name='daily_target'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_ritual_daily_target {
+            conn.execute("ALTER TABLE rituals ADD COLUMN daily_target INTEGER NOT NULL DEFAULT 1;", [])?;
+        }
+
+        let has_ritual_completion_count: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('ritual_history') WHERE name='completion_count'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_ritual_completion_count {
+            // Existing rows count as 1 completion (fully done for that day)
+            conn.execute("ALTER TABLE ritual_history ADD COLUMN completion_count INTEGER NOT NULL DEFAULT 1;", [])?;
+        }
+
+        // Hydration log table — created via schema, but add migration guard for older DBs
+        conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS hydration_log (
+                log_date TEXT PRIMARY KEY,
+                count INTEGER NOT NULL DEFAULT 0,
+                reward_given INTEGER NOT NULL DEFAULT 0
+            );
+        ")?;
+
         for (id, name, desc) in Achievement::static_list() {
             conn.execute(
                 "INSERT OR IGNORE INTO achievements (id, name, description, unlocked_at) VALUES (?1, ?2, ?3, NULL)",
@@ -1573,8 +1599,8 @@ impl Database {
 
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![r.id, r.name, r.description, r.frequency, r.reward_xp, r.created_at.to_rfc3339()],
+            "INSERT INTO rituals (id, name, description, frequency, reward_xp, daily_target, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![r.id, r.name, r.description, r.frequency, r.reward_xp, r.daily_target, r.created_at.to_rfc3339()],
         )?;
         let _ = self.log_change("ritual", &r.id, "create");
         Ok(())
@@ -1582,7 +1608,7 @@ impl Database {
 
     pub fn get_rituals(&self) -> Result<Vec<Ritual>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, frequency, reward_xp, created_at FROM rituals",
+            "SELECT id, name, description, frequency, reward_xp, daily_target, created_at FROM rituals",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -1590,7 +1616,8 @@ impl Database {
             let description: Option<String> = row.get(2)?;
             let frequency: String = row.get(3)?;
             let reward_xp: i32 = row.get(4)?;
-            let created_str: String = row.get(5)?;
+            let daily_target: i32 = row.get(5)?;
+            let created_str: String = row.get(6)?;
 
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -1602,6 +1629,7 @@ impl Database {
                 description,
                 frequency,
                 reward_xp,
+                daily_target,
                 created_at,
             })
         })?;
@@ -1619,25 +1647,190 @@ impl Database {
         Ok(())
     }
 
-    pub fn complete_ritual(&self, ritual_id: &str, date: NaiveDate) -> Result<()> {
+    // Increments today's completion count up to the ritual's daily_target.
+    // Returns Some((new_count, target)) when incremented, None when already at target.
+    pub fn complete_ritual(&self, ritual_id: &str, date: NaiveDate) -> Result<Option<(i32, i32)>> {
+        let target: i32 = self.conn.query_row(
+            "SELECT daily_target FROM rituals WHERE id = ?1",
+            params![ritual_id],
+            |row| row.get(0),
+        ).unwrap_or(1);
+
         self.conn.execute(
-            "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date) VALUES (?1, ?2)",
+            "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date, completion_count) VALUES (?1, ?2, 0)",
             params![ritual_id, date.to_string()],
         )?;
+
+        let changed = self.conn.execute(
+            "UPDATE ritual_history SET completion_count = completion_count + 1 WHERE ritual_id = ?1 AND completed_date = ?2 AND completion_count < ?3",
+            params![ritual_id, date.to_string(), target],
+        )?;
+
+        if changed == 0 {
+            return Ok(None);
+        }
         let _ = self.log_change("ritual_history", &format!("{}__{}", ritual_id, date), "create");
-        Ok(())
+
+        let new_count: i32 = self.conn.query_row(
+            "SELECT completion_count FROM ritual_history WHERE ritual_id = ?1 AND completed_date = ?2",
+            params![ritual_id, date.to_string()],
+            |row| row.get(0),
+        ).unwrap_or(1);
+
+        Ok(Some((new_count, target)))
     }
 
+    // Returns ritual IDs that are fully done today (completion_count >= daily_target).
     pub fn get_ritual_history_for_date(&self, date: NaiveDate) -> Result<Vec<String>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT ritual_id FROM ritual_history WHERE completed_date = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT rh.ritual_id FROM ritual_history rh
+             JOIN rituals r ON r.id = rh.ritual_id
+             WHERE rh.completed_date = ?1 AND rh.completion_count >= r.daily_target",
+        )?;
         let rows = stmt.query_map(params![date.to_string()], |row| row.get::<_, String>(0))?;
         let mut list = Vec::new();
         for r in rows {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    // Returns (completion_count, daily_target) for every ritual for a given date.
+    pub fn get_ritual_day_counts(&self, date: NaiveDate) -> Result<std::collections::HashMap<String, (i32, i32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT r.id, COALESCE(rh.completion_count, 0), r.daily_target
+             FROM rituals r
+             LEFT JOIN ritual_history rh ON r.id = rh.ritual_id AND rh.completed_date = ?1",
+        )?;
+        let rows = stmt.query_map(params![date.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+        })?;
+        let mut map = std::collections::HashMap::new();
+        for r in rows.filter_map(|r| r.ok()) {
+            map.insert(r.0, (r.1, r.2));
+        }
+        Ok(map)
+    }
+
+    // Consecutive-day streak for one ritual — only fully-completed days count.
+    pub fn get_ritual_streak(&self, ritual_id: &str) -> Result<i32> {
+        let target: i32 = self.conn.query_row(
+            "SELECT daily_target FROM rituals WHERE id = ?1",
+            params![ritual_id],
+            |row| row.get(0),
+        ).unwrap_or(1);
+
+        let mut stmt = self.conn.prepare(
+            "SELECT completed_date FROM ritual_history WHERE ritual_id = ?1 AND completion_count >= ?2 ORDER BY completed_date DESC",
+        )?;
+        let rows = stmt.query_map(params![ritual_id, target], |row| row.get::<_, String>(0))?;
+        let dates: Vec<NaiveDate> = rows
+            .filter_map(|r| r.ok())
+            .filter_map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .collect();
+
+        if dates.is_empty() {
+            return Ok(0);
+        }
+        let today = chrono::Local::now().date_naive();
+        if dates[0] != today {
+            return Ok(0);
+        }
+        let mut streak = 0i32;
+        let mut expected = today;
+        for date in &dates {
+            if *date == expected {
+                streak += 1;
+                expected = expected.pred_opt().unwrap_or(expected);
+            } else {
+                break;
+            }
+        }
+        Ok(streak)
+    }
+
+    // Streak for every ritual in one pass — only fully-completed days count.
+    pub fn get_all_ritual_streaks(&self) -> Result<std::collections::HashMap<String, i32>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rh.ritual_id, rh.completed_date
+             FROM ritual_history rh
+             JOIN rituals r ON r.id = rh.ritual_id
+             WHERE rh.completion_count >= r.daily_target
+             ORDER BY rh.ritual_id, rh.completed_date DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+
+        let today = chrono::Local::now().date_naive();
+        let mut per_ritual: std::collections::HashMap<String, Vec<NaiveDate>> = std::collections::HashMap::new();
+        for r in rows.filter_map(|r| r.ok()) {
+            if let Ok(d) = NaiveDate::parse_from_str(&r.1, "%Y-%m-%d") {
+                per_ritual.entry(r.0).or_default().push(d);
+            }
+        }
+
+        let mut out = std::collections::HashMap::new();
+        for (id, dates) in per_ritual {
+            if dates.is_empty() || dates[0] != today {
+                out.insert(id, 0);
+                continue;
+            }
+            let mut streak = 0i32;
+            let mut expected = today;
+            for date in &dates {
+                if *date == expected {
+                    streak += 1;
+                    expected = expected.pred_opt().unwrap_or(expected);
+                } else {
+                    break;
+                }
+            }
+            out.insert(id, streak);
+        }
+        Ok(out)
+    }
+
+    // ── Hydration ──────────────────────────────────────────────────────────────
+
+    // Returns (count_today, reward_already_given) for today.
+    pub fn hydration_get_today(&self) -> Result<(i32, bool)> {
+        let today = chrono::Local::now().date_naive().to_string();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO hydration_log (log_date, count, reward_given) VALUES (?1, 0, 0)",
+            params![today],
+        )?;
+        self.conn.query_row(
+            "SELECT count, reward_given FROM hydration_log WHERE log_date = ?1",
+            params![today],
+            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)? != 0)),
+        ).map_err(Into::into)
+    }
+
+    // Increments glass count; returns the new count.
+    pub fn hydration_drink(&self) -> Result<i32> {
+        let today = chrono::Local::now().date_naive().to_string();
+        self.conn.execute(
+            "INSERT INTO hydration_log (log_date, count, reward_given) VALUES (?1, 1, 0)
+             ON CONFLICT(log_date) DO UPDATE SET count = count + 1",
+            params![today],
+        )?;
+        self.conn.query_row(
+            "SELECT count FROM hydration_log WHERE log_date = ?1",
+            params![today],
+            |row| row.get(0),
+        ).map_err(Into::into)
+    }
+
+    // Marks the daily reward as claimed so it doesn't fire again today.
+    pub fn hydration_mark_reward_given(&self) -> Result<()> {
+        let today = chrono::Local::now().date_naive().to_string();
+        self.conn.execute(
+            "INSERT INTO hydration_log (log_date, count, reward_given) VALUES (?1, 0, 1)
+             ON CONFLICT(log_date) DO UPDATE SET reward_given = 1",
+            params![today],
+        )?;
+        Ok(())
     }
 
     pub fn insert_milestone(&self, m: &Milestone) -> Result<()> {
