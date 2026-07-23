@@ -1250,16 +1250,52 @@ impl App {
 
         let identity = crate::services::identity::Identity::load_or_create(existing_user_id)?;
 
-        // Genera un device_id único si no existe — se persiste en la DB para identificar la máquina
+        let device_name = crate::services::identity::get_local_device_name();
+
+        // Genera un device_id único si no existe — se persiste en la DB para identificar la máquina.
+        // If a full Questline DB folder is copied to another PC, it carries the old device_id too.
+        // The server filters pulls with `device_id != current_device`, so cloned IDs make both PCs
+        // hide each other's events. Bind the id to the first hostname that used it and repair copies.
         let device_id = match db.get_setting("device_id")? {
-            Some(id) => id,
+            Some(id) => {
+                match db.get_setting("device_bound_name")? {
+                    Some(bound_name) if bound_name != device_name => {
+                        let new_id = Uuid::new_v4().to_string();
+                        db.set_setting("device_id", &new_id)?;
+                        db.set_setting("device_bound_name", &device_name)?;
+                        let _ = db.set_setting("last_pull_seq", "0");
+                        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                        new_id
+                    }
+                    Some(_) => id,
+                    None => {
+                        let stored_device_name = db.conn.query_row(
+                            "SELECT device_name FROM devices WHERE device_id = ?1",
+                            params![id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        ).ok();
+
+                        if stored_device_name.as_deref().is_some_and(|name| name != device_name) {
+                            let new_id = Uuid::new_v4().to_string();
+                            db.set_setting("device_id", &new_id)?;
+                            db.set_setting("device_bound_name", &device_name)?;
+                            let _ = db.set_setting("last_pull_seq", "0");
+                            let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                            new_id
+                        } else {
+                            db.set_setting("device_bound_name", &device_name)?;
+                            id
+                        }
+                    }
+                }
+            }
             None => {
                 let id = Uuid::new_v4().to_string();
                 db.set_setting("device_id", &id)?;
+                db.set_setting("device_bound_name", &device_name)?;
                 id
             }
         };
-        let device_name = crate::services::identity::get_local_device_name();
         db.register_device(&device_id, &device_name)?;
 
         // La config tiene prioridad sobre los settings de la DB — archivo > DB
@@ -2716,10 +2752,15 @@ impl App {
                                 // Reset del cursor de pull y del contador de conflictos — el nuevo nodo arranca limpio
                                 let _ = self.db.set_setting("last_pull_seq", "0");
                                 let _ = self.db.set_setting("conflict_count", "0");
+                                // Clear dedup table — stale IDs from the old identity would cause
+                                // the new account's events to be silently skipped on first drain.
+                                let _ = self.db.conn.execute("DELETE FROM processed_remote_events", []);
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored! Syncing now...".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
-                                let _ = self.trigger_sync();
+                                // Use background sync (with drain loop) so all historic events are
+                                // pulled in one shot — trigger_sync() only pulls one 500-event batch.
+                                self.start_background_sync();
                                 self.reload_data()?;
                             }
                             Ok(_) => {
@@ -10701,8 +10742,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         self.notifications.push(Notification::info("Chronicle restored from cloud!".to_string()));
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
-                            message: "Restore complete! Press [Esc] to close.".to_string(),
+                            message: "Restore complete! Pulling recent events...".to_string(),
                         };
+                        // Pull all events since the backup — import_from_json already reset
+                        // last_pull_seq to 0 and cleared processed_remote_events, so the drain
+                        // loop in do_background_sync will catch the app up to server HEAD.
+                        self.start_background_sync();
                     }
                     Err(e) => {
                         self.modal_state = ModalType::CloudRestoreProgress {

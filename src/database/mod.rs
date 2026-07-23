@@ -716,6 +716,7 @@ impl Database {
                 project.id.to_string()
             ],
         )?;
+        let _ = self.log_change("project", &project.id.to_string(), "update");
         Ok(())
     }
 
@@ -1038,6 +1039,7 @@ impl Database {
     }
 
     pub fn delete_note(&self, id: Uuid) -> Result<()> {
+        let _ = self.log_change("note", &id.to_string(), "delete");
         self.conn
             .execute("DELETE FROM notes WHERE id = ?1", params![id.to_string()])?;
         Ok(())
@@ -1909,6 +1911,7 @@ impl Database {
     }
 
     pub fn delete_milestone(&self, id: Uuid) -> Result<()> {
+        let _ = self.log_change("milestone", &id.to_string(), "delete");
         self.conn.execute(
             "DELETE FROM milestones WHERE id = ?1",
             params![id.to_string()],

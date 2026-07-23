@@ -2,8 +2,8 @@
 
 import { signRequest, toBase64 } from './auth.js';
 
-// Primary API: webapp.questline.com (gibranlp_webappquest DB, fast reads)
-const API_BASE = import.meta.env.VITE_API_URL || 'https://questlinecli.com/api/';
+// Primary API: webapp.questlinecli.com (gibranlp_webappquest DB, fast reads)
+const API_BASE = import.meta.env.VITE_API_URL || 'https://webapp.questlinecli.com/api/';
 // Secondary API: questlinecli.com — used for import pull + dual push to keep CLI in sync
 export const QUESTLINE_API_BASE = import.meta.env.VITE_QUESTLINE_API_URL || 'https://questlinecli.com/api/';
 

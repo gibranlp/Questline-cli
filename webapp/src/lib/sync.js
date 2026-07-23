@@ -1,4 +1,4 @@
-// Sync engine — primary API is webapp.questline.com (gibranlp_webappquest DB).
+// Sync engine — primary API is webapp.questlinecli.com (gibranlp_webappquest DB).
 // Push events go to both webapp API and questlinecli.com to keep the CLI in sync.
 // E2EE: payloads are AES-GCM encrypted before transmission.
 // IndexedDB: decrypted state is cached locally for instant boot.
@@ -8,14 +8,15 @@ import {
   applySyncEvent, syncStatus, addToast,
   projects, tasks, notes, codices, journalEntries,
   milestones, achievements, rituals, focusSessions,
-  loreUnlocks, userStats, zenTree, streaks,
+  loreUnlocks, chronicleMessages, userStats, zenTree, streaks,
   dataKey,
 } from './store.js';
 import { encryptPayload, decryptPayload } from './crypto.js';
 import { saveEntity, deleteEntity, loadAllEntities } from './db.js';
 import { ApiClient, QUESTLINE_API_BASE, pullAllFromQuestline } from './api.js';
 
-const SEQ_KEY = 'questline_sync_seq';
+const SEQ_KEY     = 'questline_sync_seq';  // webapp DB (gibranlp_webappquest) pull cursor
+const CLI_SEQ_KEY = 'questline_cli_seq';   // questlinecli.com pull cursor — different DB, different seq space
 
 export function getLastSeq() {
   return parseInt(localStorage.getItem(SEQ_KEY) || '0', 10);
@@ -23,6 +24,14 @@ export function getLastSeq() {
 
 function setLastSeq(seq) {
   localStorage.setItem(SEQ_KEY, String(seq));
+}
+
+function getLastCLISeq() {
+  return parseInt(localStorage.getItem(CLI_SEQ_KEY) || '0', 10);
+}
+
+function setLastCLISeq(seq) {
+  localStorage.setItem(CLI_SEQ_KEY, String(seq));
 }
 
 // ── Boot: populate Svelte stores from IndexedDB (no network needed) ─────────
@@ -50,6 +59,23 @@ export async function loadLocalCache() {
     }
   }
 
+  try {
+    const rows = await loadAllEntities('chronicle_messages');
+    const grouped = new Map();
+    for (const row of rows) {
+      if (!row.project_id) continue;
+      const list = grouped.get(row.project_id) || [];
+      list.push(row);
+      grouped.set(row.project_id, list);
+    }
+    for (const list of grouped.values()) {
+      list.sort((a, b) => String(a.timestamp || '').localeCompare(String(b.timestamp || '')));
+    }
+    chronicleMessages.set(grouped);
+  } catch {
+    // non-fatal
+  }
+
   // Singletons — stored with id='singleton', unwrap before setting
   const singletons = [
     ['user_stats', userStats],
@@ -72,16 +98,17 @@ export async function loadLocalCache() {
 // ── Internal: decrypt + apply event to stores + persist to IndexedDB ────────
 
 const ENTITY_STORE_NAME = {
-  project:       'projects',
-  task:          'tasks',
-  note:          'notes',
-  codex:         'codices',
-  journal_entry: 'journal_entries',
-  milestone:     'milestones',
-  achievement:   'achievements',
-  ritual:        'rituals',
-  focus_session: 'focus_sessions',
-  lore_unlock:   'lore_unlocks',
+  project:           'projects',
+  task:              'tasks',
+  note:              'notes',
+  codex:             'codices',
+  journal_entry:     'journal_entries',
+  milestone:         'milestones',
+  achievement:       'achievements',
+  ritual:            'rituals',
+  focus_session:     'focus_sessions',
+  lore_unlock:       'lore_unlocks',
+  chronicle_message: 'chronicle_messages',
 };
 
 async function applyAndCacheEvent(event) {
@@ -132,10 +159,6 @@ async function applyAndCacheEvent(event) {
 export async function pullSync(api, onProgress = null) {
   syncStatus.set('syncing');
   let seq = getLastSeq();
-
-  // Only reset to seq=0 if we have no local data at all (true first sync)
-  if (get(projects).size === 0) seq = 0;
-
   let totalPulled = 0;
   let hasMore = true;
 
@@ -233,6 +256,7 @@ export async function pushEvent(api, entityType, entityId, operation, payload) {
 export async function importFromQuestline(webappApi, identity, onProgress = null) {
   syncStatus.set('syncing');
   let total = 0;
+  let cliCursor = getLastCLISeq();
 
   try {
     for await (const batch of pullAllFromQuestline(identity)) {
@@ -242,6 +266,7 @@ export async function importFromQuestline(webappApi, identity, onProgress = null
       // Apply locally
       for (const event of batch) {
         await applyAndCacheEvent(event);
+        if (event.seq > cliCursor) cliCursor = event.seq;
       }
 
       total += batch.length;
@@ -251,6 +276,7 @@ export async function importFromQuestline(webappApi, identity, onProgress = null
     // Register a webhook so future CLI pushes replicate here automatically
     await registerWebhookOnQuestline(webappApi, identity);
 
+    setLastCLISeq(cliCursor);
     syncStatus.set('idle');
     return total;
   } catch (err) {
@@ -269,7 +295,7 @@ async function registerWebhookOnQuestline(webappApi, identity) {
 
     // Register the webhook on questlinecli.com (requires questlinecli.com auth)
     const questlineClient = new ApiClient(identity, QUESTLINE_API_BASE);
-    const webappApiUrl = import.meta.env.VITE_API_URL || 'https://webapp.questline.com/api/';
+    const webappApiUrl = import.meta.env.VITE_API_URL || 'https://webapp.questlinecli.com/api/';
     await questlineClient.post('webhooks/register', {
       url:    webappApiUrl + '?route=webhook/ingest',
       events: '*',
@@ -287,7 +313,7 @@ async function registerWebhookOnQuestline(webappApi, identity) {
 export async function catchupFromQuestline(webappApi, identity, onProgress = null) {
   syncStatus.set('syncing');
   let total = 0;
-  const seq = getLastSeq();
+  const seq = getLastCLISeq();
 
   try {
     const questlineClient = new ApiClient(identity, QUESTLINE_API_BASE);
@@ -309,7 +335,7 @@ export async function catchupFromQuestline(webappApi, identity, onProgress = nul
       if (events.length < 500) hasMore = false;
     }
 
-    if (cursor > seq) setLastSeq(cursor);
+    if (cursor > seq) setLastCLISeq(cursor);
     syncStatus.set('idle');
     return total;
   } catch (err) {
@@ -326,12 +352,17 @@ export async function catchupFromQuestline(webappApi, identity, onProgress = nul
 
 export function startBackgroundSync(api) {
   let pullTimer = null;
+  let pullInFlight = false;
 
   const poll = async () => {
+    if (pullInFlight) return;
+    pullInFlight = true;
     try { await pullSync(api); } catch { /* retry next tick */ }
+    finally { pullInFlight = false; }
   };
 
   const start = () => {
+    if (pullTimer) return;
     poll();
     pullTimer = setInterval(poll, 30_000);
   };
