@@ -156,13 +156,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [b] Backup | [r] Restore | [c] Copy Share Key | [e] Export Profile",
+            "   [b] Backup | [r] Restore Backup | [c] Copy Share Key | [e] Export Profile",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity | [p] Prune Old Quests | [n] OS Alerts",
+            "   [i] Restore Identity (new device: use this first) | [p] Prune | [n] OS Alerts",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -815,6 +815,110 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let help = Paragraph::new("  [Enter] Restore  |  [Esc] Cancel")
             .style(Style::default().fg(theme.muted));
         f.render_widget(help, inner_layout[5]);
+    }
+
+    // ── Cloud Restore Progress modal ──────────────────────────────────────────
+    if let ModalType::CloudRestoreProgress { step, message } = &app.modal_state {
+        let area = centered_rect(58, 40, size);
+        f.render_widget(Clear, area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
+
+        let (border_color, title) = match step {
+            3 => (theme.danger, " Restore Failed "),
+            2 => (Color::LightGreen, " Restore Complete "),
+            _ => (accent_color, " Cloud Restore — Chronicle of the Æther "),
+        };
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(border_color))
+            .title(Span::styled(
+                title,
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ));
+
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3), // steps
+                Constraint::Length(1), // spacer
+                Constraint::Length(3), // progress bar
+                Constraint::Length(1), // spacer
+                Constraint::Length(2), // status message
+                Constraint::Min(1),    // footer
+            ])
+            .split(inner);
+
+        // Step indicators
+        let step_style = |active: bool, done: bool| {
+            if done {
+                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+            } else if active {
+                Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.muted)
+            }
+        };
+        let check = |done: bool| if done { "✓" } else { "○" };
+        let steps_text = vec![
+            Line::from(vec![
+                Span::styled(format!("  {} Downloading from cloud   ", check(*step > 0)), step_style(*step == 0, *step > 0)),
+                Span::styled(format!("{}  {} Importing data   ", if *step > 0 { "→" } else { " " }, check(*step > 1)), step_style(*step == 1, *step > 1)),
+                Span::styled(format!("{}  {} Done", if *step > 1 { "→" } else { " " }, check(*step == 2)), step_style(*step == 2, false)),
+            ]),
+        ];
+        let steps_p = Paragraph::new(steps_text);
+        f.render_widget(steps_p, layout[0]);
+
+        // Animated progress bar
+        let (bar_filled, bar_color) = match step {
+            0 => {
+                let frame = (app.intro_ticks / 4) as usize % 16;
+                let filled = 4 + (frame % 6); // pulses between 4 and 9
+                (filled, accent_color)
+            }
+            1 => {
+                let frame = (app.intro_ticks / 4) as usize % 8;
+                let filled = 10 + (frame % 6);
+                (filled, accent_color)
+            }
+            2 => (16, Color::LightGreen),
+            _ => (0, theme.danger),
+        };
+        let bar_width = layout[2].width.saturating_sub(6) as usize;
+        let filled = (bar_filled * bar_width / 16).min(bar_width);
+        let empty = bar_width.saturating_sub(filled);
+        let bar_str = format!("  [{}{}]", "█".repeat(filled), "░".repeat(empty));
+        let pct = match step { 0 => "  25%", 1 => "  65%", 2 => " 100%", _ => "   0%" };
+        let bar_lines = vec![
+            Line::from(Span::styled(bar_str, Style::default().fg(bar_color))),
+            Line::from(Span::styled(pct, Style::default().fg(theme.muted))),
+        ];
+        let bar_p = Paragraph::new(bar_lines);
+        f.render_widget(bar_p, layout[2]);
+
+        // Status message
+        let msg_color = match step { 3 => theme.danger, 2 => Color::LightGreen, _ => theme.text };
+        let msg_p = Paragraph::new(format!("  {}", message))
+            .style(Style::default().fg(msg_color));
+        f.render_widget(msg_p, layout[4]);
+
+        // Footer
+        let footer_text = if *step >= 2 {
+            "  [Esc] Close"
+        } else {
+            "  Please wait..."
+        };
+        let footer = Paragraph::new(footer_text).style(Style::default().fg(theme.muted));
+        f.render_widget(footer, layout[5]);
     }
 }
 
