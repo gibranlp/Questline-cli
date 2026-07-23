@@ -156,7 +156,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [b] Backup | [r] Restore Backup | [e] Export Profile",
+            "   [c] Copy Share Key | [b] Backup | [r] Restore Backup | [e] Export Profile",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -874,7 +874,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
 fn draw_cloud_progress_modal(
     f: &mut Frame,
-    app: &App,
+    _app: &App,
     theme: &Theme,
     size: Rect,
     accent_color: Color,
@@ -942,14 +942,8 @@ fn draw_cloud_progress_modal(
     f.render_widget(Paragraph::new(steps_text), layout[0]);
 
     let (bar_filled, bar_color) = match step {
-        0 => {
-            let frame = (app.intro_ticks / 4) as usize % 16;
-            (4 + (frame % 6), accent_color)
-        }
-        1 => {
-            let frame = (app.intro_ticks / 4) as usize % 8;
-            (10 + (frame % 6), accent_color)
-        }
+        0 => (percentages[0] as usize * 16 / 100, accent_color),
+        1 => (percentages[1] as usize * 16 / 100, accent_color),
         2 => (16, Color::LightGreen),
         _ => (0, theme.danger),
     };

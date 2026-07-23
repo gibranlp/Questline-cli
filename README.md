@@ -238,6 +238,19 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v1.1.1 — The World Before the Swarm
+*Released 2026-07-23*
+
+- **Massive World Lore expansion:** The World Lore of Questline is now roughly 200 pages of unlockable history, covering the Realm before the Notification Swarm.
+- **Book Two begins:** The Notification Swarm is now positioned as the beginning of Book Two, with the pre-Swarm world documented as its own foundation.
+- **Hydration system:** Set a daily water target, get reminders, log glasses, and earn XP when the target is met.
+- **Daily Adventures expanded:** Five daily adventures now generate from a broader pool, including focus sessions, full hydration, sidequests, notes, journals, tree care, and high-priority work.
+- **Sync and restore improvements:** Manual sync performs fuller state reconciliation, restore avoids replaying stale history, and backup/restore progress is easier to read.
+- **Fellowship sync improvements:** Shared projects now backfill existing project history for new companions instead of opening as empty shells.
+- **Supporter webapp in progress:** Work has started on the donor/supporter webapp. It is not released yet, but development is underway.
+
+---
+
 ### v1.1.0 — The Nodes Remember
 *Released 2026-07-14*
 

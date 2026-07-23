@@ -2325,6 +2325,7 @@ impl App {
                                     if !reward_given {
                                         let _ = self.db.hydration_mark_reward_given();
                                         let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                        let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
                                         self.notifications.push(Notification::info(
                                             format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
                                         ));
@@ -2809,18 +2810,12 @@ impl App {
                                         }
                                     }
                                 }
-                                // Reset del cursor de pull y del contador de conflictos — el nuevo nodo arranca limpio
-                                let _ = self.db.set_setting("last_pull_seq", "0");
+                                // Reset conflict counter only. If a cloud backup was imported, the pull
+                                // cursor was moved to server HEAD so stale history cannot replay over it.
                                 let _ = self.db.set_setting("conflict_count", "0");
-                                // Clear dedup table — stale IDs from the old identity would cause
-                                // the new account's events to be silently skipped on first drain.
-                                let _ = self.db.conn.execute("DELETE FROM processed_remote_events", []);
                                 self.modal_state = ModalType::None;
-                                self.sync_status_msg = "Identity restored! Syncing now...".to_string();
+                                self.sync_status_msg = "Identity restored.".to_string();
                                 self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
-                                // Use background sync (with drain loop) so all historic events are
-                                // pulled in one shot — trigger_sync() only pulls one 500-event batch.
-                                self.start_background_sync();
                                 self.reload_data()?;
                             }
                             Ok(_) => {
@@ -3823,6 +3818,8 @@ impl App {
                                     .unwrap_or_default();
                                 if existing.iter().any(|a| a.0 == member.0) {
                                     self.db.conn.execute("DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2", params![task_id.to_string(), member.0])?;
+                                    let compound_id = format!("{}__{}", task_id, member.0);
+                                    let _ = self.db.log_change("task_assignment", &compound_id, "delete");
                                 } else {
                                     self.db.assign_task(
                                         &task_id.to_string(),
@@ -4267,6 +4264,7 @@ impl App {
                         }
                         self.identity = new_identity;
 
+                        let mut restored_from_cloud = false;
                         if self.config.sync_enabled {
                             let client = crate::services::api_client::ApiClient::new(
                                 &self.server_url,
@@ -4282,6 +4280,7 @@ impl App {
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
                                         let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                                        restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
                                             if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
@@ -4293,13 +4292,14 @@ impl App {
                             }
                         }
 
-                        let _ = self.db.set_setting("last_pull_seq", "0");
                         let _ = self.db.set_setting("conflict_count", "0");
-                        let _ = self.trigger_sync();
                         self.reload_data()?;
-                        self.notifications.push(Notification::info(
-                            "Welcome back! Your chronicle has been restored from exile.".to_string(),
-                        ));
+                        let message = if restored_from_cloud {
+                            "Welcome back! Your chronicle has been restored from cloud backup."
+                        } else {
+                            "Identity restored. No cloud backup was found; sync will only pull future changes."
+                        };
+                        self.notifications.push(Notification::info(message.to_string()));
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
                     }
@@ -5174,6 +5174,23 @@ impl App {
                     );
                     return Ok(());
                 }
+                KeyCode::Char('c') => {
+                    match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
+                        Ok(_) => {
+                            self.sync_status_msg = "Share Key copied to clipboard!".to_string();
+                            self.notifications.push(Notification::info(
+                                "Share Key copied to clipboard.".to_string(),
+                            ));
+                        }
+                        Err(e) => {
+                            self.sync_status_msg = format!("Failed to copy Share Key: {}", e);
+                            self.notifications.push(Notification::warning(
+                                "Could not copy Share Key. Clipboard utility missing.".to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(());
+                }
                 KeyCode::Char('u') => {
                     self.modal_state = ModalType::EditServerUrl {
                         input: self.server_url.clone(),
@@ -5438,6 +5455,7 @@ impl App {
                                 if !reward_given {
                                     let _ = self.db.hydration_mark_reward_given();
                                     let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
+                                    let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
                                     self.notifications.push(Notification::info(
                                         format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
                                     ));
@@ -8756,6 +8774,22 @@ impl App {
                 }
             }
             self.db.update_zen_tree(&tree)?;
+        } else if existing_adventures.len() < 5 {
+            let mut existing_titles: std::collections::HashSet<String> = existing_adventures
+                .iter()
+                .map(|a| a.title.clone())
+                .collect();
+            let missing = 5 - existing_adventures.len();
+            let mut added = 0;
+            for q in DailyAdventure::generate_daily_quests(today) {
+                if added >= missing {
+                    break;
+                }
+                if existing_titles.insert(q.title.clone()) {
+                    self.db.insert_daily_adventure(&q)?;
+                    added += 1;
+                }
+            }
         }
 
         Ok(())
@@ -10668,10 +10702,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     Some(e) => {
                         self.sync_failure_count = self.sync_failure_count.saturating_add(1);
                         self.sync_status_msg = format!("Sync failed: {}", e);
-                        self.modal_state = ModalType::SyncProgress {
-                            step: 3,
-                            message: self.sync_status_msg.clone(),
-                        };
+                        if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
+                            self.modal_state = ModalType::SyncProgress {
+                                step: 3,
+                                message: self.sync_status_msg.clone(),
+                            };
+                        }
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         let _ = self.reload_data();
                     }
@@ -10686,10 +10722,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         }
                         self.last_sync_warlock_xp = 0;
                         self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
-                        self.modal_state = ModalType::SyncProgress {
-                            step: 2,
-                            message: format!("Full sync complete. {}", self.sync_status_msg),
-                        };
+                        if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
+                            self.modal_state = ModalType::SyncProgress {
+                                step: 2,
+                                message: format!("Full sync complete. {}", self.sync_status_msg),
+                            };
+                        }
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         self.apply_class_passive("sync_complete", 0)?;
                         self.reload_data()?;
@@ -11888,6 +11926,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     owner_identity: Some(self.identity.public_key.clone()),
                 };
                 self.db.insert_focus_session(&sess)?;
+                self.update_daily_adventure_progress("complete_focus_session", 1)?;
                 self.mark_dirty();
                 self.push_great_chronicle_async(
                     "FocusSession",
@@ -12208,6 +12247,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     } else {
                         // Fully completed for the day
                         self.push_great_chronicle_async("SidequestComplete", "fulfilled a sidequest.", true);
+                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
                         if target > 1 {
                             self.notifications.push(Notification::info(
                                 format!("Sidequest Complete: {} (all {}) +{} XP", ritual_name, target, xp)

@@ -890,6 +890,7 @@ try {
             $memberStmt = $pdo->prepare("SELECT user_identity FROM project_members WHERE project_id = ? AND user_identity != ?");
             $userIdStmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
             $replicateInsertStmt = $pdo->prepare("INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
+            $entityProjectStmt = $pdo->prepare("SELECT payload FROM sync_events WHERE user_id = ? AND entity_type = ? AND entity_id = ? AND payload != '' ORDER BY seq DESC LIMIT 1");
 
             foreach ($entries as $e) {
                 if (empty($e['id'])) continue;
@@ -913,13 +914,15 @@ try {
                 $projectId = null;
                 if ($e['entity_type'] === 'project') {
                     $projectId = $e['entity_id'];
-                } elseif (in_array($e['entity_type'], ['task', 'note', 'journal_entry', 'milestone', 'focus_session', 'codex', 'task_assignment', 'project_member', 'chronicle_message'])) {
-                    if (!empty($e['content'])) {
-                        $payloadObj = json_decode($e['content'], true);
-                        if (!empty($payloadObj['project_id'])) {
-                            $projectId = $payloadObj['project_id'];
-                        }
-                    }
+                } elseif (is_project_scoped_sync_type($e['entity_type'])) {
+                    $projectId = extract_project_id_from_payload($e['content'] ?? '');
+                }
+
+                // Deletes usually arrive after the local row is gone, so their payload can be empty.
+                // Recover the project from the last known event for this entity or shared deletes vanish.
+                if (!$projectId && is_project_scoped_sync_type($e['entity_type'])) {
+                    $entityProjectStmt->execute([$userId, $e['entity_type'], $e['entity_id']]);
+                    $projectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
                 }
 
                 if ($projectId) {
@@ -1054,6 +1057,53 @@ try {
                 $inviteeUsername = $invite['role'] . ' Companion';
             }
             $stmt->execute([$invite['project_id'], $identity, $inviteeUsername, $invite['role'], $inviteeUsername, $invite['role']]);
+
+            // El compañero nuevo necesita el historial del proyecto, no solo un placeholder local.
+            $stmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
+            $stmt->execute([$invite['inviter_identity']]);
+            $inviterUserId = $stmt->fetchColumn();
+            if ($inviterUserId) {
+                backfill_project_sync_events($pdo, $inviterUserId, $userId, $invite['project_id']);
+            }
+
+            insert_project_member_sync_event(
+                $pdo,
+                $userId,
+                $invite['project_id'],
+                $invite['inviter_identity'],
+                $invite['inviter_username'],
+                'Owner',
+                $deviceId
+            );
+            insert_project_member_sync_event(
+                $pdo,
+                $userId,
+                $invite['project_id'],
+                $identity,
+                $inviteeUsername,
+                $invite['role'],
+                $deviceId
+            );
+            if ($inviterUserId) {
+                insert_project_member_sync_event(
+                    $pdo,
+                    $inviterUserId,
+                    $invite['project_id'],
+                    $invite['inviter_identity'],
+                    $invite['inviter_username'],
+                    'Owner',
+                    $deviceId
+                );
+                insert_project_member_sync_event(
+                    $pdo,
+                    $inviterUserId,
+                    $invite['project_id'],
+                    $identity,
+                    $inviteeUsername,
+                    $invite['role'],
+                    $deviceId
+                );
+            }
             
             // Mensaje de bienvenida automático en el chronicle — para que se vea chido
             $msgId = bin2hex(random_bytes(16));
@@ -1698,6 +1748,106 @@ function verify_ed25519_signature($publicKeyHex, $signatureHex, $message) {
     } catch (Exception $e) {
         return false;
     }
+}
+
+function is_project_scoped_sync_type($entityType) {
+    return in_array($entityType, [
+        'task',
+        'note',
+        'journal_entry',
+        'milestone',
+        'focus_session',
+        'codex',
+        'task_assignment',
+        'project_member',
+        'chronicle_message'
+    ], true);
+}
+
+function extract_project_id_from_payload($payload) {
+    if (!$payload || !is_string($payload)) {
+        return null;
+    }
+    $payloadObj = json_decode($payload, true);
+    if (!is_array($payloadObj) || empty($payloadObj['project_id'])) {
+        return null;
+    }
+    return $payloadObj['project_id'];
+}
+
+function backfill_project_sync_events($pdo, $sourceUserId, $targetUserId, $projectId) {
+    if (!$sourceUserId || !$targetUserId || !$projectId || $sourceUserId === $targetUserId) {
+        return 0;
+    }
+
+    $select = $pdo->prepare("
+        SELECT id, entity_type, entity_id, operation, payload, created_at, device_id
+        FROM sync_events
+        WHERE user_id = ?
+        ORDER BY seq ASC
+    ");
+    $insert = $pdo->prepare("
+        INSERT IGNORE INTO sync_events
+            (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ");
+
+    $copied = 0;
+    $select->execute([$sourceUserId]);
+    while ($event = $select->fetch(PDO::FETCH_ASSOC)) {
+        $eventProjectId = null;
+        if ($event['entity_type'] === 'project') {
+            $eventProjectId = $event['entity_id'];
+        } elseif (is_project_scoped_sync_type($event['entity_type'])) {
+            $eventProjectId = extract_project_id_from_payload($event['payload'] ?? '');
+        }
+
+        if ($eventProjectId !== $projectId) {
+            continue;
+        }
+
+        $backfillId = md5($event['id'] . $targetUserId . 'project_backfill');
+        $insert->execute([
+            $backfillId,
+            $targetUserId,
+            $event['entity_type'],
+            $event['entity_id'],
+            $event['operation'],
+            $event['payload'] ?? '',
+            $event['created_at'],
+            $event['device_id'] ?? ''
+        ]);
+        $copied += $insert->rowCount();
+    }
+
+    return $copied;
+}
+
+function insert_project_member_sync_event($pdo, $targetUserId, $projectId, $memberIdentity, $memberUsername, $role, $deviceId) {
+    if (!$targetUserId || !$projectId || !$memberIdentity) {
+        return;
+    }
+
+    $payload = json_encode([
+        'project_id' => $projectId,
+        'user_identity' => $memberIdentity,
+        'user_username' => $memberUsername,
+        'role' => $role
+    ]);
+    $eventId = md5($targetUserId . $projectId . $memberIdentity . $role . 'project_member_accept');
+    $stmt = $pdo->prepare("
+        INSERT IGNORE INTO sync_events
+            (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id)
+        VALUES (?, ?, 'project_member', ?, 'upsert', ?, ?, ?)
+    ");
+    $stmt->execute([
+        $eventId,
+        $targetUserId,
+        $projectId . '__' . $memberIdentity,
+        $payload,
+        date(DATE_RFC3339),
+        $deviceId ?? ''
+    ]);
 }
 
 // Logger de eventos — errores, auth failures, acciones importantes

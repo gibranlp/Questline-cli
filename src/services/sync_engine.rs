@@ -635,24 +635,10 @@ impl<'a> SyncEngine<'a> {
                     ).unwrap_or(0) == 0
                 }
                 "task_assignment" => {
-                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
-                    if parts.len() == 2 {
-                        self.db.conn.query_row(
-                            "SELECT count(*) FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
-                            params![parts[0], parts[1]],
-                            |row| row.get::<_, i32>(0),
-                        ).unwrap_or(0) == 0
-                    } else { false }
+                    true
                 }
                 "project_member" => {
-                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
-                    if parts.len() == 2 {
-                        self.db.conn.query_row(
-                            "SELECT count(*) FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
-                            params![parts[0], parts[1]],
-                            |row| row.get::<_, i32>(0),
-                        ).unwrap_or(0) == 0
-                    } else { false }
+                    true
                 }
                 // Los mensajes de la crónica son inmutables — nunca se editan, solo se insertan
                 "chronicle_message" => {
@@ -969,25 +955,43 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "task_assignment" => {
-                            if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                                if parts.len() == 2 {
+                                    let _ = self.db.conn.execute(
+                                        "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                                        params![parts[0], parts[1]],
+                                    );
+                                    pulled_count += 1;
+                                }
+                            } else if let Ok(ta) = serde_json::from_str::<serde_json::Value>(content) {
                                 let task_id = ta["task_id"].as_str().unwrap_or_default();
                                 let identity = ta["user_identity"].as_str().unwrap_or_default();
                                 let username = ta["user_username"].as_str().unwrap_or_default();
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
+                                    "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
                                     params![task_id, identity, username],
                                 );
                                 pulled_count += 1;
                             }
                         }
                         "project_member" => {
-                            if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
+                            if log.operation == "delete" {
+                                let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                                if parts.len() == 2 {
+                                    let _ = self.db.conn.execute(
+                                        "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                                        params![parts[0], parts[1]],
+                                    );
+                                    pulled_count += 1;
+                                }
+                            } else if let Ok(pm) = serde_json::from_str::<serde_json::Value>(content) {
                                 let project_id = pm["project_id"].as_str().unwrap_or_default();
                                 let identity = pm["user_identity"].as_str().unwrap_or_default();
                                 let username = pm["user_username"].as_str().unwrap_or_default();
                                 let role = pm["role"].as_str().unwrap_or("Member");
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
+                                    "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
                                     params![project_id, identity, username, role],
                                 );
                                 pulled_count += 1;
