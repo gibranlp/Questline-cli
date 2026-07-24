@@ -54,6 +54,159 @@ pub fn centered_rect_fixed_height(percent_x: u16, height_lines: u16, r: ratatui:
         .split(popup_layout[1])[1]
 }
 
+// Renderiza celebraciones animadas con capas de color para mantenerlas legibles en cualquier terminal.
+fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
+    let frame = (ticks / 5) % 4;
+    let gold = Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD);
+    let amber = Style::default().fg(Color::Rgb(242, 156, 48)).add_modifier(Modifier::BOLD);
+    let orange = Style::default().fg(Color::Rgb(239, 95, 39)).add_modifier(Modifier::BOLD);
+    let red = Style::default().fg(Color::Rgb(218, 55, 42)).add_modifier(Modifier::BOLD);
+    let green = Style::default().fg(Color::Rgb(84, 180, 92)).add_modifier(Modifier::BOLD);
+    let lime = Style::default().fg(Color::Rgb(169, 226, 111)).add_modifier(Modifier::BOLD);
+    let cyan = Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD);
+    let purple = Style::default().fg(Color::Rgb(178, 121, 216)).add_modifier(Modifier::BOLD);
+    let wood = Style::default().fg(Color::Rgb(138, 82, 42)).add_modifier(Modifier::BOLD);
+    let muted = Style::default().fg(Color::Rgb(105, 100, 110));
+
+    if ascii_art.contains("LEVEL") {
+        let sparks = match frame {
+            0 => ("   *        *   ", "      +    +     "),
+            1 => ("      *  *      ", "   +        +   "),
+            2 => (" *            * ", "     +    +      "),
+            _ => ("    *      *    ", "  +          +  "),
+        };
+        return vec![
+            Line::from(Span::styled(sparks.0, gold)),
+            Line::from(vec![Span::raw("        "), Span::styled("/\\", gold), Span::raw("        ")]),
+            Line::from(vec![Span::raw("       "), Span::styled("/  \\", amber), Span::raw("       ")]),
+            Line::from(vec![Span::raw("      "), Span::styled("/ /\\ \\", orange), Span::raw("      ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("/_/  \\_\\", red), Span::raw("     ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("|", gold), Span::styled(" LEVEL ", cyan), Span::styled("|", gold), Span::raw("     ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("| ", gold), Span::styled(" UP! ", purple), Span::styled(" |", gold), Span::raw("     ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("|______|", amber), Span::raw("     ")]),
+            Line::from(Span::styled(sparks.1, cyan)),
+        ];
+    }
+
+    if ascii_art.contains("QOQO") {
+        let glint = match frame {
+            0 => ("        *        ", "    .oOQOQOo.    "),
+            1 => ("     *      *    ", "   .oQOQOQOQo.   "),
+            2 => ("   *          *  ", "  .oOQOQOQOQOo.  "),
+            _ => ("      *    *     ", "   .oQOQOQOQo.   "),
+        };
+        return vec![
+            Line::from(Span::styled(glint.0, gold)),
+            Line::from(vec![Span::raw("       "), Span::styled(".ooo.", lime), Span::raw("       ")]),
+            Line::from(vec![Span::raw("     "), Span::styled(".o", green), Span::styled("QOOPQ", lime), Span::styled("o.", green), Span::raw("     ")]),
+            Line::from(Span::styled(glint.1, lime)),
+            Line::from(vec![Span::raw("  "), Span::styled(".o", green), Span::styled("QOQOQOQOQ", lime), Span::styled("o.", green), Span::raw("  ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("|||", wood), Span::raw(" "), Span::styled("|||", wood), Span::raw("     ")]),
+            Line::from(vec![Span::raw("     "), Span::styled("|||", wood), Span::raw(" "), Span::styled("|||", wood), Span::raw("     ")]),
+            Line::from(vec![Span::raw("    "), Span::styled("===", muted), Span::styled("\\___/", wood), Span::styled("===", muted), Span::raw("    ")]),
+        ];
+    }
+
+    if ascii_art.contains("\\  V") {
+        let plume = match frame {
+            0 => ("    (  )   (  )    ", "     \\  \\ /  /     "),
+            1 => ("     ( )  ( )      ", "      \\  V  /      "),
+            2 => ("   (   ) (   )     ", "    \\   \\ /   /    "),
+            _ => ("      (  ) (  )    ", "     \\  \\ /  /     "),
+        };
+        return vec![
+            Line::from(Span::styled(plume.0, orange)),
+            Line::from(Span::styled(plume.1, amber)),
+            Line::from(vec![Span::raw("       "), Span::styled("\\  V  /", gold), Span::raw("       ")]),
+            Line::from(vec![Span::raw("        "), Span::styled(")   (", red), Span::raw("        ")]),
+            Line::from(vec![Span::raw("       "), Span::styled("/ / \\ \\", orange), Span::raw("       ")]),
+            Line::from(vec![Span::raw("      "), Span::styled("(_______)", amber), Span::raw("      ")]),
+            Line::from(vec![Span::raw("       "), Span::styled("STREAK", gold), Span::raw("       ")]),
+            Line::from(Span::styled("     *  *  *      ", red)),
+        ];
+    }
+
+    let sparks = match frame {
+        0 => ("    *   *   *    ", "  *             * "),
+        1 => ("  *   *   *   *  ", "     *       *    "),
+        2 => (" *     *     *   ", "   *     *     * "),
+        _ => ("   *   *   *    ", " *             * "),
+    };
+    vec![
+        Line::from(Span::styled(sparks.0, gold)),
+        Line::from(vec![Span::raw("    "), Span::styled("* ", amber), Span::styled("QUEST", cyan), Span::styled(" *", amber), Span::raw("    ")]),
+        Line::from(vec![Span::raw("   "), Span::styled("* ", orange), Span::styled("SUCCESS", lime), Span::styled(" *", orange), Span::raw("   ")]),
+        Line::from(Span::styled(sparks.1, purple)),
+        Line::from(vec![Span::raw("      "), Span::styled("\\____/", gold), Span::raw("      ")]),
+    ]
+}
+
+// Dibuja un fragmento de memoria como cristal animado con brillo ajustado por rareza.
+fn memory_fragment_art_lines(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
+    let frame = (ticks / 4) % 4;
+    let (edge, core, glow) = match rarity {
+        "Legendary" => (
+            Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(255, 245, 170)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(242, 156, 48)),
+        ),
+        "Rare" => (
+            Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(190, 246, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(82, 151, 219)),
+        ),
+        _ => (
+            Style::default().fg(Color::Rgb(210, 220, 232)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(250, 250, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(150, 160, 175)),
+        ),
+    };
+    let shadow = Style::default().fg(Color::Rgb(86, 78, 105));
+    let spark = match frame {
+        0 => ("     *       .     ", "  .             *  "),
+        1 => ("  .      *        ", "      *       .   "),
+        2 => ("    *         *   ", " .              . "),
+        _ => ("       .      *   ", "   *        .     "),
+    };
+    let inner = match frame {
+        0 => (" /", "\\ ", "\\/"),
+        1 => ("  /", "\\", "><"),
+        2 => (" /", "\\ ", "/\\"),
+        _ => ("  /", "\\", "\\/"),
+    };
+
+    vec![
+        Line::from(Span::styled(spark.0, glow)),
+        Line::from(vec![Span::raw("        "), Span::styled("/\\", edge), Span::raw("        ")]),
+        Line::from(vec![
+            Span::raw("       "),
+            Span::styled(inner.0, edge),
+            Span::styled("  ", core),
+            Span::styled(inner.1, edge),
+            Span::raw("       "),
+        ]),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled("/", edge),
+            Span::styled(" /", core),
+            Span::styled(inner.2, glow),
+            Span::styled("\\ ", core),
+            Span::styled("\\", edge),
+            Span::raw("      "),
+        ]),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled("\\ ", edge),
+            Span::styled("\\____/", core),
+            Span::styled(" /", edge),
+            Span::raw("      "),
+        ]),
+        Line::from(vec![Span::raw("       "), Span::styled("\\____/", edge), Span::raw("       ")]),
+        Line::from(Span::styled(spark.1, glow)),
+        Line::from(vec![Span::raw("       "), Span::styled("~~~~~~", shadow), Span::raw("       ")]),
+    ]
+}
+
 // Aquí empieza todo el desmadre — inicializa la terminal, corre el loop y maneja el shutdown
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -217,18 +370,26 @@ async fn main() -> Result<()> {
         app.terminal_height = terminal.size().map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_auto_sync()?;
-        app.tick_export_backup();
-        app.tick_cloud_backup();
-        app.tick_cloud_restore()?;
-        app.tick_chat_poll()?;
-        app.tick_presence_update()?;
+        let sync_busy = app.sync_in_progress;
+        if !sync_busy {
+            app.tick_export_backup();
+            app.tick_cloud_backup();
+            app.tick_cloud_restore()?;
+            app.tick_chat_poll()?;
+            app.tick_presence_update()?;
+        }
         app.tick_focus_session()?;
         app.tick_mpris();
         app.tick_particles();
         app.tick_update_check();
-        app.tick_chapter_progress();
+        if !sync_busy {
+            app.tick_chapter_progress();
+        }
         app.tick_sprite_notifications();
-        let _ = app.tick_hydration();
+        if !sync_busy {
+            let _ = app.tick_task_notifications();
+            let _ = app.tick_hydration();
+        }
         app.quit_confirm_ticks = app.quit_confirm_ticks.wrapping_add(1);
         app.intro_ticks = app.intro_ticks.wrapping_add(1);
         app.music_scroll_ticks = app.music_scroll_ticks.wrapping_add(1);
@@ -350,9 +511,10 @@ async fn main() -> Result<()> {
 
                             screens::character::draw(
                                 f,
-                                app.user.as_ref().unwrap(),
-                                achievements_count,
-                                tree.stage_name(),
+	                                app.user.as_ref().unwrap(),
+	                                achievements_count,
+	                                achievements.len(),
+	                                tree.stage_name(),
                                 tree.growth,
                                 tree.health,
                                 streak_obj.current_streak,
@@ -405,12 +567,20 @@ async fn main() -> Result<()> {
                                 &lore,
                                 class_name,
                                 &theme,
+                                app.quit_confirm_ticks,
                             );
                         }
                         ActiveScreen::Legends => {
                             let stats = app.db.get_statistics().unwrap();
                             let relics = app.db.get_relics().unwrap_or_default();
-                            screens::legends::draw(f, &stats, app.selected_relic_idx, &relics, &theme);
+                            screens::legends::draw(
+                                f,
+                                &stats,
+                                app.selected_relic_idx,
+                                &relics,
+                                &theme,
+                                app.quit_confirm_ticks,
+                            );
                         }
                         _ => {}
                     }
@@ -428,8 +598,7 @@ async fn main() -> Result<()> {
                         .direction(Direction::Horizontal)
                         .constraints([
                             Constraint::Min(40),
-                            Constraint::Length(30),
-                            Constraint::Length(45),
+                            Constraint::Length(16),
                         ])
                         .split(footer_area);
 
@@ -493,13 +662,24 @@ async fn main() -> Result<()> {
                         ])
                     } else if let Some(t) = app.last_sync_status_time {
                         if t.elapsed().as_secs() < 10 {
-                            let color = if app.sync_status_msg.starts_with("Sync failed") {
+                            let color = if app.sync_status_msg.starts_with("Sync failed")
+                                || app.sync_status_msg.starts_with("Sync init failed")
+                            {
                                 Color::Red
+                            } else if app.sync_status_msg == "S󰓦" {
+                                Color::LightYellow
                             } else {
                                 Color::Cyan
                             };
+                            let footer_status = if app.sync_status_msg.starts_with("Sync failed")
+                                || app.sync_status_msg.starts_with("Sync init failed")
+                            {
+                                "Sync failed".to_string()
+                            } else {
+                                app.sync_status_msg.clone()
+                            };
                             Line::from(vec![
-                                Span::styled(app.sync_status_msg.clone(), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                                Span::styled(footer_status, Style::default().fg(color).add_modifier(Modifier::BOLD)),
                             ])
                         } else {
                             Line::from(vec![])
@@ -508,58 +688,11 @@ async fn main() -> Result<()> {
                         Line::from(vec![])
                     };
 
-                    let audio_state = app.audio_player.get_state();
-
-                    // Quita el prefijo "Local: " para que se vea limpio en el footer
-                    let raw_track = audio_state.current_soundscape
-                        .trim_start_matches("Local: ")
-                        .to_string();
-
-                    // El panel derecho tiene 45 chars — "Playing: " + nombre + volumen deben caber ahí
-                    let max_name_chars: usize = 28;
-                    let vol_str = format!("({}%)", (audio_state.volume * 100.0) as i32);
-
-                    // Marquee que avanza un char cada 5 ticks (250ms) — para nombres largos de tracks
-                    let scroll_name = |name: &str| -> String {
-                        let char_count = name.chars().count();
-                        if char_count <= max_name_chars {
-                            return format!("{:<width$}", name, width = max_name_chars);
-                        }
-                        let padded: Vec<char> = format!("{}   |   ", name).chars().collect();
-                        let total = padded.len();
-                        let offset = (app.music_scroll_ticks / 5) % total;
-                        (0..max_name_chars).map(|i| padded[(offset + i) % total]).collect()
-                    };
-
-                    let music_text = match audio_state.status {
-                        questline::audio::state::PlaybackStatus::Playing => {
-                            Line::from(vec![
-                                Span::styled("Playing: ", Style::default().fg(Color::Cyan)),
-                                Span::styled(scroll_name(&raw_track), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                                Span::styled(format!(" {}", vol_str), Style::default().fg(Color::Cyan)),
-                            ])
-                        }
-                        questline::audio::state::PlaybackStatus::Paused => {
-                            Line::from(vec![
-                                Span::styled("Paused:  ", Style::default().fg(Color::Yellow)),
-                                Span::styled(scroll_name(&raw_track), Style::default().fg(Color::Rgb(200, 200, 200))),
-                                Span::styled(format!(" {}", vol_str), Style::default().fg(Color::Yellow)),
-                            ])
-                        }
-                        questline::audio::state::PlaybackStatus::Stopped => {
-                            Line::from(vec![
-                                Span::styled("Silent", Style::default().fg(Color::Rgb(140, 140, 140))),
-                            ])
-                        }
-                    };
-
                     let left_p = Paragraph::new(footer_text);
-                    let sync_p = Paragraph::new(sync_line).alignment(ratatui::layout::Alignment::Center);
-                    let right_p = Paragraph::new(music_text).alignment(ratatui::layout::Alignment::Right);
+                    let sync_p = Paragraph::new(sync_line).alignment(ratatui::layout::Alignment::Right);
                     
                     f.render_widget(left_p, footer_cols[0]);
                     f.render_widget(sync_p, footer_cols[1]);
-                    f.render_widget(right_p, footer_cols[2]);
                 }
             }
 
@@ -569,6 +702,7 @@ async fn main() -> Result<()> {
             // Suena el efecto y dispara OS alert para notificaciones nuevas
             if let Some(notif) = app.notifications.last() {
                 use questline::app::NotificationKind;
+                use questline::services::notifications::NotificationIcon;
                 let is_new = last_notification_time.map_or(true, |t| notif.unlocked_at > t);
                 if is_new {
                     if !matches!(notif.kind, NotificationKind::Swarm) {
@@ -576,10 +710,16 @@ async fn main() -> Result<()> {
                     }
                     if app.external_notifications {
                         let urgent = matches!(notif.kind, NotificationKind::Swarm);
-                        questline::services::notifications::send_system_notification(
+                        let icon = match notif.kind {
+                            NotificationKind::Info => NotificationIcon::Info,
+                            NotificationKind::Warning => NotificationIcon::Warning,
+                            NotificationKind::Swarm => NotificationIcon::NotificationSwarm,
+                        };
+                        questline::services::notifications::send_system_notification_with_icon(
                             &notif.title,
                             &notif.message,
                             urgent,
+                            icon,
                         );
                     }
                     last_notification_time = Some(notif.unlocked_at);
@@ -718,7 +858,7 @@ async fn main() -> Result<()> {
                     "Rare" => Color::Cyan,
                     _ => Color::White,
                 };
-                let overlay_area = questline::screens::intro::centered_rect(52, 22, size);
+                let overlay_area = questline::screens::intro::centered_rect(56, 32, size);
                 f.render_widget(Clear, overlay_area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
@@ -731,7 +871,11 @@ async fn main() -> Result<()> {
                         Style::default().fg(rarity_color).add_modifier(Modifier::BOLD),
                     ));
 
-                let text = vec![
+                let mut text = vec![
+                    Line::from(""),
+                ];
+                text.extend(memory_fragment_art_lines(&alert.rarity, app.quit_confirm_ticks));
+                text.extend(vec![
                     Line::from(""),
                     Line::from(Span::styled(
                         format!("Fragment {}", alert.number),
@@ -751,7 +895,7 @@ async fn main() -> Result<()> {
                         "Added to Chronicle Archives",
                         Style::default().fg(Color::Rgb(140, 140, 140)),
                     )),
-                ];
+                ]);
 
                 let paragraph = Paragraph::new(text)
                     .block(block)
@@ -767,7 +911,7 @@ async fn main() -> Result<()> {
                 && app.active_screen != ActiveScreen::Onboarding
                 && app.active_screen != ActiveScreen::Editor
                 && app.ambient_effects_enabled
-                && app.active_ambient_effect > 0
+                && (app.active_ambient_effect > 0 || app.ambient_particles_ticks_remaining > 0)
             {
                 for p in &app.ambient_particles {
                     let px = p.x;
@@ -846,7 +990,7 @@ async fn main() -> Result<()> {
 
             // Modal de celebración — se abre cuando el usuario logra algo chingón, puede traer ASCII art
             if let questline::app::ModalType::Celebration { ref title, ref details, ref ascii_art } = app.modal_state {
-                let overlay_area = questline::screens::intro::centered_rect(65, 45, size);
+                let overlay_area = questline::screens::intro::centered_rect(68, 52, size);
                 f.render_widget(Clear, overlay_area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
@@ -863,9 +1007,7 @@ async fn main() -> Result<()> {
                 ];
                 
                 if !ascii_art.is_empty() {
-                    for line in ascii_art.lines() {
-                        content.push(Line::from(Span::styled(line, Style::default().fg(Color::Cyan))));
-                    }
+                    content.extend(celebration_art_lines(ascii_art, app.quit_confirm_ticks));
                     content.push(Line::from(""));
                 }
                 
@@ -1247,7 +1389,7 @@ async fn main() -> Result<()> {
             // Modal de confirmación de salida — con fogata animada y una quote, pura vibra RPG
             if let questline::app::ModalType::QuitConfirm { ref quote } = app.modal_state {
                 // Popup de altura fija para que no se pase en terminales pequeñas
-                let overlay_area = centered_rect_fixed_height(60, 13, size);
+                let overlay_area = centered_rect_fixed_height(64, 17, size);
                 f.render_widget(Clear, overlay_area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
@@ -1257,35 +1399,80 @@ async fn main() -> Result<()> {
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Campfire Rest ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
-                // 4 frames de llama ASCII, cambian cada 6 ticks (300ms) — animación barata pero chida
-                let frame_idx = (app.quit_confirm_ticks / 6) % 4;
+                // La fogata usa capas de color para simular profundidad sin depender de imagenes externas.
+                let red = Style::default().fg(Color::Rgb(218, 55, 42)).add_modifier(Modifier::BOLD);
+                let orange = Style::default().fg(Color::Rgb(242, 126, 38)).add_modifier(Modifier::BOLD);
+                let yellow = Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD);
+                let ember = Style::default().fg(Color::Rgb(255, 94, 58));
+                let smoke = Style::default().fg(Color::Rgb(118, 105, 96));
+                let wood = Style::default().fg(Color::Rgb(138, 82, 42)).add_modifier(Modifier::BOLD);
+                let ash = Style::default().fg(Color::Rgb(92, 82, 78));
+
+                let frame_idx = (app.quit_confirm_ticks / 4) % 6;
                 let flame_lines = match frame_idx {
                     0 => vec![
-                        Line::from(Span::styled("      )  .  ", Style::default().fg(Color::LightRed))),
-                        Line::from(Span::styled("    (      )  ", Style::default().fg(Color::LightYellow))),
-                        Line::from(Span::styled("   (  .  )  ) ", Style::default().fg(Color::Red))),
+                        Line::from(vec![Span::styled("        .     .        ", smoke)]),
+                        Line::from(vec![Span::raw("          "), Span::styled("^", yellow), Span::raw("            ")]),
+                        Line::from(vec![Span::raw("        "), Span::styled("/\\", orange), Span::raw("   "), Span::styled("/\\", red), Span::raw("       ")]),
+                        Line::from(vec![Span::raw("      "), Span::styled("/  \\", red), Span::styled(" /\\ ", yellow), Span::styled("/  \\", orange), Span::raw("     ")]),
+                        Line::from(vec![Span::raw("     "), Span::styled("/ /\\ \\", orange), Span::styled("/  \\", yellow), Span::styled("/\\ \\", red), Span::raw("    ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("/_/  \\_", red), Span::styled("\\__/ ", yellow), Span::styled("_/\\_\\", orange), Span::raw("   ")]),
                     ],
                     1 => vec![
-                        Line::from(Span::styled("      .  (  ", Style::default().fg(Color::LightRed))),
-                        Line::from(Span::styled("    )      (  ", Style::default().fg(Color::LightYellow))),
-                        Line::from(Span::styled("   (  )  .  ( ", Style::default().fg(Color::Red))),
+                        Line::from(vec![Span::styled("      .         .      ", smoke)]),
+                        Line::from(vec![Span::raw("        "), Span::styled("^", orange), Span::raw("   "), Span::styled("^", yellow), Span::raw("       ")]),
+                        Line::from(vec![Span::raw("       "), Span::styled("/\\", red), Span::raw("  "), Span::styled("/\\", yellow), Span::raw("        ")]),
+                        Line::from(vec![Span::raw("     "), Span::styled("/  \\", orange), Span::styled("/  \\", yellow), Span::styled(" /\\", red), Span::raw("     ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("/\\ /  \\", red), Span::styled("/\\ ", yellow), Span::styled("/  \\", orange), Span::raw("   ")]),
+                        Line::from(vec![Span::raw("   "), Span::styled("/__\\_/\\_", orange), Span::styled("\\__/ ", yellow), Span::styled("_/\\", red), Span::raw("    ")]),
                     ],
                     2 => vec![
-                        Line::from(Span::styled("      (  )  ", Style::default().fg(Color::LightRed))),
-                        Line::from(Span::styled("    (      )  ", Style::default().fg(Color::LightYellow))),
-                        Line::from(Span::styled("   )  .  (  ) ", Style::default().fg(Color::Red))),
+                        Line::from(vec![Span::styled("         .       .     ", smoke)]),
+                        Line::from(vec![Span::raw("           "), Span::styled("^", red), Span::raw("          ")]),
+                        Line::from(vec![Span::raw("        "), Span::styled("/\\", yellow), Span::raw("  "), Span::styled("/\\", orange), Span::raw("       ")]),
+                        Line::from(vec![Span::raw("      "), Span::styled("/  \\", red), Span::styled(" /  \\", yellow), Span::styled("/\\", orange), Span::raw("     ")]),
+                        Line::from(vec![Span::raw("     "), Span::styled("/\\  /\\", orange), Span::styled("/  \\", yellow), Span::styled("/  \\", red), Span::raw("   ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("\\_\\/  ", red), Span::styled("\\__/ ", yellow), Span::styled("_/\\_\\", orange), Span::raw("   ")]),
+                    ],
+                    3 => vec![
+                        Line::from(vec![Span::styled("       .       .       ", smoke)]),
+                        Line::from(vec![Span::raw("         "), Span::styled("^", yellow), Span::raw("    "), Span::styled("^", orange), Span::raw("      ")]),
+                        Line::from(vec![Span::raw("       "), Span::styled("/\\", orange), Span::raw("    "), Span::styled("/\\", red), Span::raw("      ")]),
+                        Line::from(vec![Span::raw("     "), Span::styled("/\\  \\", red), Span::styled(" /\\ ", yellow), Span::styled("/  \\", orange), Span::raw("    ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("/  \\/\\", orange), Span::styled("/  \\", yellow), Span::styled("/\\  \\", red), Span::raw("  ")]),
+                        Line::from(vec![Span::raw("   "), Span::styled("/_/\\__\\", red), Span::styled("\\__/ ", yellow), Span::styled("_/\\_\\", orange), Span::raw("  ")]),
+                    ],
+                    4 => vec![
+                        Line::from(vec![Span::styled("     .           .     ", smoke)]),
+                        Line::from(vec![Span::raw("          "), Span::styled("^", orange), Span::raw("           ")]),
+                        Line::from(vec![Span::raw("       "), Span::styled("/\\", red), Span::raw("   "), Span::styled("/\\", yellow), Span::raw("       ")]),
+                        Line::from(vec![Span::raw("      "), Span::styled("/  \\", orange), Span::styled("/\\ ", yellow), Span::styled("/  \\", red), Span::raw("    ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("/\\ /\\ ", red), Span::styled("/  \\", yellow), Span::styled("/\\ \\", orange), Span::raw("    ")]),
+                        Line::from(vec![Span::raw("   "), Span::styled("/__\\/  ", orange), Span::styled("\\__/ ", yellow), Span::styled("_/\\_\\", red), Span::raw("  ")]),
                     ],
                     _ => vec![
-                        Line::from(Span::styled("      .  )  ", Style::default().fg(Color::LightRed))),
-                        Line::from(Span::styled("    (      (  ", Style::default().fg(Color::LightYellow))),
-                        Line::from(Span::styled("   (  (  )  ) ", Style::default().fg(Color::Red))),
+                        Line::from(vec![Span::styled("        .          .   ", smoke)]),
+                        Line::from(vec![Span::raw("        "), Span::styled("^", red), Span::raw("     "), Span::styled("^", yellow), Span::raw("     ")]),
+                        Line::from(vec![Span::raw("      "), Span::styled("/\\", orange), Span::raw("   "), Span::styled("/\\", red), Span::raw("        ")]),
+                        Line::from(vec![Span::raw("     "), Span::styled("/  \\", red), Span::styled(" /  \\", yellow), Span::styled("/\\", orange), Span::raw("     ")]),
+                        Line::from(vec![Span::raw("    "), Span::styled("/\\ /  \\", orange), Span::styled("/\\ ", yellow), Span::styled("/  \\", red), Span::raw("   ")]),
+                        Line::from(vec![Span::raw("   "), Span::styled("/_/\\__/ ", red), Span::styled("\\__/ ", yellow), Span::styled("_/\\", orange), Span::raw("    ")]),
                     ],
                 };
 
                 let mut lines = vec![];
                 lines.extend(flame_lines);
-                lines.push(Line::from(Span::styled("  ____________", Style::default().fg(Color::Red))));
-                lines.push(Line::from(Span::styled("  \\__________/", Style::default().fg(Color::Rgb(140, 140, 140)))));
+                lines.push(Line::from(vec![
+                    Span::styled("     * ", ember),
+                    Span::styled("===", wood),
+                    Span::styled("\\____/", ash),
+                    Span::styled("===", wood),
+                    Span::styled(" *", ember),
+                ]));
+                lines.push(Line::from(vec![
+                    Span::styled("       ", ash),
+                    Span::styled("/====\\  /====\\", wood),
+                ]));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(format!("\"{}\"", quote), Style::default().fg(Color::Cyan).add_modifier(Modifier::ITALIC))));
                 lines.push(Line::from(""));

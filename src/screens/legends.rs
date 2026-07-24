@@ -12,6 +12,100 @@ use ratatui::{
     Frame,
 };
 
+// Genera arte animado para reliquias sin depender de imagenes externas ni caracteres especiales.
+fn relic_art_lines(id: &str, unlocked: bool, theme: &Theme, ticks: usize) -> Vec<Line<'static>> {
+    let frame = (ticks / 5) % 4;
+    let gold = Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD);
+    let amber = Style::default().fg(Color::Rgb(242, 156, 48)).add_modifier(Modifier::BOLD);
+    let cyan = Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD);
+    let blue = Style::default().fg(Color::Rgb(82, 151, 219)).add_modifier(Modifier::BOLD);
+    let green = Style::default().fg(Color::Rgb(84, 180, 92)).add_modifier(Modifier::BOLD);
+    let purple = Style::default().fg(Color::Rgb(178, 121, 216)).add_modifier(Modifier::BOLD);
+    let stone = Style::default().fg(Color::Rgb(135, 145, 154)).add_modifier(Modifier::BOLD);
+    let ink = Style::default().fg(Color::Rgb(210, 220, 232));
+    let muted = Style::default().fg(theme.muted);
+
+    if !unlocked {
+        let pulse = if frame % 2 == 0 { theme.danger } else { theme.muted };
+        return vec![
+            Line::from(""),
+            Line::from(Span::styled("      .----.      ", Style::default().fg(pulse).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("     / ____ \\     ", muted)),
+            Line::from(Span::styled("    | |    | |    ", muted)),
+            Line::from(Span::styled("    | |LOCK| |    ", Style::default().fg(pulse).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled("    | |____| |    ", muted)),
+            Line::from(Span::styled("     \\______/     ", muted)),
+            Line::from(""),
+        ];
+    }
+
+    match id {
+        "ancient_quill" => {
+            let tip = if frame % 2 == 0 { gold } else { cyan };
+            vec![
+                Line::from(Span::styled("       *     .    ", gold)),
+                Line::from(vec![Span::raw("          "), Span::styled("//", cyan)]),
+                Line::from(vec![Span::raw("        "), Span::styled("//", cyan), Span::styled("/ ", ink), Span::styled("*", gold)]),
+                Line::from(vec![Span::raw("      "), Span::styled("//", cyan), Span::styled("/___", ink)]),
+                Line::from(vec![Span::raw("    "), Span::styled("//", cyan), Span::styled("/____/", ink)]),
+                Line::from(vec![Span::raw("      "), Span::styled("\\___", tip), Span::styled(")", amber)]),
+                Line::from(Span::styled("    ink remembers", purple)),
+            ]
+        }
+        "crystal_compass" => {
+            let needle = if frame < 2 { gold } else { cyan };
+            vec![
+                Line::from(Span::styled("      .  *  .     ", cyan)),
+                Line::from(vec![Span::raw("        "), Span::styled(".=.", gold)]),
+                Line::from(vec![Span::raw("      "), Span::styled("/ ", stone), Span::styled("|", needle), Span::styled(" \\", stone)]),
+                Line::from(vec![Span::raw("     "), Span::styled("( --", blue), Span::styled("*", gold), Span::styled("-- )", blue)]),
+                Line::from(vec![Span::raw("      "), Span::styled("\\ ", stone), Span::styled("|", needle), Span::styled(" /", stone)]),
+                Line::from(vec![Span::raw("        "), Span::styled("'='", gold)]),
+                Line::from(Span::styled("    nearest quest", green)),
+            ]
+        }
+        "rune_tablet" => {
+            let rune = if frame % 2 == 0 { green } else { gold };
+            vec![
+                Line::from(Span::styled("       .---.      ", stone)),
+                Line::from(vec![Span::raw("      "), Span::styled("/____\\", stone)]),
+                Line::from(vec![Span::raw("      "), Span::styled("| ", stone), Span::styled("*", rune), Span::styled("  |", stone)]),
+                Line::from(vec![Span::raw("      "), Span::styled("| ", stone), Span::styled("#", cyan), Span::styled("  |", stone)]),
+                Line::from(vec![Span::raw("      "), Span::styled("| ", stone), Span::styled("+", rune), Span::styled("  |", stone)]),
+                Line::from(vec![Span::raw("      "), Span::styled("'----'", stone)]),
+                Line::from(Span::styled("     roots hum", green)),
+            ]
+        }
+        "explorers_map" => {
+            let mark = if frame % 2 == 0 { Color::Rgb(218, 55, 42) } else { Color::Rgb(255, 213, 92) };
+            vec![
+                Line::from(Span::styled("     .       *    ", amber)),
+                Line::from(vec![Span::raw("     "), Span::styled(".------.", gold)]),
+                Line::from(vec![Span::raw("    "), Span::styled("/ ~  ~ /", ink)]),
+                Line::from(vec![Span::raw("   "), Span::styled("/  ", ink), Span::styled("X", Style::default().fg(mark).add_modifier(Modifier::BOLD)), Span::styled("  /", ink)]),
+                Line::from(vec![Span::raw("  "), Span::styled("/__~__/", gold)]),
+                Line::from(Span::styled("    path shifts", cyan)),
+            ]
+        }
+        "clock_of_focus" => {
+            let hand = if frame % 2 == 0 { gold } else { cyan };
+            vec![
+                Line::from(Span::styled("       .---.      ", blue)),
+                Line::from(vec![Span::raw("      "), Span::styled("/ .-. \\", stone)]),
+                Line::from(vec![Span::raw("     "), Span::styled("|  ", stone), Span::styled("|", hand), Span::styled("  |", stone)]),
+                Line::from(vec![Span::raw("     "), Span::styled("|  ", stone), Span::styled("+--", hand), Span::styled("|", stone)]),
+                Line::from(vec![Span::raw("      "), Span::styled("\\___/", blue)]),
+                Line::from(Span::styled("    time bends", purple)),
+            ]
+        }
+        _ => vec![
+            Line::from(Span::styled("      * * *      ", gold)),
+            Line::from(Span::styled("     ARTIFACT    ", cyan)),
+            Line::from(Span::styled("      * * *      ", gold)),
+        ],
+    }
+}
+
 // toda la pantalla: récords personales a la izq, inventario de reliquias a la der
 // la tupla de relics es (id, nombre, desc, desbloqueada, fecha_unlock) — medio fea pero funciona
 pub fn draw(
@@ -21,6 +115,7 @@ pub fn draw(
     // Relic status: (id, name, desc, unlocked, unlocked_at)
     relics: &[(String, String, String, bool, Option<String>)],
     theme: &Theme,
+    animation_ticks: usize,
 ) {
     let size = f.size();
     let accent_color = theme.primary;
@@ -268,65 +363,8 @@ pub fn draw(
 
     f.render_widget(details_block, relics_layout[1]);
 
-    // ASCII art hardcodeado por id de reliquia — si está bloqueada solo muestra [LOCKED], sin drama
-    let ascii_art = if !relic.3 {
-        "\n\n  [LOCKED]"
-    } else {
-        match relic.0.as_str() {
-            "ancient_quill" => {
-                "
-        /
-       /
-      /
-     /
-    /___
-    \\___)
-"
-            }
-            "crystal_compass" => {
-                "
-       .=.
-      / | \\
-     (  *  )
-      \\ | /
-       '='
-"
-            }
-            "rune_tablet" => {
-                "
-     .---.
-     | * |
-     | # |
-     '---'
-"
-            }
-            "explorers_map" => {
-                "
-     .-----.
-     | ~~~ |
-     |  X  |
-     '-----'
-"
-            }
-            "clock_of_focus" => {
-                "
-      .---.
-     / \\_/ \\
-    |   |   |
-     \\_____/
-"
-            }
-            _ => "\n   [*]\n  ARTIFACT",
-        }
-    };
-
-    let ascii_p = Paragraph::new(ascii_art)
-        .alignment(Alignment::Center)
-        .style(Style::default().fg(if relic.3 {
-            theme.warning
-        } else {
-            theme.muted
-        }));
+    let ascii_p = Paragraph::new(relic_art_lines(&relic.0, relic.3, theme, animation_ticks))
+        .alignment(Alignment::Center);
     f.render_widget(ascii_p, relic_detail_chunks[0]);
 
     // si la reliquia está bloqueada muestra el hint; si no, el nombre + fecha de desbloqueo y descripción

@@ -33,6 +33,43 @@ impl LibraryCategory {
     }
 }
 
+// Renderiza arte compacto de fragmentos para el panel de detalles de la biblioteca.
+fn fragment_detail_art(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
+    let frame = (ticks / 5) % 4;
+    let (edge, core, glow) = match rarity {
+        "Legendary" => (
+            Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(255, 245, 170)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(242, 156, 48)),
+        ),
+        "Rare" => (
+            Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(190, 246, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(82, 151, 219)),
+        ),
+        _ => (
+            Style::default().fg(Color::Rgb(210, 220, 232)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(250, 250, 255)).add_modifier(Modifier::BOLD),
+            Style::default().fg(Color::Rgb(150, 160, 175)),
+        ),
+    };
+    let spark = match frame {
+        0 => ("     *       .     ", "\\/"),
+        1 => ("  .      *        ", "><"),
+        2 => ("    *         *   ", "/\\"),
+        _ => ("       .      *   ", "\\/"),
+    };
+
+    vec![
+        Line::from(Span::styled(spark.0, glow)),
+        Line::from(vec![Span::raw("        "), Span::styled("/\\", edge)]),
+        Line::from(vec![Span::raw("       "), Span::styled("/ ", edge), Span::styled(spark.1, glow), Span::styled(" \\", edge)]),
+        Line::from(vec![Span::raw("      "), Span::styled("\\ ", edge), Span::styled("\\__/", core), Span::styled(" /", edge)]),
+        Line::from(vec![Span::raw("       "), Span::styled("\\____/", edge)]),
+        Line::from(""),
+    ]
+}
+
 // Draw principal — navegación de tres columnas: categoría → items → detalles
 // Los parámetros son bastante gordos porque todo se pasa desde el app state
 pub fn draw(
@@ -48,6 +85,7 @@ pub fn draw(
     lore_entries: &[(String, String, String, String, bool, Option<String>)],
     user_class: &str,
     theme: &Theme,
+    animation_ticks: usize,
 ) {
     let size = f.size();
     let accent_color = theme.primary;
@@ -392,13 +430,26 @@ pub fn draw(
                 format!("  {}/{} completed", q.5, q.6),
                 Style::default().fg(Color::White),
             )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    " REWARD: ",
+                    Style::default()
+                        .fg(theme.success)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{} XP + {}", q.1 * 100, q.7),
+                    Style::default().fg(theme.text),
+                ),
+            ]),
         ];
 
         // Layout interno del panel: texto + gauge de progreso + acción disponible
         let detail_layout = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(12),
+                Constraint::Length(14),
                 Constraint::Length(3), // Progress Gauge
                 Constraint::Min(2),    // Actions instruction
             ])
@@ -538,7 +589,11 @@ pub fn draw(
                 None
             };
 
-            let mut text = vec![
+            let mut text = Vec::new();
+            if let Some((rarity_label, _)) = frag_rarity {
+                text.extend(fragment_detail_art(rarity_label, animation_ticks));
+            }
+            text.extend(vec![
                 Line::from(vec![
                     Span::styled(" TITLE: ", Style::default().fg(theme.muted)),
                     Span::styled(
@@ -552,7 +607,7 @@ pub fn draw(
                     Span::styled(" TYPE:  ", Style::default().fg(theme.muted)),
                     Span::styled(cur_cat.name(), Style::default().fg(accent_color)),
                 ]),
-            ];
+            ]);
             if let Some((class_name, class_color)) = entry_class_info {
                 let is_user_class = !user_class_key.is_empty()
                     && entry.0.starts_with(&format!("class_{}_", user_class_key));

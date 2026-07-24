@@ -303,6 +303,14 @@ impl Database {
             conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT;", [])?;
         }
 
+        let has_set_date: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='set_date'",
+            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_set_date {
+            conn.execute("ALTER TABLE tasks ADD COLUMN set_date TEXT;", [])?;
+        }
+
         // v1.0.9: nested codices — un codex puede vivir dentro de otro
         let has_parent_codex: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('codices') WHERE name='parent_codex_id'",
@@ -464,6 +472,20 @@ impl Database {
                 )?;
             }
         }
+        let class_capstone_titles = vec![
+            ("class_capstone_code_warlock", "Keeper of Working Systems", "Complete the Level 100 Code Warlock class quest."),
+            ("class_capstone_task_paladin", "Avatar of Completion", "Complete the Level 100 Task Paladin class quest."),
+            ("class_capstone_mind_sage", "Lantern of the Silent Archive", "Complete the Level 100 Mind Sage class quest."),
+            ("class_capstone_systems_architect", "Keeper of the Unified Schema", "Complete the Level 100 Systems Architect class quest."),
+            ("class_capstone_time_chronomancer", "Keeper of Reality", "Complete the Level 100 Time Chronomancer class quest."),
+            ("class_capstone_arch_accountant", "Keeper of the Eternal Ledger", "Complete the Level 100 Arch Accountant class quest."),
+        ];
+        for (id, name, desc) in class_capstone_titles {
+            conn.execute(
+                "INSERT OR IGNORE INTO legendary_titles (title_id, title_name, description, unlocked, equipped) VALUES (?1, ?2, ?3, 0, 0)",
+                params![id, name, desc],
+            )?;
+        }
 
         let count_relics: i32 =
             conn.query_row("SELECT count(*) FROM relics", [], |row| row.get(0))?;
@@ -559,15 +581,15 @@ impl Database {
             )?;
         }
 
-        // Elimina quests que el admin borró — solo las que no tienen progreso iniciado
+        // Elimina quests obsoletas solo si no tienen avance del usuario.
         for q_existing in self.conn.prepare(
-            "SELECT class_name, unlock_level FROM class_quests WHERE status = 'Locked'"
+            "SELECT class_name, unlock_level FROM class_quests WHERE status != 'Completed' AND progress = 0"
         )?.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?))
         })?.flatten() {
             if !remote_keys.iter().any(|(c, l)| c == &q_existing.0 && *l == q_existing.1) {
                 self.conn.execute(
-                    "DELETE FROM class_quests WHERE class_name = ?1 AND unlock_level = ?2 AND status = 'Locked'",
+                    "DELETE FROM class_quests WHERE class_name = ?1 AND unlock_level = ?2 AND status != 'Completed' AND progress = 0",
                     rusqlite::params![q_existing.0, q_existing.1],
                 )?;
             }
@@ -732,13 +754,14 @@ impl Database {
 
     pub fn insert_task(&self, task: &Task) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            "INSERT INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 task.id.to_string(),
                 task.project_id.map(|id| id.to_string()),
                 task.title,
                 task.description,
                 task.due_date.map(|d| d.to_rfc3339()),
+                task.set_date.map(|d| d.to_rfc3339()),
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
                 task.created_at.to_rfc3339(),
@@ -758,22 +781,23 @@ impl Database {
     }
 
     pub fn get_tasks(&self) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
             let title: String = row.get(2)?;
             let description: Option<String> = row.get(3)?;
             let due_str: Option<String> = row.get(4)?;
-            let completed_int: i32 = row.get(5)?;
-            let priority_str: String = row.get(6)?;
-            let created_str: String = row.get(7)?;
-            let updated_str: String = row.get(8)?;
-            let owner_identity: Option<String> = row.get(9)?;
-            let owner_username: Option<String> = row.get(10)?;
-            let parent_task_id_str: Option<String> = row.get(11)?;
-            let xp_awarded_int: i32 = row.get(12)?;
-            let recurrence_str: Option<String> = row.get(13)?;
+            let set_str: Option<String> = row.get(5)?;
+            let completed_int: i32 = row.get(6)?;
+            let priority_str: String = row.get(7)?;
+            let created_str: String = row.get(8)?;
+            let updated_str: String = row.get(9)?;
+            let owner_identity: Option<String> = row.get(10)?;
+            let owner_username: Option<String> = row.get(11)?;
+            let parent_task_id_str: Option<String> = row.get(12)?;
+            let xp_awarded_int: i32 = row.get(13)?;
+            let recurrence_str: Option<String> = row.get(14)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -783,6 +807,14 @@ impl Database {
                 None => None,
             };
             let due_date = match due_str {
+                Some(d) => Some(
+                    DateTime::parse_from_rfc3339(&d)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?,
+                ),
+                None => None,
+            };
+            let set_date = match set_str {
                 Some(d) => Some(
                     DateTime::parse_from_rfc3339(&d)
                         .map(|dt| dt.with_timezone(&Utc))
@@ -808,6 +840,7 @@ impl Database {
                 title,
                 description,
                 due_date,
+                set_date,
                 completed: completed_int != 0,
                 priority,
                 created_at,
@@ -828,22 +861,23 @@ impl Database {
     }
 
     pub fn get_tasks_for_project(&self, project_id: Uuid) -> Result<Vec<Task>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE project_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
             let title: String = row.get(2)?;
             let description: Option<String> = row.get(3)?;
             let due_str: Option<String> = row.get(4)?;
-            let completed_int: i32 = row.get(5)?;
-            let priority_str: String = row.get(6)?;
-            let created_str: String = row.get(7)?;
-            let updated_str: String = row.get(8)?;
-            let owner_identity: Option<String> = row.get(9)?;
-            let owner_username: Option<String> = row.get(10)?;
-            let parent_task_id_str: Option<String> = row.get(11)?;
-            let xp_awarded_int: i32 = row.get(12)?;
-            let recurrence_str: Option<String> = row.get(13)?;
+            let set_str: Option<String> = row.get(5)?;
+            let completed_int: i32 = row.get(6)?;
+            let priority_str: String = row.get(7)?;
+            let created_str: String = row.get(8)?;
+            let updated_str: String = row.get(9)?;
+            let owner_identity: Option<String> = row.get(10)?;
+            let owner_username: Option<String> = row.get(11)?;
+            let parent_task_id_str: Option<String> = row.get(12)?;
+            let xp_awarded_int: i32 = row.get(13)?;
+            let recurrence_str: Option<String> = row.get(14)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -854,6 +888,10 @@ impl Database {
                 Some(d) => Some(DateTime::parse_from_rfc3339(&d).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
+            let set_date = match set_str {
+                Some(d) => Some(DateTime::parse_from_rfc3339(&d).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                None => None,
+            };
             let created_at = DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let updated_at = DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
@@ -861,7 +899,7 @@ impl Database {
                 Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
                 None => None,
             };
-            Ok(Task { id, project_id, title, description, due_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded: xp_awarded_int != 0, recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str) })
+            Ok(Task { id, project_id, title, description, due_date, set_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded: xp_awarded_int != 0, recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str) })
         })?;
         let mut tasks = Vec::new();
         for r in rows { tasks.push(r?); }
@@ -875,12 +913,13 @@ impl Database {
 
         let now = Utc::now().to_rfc3339();
         self.conn.execute(
-            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, completed = ?5, priority = ?6, updated_at = ?7, owner_identity = ?8, owner_username = ?9, parent_task_id = ?10, xp_awarded = ?11, recurrence = ?12 WHERE id = ?13",
+            "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, set_date = ?5, completed = ?6, priority = ?7, updated_at = ?8, owner_identity = ?9, owner_username = ?10, parent_task_id = ?11, xp_awarded = ?12, recurrence = ?13 WHERE id = ?14",
             params![
                 task.project_id.map(|id| id.to_string()),
                 task.title,
                 task.description,
                 task.due_date.map(|d| d.to_rfc3339()),
+                task.set_date.map(|d| d.to_rfc3339()),
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
                 now,
@@ -1599,6 +1638,75 @@ impl Database {
         Ok(max)
     }
 
+    pub fn count_completed_tasks_where(&self, predicate: &str) -> Result<i32> {
+        let query = format!("SELECT count(*) FROM tasks WHERE completed = 1 AND {}", predicate);
+        let count: i32 = self.conn.query_row(&query, [], |row| row.get(0))?;
+        Ok(count)
+    }
+
+    pub fn hydration_total_glasses(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COALESCE(SUM(count), 0) FROM hydration_log",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn hydration_goal_days(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT count(*) FROM hydration_log WHERE reward_given != 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn hydration_max_glasses_day(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(count), 0) FROM hydration_log",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn count_shared_projects(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT count(*) FROM projects WHERE is_shared = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn count_chronicle_messages(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT count(*) FROM chronicle_messages",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn count_invitations_sent(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT count(*) FROM invitations",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    pub fn count_daily_adventures_completed(&self) -> Result<i32> {
+        let count: i32 = self.conn.query_row(
+            "SELECT count(*) FROM daily_adventures WHERE completed = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
         self.conn.execute(
             "INSERT INTO rituals (id, name, description, frequency, reward_xp, daily_target, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -2054,22 +2162,23 @@ impl Database {
     }
 
     pub fn get_task_by_id(&self, id: Uuid) -> Result<Task> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence FROM tasks WHERE id = ?1")?;
         let task = stmt.query_row(params![id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: Option<String> = row.get(1)?;
             let title: String = row.get(2)?;
             let description: Option<String> = row.get(3)?;
             let due_str: Option<String> = row.get(4)?;
-            let completed_int: i32 = row.get(5)?;
-            let priority_str: String = row.get(6)?;
-            let created_str: String = row.get(7)?;
-            let updated_str: String = row.get(8)?;
-            let owner_identity: Option<String> = row.get(9)?;
-            let owner_username: Option<String> = row.get(10)?;
-            let parent_task_id_str: Option<String> = row.get(11)?;
-            let xp_awarded_int: i32 = row.get(12)?;
-            let recurrence_str: Option<String> = row.get(13)?;
+            let set_str: Option<String> = row.get(5)?;
+            let completed_int: i32 = row.get(6)?;
+            let priority_str: String = row.get(7)?;
+            let created_str: String = row.get(8)?;
+            let updated_str: String = row.get(9)?;
+            let owner_identity: Option<String> = row.get(10)?;
+            let owner_username: Option<String> = row.get(11)?;
+            let parent_task_id_str: Option<String> = row.get(12)?;
+            let xp_awarded_int: i32 = row.get(13)?;
+            let recurrence_str: Option<String> = row.get(14)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
@@ -2079,6 +2188,14 @@ impl Database {
                 None => None,
             };
             let due_date = match due_str {
+                Some(d) => Some(
+                    DateTime::parse_from_rfc3339(&d)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?,
+                ),
+                None => None,
+            };
+            let set_date = match set_str {
                 Some(d) => Some(
                     DateTime::parse_from_rfc3339(&d)
                         .map(|dt| dt.with_timezone(&Utc))
@@ -2104,6 +2221,7 @@ impl Database {
                 title,
                 description,
                 due_date,
+                set_date,
                 completed: completed_int != 0,
                 priority,
                 created_at,

@@ -216,17 +216,17 @@ impl ClassType {
     pub fn passive_description(&self) -> &'static str {
         match self {
             ClassType::TaskPaladin =>
-                "+5 XP per task  |  +10 XP high priority  |  +15 XP full daily chain",
+                "+5 XP per task  |  +10 XP high priority  |  Class quests improve task XP",
             ClassType::CodeWarlock =>
-                "+5 XP per note  |  +15 XP new project  |  +3 XP on sync",
+                "+5 XP per note  |  +15 XP new project  |  Class quests improve notes/sync",
             ClassType::MindSage =>
-                "+10 XP long notes  |  +5 XP journals  |  +10% fragment chance  |  +5 XP per fragment",
+                "+10 XP long notes  |  +5 XP journals/fragments  |  Class quests improve knowledge XP",
             ClassType::SystemsArchitect =>
-                "+10 XP new project  |  +15 XP archive  |  +5 XP restore",
+                "+10 XP new project  |  +15 XP archive  |  Class quests improve project XP",
             ClassType::TimeChronomancer =>
-                "+10 XP focus sessions  |  +25 XP pomodoros  |  +5 XP daily adventures",
+                "+10 XP focus  |  +25 XP pomodoros  |  Class quests improve focus XP",
             ClassType::ArchAccountant =>
-                "+2 XP all rewards  |  +5% XP all sources  |  +10 XP full daily chain",
+                "+2 XP all rewards  |  +5% XP all sources  |  Class quests improve all XP",
         }
     }
 

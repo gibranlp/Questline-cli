@@ -19,6 +19,7 @@ pub fn draw(
     f: &mut Frame,
     user: &User,
     achievements_count: i32,
+    achievements_total: usize,
     tree_stage: &str,
     tree_growth: i32,
     tree_health: i32,
@@ -201,7 +202,7 @@ pub fn draw(
         Line::from(vec![
             Span::styled("  ACHIEVEMENTS: ", Style::default().fg(theme.muted)),
             Span::styled(
-                format!("{} / 14 Unlocked", achievements_count),
+                format!("{} / {} Unlocked", achievements_count, achievements_total),
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),

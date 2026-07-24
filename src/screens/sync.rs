@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::app::{App, ModalType};
+use crate::models::Achievement;
 use crate::theme::Theme;
 use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
@@ -103,6 +104,20 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  [n] toggle", Style::default().fg(theme.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("   Task Alerts:", Style::default().fg(theme.muted)),
+            Span::styled(
+                if app.task_notifications_enabled { "Enabled" } else { "Disabled" },
+                Style::default()
+                    .fg(if app.task_notifications_enabled {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  [t] toggle", Style::default().fg(theme.muted)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -519,7 +534,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
-                format!("{}/14 unlocked", stats.achievements_unlocked),
+                format!(
+                    "{}/{} unlocked",
+                    stats.achievements_unlocked,
+                    Achievement::static_list().len()
+                ),
                 Style::default()
                     .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),

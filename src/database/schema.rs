@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     title TEXT NOT NULL,
     description TEXT,
     due_date TEXT,
+    set_date TEXT,
     completed INTEGER NOT NULL DEFAULT 0,
     priority TEXT NOT NULL DEFAULT 'Medium',
     created_at TEXT NOT NULL,

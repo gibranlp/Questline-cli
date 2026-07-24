@@ -14,10 +14,12 @@ echo "Setting up AppDir..."
 rm -rf AppDir
 mkdir -p AppDir/usr/bin
 mkdir -p AppDir/usr/lib
+mkdir -p AppDir/usr/share/questline/assets/icons
 
 cp target/release/questline AppDir/usr/bin/
 cp packaging/questline.desktop AppDir/
 cp packaging/questline.png AppDir/
+cp -R assets/icons/notifications AppDir/usr/share/questline/assets/icons/
 
 # Create AppRun script
 cat << 'EOF' > AppDir/AppRun

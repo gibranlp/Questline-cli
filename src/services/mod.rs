@@ -11,6 +11,7 @@ pub mod notifications;
 pub mod planner;
 pub mod sync_engine;
 pub mod theme;
+pub mod task_notifications;
 pub mod xp;
 
 pub use api_client::ApiClient;

@@ -28,6 +28,65 @@
     #chapter .intro-text {
       text-shadow: 0 1px 10px rgba(0,0,0,0.98), 0 0 30px rgba(0,0,0,0.7);
     }
+
+    #chapter .term {
+      border: none;
+      border-radius: 0;
+      box-shadow: 0 0 32px rgba(0,0,0,0.45);
+      overflow: visible;
+    }
+
+    #chapter .term::after {
+      content: '';
+      position: absolute;
+      inset: -21px 0 -11px;
+      z-index: 8;
+      pointer-events: none;
+      background-image:
+        url('assets/ui/gf-gemt.webp'),
+        url('assets/ui/gf-gemb.webp'),
+        url('assets/ui/gf-tlc.webp'),
+        url('assets/ui/gf-trc.webp'),
+        url('assets/ui/gf-blc.webp'),
+        url('assets/ui/gf-brc.webp'),
+        url('assets/ui/gf-et.webp'),
+        url('assets/ui/gf-eb.webp'),
+        url('assets/ui/gf-el.webp'),
+        url('assets/ui/gf-er.webp');
+      background-position:
+        center top,
+        center bottom,
+        left 21px,
+        right 21px,
+        left calc(100% - 11px),
+        right calc(100% - 11px),
+        left 21px,
+        left calc(100% - 11px),
+        left 63px,
+        right 63px;
+      background-size:
+        86px 45px,
+        58px 25px,
+        32px 42px,
+        32px 42px,
+        32px 42px,
+        32px 42px,
+        auto 3px,
+        auto 3px,
+        3px calc(100% - 116px),
+        3px calc(100% - 116px);
+      background-repeat:
+        no-repeat,
+        no-repeat,
+        no-repeat,
+        no-repeat,
+        no-repeat,
+        no-repeat,
+        repeat-x,
+        repeat-x,
+        no-repeat,
+        no-repeat;
+    }
   </style>
 </head>
 <body>

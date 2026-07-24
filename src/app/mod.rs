@@ -122,6 +122,7 @@ pub enum ModalType {
         priority: TaskPriority,
         due_date_type: DueDateType,
         due_date_val: String,
+        set_date_val: String,
         focus_idx: usize,
         parent_task_id: Option<Uuid>,
         recurrence: Option<RecurrenceType>,
@@ -146,6 +147,7 @@ pub enum ModalType {
         priority: TaskPriority,
         due_date_type: DueDateType,
         due_date_val: String,
+        set_date_val: String,
         focus_idx: usize,
         step_selected_idx: usize,
         // true si esta tarea es un paso hijo de otra — cambia cómo se guarda
@@ -651,6 +653,7 @@ pub struct App {
     pub server_url: String,
     pub auto_sync: bool,
     pub external_notifications: bool,
+    pub task_notifications_enabled: bool,
     pub sync_status_msg: String,
     pub sync_conflicts: Vec<String>,
     pub sync_failure_count: u32,
@@ -698,6 +701,7 @@ pub struct App {
     pub active_ambient_effect: usize,
     pub ambient_particles: Vec<Particle>,
     pub ambient_particles_ticks_remaining: usize,
+    pub ambient_burst_effect: usize,
     pub corrupted_backups_found: Vec<String>,
     pub quit_confirm_ticks: usize,
     pub intro_ticks: usize,
@@ -749,6 +753,7 @@ pub struct App {
     pub sprite_notifications_shown_this_session: u32,
     pub last_sprite_notification_time: Option<std::time::Instant>,
     pub last_sprite_check_time: Option<std::time::Instant>,
+    pub last_task_notification_tick: Option<std::time::Instant>,
 
     // Prologue — pantallas de historia con efecto typewriter que se muestran después del login
     pub prologue_page: u8,           // 0 = The Story So Far, 1 = Chapter One
@@ -1295,6 +1300,19 @@ impl App {
         let _ = db.seed_class_quests(&lore_mgr.quests);
 
         let mut user = db.get_user()?;
+        if let Some(ref u) = user {
+            let _ = db.activate_class_quests_up_to_level(u.class.name(), u.level);
+            if let Ok(quests) = db.get_class_quests(u.class.name()) {
+                let class_slug = u.class.name().to_lowercase().replace(' ', "_");
+                for q in quests.iter().filter(|q| q.4 == "Completed") {
+                    let key = format!("class_quest_completed:{}:{}", class_slug, q.1);
+                    let _ = db.set_setting(&key, "true");
+                    if let Some(story_id) = Self::class_story_lore_id(u.class.name(), q.1) {
+                        let _ = db.unlock_lore_entry(&story_id);
+                    }
+                }
+            }
+        }
 
         let existing_user_id = user.as_ref().map(|u| u.id);
 
@@ -1373,6 +1391,8 @@ impl App {
         let external_notifications = db.get_setting("external_notifications")?
             .map(|s| s == "true")
             .unwrap_or(true);
+        let task_notifications_enabled =
+            crate::services::task_notifications::task_notifications_enabled(&db);
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -1509,6 +1529,7 @@ impl App {
             server_url,
             auto_sync,
             external_notifications,
+            task_notifications_enabled,
             sync_status_msg: "Idle".to_string(),
             sync_conflicts: Vec::new(),
             sync_failure_count: 0,
@@ -1545,6 +1566,7 @@ impl App {
             active_ambient_effect: 1,
             ambient_particles: Vec::new(),
             ambient_particles_ticks_remaining: 0,
+            ambient_burst_effect: 0,
             corrupted_backups_found: Vec::new(),
             quit_confirm_ticks: 0,
             intro_ticks: 0,
@@ -1586,6 +1608,7 @@ impl App {
             sprite_notifications_shown_this_session: 0,
             last_sprite_notification_time: None,
             last_sprite_check_time: None,
+            last_task_notification_tick: None,
             prologue_page: 0,
             prologue_line_idx: 0,
             prologue_char_in_line: 0,
@@ -1799,6 +1822,7 @@ impl App {
                     title: "Design Fellowship Database Schema".to_string(),
                     description: Some("Alex handles database schemas".to_string()),
                     due_date: None,
+                    set_date: None,
                     completed: true,
                     priority: crate::models::TaskPriority::High,
                     created_at: Utc::now() - chrono::Duration::hours(2),
@@ -1821,6 +1845,7 @@ impl App {
                     title: "Build Fellowship TUI Dashboard".to_string(),
                     description: Some("Implement Fellowship Tab 9".to_string()),
                     due_date: Some(Utc::now() + chrono::Duration::days(3)),
+                    set_date: None,
                     completed: false,
                     priority: crate::models::TaskPriority::Medium,
                     created_at: Utc::now(),
@@ -1978,6 +2003,7 @@ impl App {
                             priority: crate::models::task::TaskPriority::Medium,
                             due_date_type: DueDateType::InDays,
                             due_date_val: "1".to_string(),
+                            set_date_val: String::new(),
                             focus_idx: 0,
                             parent_task_id: None,
                             recurrence: None,
@@ -2295,14 +2321,14 @@ impl App {
             if let Some(project_id) = self.active_project_id {
                 if let ModalType::NewTask {
                     ref title, ref desc, desc_cursor, priority, due_date_type,
-                    ref due_date_val, focus_idx, parent_task_id, recurrence,
+                    ref due_date_val, ref set_date_val, focus_idx, parent_task_id, recurrence,
                 } = self.overlay_modal.clone()
                 {
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                     self.handle_task_modal_key(
                         key, project_id, None,
                         title.clone(), desc.clone(), desc_cursor, priority, due_date_type,
-                        due_date_val.clone(), focus_idx, parent_task_id, 0, true, recurrence,
+                        due_date_val.clone(), set_date_val.clone(), focus_idx, parent_task_id, 0, true, recurrence,
                     )?;
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                 }
@@ -2331,12 +2357,14 @@ impl App {
                                         ));
                                     }
                                 }
-                            } else {
-                                self.notifications.push(Notification::info(
-                                    format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
-                                ));
-                            }
-                        }
+	                            } else {
+	                                self.notifications.push(Notification::info(
+	                                    format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+	                                ));
+	                            }
+	                            let _ = self.check_action_achievements();
+	                            let _ = self.increment_quest_progress(40, 1);
+	                        }
                         // Rearm reminder
                         self.hydration_next_reminder_at = Some(
                             std::time::Instant::now()
@@ -4144,6 +4172,7 @@ impl App {
                                 priority: crate::models::task::TaskPriority::Medium,
                                 due_date_type: crate::app::DueDateType::InDays,
                                 due_date_val: "1".to_string(),
+                                set_date_val: String::new(),
                                 focus_idx: 0,
                                 parent_task_id: None,
                                 recurrence: None,
@@ -4451,7 +4480,7 @@ impl App {
     }
 
     pub fn trigger_sync(&mut self) -> Result<()> {
-        self.sync_status_msg = "Syncing...".to_string();
+        self.sync_status_msg = "S󰓦".to_string();
 
         let server_url_opt = if self.config.sync_enabled {
             Some(self.server_url.as_str())
@@ -4609,7 +4638,7 @@ impl App {
                 }
 
                 self.last_sync_warlock_xp = 0;
-                self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", pushed, pulled);
+                self.sync_status_msg = format!("↑{}↓{}", pushed, pulled);
                 self.last_sync_status_time = Some(std::time::Instant::now());
                 self.apply_class_passive("sync_complete", 0)?;
             }
@@ -5174,6 +5203,18 @@ impl App {
                     );
                     return Ok(());
                 }
+                KeyCode::Char('t') => {
+                    self.task_notifications_enabled = !self.task_notifications_enabled;
+                    let _ = crate::services::task_notifications::set_task_notifications_enabled(
+                        &self.db,
+                        self.task_notifications_enabled,
+                    );
+                    self.sync_status_msg = format!(
+                        "Task Alerts {}",
+                        if self.task_notifications_enabled { "Enabled" } else { "Disabled" }
+                    );
+                    return Ok(());
+                }
                 KeyCode::Char('c') => {
                     match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
                         Ok(_) => {
@@ -5461,12 +5502,14 @@ impl App {
                                     ));
                                 }
                             }
-                        } else {
-                            self.notifications.push(Notification::info(
-                                format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
-                            ));
-                        }
-                        self.hydration_next_reminder_at = Some(
+	                        } else {
+	                            self.notifications.push(Notification::info(
+	                                format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
+	                            ));
+	                        }
+	                        let _ = self.check_action_achievements();
+	                        let _ = self.increment_quest_progress(40, 1);
+	                        self.hydration_next_reminder_at = Some(
                             std::time::Instant::now()
                                 + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
                         );
@@ -6224,7 +6267,7 @@ impl App {
                                 self.apply_class_passive(passive_trigger, 0)?;
                             }
                             self.trigger_ambient_particles();
-                            self.increment_quest_progress(10, 1)?;
+	                                self.increment_quest_progress(10, 1)?;
                             let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
                             self.simulate_memory_fragment_unlock(frag_trigger)?;
                             self.complete_productive_action()?;
@@ -6243,13 +6286,14 @@ impl App {
                             self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
                             self.maybe_spawn_task_completion_sprite();
                             if let Some(recurrence) = t.recurrence {
-                                let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
+                                let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
                                 let next_task = Task {
                                     id: Uuid::new_v4(),
                                     project_id: t.project_id,
                                     title: t.title.clone(),
                                     description: t.description.clone(),
                                     due_date: Some(next_due),
+                                    set_date: Some(next_due),
                                     completed: false,
                                     priority: t.priority,
                                     created_at: Utc::now(),
@@ -7412,7 +7456,7 @@ impl App {
                                     self.apply_class_passive(passive_trigger, 0)?;
                                 }
                                 self.trigger_ambient_particles();
-                                self.increment_quest_progress(10, 1)?;
+	                                self.increment_quest_progress(10, 1)?;
                                 let frag_trigger = if task.priority == TaskPriority::High { "high_priority_task" } else { "task" };
                                 self.simulate_memory_fragment_unlock(frag_trigger)?;
                                 self.complete_productive_action()?;
@@ -7432,13 +7476,14 @@ impl App {
                                 self.maybe_spawn_task_completion_sprite();
                                 // Tarea recurrente — genera la siguiente ocurrencia automáticamente
                                 if let Some(recurrence) = t.recurrence {
-                                    let next_due = Self::advance_recurrence_date(t.due_date, recurrence);
+                                    let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
                                     let next_task = Task {
                                         id: Uuid::new_v4(),
                                         project_id: t.project_id,
                                         title: t.title.clone(),
                                         description: t.description.clone(),
                                         due_date: Some(next_due),
+                                        set_date: Some(next_due),
                                         completed: false,
                                         priority: t.priority,
                                         created_at: Utc::now(),
@@ -7522,6 +7567,7 @@ impl App {
                         priority: TaskPriority::Medium,
                         due_date_type: DueDateType::None,
                         due_date_val: String::new(),
+                        set_date_val: String::new(),
                         focus_idx: 0,
                         parent_task_id: Some(parent_id),
                         recurrence: None,
@@ -7538,6 +7584,7 @@ impl App {
                         priority: TaskPriority::Medium,
                         due_date_type: DueDateType::None,
                         due_date_val: String::new(),
+                        set_date_val: String::new(),
                         focus_idx: 0,
                         parent_task_id: parent_id,
                         recurrence: None,
@@ -7595,6 +7642,7 @@ impl App {
                         priority: t.priority,
                         due_date_type: due_type,
                         due_date_val: due_val,
+                        set_date_val: t.set_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
                         focus_idx: 0,
                         step_selected_idx: 0,
                         is_step: t.parent_task_id.is_some(),
@@ -7799,6 +7847,7 @@ impl App {
                 priority,
                 due_date_type,
                 ref due_date_val,
+                ref set_date_val,
                 focus_idx,
                 parent_task_id,
                 recurrence,
@@ -7814,6 +7863,7 @@ impl App {
                     priority,
                     due_date_type,
                     due_date_val.clone(),
+                    set_date_val.clone(),
                     focus_idx,
                     parent_task_id,
                     0,
@@ -7829,6 +7879,7 @@ impl App {
                 priority,
                 due_date_type,
                 ref due_date_val,
+                ref set_date_val,
                 focus_idx,
                 step_selected_idx,
                 is_step,
@@ -7836,13 +7887,16 @@ impl App {
             } => {
                 // índice del bloque de steps — depende de si hay campo de valor de fecha
                 let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-                let steps_focus = if has_due_value { 6usize } else { 5usize };
+                let set_date_focus = if has_due_value { 5usize } else { 4usize };
+                let recurrence_focus = set_date_focus + 1;
+                let steps_focus = recurrence_focus + 1;
 
                 // Handle step-section keys when focus is on the steps list
                 if focus_idx == steps_focus && !is_step {
                     let title_c = title.clone();
                     let desc_c = desc.clone();
                     let due_val_c = due_date_val.clone();
+                    let set_val_c = set_date_val.clone();
                     let steps: Vec<Task> = self.db.get_tasks()
                         .unwrap_or_default()
                         .into_iter()
@@ -7853,7 +7907,7 @@ impl App {
                             let new_idx = if step_selected_idx > 0 { step_selected_idx - 1 } else { 0 };
                             self.modal_state = ModalType::EditTask {
                                 id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
                             };
                             return Ok(());
                         }
@@ -7862,7 +7916,7 @@ impl App {
                             let new_idx = (step_selected_idx + 1).min(max);
                             self.modal_state = ModalType::EditTask {
                                 id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
                             };
                             return Ok(());
                         }
@@ -7889,7 +7943,7 @@ impl App {
                             }
                             self.modal_state = ModalType::EditTask {
                                 id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, focus_idx: steps_focus, step_selected_idx, is_step, recurrence,
+                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx, is_step, recurrence,
                             };
                             return Ok(());
                         }
@@ -7903,7 +7957,7 @@ impl App {
                             let new_idx = if step_selected_idx > 0 { step_selected_idx - 1 } else { 0 };
                             self.modal_state = ModalType::EditTask {
                                 id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
                             };
                             return Ok(());
                         }
@@ -7916,6 +7970,7 @@ impl App {
                                 priority: TaskPriority::Medium,
                                 due_date_type: DueDateType::None,
                                 due_date_val: String::new(),
+                                set_date_val: String::new(),
                                 focus_idx: 0,
                                 parent_task_id: Some(id),
                                 recurrence: None,
@@ -7949,6 +8004,7 @@ impl App {
                                         priority: step.priority,
                                         due_date_type: due_type,
                                         due_date_val: due_val,
+                                        set_date_val: step.set_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
                                         focus_idx: 0,
                                         step_selected_idx: 0,
                                         is_step: true,
@@ -7971,6 +8027,7 @@ impl App {
                     priority,
                     due_date_type,
                     due_date_val.clone(),
+                    set_date_val.clone(),
                     focus_idx,
                     None,
                     step_selected_idx,
@@ -8064,6 +8121,7 @@ impl App {
         mut priority: TaskPriority,
         mut due_date_type: DueDateType,
         mut due_date_val: String,
+        mut set_date_val: String,
         mut focus_idx: usize,
         parent_task_id: Option<Uuid>,
         step_selected_idx: usize,
@@ -8073,8 +8131,9 @@ impl App {
         // Recurrencia disponible solo para tareas padre (no pasos ni subtareas)
         let show_recurrence = !is_step && parent_task_id.is_none();
         let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-        // índice dinámico del campo de recurrencia — viene después del campo de valor de fecha si existe
-        let recurrence_focus: usize = if has_due_value { 5 } else { 4 };
+        let set_date_focus: usize = if has_due_value { 5 } else { 4 };
+        // índice dinámico del campo de recurrencia — viene después de Set Date
+        let recurrence_focus: usize = set_date_focus + 1;
         let steps_focus: usize = recurrence_focus + 1;
 
         let has_steps_section = task_id.is_some() && !is_step;
@@ -8083,9 +8142,9 @@ impl App {
         } else if show_recurrence {
             recurrence_focus
         } else if has_due_value {
-            4
+            set_date_focus
         } else {
-            3
+            set_date_focus
         };
         let next_focus = |idx: usize| -> usize {
             (idx + 1) % (max_fields + 1)
@@ -8105,7 +8164,15 @@ impl App {
                     DueDateType::Specific => due_date_val.trim().to_string(),
                 };
                 let due_parsed = self.parse_due_date_input(&due_str);
+                let set_parsed = if set_date_val.trim().is_empty() {
+                    None
+                } else {
+                    self.parse_due_date_input(set_date_val.trim())
+                };
                 if due_date_type != DueDateType::None && due_parsed.is_none() {
+                    return Ok(());
+                }
+                if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                     return Ok(());
                 }
                 let xp_service = XPService::new(&self.db);
@@ -8116,6 +8183,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
+                        set_date: set_parsed,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -8145,6 +8213,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
+                        set_date: set_parsed,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -8177,14 +8246,14 @@ impl App {
                 focus_idx = next_focus(focus_idx);
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::BackTab => {
                 focus_idx = prev_focus(focus_idx);
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::Left => {
@@ -8227,7 +8296,7 @@ impl App {
                 }
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::Right => {
@@ -8270,7 +8339,7 @@ impl App {
                 }
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::Up => {
@@ -8286,7 +8355,7 @@ impl App {
                     }
                     self.update_task_modal_state(
                         task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                     );
                 }
                 // For other fields: Up does nothing (Tab handles cycling)
@@ -8306,7 +8375,7 @@ impl App {
                     }
                     self.update_task_modal_state(
                         task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                     );
                 }
                 // For other fields: Down does nothing
@@ -8317,7 +8386,7 @@ impl App {
                     desc_cursor = desc[..desc_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
                     self.update_task_modal_state(
                         task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                     );
                 }
             }
@@ -8329,7 +8398,7 @@ impl App {
                         .unwrap_or(desc.len());
                     self.update_task_modal_state(
                         task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                     );
                 }
             }
@@ -8367,11 +8436,11 @@ impl App {
                             };
                         }
                     }
-                    4 if due_date_val.len() < 20 && !show_recurrence => {
+                    4 if has_due_value && due_date_val.len() < 20 => {
                         due_date_val.push(c);
                     }
-                    4 if due_date_val.len() < 20 && show_recurrence && has_due_value => {
-                        due_date_val.push(c);
+                    _ if focus_idx == set_date_focus && set_date_val.len() < 10 => {
+                        set_date_val.push(c);
                     }
                     _ if show_recurrence && focus_idx == recurrence_focus && c == ' ' => {
                         recurrence = match recurrence {
@@ -8386,7 +8455,7 @@ impl App {
                 }
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::Backspace => {
@@ -8401,12 +8470,13 @@ impl App {
                             desc_cursor = prev;
                         }
                     }
-                    4 => { due_date_val.pop(); }
+                    4 if has_due_value => { due_date_val.pop(); }
+                    _ if focus_idx == set_date_focus => { set_date_val.pop(); }
                     _ => {}
                 }
                 self.update_task_modal_state(
                     task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                 );
             }
             KeyCode::Enter => {
@@ -8417,7 +8487,7 @@ impl App {
                         desc_cursor = cursor + 1;
                         self.update_task_modal_state(
                             task_id, title, desc, desc_cursor, priority, due_date_type,
-                            due_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                            due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
                         );
                     }
                 } else if !title.trim().is_empty() {
@@ -8434,9 +8504,17 @@ impl App {
                         DueDateType::Specific => due_date_val.trim().to_string(),
                     };
                     let due_parsed = self.parse_due_date_input(&due_str);
+                    let set_parsed = if set_date_val.trim().is_empty() {
+                        None
+                    } else {
+                        self.parse_due_date_input(set_date_val.trim())
+                    };
 
                     if due_date_type != DueDateType::None && due_parsed.is_none() {
                         // Do not save, wait for valid input
+                        return Ok(());
+                    }
+                    if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                         return Ok(());
                     }
 
@@ -8448,6 +8526,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
+                            set_date: set_parsed,
                             completed: false, // kept
                             priority,
                             created_at: Utc::now(),
@@ -8490,6 +8569,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
+                            set_date: set_parsed,
                             completed: false,
                             priority,
                             created_at: Utc::now(),
@@ -8527,6 +8607,7 @@ impl App {
                             priority: TaskPriority::Medium,
                             due_date_type: DueDateType::None,
                             due_date_val: String::new(),
+                            set_date_val: String::new(),
                             focus_idx: 0,
                             parent_task_id,
                             recurrence: None,
@@ -8551,6 +8632,7 @@ impl App {
         priority: TaskPriority,
         due_date_type: DueDateType,
         due_date_val: String,
+        set_date_val: String,
         focus_idx: usize,
         parent_task_id: Option<Uuid>,
         step_selected_idx: usize,
@@ -8566,6 +8648,7 @@ impl App {
                 priority,
                 due_date_type,
                 due_date_val,
+                set_date_val,
                 focus_idx,
                 step_selected_idx,
                 is_step,
@@ -8579,6 +8662,7 @@ impl App {
                 priority,
                 due_date_type,
                 due_date_val,
+                set_date_val,
                 focus_idx,
                 parent_task_id,
                 recurrence,
@@ -8620,11 +8704,12 @@ impl App {
                 };
                 self.db.insert_journal_entry(&entry)?;
                 self.mark_dirty();
-                self.apply_class_passive("journal_create", 0)?;
+	                self.apply_class_passive("journal_create", 0)?;
 
-                // Stage 3 Integration:
-                self.complete_productive_action()?;
-                self.update_daily_adventure_progress("write_journal", 1)?;
+	                // Stage 3 Integration:
+	                self.complete_productive_action()?;
+	                self.increment_quest_progress(60, 1)?;
+	                self.update_daily_adventure_progress("write_journal", 1)?;
                 self.check_action_achievements()?;
 
                 self.reload_data()?;
@@ -8866,7 +8951,7 @@ impl App {
         self.update_daily_adventure_progress("water_tree", 1)?;
 
         // Stage 6 quest progress increment
-        self.increment_quest_progress(50, 1)?;
+	        self.increment_quest_progress(50, 1)?;
         self.simulate_memory_fragment_unlock("zen_water")?;
 
         self.check_tree_evolution(&mut tree)?;
@@ -9029,9 +9114,10 @@ impl App {
                     tree.growth += 5;
                     self.check_tree_evolution(&mut tree)?;
                     self.db.update_zen_tree(&tree)?;
-                    self.simulate_memory_fragment_unlock("daily_adventure")?;
-                    self.apply_class_passive("daily_adventure_complete", 0)?;
-                }
+	                    self.simulate_memory_fragment_unlock("daily_adventure")?;
+	                    self.apply_class_passive("daily_adventure_complete", 0)?;
+	                    self.increment_quest_progress(20, 1)?;
+	                }
                 self.db.update_daily_adventure(adv)?;
             }
         }
@@ -9058,6 +9144,7 @@ impl App {
     }
 
     pub fn complete_productive_action(&mut self) -> Result<()> {
+        crate::services::task_notifications::record_productive_action(&self.db, Utc::now());
         let mut streak = self.db.get_streak()?;
         let today = chrono::Local::now().date_naive();
         let mut increased = false;
@@ -9072,9 +9159,10 @@ impl App {
                         streak.best_streak = streak.current_streak;
                     }
                     streak.last_active_day = Some(today);
-                    self.db.update_streak(&streak)?;
-                    increased = true;
-                    self.apply_class_passive("streak_maintain", 0)?;
+	                    self.db.update_streak(&streak)?;
+	                    increased = true;
+	                    self.apply_class_passive("streak_maintain", 0)?;
+	                    self.increment_quest_progress(100, 1)?;
 
                     self.notifications.push(Notification::info(format!("Streak increased to {} days!", streak.current_streak)));
 
@@ -9103,18 +9191,20 @@ impl App {
                 } else {
                     streak.current_streak = 1;
                     streak.last_active_day = Some(today);
-                    self.db.update_streak(&streak)?;
-                    increased = true;
+	                    self.db.update_streak(&streak)?;
+	                    increased = true;
+	                    self.increment_quest_progress(100, 1)?;
 
                     self.notifications.push(Notification::info("Starting a new streak! Day 1".to_string()));
                 }
             }
             None => {
-                streak.current_streak = 1;
-                streak.best_streak = 1;
-                streak.last_active_day = Some(today);
-                self.db.update_streak(&streak)?;
-                increased = true;
+	                streak.current_streak = 1;
+	                streak.best_streak = 1;
+	                streak.last_active_day = Some(today);
+	                self.db.update_streak(&streak)?;
+	                increased = true;
+	                self.increment_quest_progress(100, 1)?;
 
                 self.notifications.push(Notification::info("First action! Day 1 streak started".to_string()));
             }
@@ -9242,6 +9332,107 @@ impl App {
         };
     }
 
+    fn class_quest_xp_reward(level: i32) -> i32 {
+        level * 100
+    }
+
+    fn class_quest_slug(class_name: &str) -> String {
+        class_name.to_lowercase().replace(' ', "_")
+    }
+
+    fn class_capstone_title_id(class_name: &str) -> Option<&'static str> {
+        match class_name {
+            "Code Warlock" => Some("class_capstone_code_warlock"),
+            "Task Paladin" => Some("class_capstone_task_paladin"),
+            "Mind Sage" => Some("class_capstone_mind_sage"),
+            "Systems Architect" => Some("class_capstone_systems_architect"),
+            "Time Chronomancer" => Some("class_capstone_time_chronomancer"),
+            "Arch Accountant" => Some("class_capstone_arch_accountant"),
+            _ => None,
+        }
+    }
+
+    fn class_story_key(class_name: &str) -> Option<&'static str> {
+        match class_name {
+            "Code Warlock" => Some("warlock"),
+            "Task Paladin" => Some("paladin"),
+            "Mind Sage" => Some("sage"),
+            "Systems Architect" => Some("architect"),
+            "Time Chronomancer" => Some("chronomancer"),
+            "Arch Accountant" => Some("accountant"),
+            _ => None,
+        }
+    }
+
+    fn class_story_lore_id(class_name: &str, quest_level: i32) -> Option<String> {
+        Self::class_story_key(class_name).map(|key| format!("class_{}_{}", key, quest_level))
+    }
+
+    fn unlock_class_quest_story(
+        &mut self,
+        class_name: &str,
+        quest_level: i32,
+        quest_name: &str,
+    ) -> Result<()> {
+        if let Some(story_id) = Self::class_story_lore_id(class_name, quest_level) {
+            if self.db.unlock_lore_entry(&story_id)? {
+                let notif_key = format!("lore_notified_{}", story_id);
+                let _ = self.db.set_setting(&notif_key, "1");
+                self.notifications.push(Notification::info(format!(
+                    "Class Story Unlocked: {}",
+                    quest_name
+                )));
+                self.push_great_chronicle_async(
+                    "ClassStory",
+                    &format!("unlocked the Level {} class story.", quest_level),
+                    true,
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_class_quest_rewards(
+        &mut self,
+        class_name: &str,
+        quest_level: i32,
+        quest_name: &str,
+        lore_reward: &str,
+    ) -> Result<()> {
+        let class_slug = Self::class_quest_slug(class_name);
+        let reward_key = format!("class_quest_rewarded:{}:{}", class_slug, quest_level);
+        if self.db.get_setting(&reward_key)?.as_deref() == Some("true") {
+            return Ok(());
+        }
+
+        let completed_key = format!("class_quest_completed:{}:{}", class_slug, quest_level);
+        self.db.set_setting(&completed_key, "true")?;
+        self.db.set_setting(&reward_key, "true")?;
+
+        let xp = Self::class_quest_xp_reward(quest_level);
+        self.grant_xp(&format!("Class Quest: {}", quest_name), xp)?;
+        self.unlock_class_quest_story(class_name, quest_level, quest_name)?;
+
+        if quest_level == 100 {
+            if let Some(title_id) = Self::class_capstone_title_id(class_name) {
+                if self.db.unlock_legendary_title(title_id)? {
+                    self.notifications.push(Notification::info(format!(
+                        "Class Title Unlocked: {}",
+                        lore_reward
+                    )));
+                    self.push_great_chronicle_async(
+                        "Legend",
+                        "claimed a class capstone title.",
+                        true,
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn increment_quest_progress(&mut self, quest_level: i32, amount: i32) -> Result<()> {
         if let Some(ref u) = self.user {
             let class_name = u.class.name();
@@ -9265,21 +9456,7 @@ impl App {
                             ),
                         )?;
 
-                        // Grant Quest Completion XP (100 * quest_level)
-                        self.grant_xp("Quest Completed Bonus", 100 * quest_level)?;
-
-                        // Insert unlocked custom quest lore entry into the Library
-                        let entry_id = format!("quest_lore_{}", quest_level);
-                        self.db.insert_custom_lore_entry(
-                            &entry_id,
-                            "Questline",
-                            &q.2,
-                            &format!(
-                                "The saga of the level {} quest: '{}'.\nReward lore unlocked: {}",
-                                quest_level, q.2, q.7
-                            ),
-                            true,
-                        )?;
+                        self.apply_class_quest_rewards(class_name, quest_level, &q.2, &q.7)?;
 
                         self.notifications.push(Notification::info(format!("QUEST SUCCESS: {} completed!", q.2)));
                         self.push_great_chronicle_async(
@@ -9424,7 +9601,7 @@ impl App {
             ClassType::ArchAccountant => "accountant",
         };
 
-        for lvl in &[5, 15, 20, 30] {
+        for lvl in &[5, 15] {
             if user_ref.level >= *lvl {
                 let class_key = format!("class_{}_{}", base_class_key, lvl);
                 let notif_key = format!("lore_notified_{}", class_key);
@@ -9519,20 +9696,13 @@ impl App {
             self.reload_data()?;
         } else if status == "Active" && progress >= target {
             self.db.complete_class_quest(class_name, unlock_level)?;
-            self.grant_xp("Completed Class Quest", 200)?;
+            self.apply_class_quest_rewards(class_name, unlock_level, &quest_name, &lore_reward)?;
             self.db.add_chronicle_entry(
                 day_number,
                 &format!(
                     "Completed Class Quest: '{}' - Unlocked: {}",
                     quest_name, lore_reward
                 ),
-            )?;
-            self.db.insert_custom_lore_entry(
-                &format!("quest_story_{}_{}", class_name, unlock_level),
-                "Class",
-                &quest_name,
-                &lore_reward,
-                true,
             )?;
 
             self.trigger_celebration(
@@ -10234,6 +10404,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         priority: TaskPriority::Medium,
                         due_date_type: DueDateType::InDays,
                         due_date_val: "1".to_string(),
+                        set_date_val: String::new(),
                         focus_idx: 0,
                         parent_task_id: None,
                         recurrence: None,
@@ -10426,7 +10597,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn trigger_ambient_particles(&mut self) {
-        self.ambient_particles_ticks_remaining = 60; // 3 seconds at 50ms per tick
+        if !self.ambient_effects_enabled {
+            return;
+        }
+        self.ambient_particles_ticks_remaining = 90; // 4.5 segundos a 50ms por tick
+        self.ambient_burst_effect = if self.active_ambient_effect > 0 {
+            self.active_ambient_effect
+        } else {
+            5
+        };
     }
 
     pub fn tick_prologue(&mut self) {
@@ -10471,21 +10650,35 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_particles(&mut self) {
-        if !self.ambient_effects_enabled || self.active_ambient_effect == 0 {
+        if !self.ambient_effects_enabled {
             self.ambient_particles.clear();
+            self.ambient_burst_effect = 0;
             return;
         }
 
-        let should_spawn = true;
+        let burst_active = self.ambient_particles_ticks_remaining > 0;
+        let effect = if self.active_ambient_effect > 0 {
+            self.active_ambient_effect
+        } else if burst_active {
+            self.ambient_burst_effect.max(1)
+        } else {
+            self.ambient_particles.clear();
+            self.ambient_burst_effect = 0;
+            return;
+        };
+
         if self.ambient_particles_ticks_remaining > 0 {
             self.ambient_particles_ticks_remaining -= 1;
+            if self.ambient_particles_ticks_remaining == 0 && self.active_ambient_effect == 0 {
+                self.ambient_burst_effect = 0;
+            }
         }
 
         use rand::prelude::SliceRandom;
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
-        let max_particles = match self.active_ambient_effect {
+        let max_particles = match effect {
             3 => 120, // Rain
             6 => 120, // Matrix Rain
             4 => 60,  // Snow
@@ -10493,14 +10686,27 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             2 => 40,  // Stars
             _ => 30,
         };
-
-        let spawn_prob = match self.active_ambient_effect {
-            3 | 6 => 0.5, // High spawn rate for rain/matrix
-            _ => 0.25,
+        let max_particles = if burst_active {
+            (max_particles + 60).min(160)
+        } else {
+            max_particles
         };
 
-        if should_spawn && self.ambient_particles.len() < max_particles && rng.gen_bool(spawn_prob) {
-            let symbol = match self.active_ambient_effect {
+        let spawn_prob = if burst_active {
+            1.0
+        } else {
+            match effect {
+            3 | 6 => 0.5, // High spawn rate for rain/matrix
+            _ => 0.25,
+            }
+        };
+
+        let spawn_count = if burst_active { 3 } else { 1 };
+        for _ in 0..spawn_count {
+            if self.ambient_particles.len() >= max_particles || !rng.gen_bool(spawn_prob) {
+                continue;
+            }
+            let symbol = match effect {
                 1 => *['*', 'o', '~', 's'].choose(&mut rng).unwrap_or(&'*'),
                 2 => *['.', '*', '+'].choose(&mut rng).unwrap_or(&'.'),
                 3 => '|',
@@ -10514,7 +10720,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 _ => '*',
             };
 
-            let color = match self.active_ambient_effect {
+            let color = match effect {
                 1 => *[
                     ratatui::style::Color::Rgb(249, 115, 22),
                     ratatui::style::Color::Rgb(163, 230, 53),
@@ -10536,7 +10742,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 _ => ratatui::style::Color::White,
             };
 
-            let speed = match self.active_ambient_effect {
+            let speed = match effect {
                 1 => rng.gen_range(0.1..0.25),
                 2 => rng.gen_range(0.01..0.03),
                 3 => rng.gen_range(0.8..1.3),
@@ -10548,7 +10754,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
             self.ambient_particles.push(Particle {
                 x: rng.gen_range(0..200),
-                y: 0.0,
+                y: if burst_active { rng.gen_range(1.0..18.0) } else { 0.0 },
                 speed,
                 symbol,
                 color,
@@ -10559,7 +10765,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         for mut p in self.ambient_particles.drain(..) {
             p.y += p.speed;
 
-            if self.active_ambient_effect == 1 || self.active_ambient_effect == 4 {
+            if effect == 1 || effect == 4 {
                 let drift = rng.gen_range(-1..=1);
                 p.x = (p.x as i32 + drift).max(0) as u16;
             }
@@ -10574,76 +10780,267 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     fn check_action_achievements(&mut self) -> Result<()> {
         let stats = self.db.get_statistics()?;
 
-        // Task achievements
-        if stats.tasks_completed >= 1 {
-            self.unlock_achievement("first_quest")?;
+        // Logros retroactivos por umbral; cada bloque usa datos persistidos para no depender del evento actual.
+        for (id, target) in [
+            ("first_quest", 1),
+            ("task_apprentice", 10),
+            ("task_squire", 25),
+            ("task_knight", 50),
+            ("task_champion", 250),
+            ("task_legend", 500),
+            ("backlog_reaper", 750),
+            ("thousand_quest_myth", 1000),
+        ] {
+            if stats.tasks_completed >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if self.db.count_completed_tasks_where("priority = 'High'")? >= 25 {
+            self.unlock_achievement("high_priority_slayer")?;
+        }
+        if self.db.count_completed_tasks_where("parent_task_id IS NOT NULL")? >= 50 {
+            self.unlock_achievement("step_sweeper")?;
+        }
+        if self.db.count_completed_tasks_where("recurrence IS NOT NULL")? >= 25 {
+            self.unlock_achievement("recurring_keeper")?;
+        }
+        if self.db.count_completed_tasks_where("due_date IS NOT NULL")? >= 50 {
+            self.unlock_achievement("deadline_dodger")?;
         }
 
-        // Note / journal achievements
-        if stats.notes_created >= 25 {
-            self.unlock_achievement("scholar")?;
+        for (id, target) in [
+            ("note_taker", 1),
+            ("scholar", 25),
+            ("note_architect", 50),
+            ("note_vault", 100),
+            ("note_grand_vault", 250),
+        ] {
+            if stats.notes_created >= target {
+                self.unlock_achievement(id)?;
+            }
         }
-        if stats.journal_entries >= 50 {
-            self.unlock_achievement("chronicler")?;
+        for (id, target) in [
+            ("journal_spark", 1),
+            ("journal_keeper", 10),
+            ("chronicler", 50),
+            ("journal_oracle", 100),
+        ] {
+            if stats.journal_entries >= target {
+                self.unlock_achievement(id)?;
+            }
         }
 
-        // Project achievements — "Complete 10 projects" tracks completed, not created
-        if stats.projects_completed >= 10 {
-            self.unlock_achievement("project_master")?;
+        for (id, target) in [
+            ("project_starter", 1),
+            ("project_builder", 5),
+            ("project_architect", 25),
+            ("project_city_planner", 50),
+        ] {
+            if stats.projects_created >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        for (id, target) in [("project_finisher", 1), ("project_master", 10)] {
+            if stats.projects_completed >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        for (id, target) in [
+            ("milestone_marker", 1),
+            ("milestone_hunter", 10),
+            ("milestone_veteran", 50),
+            ("milestone_legend", 100),
+        ] {
+            if stats.milestones_completed >= target {
+                self.unlock_achievement(id)?;
+            }
         }
 
-        // Focus session achievements
-        if stats.sessions_completed >= 1 {
-            self.unlock_achievement("first_focus")?;
-        }
-        if stats.sessions_completed >= 100 {
-            self.unlock_achievement("deep_worker")?;
-        }
-        if stats.sessions_completed >= 500 {
-            self.unlock_achievement("master_concentration")?;
+        for (id, target) in [
+            ("first_focus", 1),
+            ("focus_initiate", 5),
+            ("focus_regular", 25),
+            ("focus_veteran", 50),
+            ("deep_worker", 100),
+            ("focus_marathoner", 250),
+            ("master_concentration", 500),
+            ("focus_grandmaster", 1000),
+        ] {
+            if stats.sessions_completed >= target {
+                self.unlock_achievement(id)?;
+            }
         }
         let max_duration = self.db.get_max_focus_session_duration()?;
-        if max_duration >= 90 {
-            self.unlock_achievement("ninety_minute_sage")?;
+        for (id, target) in [
+            ("focus_hour", 60),
+            ("ninety_minute_sage", 90),
+            ("two_hour_anchor", 120),
+        ] {
+            if max_duration >= target {
+                self.unlock_achievement(id)?;
+            }
         }
 
-        // Soundscape achievements
         let silent_count = self.db.count_focus_sessions_with_soundscape(&["Silent"])?;
         if silent_count >= 25 {
             self.unlock_achievement("silent_monk")?;
+        }
+        if silent_count >= 50 {
+            self.unlock_achievement("silent_adept")?;
         }
         let forest_count = self.db.count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
         if forest_count >= 50 {
             self.unlock_achievement("forest_wanderer")?;
         }
+        if forest_count >= 100 {
+            self.unlock_achievement("forest_warden")?;
+        }
         let rain_count = self.db.count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
         if rain_count >= 50 {
             self.unlock_achievement("rain_listener")?;
         }
+        if rain_count >= 100 {
+            self.unlock_achievement("storm_listener")?;
+        }
         let unique_soundscapes = self.db.count_unique_soundscapes_used()?;
-        if unique_soundscapes >= 8 {
-            self.unlock_achievement("master_atmosphere")?;
+        for (id, target) in [
+            ("atmosphere_explorer", 3),
+            ("atmosphere_collector", 5),
+            ("master_atmosphere", 8),
+        ] {
+            if unique_soundscapes >= target {
+                self.unlock_achievement(id)?;
+            }
         }
 
-        // Codex achievements
         let codex_count = self.db.count_codices().unwrap_or(0);
-        if codex_count >= 3 {
-            self.unlock_achievement("archivist")?;
-        }
-        if codex_count >= 10 {
-            self.unlock_achievement("grand_archivist")?;
-        }
-
-        // Tree achievement — retroactive if already at stage 5+
-        let zen_stage = self.db.get_zen_tree().map(|t| t.stage).unwrap_or(0);
-        if zen_stage >= 5 {
-            self.unlock_achievement("ancient_gardener")?;
+        for (id, target) in [
+            ("archivist", 3),
+            ("grand_archivist", 10),
+        ] {
+            if codex_count >= target {
+                self.unlock_achievement(id)?;
+            }
         }
 
-        // Streak achievement — use >= so it triggers even if already past 100
+        let zen_tree = self.db.get_zen_tree().ok();
+        let zen_stage = zen_tree.as_ref().map(|t| t.stage).unwrap_or(0);
+        for (id, target) in [
+            ("tree_sprout", 2),
+            ("tree_guardian", 3),
+            ("tree_elder", 4),
+            ("ancient_gardener", 5),
+        ] {
+            if zen_stage >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if zen_tree.as_ref().map(|t| t.growth).unwrap_or(0) >= 500 {
+            self.unlock_achievement("tree_ascendant")?;
+        }
+
+        let hydration_total = self.db.hydration_total_glasses()?;
+        for (id, target) in [
+            ("hyd_first_glass", 1),
+            ("hyd_100_glasses", 100),
+            ("hyd_500_glasses", 500),
+            ("hyd_1000_glasses", 1000),
+        ] {
+            if hydration_total >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        let hydration_goal_days = self.db.hydration_goal_days()?;
+        for (id, target) in [
+            ("hyd_daily_goal", 1),
+            ("hyd_week_goals", 7),
+            ("hyd_fortnight_goals", 14),
+            ("hyd_month_goals", 30),
+        ] {
+            if hydration_goal_days >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if self.db.hydration_max_glasses_day()? >= 12 {
+            self.unlock_achievement("hyd_overachiever")?;
+        }
+
         let streak = self.db.get_streak()?;
-        if streak.current_streak >= 100 {
-            self.unlock_achievement("hundred_day_journey")?;
+        for (id, target) in [
+            ("streak_three", 3),
+            ("streak_week", 7),
+            ("streak_month", 30),
+            ("hundred_day_journey", 100),
+        ] {
+            if streak.current_streak >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+
+        let shared_projects = self.db.count_shared_projects()?;
+        for (id, target) in [
+            ("first_companion", 1),
+            ("shared_initiate", 3),
+            ("alliance_builder", 25),
+        ] {
+            if shared_projects >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if stats.projects_completed >= 1 && shared_projects >= 1 {
+            self.unlock_achievement("quest_together")?;
+        }
+        let messages = self.db.count_chronicle_messages()?;
+        for (id, target) in [
+            ("fellowship_scribe", 25),
+            ("fellowship_voice", 50),
+            ("chronicler_fellowship", 100),
+        ] {
+            if messages >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        let invites = self.db.count_invitations_sent()?;
+        if invites >= 1 {
+            self.unlock_achievement("invitation_sent")?;
+        }
+        if invites >= 10 {
+            self.unlock_achievement("mentor")?;
+        }
+
+        for (id, target) in [
+            ("ritual_first", 1),
+            ("ritual_keeper", 10),
+            ("ritual_master", 50),
+            ("ritual_legend", 200),
+        ] {
+            if stats.rituals_completed >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if self.db.count_daily_adventures_completed()? >= 25 {
+            self.unlock_achievement("daily_adventurer")?;
+        }
+        for (id, target) in [
+            ("xp_initiate", 1000),
+            ("xp_adept", 10000),
+            ("xp_legend", 100000),
+        ] {
+            if stats.total_xp_earned >= target {
+                self.unlock_achievement(id)?;
+            }
+        }
+        if stats.backup_count >= 1 {
+            self.unlock_achievement("backup_initiate")?;
+        }
+        if stats.sync_count >= 1 {
+            self.unlock_achievement("sync_initiate")?;
+        }
+        if stats.sync_count >= 10 {
+            self.unlock_achievement("sync_regular")?;
+        }
+        if stats.conflict_count >= 1 {
+            self.unlock_achievement("conflict_survivor")?;
         }
 
         // Stage 6 milestone check: 1000 tasks
@@ -10676,6 +11073,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 )?;
 
                 self.notifications.push(Notification::info(format!("ACHIEVEMENT UNLOCKED: {} ({})", ach.name, ach.description)));
+                self.trigger_ambient_particles();
                 self.push_great_chronicle_async(
                     "Achievement",
                     "unlocked an achievement.",
@@ -10698,6 +11096,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             let result = self.sync_result.try_lock().ok().and_then(|mut g| g.take());
             if let Some(bg) = result {
                 self.sync_in_progress = false;
+                let _ = self.db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
                 match bg.error {
                     Some(e) => {
                         self.sync_failure_count = self.sync_failure_count.saturating_add(1);
@@ -10721,7 +11120,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                             )));
                         }
                         self.last_sync_warlock_xp = 0;
-                        self.sync_status_msg = format!("↑{} pushed  ↓{} pulled", bg.pushed, bg.pulled);
+                        self.sync_status_msg = format!("↑{}↓{}", bg.pushed, bg.pulled);
                         if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
                             self.modal_state = ModalType::SyncProgress {
                                 step: 2,
@@ -10731,6 +11130,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         self.apply_class_passive("sync_complete", 0)?;
                         self.reload_data()?;
+                        self.last_task_notification_tick = None;
                         self.load_chapter_progress_from_cache();
                         self.great_chronicle_entries =
                             self.db.get_global_chronicle_entries().unwrap_or_default();
@@ -11138,11 +11538,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     fn start_forced_sync(&mut self) {
         if self.sync_in_progress {
-            self.sync_status_msg = "Sync already in progress...".to_string();
+            self.sync_status_msg = "S󰓦".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             return;
         }
-        self.sync_status_msg = "Syncing...".to_string();
+        self.sync_status_msg = "S󰓦".to_string();
         self.modal_state = ModalType::SyncProgress {
             step: 0,
             message: "Preparing full synchronization...".to_string(),
@@ -11155,7 +11555,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
         self.sync_in_progress = true;
-        self.sync_status_msg = "Syncing...".to_string();
+        self.sync_status_msg = "S󰓦".to_string();
+        let _ = self.db.conn.execute_batch("PRAGMA busy_timeout = 50;");
 
         let result_slot = std::sync::Arc::clone(&self.sync_result);
         let identity = self.identity.clone();
@@ -11505,6 +11906,42 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
+    }
+
+    pub fn tick_task_notifications(&mut self) -> Result<()> {
+        if let Some(t) = self.last_task_notification_tick {
+            if t.elapsed().as_secs() < 60 {
+                return Ok(());
+            }
+        }
+        self.last_task_notification_tick = Some(std::time::Instant::now());
+
+        self.task_notifications_enabled =
+            crate::services::task_notifications::task_notifications_enabled(&self.db);
+        if !self.task_notifications_enabled {
+            return Ok(());
+        }
+
+        let events = crate::services::task_notifications::collect_task_notifications(
+            &self.db,
+            &self.all_tasks,
+            Utc::now(),
+        )?;
+        for event in events {
+            if self.external_notifications {
+                crate::services::notifications::send_system_notification_with_icon(
+                    &event.title,
+                    &event.message,
+                    event.urgent,
+                    event.icon,
+                );
+            }
+            self.notifications.push(Notification::info(format!(
+                "{}: {}",
+                event.title, event.message
+            )));
+        }
+        Ok(())
     }
 
     // Show the update modal as soon as the background check finishes and the screen is ready.
@@ -11877,10 +12314,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.audio_player.play_focus_end();
                 if self.external_notifications {
                     let duration = active.duration_mins;
-                    crate::services::notifications::send_system_notification(
+                    crate::services::notifications::send_system_notification_with_icon(
                         "Focus Session Complete",
                         &format!("{} min session complete. Great work!", duration),
                         false,
+                        crate::services::notifications::NotificationIcon::Focus,
                     );
                 }
                 // Focus session completes!
@@ -11905,7 +12343,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.grant_xp("Focus Session Complete", xp)?;
                 let focus_trigger = if duration == 25 { "focus_pomodoro" } else { "focus_session" };
                 self.apply_class_passive(focus_trigger, 0)?;
-                self.increment_quest_progress(25, duration)?;
+	                self.increment_quest_progress(30, duration)?;
+	                self.increment_quest_progress(25, duration)?;
                 self.simulate_memory_fragment_unlock("focus_session")?;
 
                 let final_duration = if active_soundscape == "White Noise" {
@@ -12247,7 +12686,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     } else {
                         // Fully completed for the day
                         self.push_great_chronicle_async("SidequestComplete", "fulfilled a sidequest.", true);
-                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
+	                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
+	                        self.increment_quest_progress(70, 1)?;
                         if target > 1 {
                             self.notifications.push(Notification::info(
                                 format!("Sidequest Complete: {} (all {}) +{} XP", ritual_name, target, xp)
@@ -12379,7 +12819,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
                 let milestone_xp = m.xp_reward;
                 let milestone_name = m.name.clone();
-                self.grant_xp(&format!("Milestone Met: {}", milestone_name), milestone_xp)?;
+	                self.grant_xp(&format!("Milestone Met: {}", milestone_name), milestone_xp)?;
+	                self.increment_quest_progress(80, 1)?;
                 self.trigger_ambient_particles();
 
                 if let Some(ref u) = self.user {
@@ -12422,8 +12863,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let proj_name = existing.name.clone();
                 self.grant_xp(&format!("Complete Campaign: {}", proj_name), 200)?;
 
-                // Stage 6: increment Level 75 quest progress
-                self.increment_quest_progress(75, 1)?;
+	                self.increment_quest_progress(90, 1)?;
+	                self.increment_quest_progress(75, 1)?;
 
                 if let Some(ref u) = self.user {
                     let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
@@ -12642,10 +13083,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if matches!(self.modal_state, ModalType::None) {
                     self.audio_player.play_water_alert();
                     if self.external_notifications {
-                        crate::services::notifications::send_system_notification(
+                        crate::services::notifications::send_system_notification_with_icon(
                             "Hydration Reminder",
                             "Time to drink a glass of water!",
                             false,
+                            crate::services::notifications::NotificationIcon::Hydration,
                         );
                     }
                     self.modal_state = ModalType::HydrationReminder;
@@ -12876,6 +13318,7 @@ mod app_tests {
             description: None,
             priority: TaskPriority::Medium,
             due_date: None,
+            set_date: None,
             completed: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -13147,6 +13590,7 @@ mod app_tests {
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 due_date: None,
+                set_date: None,
                 owner_identity: None,
                 owner_username: None,
                 parent_task_id: None,
@@ -13211,6 +13655,7 @@ mod app_tests {
             description: Some("Stay hydrated during focus".to_string()),
             frequency: "Daily".to_string(),
             reward_xp: 30,
+            daily_target: 1,
             created_at: Utc::now(),
         };
         app.db.insert_ritual(&rit).unwrap();
@@ -13584,17 +14029,24 @@ mod app_tests {
 
         // Triggering sets ticks remaining
         app.trigger_ambient_particles();
-        assert_eq!(app.ambient_particles_ticks_remaining, 60);
+        assert_eq!(app.ambient_particles_ticks_remaining, 90);
+        assert_eq!(app.ambient_burst_effect, app.active_ambient_effect);
 
         // Ticking down decrements ticks remaining
         app.tick_particles();
-        assert_eq!(app.ambient_particles_ticks_remaining, 59);
+        assert_eq!(app.ambient_particles_ticks_remaining, 89);
 
         // Verify ticking down to 0
-        for _ in 0..59 {
+        for _ in 0..89 {
             app.tick_particles();
         }
         assert_eq!(app.ambient_particles_ticks_remaining, 0);
+
+        app.active_ambient_effect = 0;
+        app.trigger_ambient_particles();
+        assert_eq!(app.ambient_burst_effect, 5);
+        app.tick_particles();
+        assert!(!app.ambient_particles.is_empty());
 
         let _ = std::fs::remove_file(db_file);
     }
