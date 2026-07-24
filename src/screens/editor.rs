@@ -4,11 +4,11 @@
 
 use crate::theme::Theme;
 use ratatui::{
-    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
+    Frame,
 };
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
@@ -966,6 +966,22 @@ impl EditorState {
         }
     }
 
+    pub fn handle_ctrl_backspace(&mut self) {
+        if self.editing_title {
+            let cursor = self.title.len();
+            delete_word_before_cursor(&mut self.title, cursor);
+        } else if self.cursor_x > 0 {
+            let line = &mut self.lines[self.cursor_y];
+            self.cursor_x = delete_word_before_cursor(line, self.cursor_x);
+        } else if self.cursor_y > 0 {
+            let cur = self.lines.remove(self.cursor_y);
+            self.cursor_y -= 1;
+            let prev_line = &mut self.lines[self.cursor_y];
+            self.cursor_x = prev_line.len();
+            prev_line.push_str(&cur);
+        }
+    }
+
     pub fn handle_delete(&mut self) {
         if self.editing_title {
             return;
@@ -1009,6 +1025,32 @@ impl EditorState {
     }
 }
 
+fn delete_word_before_cursor(input: &mut String, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    if cursor == 0 {
+        return 0;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+
+    input.drain(start..cursor);
+    start
+}
+
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // Returns (sel_start_byte, sel_end_byte_exclusive) for `line_i` in visual mode
@@ -1029,7 +1071,11 @@ fn line_sel_range(line_i: usize, line: &str, state: &EditorState) -> Option<(usi
         floor_char_boundary(line, sx.min(line.len()))
     };
     let end = if line_i < ey {
-        if line.is_empty() { 1 } else { line.len() }
+        if line.is_empty() {
+            1
+        } else {
+            line.len()
+        }
     } else {
         // inclusive end — include the char at ex
         let clamped = floor_char_boundary(line, ex.min(line.len().saturating_sub(1)));
@@ -1414,6 +1460,24 @@ mod tests {
         assert_eq!(editor.lines[0], "Hi    Y");
         assert_eq!(editor.cursor_y, 0);
         assert_eq!(editor.cursor_x, 2);
+    }
+
+    #[test]
+    fn test_ctrl_backspace_deletes_previous_word() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            Some(Uuid::new_v4()),
+            "Title".to_string(),
+            "alpha beta gamma".to_string(),
+        );
+        editor.mode = EditorMode::Insert;
+        editor.cursor_x = "alpha beta ".len();
+
+        editor.handle_ctrl_backspace();
+
+        assert_eq!(editor.lines[0], "alpha gamma");
+        assert_eq!(editor.cursor_x, "alpha ".len());
     }
 
     #[test]

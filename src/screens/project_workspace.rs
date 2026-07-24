@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // project_workspace.rs — el workspace donde ocurre todo: tareas, notas, journal y milestones
 // ─────────────────────────────────────────────────────────────────────────────
-use crate::app::{App, DueDateType, ModalType};
+use crate::app::{App, DueDateType, JOURNAL_ENTRY_CHAR_LIMIT, ModalType};
 use crate::milestone_templates::{self, ProjectStats, Tier};
 use crate::models::RecurrenceType;
 use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
@@ -3004,6 +3004,9 @@ fn draw_journal_modal(f: &mut Frame, content: &str, theme: &Theme) {
     );
 
     let accent_color = theme.primary;
+    let chars_used = content.chars().count();
+    let chars_left = JOURNAL_ENTRY_CHAR_LIMIT.saturating_sub(chars_used);
+    let modal_title = format!(" Write Daily Chronicle (Journal) [{:03}] ", chars_left);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -3019,7 +3022,7 @@ fn draw_journal_modal(f: &mut Frame, content: &str, theme: &Theme) {
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
-            " Write Daily Chronicle (Journal) ",
+            modal_title,
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
