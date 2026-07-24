@@ -421,6 +421,17 @@ fn draw_quick_wins(
                     )
                 };
                 let (prio_label, prio_color) = priority_label(t.priority);
+                let project_name = app
+                    .projects
+                    .iter()
+                    .find(|p| Some(p.id) == t.project_id)
+                    .map(|p| p.name.as_str())
+                    .unwrap_or("Unknown Project");
+                let project_style = if is_sel {
+                    text_style
+                } else {
+                    Style::default().fg(theme.muted)
+                };
                 ListItem::new(Line::from(vec![
                     Span::styled(cursor, cursor_style),
                     Span::styled(
@@ -428,6 +439,7 @@ fn draw_quick_wins(
                         Style::default().fg(prio_color),
                     ),
                     Span::styled(t.title.as_str(), text_style),
+                    Span::styled(format!(" ({})", project_name), project_style),
                 ]))
             })
             .collect()
@@ -1032,6 +1044,8 @@ fn draw_fellowship_panel(
                 format!("{}", pending),
                 Style::default().fg(if pending > 0 { theme.warning } else { theme.disabled }),
             ),
+        ]),
+        Line::from(vec![
             Span::styled("   Unread: ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("{}", unread_count),

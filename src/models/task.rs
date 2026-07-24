@@ -75,6 +75,8 @@ pub struct Task {
     pub title: String,
     pub description: Option<String>,
     pub due_date: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub set_date: Option<DateTime<Utc>>,
     pub completed: bool,
     pub priority: TaskPriority,
     pub created_at: DateTime<Utc>,

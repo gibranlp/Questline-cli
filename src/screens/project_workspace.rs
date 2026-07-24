@@ -7,7 +7,7 @@ use crate::milestone_templates::{self, ProjectStats, Tier};
 use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
@@ -467,6 +467,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             priority,
             due_date_type,
             due_date_val,
+            set_date_val,
             focus_idx,
             parent_task_id,
             recurrence,
@@ -482,6 +483,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 *priority,
                 *due_date_type,
                 due_date_val,
+                set_date_val,
                 *focus_idx,
                 theme,
                 None,
@@ -499,6 +501,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             priority,
             due_date_type,
             due_date_val,
+            set_date_val,
             focus_idx,
             step_selected_idx,
             is_step,
@@ -517,6 +520,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 *priority,
                 *due_date_type,
                 due_date_val,
+                set_date_val,
                 *focus_idx,
                 theme,
                 steps_opt,
@@ -577,6 +581,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         priority,
         due_date_type,
         due_date_val,
+        set_date_val,
         focus_idx,
         parent_task_id,
         recurrence,
@@ -593,6 +598,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             *priority,
             *due_date_type,
             due_date_val,
+            set_date_val,
             *focus_idx,
             theme,
             None,
@@ -994,6 +1000,27 @@ fn draw_tasks_tab(
                         String::new()
                     };
 
+                    let today = Utc::now().date_naive();
+                    let date_badge = t
+                        .due_date
+                        .or(t.set_date);
+                    let date_badge_style = |date: DateTime<Utc>| {
+                        let date_day = date.date_naive();
+                        let fg = if date_day <= today {
+                            theme.danger
+                        } else if date_day <= today + Duration::days(7) {
+                            theme.warning
+                        } else {
+                            theme.success
+                        };
+
+                        if is_sel {
+                            Style::default().fg(fg).bg(theme.selection).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(fg)
+                        }
+                    };
+
                     if t.completed {
                         let (fg, bg) = if is_sel { (theme.muted, accent_color) } else { (theme.muted, Color::Reset) };
                         let mut spans = vec![
@@ -1007,6 +1034,12 @@ fn draw_tasks_tab(
                         if !recur_badge.is_empty() {
                             spans.push(Span::styled(recur_badge, Style::default().fg(fg).bg(bg)));
                         }
+                        if let Some(date) = date_badge {
+                            spans.push(Span::styled(
+                                format!(" [{}]", date.format("%Y-%m-%d")),
+                                Style::default().fg(fg).bg(bg),
+                            ));
+                        }
                         ListItem::new(Line::from(spans))
                     } else {
                         let mut spans = vec![
@@ -1019,6 +1052,12 @@ fn draw_tasks_tab(
                         }
                         if !recur_badge.is_empty() {
                             spans.push(Span::styled(recur_badge, Style::default().fg(Color::Cyan)));
+                        }
+                        if let Some(date) = date_badge {
+                            spans.push(Span::styled(
+                                format!(" [{}]", date.format("%Y-%m-%d")),
+                                date_badge_style(date),
+                            ));
                         }
                         // Badge de compañero — muestra quién creó la tarea en proyectos compartidos
                         if is_shared {
@@ -2067,6 +2106,7 @@ fn draw_task_modal(
     priority: TaskPriority,
     due_date_type: DueDateType,
     due_date_val: &str,
+    set_date_val: &str,
     focus_idx: usize,
     theme: &Theme,
     // None = NewTask (no steps section); Some(slice) = EditTask (always show steps section)
@@ -2081,7 +2121,8 @@ fn draw_task_modal(
 
     let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
     // índice de foco dinámico para recurrencia y steps
-    let recurrence_focus_idx: usize = if has_due_value { 5 } else { 4 };
+    let set_date_focus_idx: usize = if has_due_value { 5 } else { 4 };
+    let recurrence_focus_idx: usize = set_date_focus_idx + 1;
     let steps_focus_idx: usize = recurrence_focus_idx + 1;
 
     // Los índices de chunk cambian según si mostramos description o no — no manches qué rollo
@@ -2236,10 +2277,10 @@ fn draw_task_modal(
         f.render_widget(desc_p, chunks[1]);
     }
 
-    // Priority & Due Date side-by-side row
+    // Priority, Due Date, and Set Date row
     let row_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Percentage(32), Constraint::Percentage(38), Constraint::Percentage(30)])
         .split(chunks[prio_chunk]);
 
     // Priority selector field
@@ -2292,13 +2333,17 @@ fn draw_task_modal(
             } else {
                 Style::default().fg(theme.border)
             };
-            let type_text = due_date_type.name();
+            let type_text = if focus_idx == 3 {
+                format!("< {} >", due_date_type.name())
+            } else {
+                due_date_type.name().to_string()
+            };
             let type_p = Paragraph::new(type_text).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(type_border_style)
-                    .title(" Due Type "),
+                    .title(if focus_idx == 3 { " Due Type  <-/-> " } else { " Due Type " }),
             );
             f.render_widget(type_p, due_sub_chunks[0]);
 
@@ -2350,16 +2395,52 @@ fn draw_task_modal(
             } else {
                 Style::default().fg(theme.border)
             };
-            let due_p = Paragraph::new(due_date_type.name()).block(
+            let due_text = if focus_idx == 3 {
+                format!("< {} >", due_date_type.name())
+            } else {
+                due_date_type.name().to_string()
+            };
+            let due_p = Paragraph::new(due_text).block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
                     .border_style(due_border_style)
-                    .title(" Due Date "),
+                    .title(if focus_idx == 3 { " Due Date  <-/-> " } else { " Due Date " }),
             );
             f.render_widget(due_p, row_chunks[1]);
         }
     }
+
+    let set_border_style = if focus_idx == set_date_focus_idx {
+        Style::default()
+            .fg(accent_color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(theme.border)
+    };
+    let set_date_owned;
+    let set_date_text = if set_date_val.is_empty() {
+        if focus_idx == set_date_focus_idx { "_" } else { "yyyy-mm-dd" }
+    } else if focus_idx == set_date_focus_idx {
+        set_date_owned = format!("{}_", set_date_val);
+        &set_date_owned
+    } else {
+        set_date_val
+    };
+    let set_p = Paragraph::new(set_date_text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(set_border_style)
+                .title(" Set Date "),
+        )
+        .style(if set_date_val.is_empty() && focus_idx != set_date_focus_idx {
+            Style::default().fg(theme.muted)
+        } else {
+            Style::default().fg(Color::White)
+        });
+    f.render_widget(set_p, row_chunks[2]);
 
     // Campo de recurrencia — solo para tareas padre (no pasos)
     if show_recurrence {

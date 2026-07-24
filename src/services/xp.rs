@@ -56,6 +56,11 @@ impl<'a> XPService<'a> {
             final_xp = (final_xp as f64 * 1.05).round() as i32 + 2;
         }
 
+        let quest_bonus = self.class_quest_bonus_percent(user.class, event_type)?;
+        if quest_bonus > 0 {
+            final_xp = (final_xp as f64 * (1.0 + quest_bonus as f64 / 100.0)).round() as i32;
+        }
+
         // Persiste el evento en la DB para que el historial de XP quede registrado
         let event = XPEvent {
             id: Uuid::new_v4(),
@@ -87,5 +92,80 @@ impl<'a> XPService<'a> {
         self.db.update_user(user)?;
 
         Ok(leveled_up)
+    }
+
+    fn class_quest_bonus_percent(&self, class: ClassType, event_type: &str) -> Result<i32> {
+        if event_type.starts_with("Passive:") || event_type.contains("Class Quest") {
+            return Ok(0);
+        }
+
+        let completed = |level: i32| -> Result<bool> {
+            let key = format!("class_quest_completed:{}:{}", class_slug(class), level);
+            Ok(self.db.get_setting(&key)?.as_deref() == Some("true"))
+        };
+
+        let is_task = event_type.contains("Task") || event_type.contains("Quest") || event_type.contains("Hero");
+        let is_daily = event_type.contains("Daily Quest") || event_type.contains("Quest Chain");
+        let is_focus = event_type.contains("Focus");
+        let is_note = event_type.contains("Note") || event_type.contains("Scroll");
+        let is_journal = event_type.contains("Journal");
+        let is_sidequest = event_type.contains("Sidequest") || event_type.contains("Ritual");
+        let is_milestone = event_type.contains("Milestone");
+        let is_project = event_type.contains("Project") || event_type.contains("Campaign");
+        let is_sync = event_type.contains("Sync");
+        let is_memory = event_type.contains("Memory") || event_type.contains("Fragment");
+
+        let mut percent = 0;
+        if completed(10)? && is_task {
+            percent += 5;
+        }
+        if completed(20)? && is_daily {
+            percent += 5;
+        }
+        if completed(30)? && is_focus {
+            percent += 5;
+        }
+        if completed(60)? && is_journal {
+            percent += 5;
+        }
+        if completed(70)? && is_sidequest {
+            percent += 5;
+        }
+        if completed(80)? && is_milestone {
+            percent += 5;
+        }
+        if completed(90)? && is_project {
+            percent += 10;
+        }
+        if completed(100)? {
+            percent += 10;
+        }
+
+        if completed(40)? {
+            let class_match = match class {
+                ClassType::CodeWarlock => is_note || is_sync,
+                ClassType::TaskPaladin => is_task,
+                ClassType::MindSage => is_note || is_journal || is_memory,
+                ClassType::SystemsArchitect => is_project || is_milestone,
+                ClassType::TimeChronomancer => is_focus,
+                ClassType::ArchAccountant => true,
+            };
+            if class_match {
+                percent += 5;
+            }
+        }
+
+        Ok(percent)
+    }
+}
+
+fn class_slug(class: ClassType) -> &'static str {
+    match class {
+        ClassType::CodeWarlock => "code_warlock",
+        ClassType::TaskPaladin => "task_paladin",
+        ClassType::MindSage => "mind_sage",
+        ClassType::SystemsArchitect => "systems_architect",
+        ClassType::TimeChronomancer => "time_chronomancer",
+        ClassType::ArchAccountant => "arch_accountant",
     }
 }

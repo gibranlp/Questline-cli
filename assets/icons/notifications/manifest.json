@@ -1,0 +1,23 @@
+{
+  "tasks": "assets/icons/notifications/tasks.png",
+  "task_due": "assets/icons/notifications/task_due.png",
+  "task_overdue": "assets/icons/notifications/task_overdue.png",
+  "task_completed": "assets/icons/notifications/task_completed.png",
+  "task_recurring": "assets/icons/notifications/task_recurring.png",
+  "task_high_priority": "assets/icons/notifications/task_high_priority.png",
+  "warning": "assets/icons/notifications/warning.png",
+  "info": "assets/icons/notifications/info.png",
+  "focus": "assets/icons/notifications/focus.png",
+  "task_daily_summary": "assets/icons/notifications/task_daily_summary.png",
+  "task_idle": "assets/icons/notifications/task_idle.png",
+  "fellowship": "assets/icons/notifications/fellowship.png",
+  "notification_swarm": "assets/icons/notifications/notification_swarm.png",
+  "level_up": "assets/icons/notifications/level_up.png",
+  "achievement": "assets/icons/notifications/achievement.png",
+  "hydration": "assets/icons/notifications/hydration.png",
+  "sync": "assets/icons/notifications/sync.png",
+  "journal_notes": "assets/icons/notifications/journal_notes.png",
+  "rewards": "assets/icons/notifications/rewards.png",
+  "daily_adventure": "assets/icons/notifications/daily_adventure.png",
+  "evergrowth": "assets/icons/notifications/evergrowth.png"
+}

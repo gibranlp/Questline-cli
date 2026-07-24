@@ -712,22 +712,31 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             } else if let Ok(t) = serde_json::from_str::<Task>(content) {
                                 // Triquete de completado: si ya está completa localmente, no la regresamos a incompleta
-                                let local_completed = self.db.get_task_by_id(ent_uuid)
+                                let local_task = self.db.get_task_by_id(ent_uuid).ok();
+                                let local_completed = local_task
+                                    .as_ref()
                                     .map(|lt| lt.completed)
                                     .unwrap_or(false);
                                 let was_incomplete_locally = !local_completed;
+                                let assigned_to_me = self
+                                    .db
+                                    .get_task_assignments(&t.id.to_string())
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .any(|(id, _)| id == self.identity.public_key.as_str());
                                 if local_completed && !t.completed {
                                     pulled_count += 1;
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
                                     let _ = self.db.conn.execute(
-                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
                                         params![
                                             t.id.to_string(),
                                             t.project_id.map(|id| id.to_string()),
                                             t.title.clone(),
                                             t.description.clone(),
                                             t.due_date.map(|d| d.to_rfc3339()),
+                                            t.set_date.map(|d| d.to_rfc3339()),
                                             if t.completed { 1 } else { 0 },
                                             t.priority.name(),
                                             t.created_at.to_rfc3339(),
@@ -748,6 +757,29 @@ impl<'a> SyncEngine<'a> {
                                                 let xp = if t.priority == crate::models::TaskPriority::High { 50 } else { 25 };
                                                 let xp_svc = crate::services::XPService::new(self.db);
                                                 let _ = xp_svc.grant_xp(&mut user, "Complete Shared Task Quest", xp);
+                                            }
+                                            self.create_task_fellowship_notification(
+                                                &format!("task_completed:{}", log.id),
+                                                "task_completed",
+                                                "Assigned quest completed",
+                                                &format!("{} was completed.", t.title),
+                                                &t.id.to_string(),
+                                            );
+                                        }
+                                    } else if assigned_to_me && log.operation == "update" {
+                                        if let Some(local) = local_task {
+                                            let meaningful_update = local.title != t.title
+                                                || local.description != t.description
+                                                || local.due_date != t.due_date
+                                                || local.set_date != t.set_date;
+                                            if meaningful_update {
+                                                self.create_task_fellowship_notification(
+                                                    &format!("task_updated:{}", log.id),
+                                                    "task_updated",
+                                                    "Assigned quest updated",
+                                                    &format!("{} was updated.", t.title),
+                                                    &t.id.to_string(),
+                                                );
                                             }
                                         }
                                     }
@@ -972,6 +1004,20 @@ impl<'a> SyncEngine<'a> {
                                     "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
                                     params![task_id, identity, username],
                                 );
+                                if identity == self.identity.public_key {
+                                    let task_title = Uuid::parse_str(task_id)
+                                        .ok()
+                                        .and_then(|id| self.db.get_task_by_id(id).ok())
+                                        .map(|t| t.title)
+                                        .unwrap_or_else(|| "A quest".to_string());
+                                    self.create_task_fellowship_notification(
+                                        &format!("task_assigned:{}", log.id),
+                                        "task_assignment",
+                                        "Quest assigned",
+                                        &format!("{} was assigned to you.", task_title),
+                                        task_id,
+                                    );
+                                }
                                 pulled_count += 1;
                             }
                         }
@@ -1084,6 +1130,25 @@ impl<'a> SyncEngine<'a> {
 
         Ok((pushed_count, pulled_count, conflicts))
     }
+
+    /// Registra una notificación de Fellowship una sola vez por evento remoto aplicado.
+    fn create_task_fellowship_notification(
+        &self,
+        dedup_key: &str,
+        notif_type: &str,
+        title: &str,
+        content: &str,
+        task_id: &str,
+    ) {
+        let setting_key = format!("task_notify:fellowship_created:{}", dedup_key);
+        if self.db.get_setting(&setting_key).ok().flatten().is_some() {
+            return;
+        }
+        let _ = self.db.set_setting(&setting_key, "1");
+        let _ = self
+            .db
+            .create_notification(notif_type, title, content, Some(task_id));
+    }
 }
 
 #[cfg(test)]
@@ -1152,6 +1217,7 @@ mod tests {
             title: "Test Sync Task".to_string(),
             description: Some("Description for testing sync".to_string()),
             due_date: None,
+            set_date: None,
             completed: false,
             priority: TaskPriority::High,
             created_at: Utc::now(),
