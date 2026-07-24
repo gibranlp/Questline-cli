@@ -903,27 +903,48 @@ async fn main() -> Result<()> {
                         height: popup_h.min(size.height),
                     };
 
+                    let is_swarm = matches!(notif.kind, NotificationKind::Swarm);
+                    let popup_bg = if is_swarm {
+                        Color::Rgb(24, 10, 38)
+                    } else {
+                        theme.background
+                    };
                     f.render_widget(Clear, overlay_area);
-                    f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
+                    f.render_widget(
+                        Block::default().style(Style::default().bg(popup_bg)),
+                        overlay_area,
+                    );
 
                     let msg_color = match notif.kind {
-                        NotificationKind::Info    => Color::Rgb(200, 230, 255),
+                        NotificationKind::Info => Color::Rgb(200, 230, 255),
                         NotificationKind::Warning => Color::Rgb(255, 240, 180),
-                        NotificationKind::Swarm   => Color::Rgb(255, 200, 200),
+                        NotificationKind::Swarm => Color::Rgb(233, 213, 255),
                     };
-                    let border_color = theme.primary;
+                    let border_color = if is_swarm {
+                        Color::Rgb(168, 85, 247)
+                    } else {
+                        theme.primary
+                    };
+                    let title_color = if is_swarm {
+                        Color::Rgb(216, 180, 254)
+                    } else {
+                        border_color
+                    };
                     let title_text = format!("  {}  ", notif.title);
                     let block = Block::default()
                         .borders(Borders::ALL)
                         .border_type(BorderType::Double)
                         .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
-                        .title(Span::styled(title_text, Style::default().fg(border_color).add_modifier(Modifier::BOLD)));
+                        .title(Span::styled(
+                            title_text,
+                            Style::default().fg(title_color).add_modifier(Modifier::BOLD),
+                        ));
 
                     let paragraph = Paragraph::new(format!(" {}", notif.message))
                         .block(block)
                         .alignment(Alignment::Center)
                         .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(msg_color));
+                        .style(Style::default().fg(msg_color).bg(popup_bg));
 
                     f.render_widget(paragraph, overlay_area);
                 }

@@ -16,11 +16,67 @@ use crate::models::{
     ClassType, DailyAdventure, DailyQuest, DailyReflection, FocusSession, JournalEntry, Milestone,
     Note, Project, RecurrenceType, Ritual, Task, TaskPriority, User, ZenTree,
 };
+use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
 use crate::screens::onboarding::OnboardingFocus;
-use crate::screens::ActiveScreen;
 use crate::services::{ThemeService, XPService};
 use crate::theme::ThemeChoice;
+
+pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
+
+fn delete_word_before_cursor(input: &mut String, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    if cursor == 0 {
+        return 0;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+
+    input.drain(start..cursor);
+    start
+}
+
+fn delete_last_word(input: &mut String) {
+    let cursor = input.len();
+    delete_word_before_cursor(input, cursor);
+}
+
+fn is_ctrl_backspace(key: KeyEvent) -> bool {
+    let ctrl_word_delete = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Backspace
+                | KeyCode::Char('h')
+                | KeyCode::Char('H')
+                | KeyCode::Char('w')
+                | KeyCode::Char('W')
+        );
+    let modified_backspace = key.code == KeyCode::Backspace
+        && (key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SHIFT));
+    ctrl_word_delete || modified_backspace
+}
+
+fn normalize_ctrl_backspace(mut key: KeyEvent) -> KeyEvent {
+    if is_ctrl_backspace(key) {
+        key.code = KeyCode::Backspace;
+    }
+    key
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DueDateType {
@@ -331,7 +387,7 @@ pub enum ModalType {
 pub enum NotificationKind {
     Info,    // azul  — informativo, todo bien
     Warning, // amarillo — advertencia, algo que el héroe debe saber
-    Swarm,   // rojo  — los Notification Sprites atacan
+    Swarm,   // púrpura — los Notification Sprites atacan
 }
 
 #[derive(Debug, Clone)]
@@ -360,10 +416,16 @@ impl Notification {
         }
     }
     pub fn swarm(msg: impl Into<String>, title: impl Into<String>) -> Self {
+        let title = title.into();
+        let title = if title.contains("Notification Swarm") {
+            title
+        } else {
+            format!("Notification Swarm — {}", title)
+        };
         Self {
             message: msg.into(),
             kind: NotificationKind::Swarm,
-            title: title.into(),
+            title,
             unlocked_at: std::time::Instant::now(),
         }
     }
@@ -490,8 +552,8 @@ const SPRITE_MSG_RARE_CHRONICLE: &[&str] = &[
 
 // cada pool de Sprites tiene su título absurdo — el título combina con el tono del mensaje
 fn pick_sprite_message() -> (String, &'static str) {
-    use rand::seq::SliceRandom;
     use rand::Rng;
+    use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
     if rng.r#gen::<f64>() < 0.008 {
         let msg = SPRITE_MSG_RARE_CHRONICLE
@@ -1441,7 +1503,7 @@ impl App {
             );
             if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
                 if !json.trim().is_empty() {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let decoded = STANDARD
                         .decode(json.trim())
                         .ok()
@@ -1995,6 +2057,8 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        let key = normalize_ctrl_backspace(key);
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.notifications.push(Notification::info(
                 "Use [q] to quit — seals the Chronicle and syncs before exit.",
@@ -2908,7 +2972,11 @@ impl App {
                         }
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::CustomFocusDuration { input: val };
                     }
                     KeyCode::Enter => {
@@ -2935,7 +3003,11 @@ impl App {
                         self.modal_state = ModalType::EditServerUrl { input: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::EditServerUrl { input: val };
                     }
                     KeyCode::Enter => {
@@ -2986,11 +3058,15 @@ impl App {
                         self.modal_state = ModalType::RestoreIdentity { input: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::RestoreIdentity { input: val };
                     }
                     KeyCode::Enter => {
-                        use base64::{engine::general_purpose::STANDARD, Engine as _};
+                        use base64::{Engine as _, engine::general_purpose::STANDARD};
                         let trimmed = val.trim().to_string();
                         match STANDARD.decode(&trimmed) {
                             Ok(decoded_bytes)
@@ -3053,7 +3129,7 @@ impl App {
                                     {
                                         if !json.trim().is_empty() {
                                             use base64::{
-                                                engine::general_purpose::STANDARD, Engine as _,
+                                                Engine as _, engine::general_purpose::STANDARD,
                                             };
                                             let decoded = STANDARD
                                                 .decode(json.trim())
@@ -3142,7 +3218,11 @@ impl App {
                         };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         sugs = App::path_suggestions(&val);
                         sel = 0;
                         self.modal_state = ModalType::LocalMusicFolder {
@@ -3240,9 +3320,17 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if idx == 0 {
-                            well.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut well);
+                            } else {
+                                well.pop();
+                            }
                         } else {
-                            improve.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut improve);
+                            } else {
+                                improve.pop();
+                            }
                         }
                         self.modal_state = ModalType::DailyReflection {
                             what_went_well: well,
@@ -3433,11 +3521,23 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if idx == 0 {
-                            r_name.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut r_name);
+                            } else {
+                                r_name.pop();
+                            }
                         } else if idx == 1 {
-                            r_desc.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut r_desc);
+                            } else {
+                                r_desc.pop();
+                            }
                         } else if idx == 3 {
-                            xp_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut xp_str);
+                            } else {
+                                xp_str.pop();
+                            }
                         }
                         self.modal_state = ModalType::NewRitual {
                             name: r_name,
@@ -3545,7 +3645,7 @@ impl App {
                 tier,
                 selected_idx,
             } => {
-                use crate::milestone_templates::{get_template_by_id, templates_for_tier, Tier};
+                use crate::milestone_templates::{Tier, get_template_by_id, templates_for_tier};
                 let tier_enum = Tier::from_u8(tier).unwrap_or(Tier::Initiate);
                 let templates: Vec<&'static crate::milestone_templates::MilestoneTemplate> =
                     templates_for_tier(tier_enum).collect();
@@ -3759,9 +3859,17 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if f_idx == 1 {
-                            id_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut id_str);
+                            } else {
+                                id_str.pop();
+                            }
                         } else if f_idx == 2 {
-                            name_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut name_str);
+                            } else {
+                                name_str.pop();
+                            }
                         }
                         self.modal_state = ModalType::InviteMember {
                             identity: id_str,
@@ -3907,7 +4015,11 @@ impl App {
                         self.modal_state = ModalType::PostMessage { content: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::PostMessage { content: val };
                     }
                     KeyCode::Enter => {
@@ -4064,7 +4176,11 @@ impl App {
                         self.modal_state = ModalType::SearchMessages { query: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::SearchMessages { query: val };
                     }
                     KeyCode::Enter => {
@@ -4375,7 +4491,11 @@ impl App {
                         };
                     }
                     KeyCode::Backspace => {
-                        q.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut q);
+                        } else {
+                            q.pop();
+                        }
                         res = self.perform_unified_search(&q);
                         self.modal_state = ModalType::SearchEverywhere {
                             query: q,
@@ -4433,7 +4553,11 @@ impl App {
                         };
                     }
                     KeyCode::Backspace => {
-                        q.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut q);
+                        } else {
+                            q.pop();
+                        }
                         act = self.get_available_command_actions(&q);
                         self.modal_state = ModalType::CommandPalette {
                             query: q,
@@ -4572,11 +4696,15 @@ impl App {
                 self.restore_error = None;
             }
             KeyCode::Backspace => {
-                self.restore_input.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut self.restore_input);
+                } else {
+                    self.restore_input.pop();
+                }
                 self.restore_error = None;
             }
             KeyCode::Enter => {
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
                 let trimmed = self.restore_input.trim().to_string();
                 match STANDARD.decode(&trimmed) {
                     Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
@@ -4633,7 +4761,7 @@ impl App {
                             );
                             if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
                                 if !json.trim().is_empty() {
-                                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
                                     let decoded = STANDARD
                                         .decode(json.trim())
                                         .ok()
@@ -4697,7 +4825,11 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => {
-                    self.onboarding_username.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.onboarding_username);
+                    } else {
+                        self.onboarding_username.pop();
+                    }
                     self.onboarding_error = None;
                 }
                 KeyCode::Tab | KeyCode::Enter => {
@@ -5134,7 +5266,11 @@ impl App {
                     return Ok(true);
                 }
                 KeyCode::Backspace => {
-                    self.fellowship_chat_input.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.fellowship_chat_input);
+                    } else {
+                        self.fellowship_chat_input.pop();
+                    }
                     return Ok(true);
                 }
                 KeyCode::Left => {
@@ -5375,7 +5511,11 @@ impl App {
                     state.mode = EditorMode::Insert;
                 }
                 KeyCode::Backspace => {
-                    state.title.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut state.title);
+                    } else {
+                        state.title.pop();
+                    }
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                     if state.title.len() < 50 {
@@ -5416,6 +5556,7 @@ impl App {
                 KeyCode::Down => state.move_down(),
                 KeyCode::Left => state.move_left(),
                 KeyCode::Right => state.move_right(),
+                KeyCode::Backspace if is_ctrl_backspace(key) => state.handle_ctrl_backspace(),
                 KeyCode::Backspace => state.handle_backspace(),
                 KeyCode::Delete => state.handle_delete(),
                 KeyCode::Enter => state.handle_enter(),
@@ -5804,7 +5945,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('e') => {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let storage_dir = crate::storage::get_storage_dir()?;
                     let db_path = storage_dir.join("questline.db");
                     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -5842,17 +5983,18 @@ impl App {
                                             identity,
                                             &device_id,
                                         );
-                                        let outcome =
-                                            match client.send_request("POST", "recovery", &json) {
-                                                Ok(_) => Ok(format!(
+                                        let outcome = match client
+                                            .send_request("POST", "recovery", &json)
+                                        {
+                                            Ok(_) => Ok(format!(
                                                 "Profile exported & cloud backup saved! Local: {}",
                                                 backup_display
                                             )),
-                                                Err(e) => Err(format!(
+                                            Err(e) => Err(format!(
                                                 "Profile exported to {} (cloud backup failed: {})",
                                                 backup_display, e
                                             )),
-                                            };
+                                        };
                                         if let Ok(mut slot) = result_slot.lock() {
                                             *slot = Some(outcome);
                                         }
@@ -6959,29 +7101,29 @@ impl App {
                                     "task_complete"
                                 };
                                 self.apply_class_passive(passive_trigger, 0)?;
+                                self.increment_quest_progress(10, 1)?;
+                                let frag_trigger = if t.priority == TaskPriority::High {
+                                    "high_priority_task"
+                                } else {
+                                    "task"
+                                };
+                                self.simulate_memory_fragment_unlock(frag_trigger)?;
+                                self.complete_productive_action()?;
+                                let growth = if t.priority == TaskPriority::High {
+                                    4
+                                } else {
+                                    2
+                                };
+                                self.grow_tree(growth)?;
+                                self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                if t.priority == TaskPriority::High {
+                                    self.update_daily_adventure_progress(
+                                        "complete_high_priority_task",
+                                        1,
+                                    )?;
+                                }
                             }
                             self.trigger_ambient_particles();
-                            self.increment_quest_progress(10, 1)?;
-                            let frag_trigger = if t.priority == TaskPriority::High {
-                                "high_priority_task"
-                            } else {
-                                "task"
-                            };
-                            self.simulate_memory_fragment_unlock(frag_trigger)?;
-                            self.complete_productive_action()?;
-                            let growth = if t.priority == TaskPriority::High {
-                                4
-                            } else {
-                                2
-                            };
-                            self.grow_tree(growth)?;
-                            self.update_daily_adventure_progress("complete_tasks", 1)?;
-                            if t.priority == TaskPriority::High {
-                                self.update_daily_adventure_progress(
-                                    "complete_high_priority_task",
-                                    1,
-                                )?;
-                            }
                             self.check_action_achievements()?;
                             let chronicle_desc = if total_steps > 0 {
                                 format!(
@@ -7593,7 +7735,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 if focus_idx == 0 {
-                    if name_cursor > 0 {
+                    if is_ctrl_backspace(key) {
+                        name_cursor = delete_word_before_cursor(&mut name, name_cursor);
+                    } else if name_cursor > 0 {
                         let mut prev = name_cursor - 1;
                         while prev > 0 && !name.is_char_boundary(prev) {
                             prev -= 1;
@@ -7602,7 +7746,9 @@ impl App {
                         name_cursor = prev;
                     }
                 } else {
-                    if desc_cursor > 0 {
+                    if is_ctrl_backspace(key) {
+                        desc_cursor = delete_word_before_cursor(&mut desc, desc_cursor);
+                    } else if desc_cursor > 0 {
                         let mut prev = desc_cursor - 1;
                         while prev > 0 && !desc.is_char_boundary(prev) {
                             prev -= 1;
@@ -7862,7 +8008,11 @@ impl App {
                     self.searching = false;
                 }
                 KeyCode::Backspace => {
-                    self.search_query.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.search_query);
+                    } else {
+                        self.search_query.pop();
+                    }
                 }
                 KeyCode::Char(c) if self.search_query.len() < 30 => {
                     self.search_query.push(c);
@@ -8249,11 +8399,11 @@ impl App {
                                 };
                                 self.grant_xp(label, xp)?;
                                 self.apply_class_passive("task_complete", 0)?;
+                                self.complete_productive_action()?;
+                                self.grow_tree(2)?;
+                                self.update_daily_adventure_progress("complete_tasks", 1)?;
                             }
                             self.trigger_ambient_particles();
-                            self.complete_productive_action()?;
-                            self.grow_tree(2)?;
-                            self.update_daily_adventure_progress("complete_tasks", 1)?;
                             self.check_action_achievements()?;
                             self.reload_data()?;
                         }
@@ -8324,29 +8474,29 @@ impl App {
                                         "task_complete"
                                     };
                                     self.apply_class_passive(passive_trigger, 0)?;
+                                    self.increment_quest_progress(10, 1)?;
+                                    let frag_trigger = if task.priority == TaskPriority::High {
+                                        "high_priority_task"
+                                    } else {
+                                        "task"
+                                    };
+                                    self.simulate_memory_fragment_unlock(frag_trigger)?;
+                                    self.complete_productive_action()?;
+                                    let growth = if task.priority == TaskPriority::High {
+                                        4
+                                    } else {
+                                        2
+                                    };
+                                    self.grow_tree(growth)?;
+                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                    if task.priority == TaskPriority::High {
+                                        self.update_daily_adventure_progress(
+                                            "complete_high_priority_task",
+                                            1,
+                                        )?;
+                                    }
                                 }
                                 self.trigger_ambient_particles();
-                                self.increment_quest_progress(10, 1)?;
-                                let frag_trigger = if task.priority == TaskPriority::High {
-                                    "high_priority_task"
-                                } else {
-                                    "task"
-                                };
-                                self.simulate_memory_fragment_unlock(frag_trigger)?;
-                                self.complete_productive_action()?;
-                                let growth = if task.priority == TaskPriority::High {
-                                    4
-                                } else {
-                                    2
-                                };
-                                self.grow_tree(growth)?;
-                                self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                if task.priority == TaskPriority::High {
-                                    self.update_daily_adventure_progress(
-                                        "complete_high_priority_task",
-                                        1,
-                                    )?;
-                                }
                                 self.check_action_achievements()?;
                                 let chronicle_desc = if total_steps > 0 {
                                     format!(
@@ -8881,22 +9031,25 @@ impl App {
                                 if !step.completed {
                                     let mut s = step.clone();
                                     s.completed = true;
+                                    s.xp_awarded = true;
                                     self.db.update_task(&s)?;
                                     self.mark_dirty();
                                     self.audio_player.play_task_complete();
-                                    let is_high = s.priority == TaskPriority::High;
-                                    let xp = if is_high { 50 } else { 25 };
-                                    let label = if is_high {
-                                        "Resolve Hero Step Quest"
-                                    } else {
-                                        "Complete Step Quest"
-                                    };
-                                    self.grant_xp(label, xp)?;
-                                    self.apply_class_passive("task_complete", 0)?;
+                                    if !step.xp_awarded {
+                                        let is_high = s.priority == TaskPriority::High;
+                                        let xp = if is_high { 50 } else { 25 };
+                                        let label = if is_high {
+                                            "Resolve Hero Step Quest"
+                                        } else {
+                                            "Complete Step Quest"
+                                        };
+                                        self.grant_xp(label, xp)?;
+                                        self.apply_class_passive("task_complete", 0)?;
+                                        self.complete_productive_action()?;
+                                        self.grow_tree(2)?;
+                                        self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                    }
                                     self.trigger_ambient_particles();
-                                    self.complete_productive_action()?;
-                                    self.grow_tree(2)?;
-                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
                                     self.check_action_achievements()?;
                                     self.reload_data()?;
                                 }
@@ -9056,7 +9209,11 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         let mut n = name.clone();
-                        n.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut n);
+                        } else {
+                            n.pop();
+                        }
                         self.modal_state = ModalType::NewCodex {
                             name: n,
                             parent_codex_id: pcid,
@@ -9090,7 +9247,11 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         let mut n = name.clone();
-                        n.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut n);
+                        } else {
+                            n.pop();
+                        }
                         self.modal_state = ModalType::RenameCodex {
                             codex_id: cid,
                             name: n,
@@ -9152,13 +9313,7 @@ impl App {
             set_date_focus
         };
         let next_focus = |idx: usize| -> usize { (idx + 1) % (max_fields + 1) };
-        let prev_focus = |idx: usize| -> usize {
-            if idx > 0 {
-                idx - 1
-            } else {
-                max_fields
-            }
-        };
+        let prev_focus = |idx: usize| -> usize { if idx > 0 { idx - 1 } else { max_fields } };
         // Ctrl+S — guarda y cierra desde cualquier campo, igual que Enter pero sin reabrir el form de steps
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             if !title.trim().is_empty() {
@@ -9594,10 +9749,16 @@ impl App {
             KeyCode::Backspace => {
                 match focus_idx {
                     0 => {
-                        title.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut title);
+                        } else {
+                            title.pop();
+                        }
                     }
                     1 => {
-                        if desc_cursor > 0 {
+                        if is_ctrl_backspace(key) {
+                            desc_cursor = delete_word_before_cursor(&mut desc, desc_cursor);
+                        } else if desc_cursor > 0 {
                             let cursor = desc_cursor.min(desc.len());
                             // find start of previous char
                             let prev = desc[..cursor]
@@ -9610,10 +9771,18 @@ impl App {
                         }
                     }
                     4 if has_due_value => {
-                        due_date_val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut due_date_val);
+                        } else {
+                            due_date_val.pop();
+                        }
                     }
                     _ if focus_idx == set_date_focus => {
-                        set_date_val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut set_date_val);
+                        } else {
+                            set_date_val.pop();
+                        }
                     }
                     _ => {}
                 }
@@ -9848,13 +10017,17 @@ impl App {
                 self.modal_state = ModalType::None;
             }
             KeyCode::Char(c) => {
-                if content.len() < 120 {
+                if content.chars().count() < JOURNAL_ENTRY_CHAR_LIMIT {
                     content.push(c);
                 }
                 self.modal_state = ModalType::NewJournalEntry { content };
             }
             KeyCode::Backspace => {
-                content.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut content);
+                } else {
+                    content.pop();
+                }
                 self.modal_state = ModalType::NewJournalEntry { content };
             }
             KeyCode::Enter if !content.trim().is_empty() => {
@@ -12052,7 +12225,7 @@ impl App {
             self.prologue_delay_ticks -= 1;
             return;
         }
-        use crate::screens::prologue::{page_lines, LineKind};
+        use crate::screens::prologue::{LineKind, page_lines};
         let lines = page_lines(self.prologue_page);
         let total = lines.len();
 
@@ -12109,8 +12282,8 @@ impl App {
             }
         }
 
-        use rand::prelude::SliceRandom;
         use rand::Rng;
+        use rand::prelude::SliceRandom;
         let mut rng = rand::thread_rng();
 
         let max_particles = match effect {
@@ -12785,7 +12958,7 @@ impl App {
                     message: "Importing chronicle data...".to_string(),
                 };
                 let decoded_json = {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
                     STANDARD
                         .decode(json.trim())
                         .ok()
@@ -14828,7 +15001,11 @@ impl App {
             }
             KeyCode::Backspace => {
                 let modal = self.bug_report_modal.as_mut().unwrap();
-                modal.description.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut modal.description);
+                } else {
+                    modal.description.pop();
+                }
             }
             KeyCode::Enter => {
                 let modal = self.bug_report_modal.as_mut().unwrap();
@@ -15075,6 +15252,60 @@ mod app_tests {
     use super::*;
     use crate::models::Season;
     use std::path::Path;
+
+    #[test]
+    fn test_delete_word_before_cursor() {
+        let mut input = "one two three".to_string();
+        let end = input.len();
+        let cursor = delete_word_before_cursor(&mut input, end);
+        assert_eq!(input, "one two ");
+        assert_eq!(cursor, input.len());
+
+        let mut input = "one two   ".to_string();
+        let end = input.len();
+        let cursor = delete_word_before_cursor(&mut input, end);
+        assert_eq!(input, "one ");
+        assert_eq!(cursor, 4);
+
+        let mut input = "alpha beta gamma".to_string();
+        let cursor = delete_word_before_cursor(&mut input, 10);
+        assert_eq!(input, "alpha  gamma");
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn test_ctrl_h_normalizes_to_ctrl_backspace() {
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(normalized.modifiers.contains(KeyModifiers::CONTROL));
+
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+    }
+
+    #[test]
+    fn test_swarm_notification_titles_are_labeled() {
+        let notif = Notification::swarm("Please return to scrolling.", "Important Notification");
+        assert_eq!(notif.kind, NotificationKind::Swarm);
+        assert!(notif.title.starts_with("Notification Swarm"));
+        assert!(notif.title.contains("Important Notification"));
+
+        let already_labeled = Notification::swarm("Again.", "Notification Swarm");
+        assert_eq!(already_labeled.title, "Notification Swarm");
+    }
 
     #[test]
     fn test_parse_due_date_input() {
@@ -15913,12 +16144,13 @@ mod app_tests {
         let rituals_after = app.db.get_rituals().unwrap();
         assert_eq!(rituals_after.len(), rituals_init.len());
         assert!(!app.notifications.is_empty());
-        assert!(app
-            .notifications
-            .last()
-            .unwrap()
-            .message
-            .contains("at least one"));
+        assert!(
+            app.notifications
+                .last()
+                .unwrap()
+                .message
+                .contains("at least one")
+        );
 
         // 4. Try to create a ritual with 150 XP (over 100 XP cheating limit)
         app.modal_state = ModalType::NewRitual {
@@ -15940,12 +16172,13 @@ mod app_tests {
         }
         let rituals_after_creation = app.db.get_rituals().unwrap();
         assert_eq!(rituals_after_creation.len(), rituals_init.len());
-        assert!(app
-            .notifications
-            .last()
-            .unwrap()
-            .message
-            .contains("cannot exceed 100 XP"));
+        assert!(
+            app.notifications
+                .last()
+                .unwrap()
+                .message
+                .contains("cannot exceed 100 XP")
+        );
 
         let _ = std::fs::remove_file(db_file);
     }
