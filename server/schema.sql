@@ -94,6 +94,7 @@ CREATE TABLE IF NOT EXISTS nonces (
 CREATE TABLE IF NOT EXISTS global_chronicle (
     id VARCHAR(36) PRIMARY KEY,
     hero_name VARCHAR(255) NOT NULL,
+    hero_class VARCHAR(50) NULL,
     event_type VARCHAR(50) NOT NULL,
     description TEXT NOT NULL,
     timestamp VARCHAR(50) NOT NULL,

@@ -191,7 +191,7 @@ impl OceanWaves {
             rng: Xorshift32::new(34567),
             brown: BrownNoise::new(),
             phase1: 0.0,
-            phase2: PI * 0.7,  // staggered so crests don't always coincide
+            phase2: PI * 0.7, // staggered so crests don't always coincide
             phase3: PI * 1.4,
             foam: 0.0,
         }
@@ -374,10 +374,8 @@ impl Iterator for ForestSounds {
         let chirp = if self.note_ticks_left > 0 {
             // reproduciendo nota actual — frecuencia va barriendo de note_freq a note_target_freq
             self.note_ticks_left -= 1;
-            let progress =
-                1.0 - (self.note_ticks_left as f32 / self.note_ticks_total as f32);
-            let freq =
-                self.note_freq + (self.note_target_freq - self.note_freq) * progress;
+            let progress = 1.0 - (self.note_ticks_left as f32 / self.note_ticks_total as f32);
+            let freq = self.note_freq + (self.note_target_freq - self.note_freq) * progress;
             self.note_phase += 2.0 * std::f32::consts::PI * freq / 44100.0;
             if self.note_phase > 2.0 * std::f32::consts::PI {
                 self.note_phase -= 2.0 * std::f32::consts::PI;

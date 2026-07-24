@@ -16,15 +16,15 @@ use anyhow::Result;
 use crossterm::{
     event::{self, Event},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
-    Terminal,
 };
 use std::io;
 
@@ -34,7 +34,11 @@ use questline::screens;
 use questline::screens::ActiveScreen;
 use questline::storage;
 // Centra un rect en la pantalla con altura fija — los modales lo usan para no sobrepasar el tamaño
-pub fn centered_rect_fixed_height(percent_x: u16, height_lines: u16, r: ratatui::layout::Rect) -> ratatui::layout::Rect {
+pub fn centered_rect_fixed_height(
+    percent_x: u16,
+    height_lines: u16,
+    r: ratatui::layout::Rect,
+) -> ratatui::layout::Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -57,15 +61,33 @@ pub fn centered_rect_fixed_height(percent_x: u16, height_lines: u16, r: ratatui:
 // Renderiza celebraciones animadas con capas de color para mantenerlas legibles en cualquier terminal.
 fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
     let frame = (ticks / 5) % 4;
-    let gold = Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD);
-    let amber = Style::default().fg(Color::Rgb(242, 156, 48)).add_modifier(Modifier::BOLD);
-    let orange = Style::default().fg(Color::Rgb(239, 95, 39)).add_modifier(Modifier::BOLD);
-    let red = Style::default().fg(Color::Rgb(218, 55, 42)).add_modifier(Modifier::BOLD);
-    let green = Style::default().fg(Color::Rgb(84, 180, 92)).add_modifier(Modifier::BOLD);
-    let lime = Style::default().fg(Color::Rgb(169, 226, 111)).add_modifier(Modifier::BOLD);
-    let cyan = Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD);
-    let purple = Style::default().fg(Color::Rgb(178, 121, 216)).add_modifier(Modifier::BOLD);
-    let wood = Style::default().fg(Color::Rgb(138, 82, 42)).add_modifier(Modifier::BOLD);
+    let gold = Style::default()
+        .fg(Color::Rgb(255, 213, 92))
+        .add_modifier(Modifier::BOLD);
+    let amber = Style::default()
+        .fg(Color::Rgb(242, 156, 48))
+        .add_modifier(Modifier::BOLD);
+    let orange = Style::default()
+        .fg(Color::Rgb(239, 95, 39))
+        .add_modifier(Modifier::BOLD);
+    let red = Style::default()
+        .fg(Color::Rgb(218, 55, 42))
+        .add_modifier(Modifier::BOLD);
+    let green = Style::default()
+        .fg(Color::Rgb(84, 180, 92))
+        .add_modifier(Modifier::BOLD);
+    let lime = Style::default()
+        .fg(Color::Rgb(169, 226, 111))
+        .add_modifier(Modifier::BOLD);
+    let cyan = Style::default()
+        .fg(Color::Rgb(85, 214, 217))
+        .add_modifier(Modifier::BOLD);
+    let purple = Style::default()
+        .fg(Color::Rgb(178, 121, 216))
+        .add_modifier(Modifier::BOLD);
+    let wood = Style::default()
+        .fg(Color::Rgb(138, 82, 42))
+        .add_modifier(Modifier::BOLD);
     let muted = Style::default().fg(Color::Rgb(105, 100, 110));
 
     if ascii_art.contains("LEVEL") {
@@ -77,13 +99,45 @@ fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
         };
         return vec![
             Line::from(Span::styled(sparks.0, gold)),
-            Line::from(vec![Span::raw("        "), Span::styled("/\\", gold), Span::raw("        ")]),
-            Line::from(vec![Span::raw("       "), Span::styled("/  \\", amber), Span::raw("       ")]),
-            Line::from(vec![Span::raw("      "), Span::styled("/ /\\ \\", orange), Span::raw("      ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("/_/  \\_\\", red), Span::raw("     ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("|", gold), Span::styled(" LEVEL ", cyan), Span::styled("|", gold), Span::raw("     ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("| ", gold), Span::styled(" UP! ", purple), Span::styled(" |", gold), Span::raw("     ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("|______|", amber), Span::raw("     ")]),
+            Line::from(vec![
+                Span::raw("        "),
+                Span::styled("/\\", gold),
+                Span::raw("        "),
+            ]),
+            Line::from(vec![
+                Span::raw("       "),
+                Span::styled("/  \\", amber),
+                Span::raw("       "),
+            ]),
+            Line::from(vec![
+                Span::raw("      "),
+                Span::styled("/ /\\ \\", orange),
+                Span::raw("      "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("/_/  \\_\\", red),
+                Span::raw("     "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("|", gold),
+                Span::styled(" LEVEL ", cyan),
+                Span::styled("|", gold),
+                Span::raw("     "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("| ", gold),
+                Span::styled(" UP! ", purple),
+                Span::styled(" |", gold),
+                Span::raw("     "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("|______|", amber),
+                Span::raw("     "),
+            ]),
             Line::from(Span::styled(sparks.1, cyan)),
         ];
     }
@@ -97,13 +151,47 @@ fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
         };
         return vec![
             Line::from(Span::styled(glint.0, gold)),
-            Line::from(vec![Span::raw("       "), Span::styled(".ooo.", lime), Span::raw("       ")]),
-            Line::from(vec![Span::raw("     "), Span::styled(".o", green), Span::styled("QOOPQ", lime), Span::styled("o.", green), Span::raw("     ")]),
+            Line::from(vec![
+                Span::raw("       "),
+                Span::styled(".ooo.", lime),
+                Span::raw("       "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled(".o", green),
+                Span::styled("QOOPQ", lime),
+                Span::styled("o.", green),
+                Span::raw("     "),
+            ]),
             Line::from(Span::styled(glint.1, lime)),
-            Line::from(vec![Span::raw("  "), Span::styled(".o", green), Span::styled("QOQOQOQOQ", lime), Span::styled("o.", green), Span::raw("  ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("|||", wood), Span::raw(" "), Span::styled("|||", wood), Span::raw("     ")]),
-            Line::from(vec![Span::raw("     "), Span::styled("|||", wood), Span::raw(" "), Span::styled("|||", wood), Span::raw("     ")]),
-            Line::from(vec![Span::raw("    "), Span::styled("===", muted), Span::styled("\\___/", wood), Span::styled("===", muted), Span::raw("    ")]),
+            Line::from(vec![
+                Span::raw("  "),
+                Span::styled(".o", green),
+                Span::styled("QOQOQOQOQ", lime),
+                Span::styled("o.", green),
+                Span::raw("  "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("|||", wood),
+                Span::raw(" "),
+                Span::styled("|||", wood),
+                Span::raw("     "),
+            ]),
+            Line::from(vec![
+                Span::raw("     "),
+                Span::styled("|||", wood),
+                Span::raw(" "),
+                Span::styled("|||", wood),
+                Span::raw("     "),
+            ]),
+            Line::from(vec![
+                Span::raw("    "),
+                Span::styled("===", muted),
+                Span::styled("\\___/", wood),
+                Span::styled("===", muted),
+                Span::raw("    "),
+            ]),
         ];
     }
 
@@ -117,11 +205,31 @@ fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
         return vec![
             Line::from(Span::styled(plume.0, orange)),
             Line::from(Span::styled(plume.1, amber)),
-            Line::from(vec![Span::raw("       "), Span::styled("\\  V  /", gold), Span::raw("       ")]),
-            Line::from(vec![Span::raw("        "), Span::styled(")   (", red), Span::raw("        ")]),
-            Line::from(vec![Span::raw("       "), Span::styled("/ / \\ \\", orange), Span::raw("       ")]),
-            Line::from(vec![Span::raw("      "), Span::styled("(_______)", amber), Span::raw("      ")]),
-            Line::from(vec![Span::raw("       "), Span::styled("STREAK", gold), Span::raw("       ")]),
+            Line::from(vec![
+                Span::raw("       "),
+                Span::styled("\\  V  /", gold),
+                Span::raw("       "),
+            ]),
+            Line::from(vec![
+                Span::raw("        "),
+                Span::styled(")   (", red),
+                Span::raw("        "),
+            ]),
+            Line::from(vec![
+                Span::raw("       "),
+                Span::styled("/ / \\ \\", orange),
+                Span::raw("       "),
+            ]),
+            Line::from(vec![
+                Span::raw("      "),
+                Span::styled("(_______)", amber),
+                Span::raw("      "),
+            ]),
+            Line::from(vec![
+                Span::raw("       "),
+                Span::styled("STREAK", gold),
+                Span::raw("       "),
+            ]),
             Line::from(Span::styled("     *  *  *      ", red)),
         ];
     }
@@ -134,10 +242,26 @@ fn celebration_art_lines(ascii_art: &str, ticks: usize) -> Vec<Line<'static>> {
     };
     vec![
         Line::from(Span::styled(sparks.0, gold)),
-        Line::from(vec![Span::raw("    "), Span::styled("* ", amber), Span::styled("QUEST", cyan), Span::styled(" *", amber), Span::raw("    ")]),
-        Line::from(vec![Span::raw("   "), Span::styled("* ", orange), Span::styled("SUCCESS", lime), Span::styled(" *", orange), Span::raw("   ")]),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled("* ", amber),
+            Span::styled("QUEST", cyan),
+            Span::styled(" *", amber),
+            Span::raw("    "),
+        ]),
+        Line::from(vec![
+            Span::raw("   "),
+            Span::styled("* ", orange),
+            Span::styled("SUCCESS", lime),
+            Span::styled(" *", orange),
+            Span::raw("   "),
+        ]),
         Line::from(Span::styled(sparks.1, purple)),
-        Line::from(vec![Span::raw("      "), Span::styled("\\____/", gold), Span::raw("      ")]),
+        Line::from(vec![
+            Span::raw("      "),
+            Span::styled("\\____/", gold),
+            Span::raw("      "),
+        ]),
     ]
 }
 
@@ -146,18 +270,30 @@ fn memory_fragment_art_lines(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
     let frame = (ticks / 4) % 4;
     let (edge, core, glow) = match rarity {
         "Legendary" => (
-            Style::default().fg(Color::Rgb(255, 213, 92)).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(255, 245, 170)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(255, 213, 92))
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(255, 245, 170))
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Rgb(242, 156, 48)),
         ),
         "Rare" => (
-            Style::default().fg(Color::Rgb(85, 214, 217)).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(190, 246, 255)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(85, 214, 217))
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(190, 246, 255))
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Rgb(82, 151, 219)),
         ),
         _ => (
-            Style::default().fg(Color::Rgb(210, 220, 232)).add_modifier(Modifier::BOLD),
-            Style::default().fg(Color::Rgb(250, 250, 255)).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(210, 220, 232))
+                .add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Rgb(250, 250, 255))
+                .add_modifier(Modifier::BOLD),
             Style::default().fg(Color::Rgb(150, 160, 175)),
         ),
     };
@@ -177,7 +313,11 @@ fn memory_fragment_art_lines(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
 
     vec![
         Line::from(Span::styled(spark.0, glow)),
-        Line::from(vec![Span::raw("        "), Span::styled("/\\", edge), Span::raw("        ")]),
+        Line::from(vec![
+            Span::raw("        "),
+            Span::styled("/\\", edge),
+            Span::raw("        "),
+        ]),
         Line::from(vec![
             Span::raw("       "),
             Span::styled(inner.0, edge),
@@ -201,9 +341,17 @@ fn memory_fragment_art_lines(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
             Span::styled(" /", edge),
             Span::raw("      "),
         ]),
-        Line::from(vec![Span::raw("       "), Span::styled("\\____/", edge), Span::raw("       ")]),
+        Line::from(vec![
+            Span::raw("       "),
+            Span::styled("\\____/", edge),
+            Span::raw("       "),
+        ]),
         Line::from(Span::styled(spark.1, glow)),
-        Line::from(vec![Span::raw("       "), Span::styled("~~~~~~", shadow), Span::raw("       ")]),
+        Line::from(vec![
+            Span::raw("       "),
+            Span::styled("~~~~~~", shadow),
+            Span::raw("       "),
+        ]),
     ]
 }
 
@@ -381,6 +529,7 @@ async fn main() -> Result<()> {
         app.tick_focus_session()?;
         app.tick_mpris();
         app.tick_particles();
+        app.tick_pywal_theme();
         app.tick_update_check();
         if !sync_busy {
             app.tick_chapter_progress();
@@ -540,6 +689,9 @@ async fn main() -> Result<()> {
                         ActiveScreen::Soundscapes => {
                             screens::soundscapes::draw(f, &app, &theme, chunks[0]);
                         }
+                        ActiveScreen::Settings => {
+                            screens::settings::draw(f, &app, &theme, chunks[0]);
+                        }
                         ActiveScreen::SyncSettings => {
                             screens::sync::draw(f, &app, &theme, chunks[0]);
                         }
@@ -612,6 +764,7 @@ async fn main() -> Result<()> {
                         ("Fellowship", ActiveScreen::Fellowship),
                         ("Chronicle",  ActiveScreen::GreatChronicle),
                         ("Sync",       ActiveScreen::SyncSettings),
+                        ("Settings",   ActiveScreen::Settings),
                     ];
 
                     let muted = Color::Rgb(90, 90, 90);
@@ -753,11 +906,12 @@ async fn main() -> Result<()> {
                     f.render_widget(Clear, overlay_area);
                     f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
-                    let (border_color, msg_color) = match notif.kind {
-                        NotificationKind::Info    => (Color::Rgb(56, 189, 248),  Color::Rgb(200, 230, 255)),
-                        NotificationKind::Warning => (Color::Rgb(234, 179, 8),   Color::Rgb(255, 240, 180)),
-                        NotificationKind::Swarm   => (Color::Rgb(220, 50, 50),   Color::Rgb(255, 200, 200)),
+                    let msg_color = match notif.kind {
+                        NotificationKind::Info    => Color::Rgb(200, 230, 255),
+                        NotificationKind::Warning => Color::Rgb(255, 240, 180),
+                        NotificationKind::Swarm   => Color::Rgb(255, 200, 200),
                     };
+                    let border_color = theme.primary;
                     let title_text = format!("  {}  ", notif.title);
                     let block = Block::default()
                         .borders(Borders::ALL)
@@ -2136,7 +2290,6 @@ async fn main() -> Result<()> {
                 f.render_widget(block, overlay_area);
             }
         })?;
-
     }
 
     // Para el audio limpiamente antes de soltar la terminal

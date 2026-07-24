@@ -4,8 +4,8 @@
 // usa pacat que viene incluido con pipewire-pulse o pulseaudio en Linux
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::audio::spectrum::{update_from_mono, SpectrumData, FFT_SIZE, HOP_SIZE};
-use rustfft::{num_complex::Complex, FftPlanner};
+use crate::audio::spectrum::{FFT_SIZE, HOP_SIZE, SpectrumData, update_from_mono};
+use rustfft::{FftPlanner, num_complex::Complex};
 use std::io::Read;
 
 const CAPTURE_RATE: u32 = 44100;
@@ -50,8 +50,20 @@ pub fn start_system_capture(spectrum: SpectrumData) {
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(FFT_SIZE);
         let scratch_len = fft.get_inplace_scratch_len();
-        let mut fft_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; FFT_SIZE];
-        let mut fft_scratch = vec![Complex { re: 0.0f32, im: 0.0f32 }; scratch_len];
+        let mut fft_buf = vec![
+            Complex {
+                re: 0.0f32,
+                im: 0.0f32
+            };
+            FFT_SIZE
+        ];
+        let mut fft_scratch = vec![
+            Complex {
+                re: 0.0f32,
+                im: 0.0f32
+            };
+            scratch_len
+        ];
 
         let mut acc_buf: Vec<f32> = Vec::with_capacity(FFT_SIZE + HOP_SIZE);
         let mut raw = vec![0u8; CAPTURE_CHUNK * 4]; // 4 bytes por muestra f32

@@ -3,9 +3,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod capture;
 pub mod generator;
+pub mod mpris_player;
 pub mod player;
 pub mod soundscapes;
-pub mod mpris_player;
 pub mod spectrum;
 pub mod state;
 pub mod streams;

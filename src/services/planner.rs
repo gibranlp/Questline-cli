@@ -158,9 +158,7 @@ pub fn generate_plan(
             let has_pending_steps = all_tasks
                 .iter()
                 .any(|s| s.parent_task_id == Some(t.id) && !s.completed);
-            !has_pending_steps
-                && Some(t.id) != main_id
-                && Some(t.id) != next_id
+            !has_pending_steps && Some(t.id) != main_id && Some(t.id) != next_id
         })
         .take(5)
         .map(|t| (*t).clone())

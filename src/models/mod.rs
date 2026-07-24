@@ -14,8 +14,8 @@ pub mod user;
 pub mod xp_event;
 
 pub use codex::Codex;
-pub use global_chronicle::GlobalChronicleEntry;
 pub use daily_quest::DailyQuest;
+pub use global_chronicle::GlobalChronicleEntry;
 pub use journal_entry::JournalEntry;
 pub use note::Note;
 pub use project::Project;

@@ -89,7 +89,11 @@ pub fn send_system_notification_with_icon(
         #[cfg(target_os = "macos")]
         {
             // AppleScript no permite elegir iconos por notificación; terminal-notifier sí cuando está instalado.
-            let subtitle = if urgent { "Questline - Urgent" } else { "Questline" };
+            let subtitle = if urgent {
+                "Questline - Urgent"
+            } else {
+                "Questline"
+            };
             let mut used_terminal_notifier = false;
             if let Some(path) = icon_path.as_ref() {
                 if std::process::Command::new("terminal-notifier")
@@ -129,7 +133,11 @@ pub fn send_system_notification_with_icon(
             } else {
                 ""
             };
-            let template = if icon_path.is_some() { "ToastImageAndText02" } else { "ToastText02" };
+            let template = if icon_path.is_some() {
+                "ToastImageAndText02"
+            } else {
+                "ToastText02"
+            };
             let image_line = icon_path
                 .as_ref()
                 .map(|path| {
@@ -177,7 +185,12 @@ fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
         if let Some(dir) = exe.parent() {
             candidates.push(dir.join(&relative));
             candidates.push(dir.join("..").join(&relative));
-            candidates.push(dir.join("..").join("share").join("questline").join(&relative));
+            candidates.push(
+                dir.join("..")
+                    .join("share")
+                    .join("questline")
+                    .join(&relative),
+            );
         }
     }
     if let Ok(cwd) = std::env::current_dir() {
@@ -188,7 +201,9 @@ fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
 }
 
 fn strip_non_ascii(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii() && !c.is_ascii_control()).collect()
+    s.chars()
+        .filter(|c| c.is_ascii() && !c.is_ascii_control())
+        .collect()
 }
 
 #[cfg(target_os = "macos")]

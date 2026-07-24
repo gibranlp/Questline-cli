@@ -3,11 +3,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 // Helper to center a rectangular block on the terminal frame.
@@ -45,24 +45,17 @@ const LOGO: &[&str] = &[
 // CodeWarlock (purple) → TaskPaladin (pink) → MindSage (cyan) →
 // SystemsArchitect (blue) → TimeChronomancer (orange) → ArchAccountant (gold)
 const PALETTE: &[Color] = &[
-    Color::Rgb(168,  85, 247), // CodeWarlock     — Purple
+    Color::Rgb(168, 85, 247),  // CodeWarlock     — Purple
     Color::Rgb(255, 105, 180), // TaskPaladin     — Pink
-    Color::Rgb(  6, 182, 212), // MindSage        — Cyan
-    Color::Rgb( 59, 130, 246), // SystemsArchitect — Blue
-    Color::Rgb(249, 115,  22), // TimeChronomancer — Orange
-    Color::Rgb(245, 158,  11), // ArchAccountant   — Gold
+    Color::Rgb(6, 182, 212),   // MindSage        — Cyan
+    Color::Rgb(59, 130, 246),  // SystemsArchitect — Blue
+    Color::Rgb(249, 115, 22),  // TimeChronomancer — Orange
+    Color::Rgb(245, 158, 11),  // ArchAccountant   — Gold
 ];
-
 
 // Renders the skippable splash screen with animated ASCII logo and a Questline quote.
 // `ticks` comes from `app.intro_ticks` and advances at 50 ms per tick.
-pub fn draw(
-    f: &mut Frame,
-    quote: &str,
-    author: &str,
-    ticks: usize,
-    theme: &Theme,
-) {
+pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Theme) {
     let size = f.size();
 
     // Fill background
@@ -76,7 +69,7 @@ pub fn draw(
     // ── Layout ────────────────────────────────────────────────────────────────
     // Split vertically: logo block (top) + quote block (bottom-ish)
     let logo_height = LOGO.len() as u16 + 2; // +2 for top/bottom border
-    let quote_height = 9u16;                  // border + lines
+    let quote_height = 9u16; // border + lines
     let total_needed = logo_height + 1 + quote_height;
 
     // Center the whole composition vertically
@@ -85,11 +78,11 @@ pub fn draw(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(v_margin),          // top padding
-            Constraint::Length(logo_height),        // logo
-            Constraint::Length(1),                  // gap
-            Constraint::Length(quote_height),       // quote box
-            Constraint::Min(0),                     // bottom padding
+            Constraint::Length(v_margin),     // top padding
+            Constraint::Length(logo_height),  // logo
+            Constraint::Length(1),            // gap
+            Constraint::Length(quote_height), // quote box
+            Constraint::Min(0),               // bottom padding
         ])
         .split(size);
 
@@ -103,7 +96,9 @@ pub fn draw(
                     let style = if ch == ' ' || ch == '\t' {
                         Style::default()
                     } else {
-                        Style::default().fg(current_color).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(current_color)
+                            .add_modifier(Modifier::BOLD)
                     };
                     Span::styled(ch.to_string(), style)
                 })

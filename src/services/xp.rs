@@ -104,7 +104,9 @@ impl<'a> XPService<'a> {
             Ok(self.db.get_setting(&key)?.as_deref() == Some("true"))
         };
 
-        let is_task = event_type.contains("Task") || event_type.contains("Quest") || event_type.contains("Hero");
+        let is_task = event_type.contains("Task")
+            || event_type.contains("Quest")
+            || event_type.contains("Hero");
         let is_daily = event_type.contains("Daily Quest") || event_type.contains("Quest Chain");
         let is_focus = event_type.contains("Focus");
         let is_note = event_type.contains("Note") || event_type.contains("Scroll");

@@ -3,7 +3,7 @@
 // y calcula un espectro de frecuencias en tiempo real usando FFT
 // ─────────────────────────────────────────────────────────────────────────────
 
-use rustfft::{num_complex::Complex, FftPlanner};
+use rustfft::{FftPlanner, num_complex::Complex};
 use std::sync::{Arc, Mutex};
 
 pub const NUM_BARS: usize = 48;
@@ -31,9 +31,12 @@ pub fn update_from_mono(
     let sr = sample_rate as f32;
 
     // ventana Hanning para reducir spectral leakage en los bordes del buffer
-    for (i, (&s, c)) in buffer[..FFT_SIZE].iter().zip(fft_buf.iter_mut()).enumerate() {
-        let w = 0.5
-            * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos());
+    for (i, (&s, c)) in buffer[..FFT_SIZE]
+        .iter()
+        .zip(fft_buf.iter_mut())
+        .enumerate()
+    {
+        let w = 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos());
         c.re = s * w;
         c.im = 0.0;
     }
@@ -53,14 +56,19 @@ pub fn update_from_mono(
         let freq_lo = f_lo * (log_ratio * t_lo).exp();
         let freq_hi = f_lo * (log_ratio * t_hi).exp();
 
-        let bin_lo = ((freq_lo / sr * FFT_SIZE as f32) as usize).max(1).min(bins - 1);
+        let bin_lo = ((freq_lo / sr * FFT_SIZE as f32) as usize)
+            .max(1)
+            .min(bins - 1);
         let bin_hi = ((freq_hi / sr * FFT_SIZE as f32) as usize + 1)
             .max(bin_lo + 1)
             .min(bins);
 
         let count = (bin_hi - bin_lo) as f32;
-        let sum_sq: f32 =
-            fft_buf[bin_lo..bin_hi].iter().map(|c| c.norm_sqr()).sum::<f32>() / count;
+        let sum_sq: f32 = fft_buf[bin_lo..bin_hi]
+            .iter()
+            .map(|c| c.norm_sqr())
+            .sum::<f32>()
+            / count;
 
         // escala dB perceptual: mapea -60 dB→0.0, 0 dB→1.0 para buena dinámica visual
         let amplitude = 2.0 * sum_sq.sqrt() / FFT_SIZE as f32;
