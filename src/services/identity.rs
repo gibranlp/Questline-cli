@@ -2,7 +2,7 @@
 // services/identity.rs — maneja las llaves criptográficas Ed25519 para identificar al usuario
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
@@ -165,7 +165,10 @@ pub fn copy_to_clipboard(text: &str) -> std::io::Result<()> {
         if pipe_to(&mut Command::new("wl-copy"), text) {
             return Ok(());
         }
-        if pipe_to(Command::new("xclip").args(["-selection", "clipboard"]), text) {
+        if pipe_to(
+            Command::new("xclip").args(["-selection", "clipboard"]),
+            text,
+        ) {
             return Ok(());
         }
         if pipe_to(Command::new("xsel").args(["-b", "-i"]), text) {

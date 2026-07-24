@@ -4,11 +4,11 @@
 
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 /// Dibuja la pantalla de restauración de identidad para aventureros que regresan del exilio.
@@ -16,10 +16,10 @@ use ratatui::{
 pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme: &Theme) {
     let size = f.size();
     let accent = Color::Rgb(6, 182, 212);
-    let gold   = Color::Rgb(245, 158, 11);
+    let gold = Color::Rgb(245, 158, 11);
     let danger = Color::Rgb(210, 65, 65);
-    let ghost  = Color::Rgb(110, 110, 110);
-    let dim    = Color::Rgb(55, 55, 55);
+    let ghost = Color::Rgb(110, 110, 110);
+    let dim = Color::Rgb(55, 55, 55);
 
     let show_cursor = (ticks / 10) % 2 == 0;
 
@@ -54,7 +54,11 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
     // ── Título ────────────────────────────────────────────────────────────────
     let title_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)])
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
         .split(layout[1])[1];
 
     f.render_widget(
@@ -81,20 +85,29 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
     // ── Separador ─────────────────────────────────────────────────────────────
     let sep_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(10), Constraint::Percentage(80), Constraint::Percentage(10)])
+        .constraints([
+            Constraint::Percentage(10),
+            Constraint::Percentage(80),
+            Constraint::Percentage(10),
+        ])
         .split(layout[2])[1];
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(64),
             Style::default().fg(dim),
-        ))).alignment(Alignment::Center),
+        )))
+        .alignment(Alignment::Center),
         sep_area,
     );
 
     // ── Advertencia sagrada ───────────────────────────────────────────────────
     let warn_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(8), Constraint::Percentage(84), Constraint::Percentage(8)])
+        .constraints([
+            Constraint::Percentage(8),
+            Constraint::Percentage(84),
+            Constraint::Percentage(8),
+        ])
         .split(layout[3])[1];
     f.render_widget(
         Paragraph::new(vec![
@@ -115,7 +128,11 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
     // ── Campo de entrada ──────────────────────────────────────────────────────
     let input_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(5), Constraint::Percentage(90), Constraint::Percentage(5)])
+        .constraints([
+            Constraint::Percentage(5),
+            Constraint::Percentage(90),
+            Constraint::Percentage(5),
+        ])
         .split(layout[5])[1];
 
     let cursor = if show_cursor { "▌" } else { " " };
@@ -141,15 +158,17 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
     if let Some(err) = error {
         let err_area = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(5), Constraint::Percentage(90), Constraint::Percentage(5)])
+            .constraints([
+                Constraint::Percentage(5),
+                Constraint::Percentage(90),
+                Constraint::Percentage(5),
+            ])
             .split(layout[6])[1];
         f.render_widget(
-            Paragraph::new(vec![
-                Line::from(Span::styled(
-                    err,
-                    Style::default().fg(danger).add_modifier(Modifier::BOLD),
-                )),
-            ])
+            Paragraph::new(vec![Line::from(Span::styled(
+                err,
+                Style::default().fg(danger).add_modifier(Modifier::BOLD),
+            ))])
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
             err_area,
@@ -159,7 +178,11 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
     // ── Footer ────────────────────────────────────────────────────────────────
     let footer_area = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(15), Constraint::Percentage(70), Constraint::Percentage(15)])
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Percentage(70),
+            Constraint::Percentage(15),
+        ])
         .split(layout[7])[1];
     f.render_widget(
         Paragraph::new(Line::from(vec![
@@ -167,7 +190,8 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
             Span::styled("  Invoke Restoration    ·    ", Style::default().fg(dim)),
             Span::styled("[ Esc ]", Style::default().fg(ghost)),
             Span::styled("  Return to the Gates", Style::default().fg(dim)),
-        ])).alignment(Alignment::Center),
+        ]))
+        .alignment(Alignment::Center),
         footer_area,
     );
 }

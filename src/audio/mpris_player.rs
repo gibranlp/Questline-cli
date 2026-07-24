@@ -29,7 +29,12 @@ pub fn get_now_playing() -> Option<NowPlaying> {
         .unwrap_or_else(|| "Unknown Artist".to_string());
     let is_playing = status == mpris::PlaybackStatus::Playing;
 
-    Some(NowPlaying { title, artist, player: player_name, is_playing })
+    Some(NowPlaying {
+        title,
+        artist,
+        player: player_name,
+        is_playing,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]

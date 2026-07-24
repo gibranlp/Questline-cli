@@ -2,14 +2,14 @@
 // fellowship.rs — la pantalla del equipo: chat, presencia y proyectos compartidos
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::app::{extract_url, App, ModalType};
+use crate::app::{App, ModalType, extract_url};
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
-    Frame,
 };
 
 // La función principal — pinta toda la pantalla de fellowship, tabs y modales incluidos
@@ -37,13 +37,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             let is_selected = idx == app.selected_fellowship_project_idx;
             let marker = if is_selected { " > " } else { "   " };
             let style = if is_selected {
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
 
             // Contamos cuántos miembros están online en este proyecto para el badge lateral
-            let members = app.db.get_presence_for_project(&proj.id.to_string()).unwrap_or_default();
+            let members = app
+                .db
+                .get_presence_for_project(&proj.id.to_string())
+                .unwrap_or_default();
             let online_n = members.iter().filter(|m| m.3).count();
             let online_badge = if online_n > 0 {
                 format!("● {}", online_n)
@@ -55,8 +60,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Span::styled(marker, Style::default().fg(accent_color)),
                 Span::styled(proj.name.clone(), style),
                 Span::styled(
-                    if online_n > 0 { format!("  {}", online_badge) } else { String::new() },
-                    Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+                    if online_n > 0 {
+                        format!("  {}", online_badge)
+                    } else {
+                        String::new()
+                    },
+                    Style::default()
+                        .fg(theme.success)
+                        .add_modifier(Modifier::BOLD),
                 ),
             ]));
 
@@ -70,7 +81,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     let left_focused = app.fellowship_focus_left;
-    let left_border_color = if left_focused { accent_color } else { theme.border };
+    let left_border_color = if left_focused {
+        accent_color
+    } else {
+        theme.border
+    };
     let left_block = Paragraph::new(proj_lines).block(
         Block::default()
             .borders(Borders::ALL)
@@ -79,7 +94,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .title(Span::styled(
                 " Shared Fellowship Campaigns",
                 Style::default()
-                    .fg(if left_focused { theme.warning } else { Color::Gray })
+                    .fg(if left_focused {
+                        theme.warning
+                    } else {
+                        Color::Gray
+                    })
                     .add_modifier(Modifier::BOLD),
             )),
     );
@@ -141,8 +160,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     ])
                     .split(right_chunks[1]);
 
-                let desc_p = Paragraph::new("\n   Select or join a shared campaign to view its Chronicle.")
-                    .style(Style::default().fg(theme.text));
+                let desc_p =
+                    Paragraph::new("\n   Select or join a shared campaign to view its Chronicle.")
+                        .style(Style::default().fg(theme.text));
                 f.render_widget(desc_p, sub_chunks[0]);
 
                 let notifications = app.db.get_notifications().unwrap_or_default();
@@ -194,16 +214,22 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         notif_lines.push(Line::from(vec![
                             Span::styled(marker, Style::default().fg(accent_color)),
                             read_marker,
-                            Span::styled(format!("[{}] ", notif.1.to_uppercase()), notif_type_style),
+                            Span::styled(
+                                format!("[{}] ", notif.1.to_uppercase()),
+                                notif_type_style,
+                            ),
                             Span::styled(&notif.2, style),
                         ]));
 
                         // Parsea el timestamp RFC3339 y lo convierte a hora local legible
-                        let ts_formatted = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&notif.6) {
-                            dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()
-                        } else {
-                            notif.6.clone()
-                        };
+                        let ts_formatted =
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&notif.6) {
+                                dt.with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                                    .to_string()
+                            } else {
+                                notif.6.clone()
+                            };
 
                         notif_lines.push(Line::from(vec![
                             Span::styled(
@@ -266,32 +292,47 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         msg_start_lines.push(chat_lines.len() as u16);
                         let is_selected = app.fellowship_selected_msg_idx == msg_idx;
                         // Fondo azulado oscuro para el mensaje seleccionado
-                        let sel_bg = if is_selected { Color::Rgb(30, 35, 55) } else { Color::Reset };
+                        let sel_bg = if is_selected {
+                            Color::Rgb(30, 35, 55)
+                        } else {
+                            Color::Reset
+                        };
                         let msg_type = &msg.5;
                         let ts = &msg.6;
-                        let formatted_time = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                            dt.with_timezone(&chrono::Local).format("%H:%M").to_string()
-                        } else { ts.clone() };
+                        let formatted_time =
+                            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+                                dt.with_timezone(&chrono::Local).format("%H:%M").to_string()
+                            } else {
+                                ts.clone()
+                            };
 
                         // Traemos las reacciones del mensaje — cada DB call aquí, ojo con el performance
                         let reactions = app.db.get_message_reactions(&msg.0).unwrap_or_default();
 
                         if msg_type == "system" {
-                            chat_lines.push(Line::from(vec![
-                                Span::styled(
-                                    format!(" ── {} ──  ", &msg.4),
-                                    Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC).bg(sel_bg),
-                                ),
-                            ]));
+                            chat_lines.push(Line::from(vec![Span::styled(
+                                format!(" ── {} ──  ", &msg.4),
+                                Style::default()
+                                    .fg(theme.muted)
+                                    .add_modifier(Modifier::ITALIC)
+                                    .bg(sel_bg),
+                            )]));
                         } else {
                             // Si el public_key del mensaje es el nuestro, el nombre va en accent color
                             let is_mine = msg.2 == app.identity.public_key;
-                            let name_color = if is_mine { accent_color } else { Color::LightCyan };
+                            let name_color = if is_mine {
+                                accent_color
+                            } else {
+                                Color::LightCyan
+                            };
                             let sel_marker = if is_selected { "▌" } else { " " };
 
                             // Header line: marker + time + sender
                             chat_lines.push(Line::from(vec![
-                                Span::styled(sel_marker, Style::default().fg(accent_color).bg(sel_bg)),
+                                Span::styled(
+                                    sel_marker,
+                                    Style::default().fg(accent_color).bg(sel_bg),
+                                ),
                                 Span::styled(
                                     format!(" {}", formatted_time),
                                     Style::default().fg(theme.muted).bg(sel_bg),
@@ -299,7 +340,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                                 Span::styled("  ", Style::default().bg(sel_bg)),
                                 Span::styled(
                                     format!("{}", &msg.3),
-                                    Style::default().fg(name_color).add_modifier(Modifier::BOLD).bg(sel_bg),
+                                    Style::default()
+                                        .fg(name_color)
+                                        .add_modifier(Modifier::BOLD)
+                                        .bg(sel_bg),
                                 ),
                                 Span::styled("  ", Style::default().bg(sel_bg)),
                             ]));
@@ -307,22 +351,27 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                             // Detección de URLs — si hay link, se pinta en cyan con underline
                             let content = &msg.4;
                             let has_url = extract_url(content).is_some();
-                            let mut content_spans = vec![
-                                Span::styled(if is_selected { "▌ " } else { "  " }, Style::default().fg(accent_color).bg(sel_bg)),
-                            ];
+                            let mut content_spans = vec![Span::styled(
+                                if is_selected { "▌ " } else { "  " },
+                                Style::default().fg(accent_color).bg(sel_bg),
+                            )];
                             if has_url {
                                 // Partimos el contenido palabra por palabra para colorear solo las URLs
                                 for word in content.split(' ') {
-                                    let is_url = word.starts_with("http://") || word.starts_with("https://");
+                                    let is_url =
+                                        word.starts_with("http://") || word.starts_with("https://");
                                     if is_url {
                                         // Imagen o link normal — prefijo distinto para que se note
-                                        let is_img = ["jpg","jpeg","png","gif","webp"].iter()
+                                        let is_img = ["jpg", "jpeg", "png", "gif", "webp"]
+                                            .iter()
                                             .any(|e| word.to_lowercase().ends_with(e));
                                         let prefix = if is_img { "[img] " } else { "-> " };
                                         content_spans.push(Span::styled(
                                             format!("{}{} ", prefix, word),
-                                            Style::default().fg(Color::Cyan)
-                                                .add_modifier(Modifier::UNDERLINED).bg(sel_bg),
+                                            Style::default()
+                                                .fg(Color::Cyan)
+                                                .add_modifier(Modifier::UNDERLINED)
+                                                .bg(sel_bg),
                                         ));
                                     } else {
                                         content_spans.push(Span::styled(
@@ -341,9 +390,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
                             // Reactions line (only if there are reactions or it's selected)
                             if !reactions.is_empty() {
-                                let r_list: Vec<String> = reactions.iter().map(|r| r.1.clone()).collect();
+                                let r_list: Vec<String> =
+                                    reactions.iter().map(|r| r.1.clone()).collect();
                                 chat_lines.push(Line::from(vec![
-                                    Span::styled(if is_selected { "▌ " } else { "  " }, Style::default().fg(accent_color).bg(sel_bg)),
+                                    Span::styled(
+                                        if is_selected { "▌ " } else { "  " },
+                                        Style::default().fg(accent_color).bg(sel_bg),
+                                    ),
                                     Span::styled(
                                         r_list.join("  "),
                                         Style::default().fg(theme.warning).bg(sel_bg),
@@ -352,7 +405,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                             }
 
                             // Small gap between messages
-                            chat_lines.push(Line::from(Span::styled(" ", Style::default().bg(Color::Reset))));
+                            chat_lines.push(Line::from(Span::styled(
+                                " ",
+                                Style::default().bg(Color::Reset),
+                            )));
                         }
                     }
                 }
@@ -360,13 +416,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 // Lógica de scroll — auto-baja al fondo si no estamos navegando mensajes
                 let visible_h = chat_chunks[0].height.saturating_sub(2) as usize;
                 let total_lines = chat_lines.len();
-                let scroll: u16 = if !browsing || app.fellowship_selected_msg_idx >= msg_start_lines.len() {
+                let scroll: u16 = if !browsing
+                    || app.fellowship_selected_msg_idx >= msg_start_lines.len()
+                {
                     // Sin browsing activo: siempre al fondo como chat normal
                     total_lines.saturating_sub(visible_h) as u16
                 } else {
                     let msg_line = msg_start_lines[app.fellowship_selected_msg_idx] as usize;
                     // Ajusta el scroll para que el mensaje seleccionado quede visible con 2 líneas de margen
-                    msg_line.saturating_sub(2).min(total_lines.saturating_sub(visible_h)) as u16
+                    msg_line
+                        .saturating_sub(2)
+                        .min(total_lines.saturating_sub(visible_h)) as u16
                 };
 
                 let chat_border_color = if app.fellowship_focus_left {
@@ -377,7 +437,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     accent_color
                 };
                 // Contamos solo miembros de ESTE proyecto que están online — no contamos a todos
-                let proj_members = app.db.get_presence_for_project(&current_proj.id.to_string()).unwrap_or_default();
+                let proj_members = app
+                    .db
+                    .get_presence_for_project(&current_proj.id.to_string())
+                    .unwrap_or_default();
                 let online_count = proj_members.iter().filter(|m| m.3).count();
                 let online_badge = if online_count > 0 {
                     format!("● {} online  ", online_count)
@@ -394,11 +457,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                             .title(vec![
                                 Span::styled(
                                     format!(" Chronicle: {}  ", current_proj.name),
-                                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(theme.warning)
+                                        .add_modifier(Modifier::BOLD),
                                 ),
                                 Span::styled(
                                     online_badge,
-                                    Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+                                    Style::default()
+                                        .fg(theme.success)
+                                        .add_modifier(Modifier::BOLD),
                                 ),
                             ]),
                     )
@@ -410,21 +477,48 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 let (input_text, input_border_color, input_title) = if browsing {
                     let total = messages.len();
                     let idx = app.fellowship_selected_msg_idx + 1;
-                    let hint = if extract_url(messages.get(app.fellowship_selected_msg_idx).map(|m| m.4.as_str()).unwrap_or("")).is_some() {
+                    let hint = if extract_url(
+                        messages
+                            .get(app.fellowship_selected_msg_idx)
+                            .map(|m| m.4.as_str())
+                            .unwrap_or(""),
+                    )
+                    .is_some()
+                    {
                         "  [r] react  [c] copy URL  [↑↓] navigate  [Esc] exit browse"
                     } else {
                         "  [r] react  [c] copy  [↑↓] navigate  [Esc] exit browse"
                     };
-                    (format!("  [{}/{}]{}", idx, total, hint), theme.muted, " Browse ")
+                    (
+                        format!("  [{}/{}]{}", idx, total, hint),
+                        theme.muted,
+                        " Browse ",
+                    )
                 } else if app.fellowship_composing {
                     // Cursor parpadeante — alterna cada 500ms usando el timestamp del sistema
                     let cursor = if (std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_millis() / 500) % 2 == 0 { "█" } else { " " };
-                    (format!("  > {}{}", app.fellowship_chat_input, cursor), accent_color, " Compose ")
+                        .as_millis()
+                        / 500)
+                        % 2
+                        == 0
+                    {
+                        "█"
+                    } else {
+                        " "
+                    };
+                    (
+                        format!("  > {}{}", app.fellowship_chat_input, cursor),
+                        accent_color,
+                        " Compose ",
+                    )
                 } else {
-                    ("  Press [Enter] to compose a message...".to_string(), theme.muted, " Message ")
+                    (
+                        "  Press [Enter] to compose a message...".to_string(),
+                        theme.muted,
+                        " Message ",
+                    )
                 };
 
                 let input_p = Paragraph::new(input_text).block(
@@ -506,11 +600,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
         2 => {
             // Tab de compañeros — muestra miembros DEL PROYECTO SELECCIONADO con su presencia
-            let (members, proj_name) = if shared_projects.is_empty() || app.selected_fellowship_project_idx >= shared_projects.len() {
+            let (members, proj_name) = if shared_projects.is_empty()
+                || app.selected_fellowship_project_idx >= shared_projects.len()
+            {
                 (Vec::new(), "None".to_string())
             } else {
                 let proj = shared_projects[app.selected_fellowship_project_idx];
-                let m = app.db.get_presence_for_project(&proj.id.to_string()).unwrap_or_default();
+                let m = app
+                    .db
+                    .get_presence_for_project(&proj.id.to_string())
+                    .unwrap_or_default();
                 (m, proj.name.clone())
             };
             let mut comp_lines = vec![Line::from("")];
@@ -520,31 +619,37 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 comp_lines.push(Line::from("   Invite members with [i] to see them here."));
             } else {
                 let online_n = members.iter().filter(|m| m.3).count();
-                comp_lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("   {} online  •  {} members", online_n, members.len()),
-                        Style::default().fg(theme.muted),
-                    ),
-                ]));
+                comp_lines.push(Line::from(vec![Span::styled(
+                    format!("   {} online  •  {} members", online_n, members.len()),
+                    Style::default().fg(theme.muted),
+                )]));
                 comp_lines.push(Line::from(""));
 
                 for member in &members {
                     // member: (identity, username, role, is_online, last_seen, current_project)
-                    let (identity, username, role, is_online, last_seen, current_proj) =
-                        (&member.0, &member.1, &member.2, member.3, &member.4, &member.5);
+                    let (identity, username, role, is_online, last_seen, current_proj) = (
+                        &member.0, &member.1, &member.2, member.3, &member.4, &member.5,
+                    );
 
                     let dot = if is_online { "● " } else { "○ " };
-                    let dot_color = if is_online { theme.success } else { theme.muted };
+                    let dot_color = if is_online {
+                        theme.success
+                    } else {
+                        theme.muted
+                    };
                     let name_color = if is_online { Color::White } else { Color::Gray };
 
                     comp_lines.push(Line::from(vec![
                         Span::styled("   ", Style::default()),
-                        Span::styled(dot, Style::default().fg(dot_color).add_modifier(Modifier::BOLD)),
-                        Span::styled(username.clone(), Style::default().fg(name_color).add_modifier(Modifier::BOLD)),
                         Span::styled(
-                            format!("  [{}]", role),
-                            Style::default().fg(theme.muted),
+                            dot,
+                            Style::default().fg(dot_color).add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(
+                            username.clone(),
+                            Style::default().fg(name_color).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("  [{}]", role), Style::default().fg(theme.muted)),
                     ]));
 
                     // Mostrar en qué proyecto está o cuándo fue la última actividad
@@ -560,7 +665,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         }
                     } else if !last_seen.is_empty() && last_seen != "Never" {
                         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(last_seen) {
-                            let mins = (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes();
+                            let mins =
+                                (chrono::Utc::now() - dt.with_timezone(&chrono::Utc)).num_minutes();
                             if mins < 60 {
                                 format!("       Last seen {} min ago", mins)
                             } else if mins < 1440 {
@@ -576,7 +682,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     };
                     comp_lines.push(Line::from(vec![Span::styled(
                         detail,
-                        Style::default().fg(if is_online { Color::LightCyan } else { theme.muted }),
+                        Style::default().fg(if is_online {
+                            Color::LightCyan
+                        } else {
+                            theme.muted
+                        }),
                     )]));
                     comp_lines.push(Line::from(vec![Span::styled(
                         format!("       id: {}…", &identity[..identity.len().min(20)]),
@@ -594,7 +704,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .border_style(Style::default().fg(accent_color))
                     .title(Span::styled(
                         comp_title,
-                        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
                     )),
             );
             f.render_widget(comp_p, right_chunks[1]);
@@ -610,7 +722,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 for act in &activities {
                     let formatted_time =
                         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&act.6) {
-                            dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string()
+                            dt.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M:%S")
+                                .to_string()
                         } else {
                             act.6.clone()
                         };
@@ -680,7 +794,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     let content = &res.4;
                     let ts = &res.6;
                     let formatted_time = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                        dt.with_timezone(&chrono::Local).format("%m-%d %H:%M").to_string()
+                        dt.with_timezone(&chrono::Local)
+                            .format("%m-%d %H:%M")
+                            .to_string()
                     } else {
                         ts.clone()
                     };
@@ -755,7 +871,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::PostMessage { content } = &app.modal_state {
         let area = centered_rect(50, 20, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -796,7 +915,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::AddReaction { message_id: _ } = &app.modal_state {
         let area = centered_rect(40, 20, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -837,7 +959,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::ProjectSharing { project_id } = &app.modal_state {
         let area = centered_rect(50, 25, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         // Buscamos el proyecto por ID para saber su estado actual de sharing
         let is_proj_shared = app
@@ -897,7 +1022,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::SearchMessages { query } = &app.modal_state {
         let area = centered_rect(55, 30, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -905,7 +1033,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .border_style(Style::default().fg(accent_color))
             .title(Span::styled(
                 " Search Chronicle ",
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ));
 
         let inner_layout = Layout::default()
@@ -923,7 +1053,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let cursor = if (std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
-            .as_millis() / 500) % 2 == 0 { "█" } else { " " };
+            .as_millis()
+            / 500)
+            % 2
+            == 0
+        {
+            "█"
+        } else {
+            " "
+        };
 
         let input_p = Paragraph::new(format!("  > {}{}", query, cursor)).block(
             Block::default()

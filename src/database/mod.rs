@@ -6,7 +6,7 @@ pub mod schema;
 
 use anyhow::Result;
 use chrono::{DateTime, NaiveDate, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use uuid::Uuid;
 
@@ -36,12 +36,21 @@ impl Database {
         let has_task_updated_at: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='updated_at'",
             [],
-            |row| { let cnt: i32 = row.get(0)?; Ok(cnt > 0) },
+            |row| {
+                let cnt: i32 = row.get(0)?;
+                Ok(cnt > 0)
+            },
         )?;
         if !has_task_updated_at {
-            conn.execute("ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';", [])?;
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';",
+                [],
+            )?;
             // Rellenar updated_at con created_at para tareas existentes — sin esto quedan vacías
-            conn.execute("UPDATE tasks SET updated_at = created_at WHERE updated_at = '';", [])?;
+            conn.execute(
+                "UPDATE tasks SET updated_at = created_at WHERE updated_at = '';",
+                [],
+            )?;
         }
 
         let has_priority_col: bool = conn.query_row(
@@ -107,10 +116,16 @@ impl Database {
         let has_focus_owner_col: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('focus_sessions') WHERE name='owner_identity'",
             [],
-            |row| { let cnt: i32 = row.get(0)?; Ok(cnt > 0) },
+            |row| {
+                let cnt: i32 = row.get(0)?;
+                Ok(cnt > 0)
+            },
         )?;
         if !has_focus_owner_col {
-            conn.execute("ALTER TABLE focus_sessions ADD COLUMN owner_identity TEXT;", [])?;
+            conn.execute(
+                "ALTER TABLE focus_sessions ADD COLUMN owner_identity TEXT;",
+                [],
+            )?;
         }
 
         // Migraciones del modo colaborativo (Stage 5B) — dueño e identidad por entidad
@@ -162,7 +177,10 @@ impl Database {
             |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_journal_author {
-            conn.execute("ALTER TABLE journal_entries ADD COLUMN author_username TEXT NOT NULL DEFAULT '';", [])?;
+            conn.execute(
+                "ALTER TABLE journal_entries ADD COLUMN author_username TEXT NOT NULL DEFAULT '';",
+                [],
+            )?;
         }
 
         let has_milestone_created_at: bool = conn.query_row(
@@ -231,9 +249,7 @@ impl Database {
         if !has_codex_id {
             conn.execute("ALTER TABLE notes ADD COLUMN codex_id TEXT;", [])?;
         }
-        conn.execute_batch(
-            "CREATE INDEX IF NOT EXISTS idx_notes_codex_id ON notes(codex_id);",
-        )?;
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_notes_codex_id ON notes(codex_id);")?;
 
         let has_note_owner_identity: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('notes') WHERE name='owner_identity'",
@@ -273,7 +289,10 @@ impl Database {
             |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_chronicle_hero_class {
-            conn.execute("ALTER TABLE global_chronicle ADD COLUMN hero_class TEXT;", [])?;
+            conn.execute(
+                "ALTER TABLE global_chronicle ADD COLUMN hero_class TEXT;",
+                [],
+            )?;
         }
 
         // v1.0.7: xp_awarded — evita que reabrir y re-completar una tarea dé XP extra
@@ -288,16 +307,14 @@ impl Database {
                 [],
             )?;
             // Las tareas ya completadas antes de esta versión ya dieron XP — se marca como cobrado
-            conn.execute(
-                "UPDATE tasks SET xp_awarded = 1 WHERE completed = 1;",
-                [],
-            )?;
+            conn.execute("UPDATE tasks SET xp_awarded = 1 WHERE completed = 1;", [])?;
         }
 
         // v1.0.8: recurrence — tareas que renacen solas al completarse
         let has_recurrence: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='recurrence'",
-            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_recurrence {
             conn.execute("ALTER TABLE tasks ADD COLUMN recurrence TEXT;", [])?;
@@ -305,7 +322,8 @@ impl Database {
 
         let has_set_date: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='set_date'",
-            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_set_date {
             conn.execute("ALTER TABLE tasks ADD COLUMN set_date TEXT;", [])?;
@@ -314,7 +332,8 @@ impl Database {
         // v1.0.9: nested codices — un codex puede vivir dentro de otro
         let has_parent_codex: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('codices') WHERE name='parent_codex_id'",
-            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_parent_codex {
             conn.execute("ALTER TABLE codices ADD COLUMN parent_codex_id TEXT;", [])?;
@@ -322,18 +341,26 @@ impl Database {
 
         let has_codex_collapsed: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('codices') WHERE name='collapsed'",
-            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_codex_collapsed {
-            conn.execute("ALTER TABLE codices ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0;", [])?;
+            conn.execute(
+                "ALTER TABLE codices ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0;",
+                [],
+            )?;
         }
 
         let has_ritual_daily_target: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('rituals') WHERE name='daily_target'",
-            [], |row| row.get::<_, i32>(0).map(|c| c > 0),
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
         )?;
         if !has_ritual_daily_target {
-            conn.execute("ALTER TABLE rituals ADD COLUMN daily_target INTEGER NOT NULL DEFAULT 1;", [])?;
+            conn.execute(
+                "ALTER TABLE rituals ADD COLUMN daily_target INTEGER NOT NULL DEFAULT 1;",
+                [],
+            )?;
         }
 
         let has_ritual_completion_count: bool = conn.query_row(
@@ -346,13 +373,15 @@ impl Database {
         }
 
         // Hydration log table — created via schema, but add migration guard for older DBs
-        conn.execute_batch("
+        conn.execute_batch(
+            "
             CREATE TABLE IF NOT EXISTS hydration_log (
                 log_date TEXT PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0,
                 reward_given INTEGER NOT NULL DEFAULT 0
             );
-        ")?;
+        ",
+        )?;
 
         for (id, name, desc) in Achievement::static_list() {
             conn.execute(
@@ -473,12 +502,36 @@ impl Database {
             }
         }
         let class_capstone_titles = vec![
-            ("class_capstone_code_warlock", "Keeper of Working Systems", "Complete the Level 100 Code Warlock class quest."),
-            ("class_capstone_task_paladin", "Avatar of Completion", "Complete the Level 100 Task Paladin class quest."),
-            ("class_capstone_mind_sage", "Lantern of the Silent Archive", "Complete the Level 100 Mind Sage class quest."),
-            ("class_capstone_systems_architect", "Keeper of the Unified Schema", "Complete the Level 100 Systems Architect class quest."),
-            ("class_capstone_time_chronomancer", "Keeper of Reality", "Complete the Level 100 Time Chronomancer class quest."),
-            ("class_capstone_arch_accountant", "Keeper of the Eternal Ledger", "Complete the Level 100 Arch Accountant class quest."),
+            (
+                "class_capstone_code_warlock",
+                "Keeper of Working Systems",
+                "Complete the Level 100 Code Warlock class quest.",
+            ),
+            (
+                "class_capstone_task_paladin",
+                "Avatar of Completion",
+                "Complete the Level 100 Task Paladin class quest.",
+            ),
+            (
+                "class_capstone_mind_sage",
+                "Lantern of the Silent Archive",
+                "Complete the Level 100 Mind Sage class quest.",
+            ),
+            (
+                "class_capstone_systems_architect",
+                "Keeper of the Unified Schema",
+                "Complete the Level 100 Systems Architect class quest.",
+            ),
+            (
+                "class_capstone_time_chronomancer",
+                "Keeper of Reality",
+                "Complete the Level 100 Time Chronomancer class quest.",
+            ),
+            (
+                "class_capstone_arch_accountant",
+                "Keeper of the Eternal Ledger",
+                "Complete the Level 100 Arch Accountant class quest.",
+            ),
         ];
         for (id, name, desc) in class_capstone_titles {
             conn.execute(
@@ -491,11 +544,31 @@ impl Database {
             conn.query_row("SELECT count(*) FROM relics", [], |row| row.get(0))?;
         if count_relics == 0 {
             let default_relics = vec![
-                ("ancient_quill", "Ancient Quill", "A feather plucked from an owl of the high canopy. It writes with invisible ink that glows only under moonlight. (Unlocked by Scholar achievement)"),
-                ("crystal_compass", "Crystal Compass", "Its needle does not point north, but toward the nearest unfinished task. (Unlocked by Project Master achievement)"),
-                ("rune_tablet", "Rune Tablet", "An ancient stone slab inscribed with glowing symbols that pulse in harmony with your tree. (Unlocked at Level 50)"),
-                ("explorers_map", "Explorer's Map", "A dusty parchment depicting shifting landscapes that update as your streak grows. (Unlocked by 30-day streak)"),
-                ("clock_of_focus", "Clock of Focus", "A pocket watch that ticks slower when you are concentrated, expanding time itself. (Unlocked by 50 focus sessions)"),
+                (
+                    "ancient_quill",
+                    "Ancient Quill",
+                    "A feather plucked from an owl of the high canopy. It writes with invisible ink that glows only under moonlight. (Unlocked by Scholar achievement)",
+                ),
+                (
+                    "crystal_compass",
+                    "Crystal Compass",
+                    "Its needle does not point north, but toward the nearest unfinished task. (Unlocked by Project Master achievement)",
+                ),
+                (
+                    "rune_tablet",
+                    "Rune Tablet",
+                    "An ancient stone slab inscribed with glowing symbols that pulse in harmony with your tree. (Unlocked at Level 50)",
+                ),
+                (
+                    "explorers_map",
+                    "Explorer's Map",
+                    "A dusty parchment depicting shifting landscapes that update as your streak grows. (Unlocked by 30-day streak)",
+                ),
+                (
+                    "clock_of_focus",
+                    "Clock of Focus",
+                    "A pocket watch that ticks slower when you are concentrated, expanding time itself. (Unlocked by 50 focus sessions)",
+                ),
             ];
             for (id, name, desc) in default_relics {
                 conn.execute(
@@ -513,7 +586,10 @@ impl Database {
     // Se usan INSERT OR IGNORE para no pisar el estado de desbloqueo del usuario.
     // Se llaman desde app/mod.rs después de que LoreManager descargó los datos.
 
-    pub fn seed_lore_entries(&self, entries: &[crate::services::lore_manager::LoreEntry]) -> Result<()> {
+    pub fn seed_lore_entries(
+        &self,
+        entries: &[crate::services::lore_manager::LoreEntry],
+    ) -> Result<()> {
         // Recolecta los IDs que vienen del servidor para detectar eliminaciones
         let remote_ids: Vec<&str> = entries.iter().map(|e| e.id.as_str()).collect();
 
@@ -543,7 +619,9 @@ impl Database {
         // Elimina entradas que el admin borró del JSON — si el ID ya no está en el servidor, no debe estar aquí
         // Solo borra las que aún están bloqueadas; si el usuario ya la desbloqueó se conserva como recuerdo
         if !remote_ids.is_empty() {
-            let placeholders = remote_ids.iter().enumerate()
+            let placeholders = remote_ids
+                .iter()
+                .enumerate()
                 .map(|(i, _)| format!("?{}", i + 1))
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -561,10 +639,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn seed_class_quests(&self, quests: &[crate::services::lore_manager::ClassQuest]) -> Result<()> {
-        let remote_keys: Vec<(String, i32)> = quests.iter()
-            .map(|q| (q.class.clone(), q.level))
-            .collect();
+    pub fn seed_class_quests(
+        &self,
+        quests: &[crate::services::lore_manager::ClassQuest],
+    ) -> Result<()> {
+        let remote_keys: Vec<(String, i32)> =
+            quests.iter().map(|q| (q.class.clone(), q.level)).collect();
 
         for q in quests {
             // Inserta si no existe — preserva status y progress del usuario
@@ -830,7 +910,9 @@ impl Database {
                 .unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
-                Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(p) => {
+                    Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
 
@@ -881,31 +963,64 @@ impl Database {
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
-                Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(p) => {
+                    Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
             let due_date = match due_str {
-                Some(d) => Some(DateTime::parse_from_rfc3339(&d).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(d) => Some(
+                    DateTime::parse_from_rfc3339(&d)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?,
+                ),
                 None => None,
             };
             let set_date = match set_str {
-                Some(d) => Some(DateTime::parse_from_rfc3339(&d).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(d) => Some(
+                    DateTime::parse_from_rfc3339(&d)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?,
+                ),
                 None => None,
             };
-            let created_at = DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            let updated_at = DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).unwrap_or(created_at);
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
-                Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(p) => {
+                    Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
-            Ok(Task { id, project_id, title, description, due_date, set_date, completed: completed_int != 0, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded: xp_awarded_int != 0, recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str) })
+            Ok(Task {
+                id,
+                project_id,
+                title,
+                description,
+                due_date,
+                set_date,
+                completed: completed_int != 0,
+                priority,
+                created_at,
+                updated_at,
+                owner_identity,
+                owner_username,
+                parent_task_id,
+                xp_awarded: xp_awarded_int != 0,
+                recurrence: recurrence_str.as_deref().and_then(RecurrenceType::from_str),
+            })
         })?;
         let mut tasks = Vec::new();
-        for r in rows { tasks.push(r?); }
+        for r in rows {
+            tasks.push(r?);
+        }
         Ok(tasks)
     }
-
 
     pub fn update_task(&self, task: &Task) -> Result<()> {
         let old_task = self.get_task_by_id(task.id).ok();
@@ -1002,7 +1117,9 @@ impl Database {
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let codex_id = match codex_id_str {
-                Some(c) => Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(c) => {
+                    Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
 
@@ -1041,19 +1158,39 @@ impl Database {
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = match project_id_str {
-                Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(p) => {
+                    Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
-            let created_at = DateTime::parse_from_rfc3339(&created_str).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            let updated_at = DateTime::parse_from_rfc3339(&updated_str).map(|dt| dt.with_timezone(&Utc)).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let created_at = DateTime::parse_from_rfc3339(&created_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let codex_id = match codex_id_str {
-                Some(c) => Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(c) => {
+                    Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
-            Ok(Note { id, project_id, title, markdown_content: content, created_at, updated_at, sharing_permission, codex_id, owner_identity })
+            Ok(Note {
+                id,
+                project_id,
+                title,
+                markdown_content: content,
+                created_at,
+                updated_at,
+                sharing_permission,
+                codex_id,
+                owner_identity,
+            })
         })?;
         let mut notes = Vec::new();
-        for r in rows { notes.push(r?); }
+        for r in rows {
+            notes.push(r?);
+        }
         Ok(notes)
     }
 
@@ -1455,21 +1592,24 @@ impl Database {
             |row| row.get(0)
         ).optional()?.unwrap_or_else(|| "None".to_string());
 
-        let days_elapsed = match self.conn
+        let days_elapsed =
+            match self
+                .conn
                 .query_row("SELECT created_at FROM users LIMIT 1", [], |row| {
                     row.get::<_, String>(0)
-                }) { Ok(created_str) => {
-            if let Ok(created_at) = DateTime::parse_from_rfc3339(&created_str) {
-                let diff = Utc::now()
-                    .signed_duration_since(created_at.with_timezone(&Utc))
-                    .num_days();
-                diff.max(1)
-            } else {
-                1
-            }
-        } _ => {
-            1
-        }};
+                }) {
+                Ok(created_str) => {
+                    if let Ok(created_at) = DateTime::parse_from_rfc3339(&created_str) {
+                        let diff = Utc::now()
+                            .signed_duration_since(created_at.with_timezone(&Utc))
+                            .num_days();
+                        diff.max(1)
+                    } else {
+                        1
+                    }
+                }
+                _ => 1,
+            };
 
         let avg_tasks_per_day = tasks_completed as f64 / days_elapsed as f64;
         let avg_xp_per_day = total_xp_earned as f64 / days_elapsed as f64;
@@ -1639,7 +1779,10 @@ impl Database {
     }
 
     pub fn count_completed_tasks_where(&self, predicate: &str) -> Result<i32> {
-        let query = format!("SELECT count(*) FROM tasks WHERE completed = 1 AND {}", predicate);
+        let query = format!(
+            "SELECT count(*) FROM tasks WHERE completed = 1 AND {}",
+            predicate
+        );
         let count: i32 = self.conn.query_row(&query, [], |row| row.get(0))?;
         Ok(count)
     }
@@ -1681,20 +1824,18 @@ impl Database {
     }
 
     pub fn count_chronicle_messages(&self) -> Result<i32> {
-        let count: i32 = self.conn.query_row(
-            "SELECT count(*) FROM chronicle_messages",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i32 =
+            self.conn
+                .query_row("SELECT count(*) FROM chronicle_messages", [], |row| {
+                    row.get(0)
+                })?;
         Ok(count)
     }
 
     pub fn count_invitations_sent(&self) -> Result<i32> {
-        let count: i32 = self.conn.query_row(
-            "SELECT count(*) FROM invitations",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i32 = self
+            .conn
+            .query_row("SELECT count(*) FROM invitations", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -1760,11 +1901,14 @@ impl Database {
     // Increments today's completion count up to the ritual's daily_target.
     // Returns Some((new_count, target)) when incremented, None when already at target.
     pub fn complete_ritual(&self, ritual_id: &str, date: NaiveDate) -> Result<Option<(i32, i32)>> {
-        let target: i32 = self.conn.query_row(
-            "SELECT daily_target FROM rituals WHERE id = ?1",
-            params![ritual_id],
-            |row| row.get(0),
-        ).unwrap_or(1);
+        let target: i32 = self
+            .conn
+            .query_row(
+                "SELECT daily_target FROM rituals WHERE id = ?1",
+                params![ritual_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
 
         self.conn.execute(
             "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date, completion_count) VALUES (?1, ?2, 0)",
@@ -1779,7 +1923,11 @@ impl Database {
         if changed == 0 {
             return Ok(None);
         }
-        let _ = self.log_change("ritual_history", &format!("{}__{}", ritual_id, date), "create");
+        let _ = self.log_change(
+            "ritual_history",
+            &format!("{}__{}", ritual_id, date),
+            "create",
+        );
 
         let new_count: i32 = self.conn.query_row(
             "SELECT completion_count FROM ritual_history WHERE ritual_id = ?1 AND completed_date = ?2",
@@ -1806,14 +1954,21 @@ impl Database {
     }
 
     // Returns (completion_count, daily_target) for every ritual for a given date.
-    pub fn get_ritual_day_counts(&self, date: NaiveDate) -> Result<std::collections::HashMap<String, (i32, i32)>> {
+    pub fn get_ritual_day_counts(
+        &self,
+        date: NaiveDate,
+    ) -> Result<std::collections::HashMap<String, (i32, i32)>> {
         let mut stmt = self.conn.prepare(
             "SELECT r.id, COALESCE(rh.completion_count, 0), r.daily_target
              FROM rituals r
              LEFT JOIN ritual_history rh ON r.id = rh.ritual_id AND rh.completed_date = ?1",
         )?;
         let rows = stmt.query_map(params![date.to_string()], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i32>(1)?, row.get::<_, i32>(2)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i32>(1)?,
+                row.get::<_, i32>(2)?,
+            ))
         })?;
         let mut map = std::collections::HashMap::new();
         for r in rows.filter_map(|r| r.ok()) {
@@ -1824,11 +1979,14 @@ impl Database {
 
     // Consecutive-day streak for one ritual — only fully-completed days count.
     pub fn get_ritual_streak(&self, ritual_id: &str) -> Result<i32> {
-        let target: i32 = self.conn.query_row(
-            "SELECT daily_target FROM rituals WHERE id = ?1",
-            params![ritual_id],
-            |row| row.get(0),
-        ).unwrap_or(1);
+        let target: i32 = self
+            .conn
+            .query_row(
+                "SELECT daily_target FROM rituals WHERE id = ?1",
+                params![ritual_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(1);
 
         let mut stmt = self.conn.prepare(
             "SELECT completed_date FROM ritual_history WHERE ritual_id = ?1 AND completion_count >= ?2 ORDER BY completed_date DESC",
@@ -1873,7 +2031,8 @@ impl Database {
         })?;
 
         let today = chrono::Local::now().date_naive();
-        let mut per_ritual: std::collections::HashMap<String, Vec<NaiveDate>> = std::collections::HashMap::new();
+        let mut per_ritual: std::collections::HashMap<String, Vec<NaiveDate>> =
+            std::collections::HashMap::new();
         for r in rows.filter_map(|r| r.ok()) {
             if let Ok(d) = NaiveDate::parse_from_str(&r.1, "%Y-%m-%d") {
                 per_ritual.entry(r.0).or_default().push(d);
@@ -1910,11 +2069,13 @@ impl Database {
             "INSERT OR IGNORE INTO hydration_log (log_date, count, reward_given) VALUES (?1, 0, 0)",
             params![today],
         )?;
-        self.conn.query_row(
-            "SELECT count, reward_given FROM hydration_log WHERE log_date = ?1",
-            params![today],
-            |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)? != 0)),
-        ).map_err(Into::into)
+        self.conn
+            .query_row(
+                "SELECT count, reward_given FROM hydration_log WHERE log_date = ?1",
+                params![today],
+                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, i32>(1)? != 0)),
+            )
+            .map_err(Into::into)
     }
 
     // Increments glass count; returns the new count.
@@ -1925,11 +2086,13 @@ impl Database {
              ON CONFLICT(log_date) DO UPDATE SET count = count + 1",
             params![today],
         )?;
-        self.conn.query_row(
-            "SELECT count FROM hydration_log WHERE log_date = ?1",
-            params![today],
-            |row| row.get(0),
-        ).map_err(Into::into)
+        self.conn
+            .query_row(
+                "SELECT count FROM hydration_log WHERE log_date = ?1",
+                params![today],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     // Marks the daily reward as claimed so it doesn't fire again today.
@@ -2211,7 +2374,9 @@ impl Database {
                 .unwrap_or(created_at);
             let priority = TaskPriority::from_str(&priority_str);
             let parent_task_id = match parent_task_id_str {
-                Some(p) => Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(p) => {
+                    Some(Uuid::parse_str(&p).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
 
@@ -2263,7 +2428,9 @@ impl Database {
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let codex_id = match codex_id_str {
-                Some(c) => Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(c) => {
+                    Some(Uuid::parse_str(&c).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
 
@@ -2313,18 +2480,30 @@ impl Database {
             let parent_str: Option<String> = row.get(4)?;
             let collapsed: i32 = row.get(5).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let pid =
+                Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let parent_codex_id = match parent_str {
-                Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(s) => {
+                    Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
-            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id, collapsed: collapsed != 0 })
+            Ok(Codex {
+                id,
+                project_id: pid,
+                name,
+                created_at,
+                parent_codex_id,
+                collapsed: collapsed != 0,
+            })
         })?;
         let mut list = Vec::new();
-        for r in rows { list.push(r?); }
+        for r in rows {
+            list.push(r?);
+        }
         Ok(list)
     }
 
@@ -2340,15 +2519,25 @@ impl Database {
             let parent_str: Option<String> = row.get(4)?;
             let collapsed: i32 = row.get(5).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            let pid = Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let pid =
+                Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let parent_codex_id = match parent_str {
-                Some(s) => Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?),
+                Some(s) => {
+                    Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
+                }
                 None => None,
             };
-            Ok(Codex { id, project_id: pid, name, created_at, parent_codex_id, collapsed: collapsed != 0 })
+            Ok(Codex {
+                id,
+                project_id: pid,
+                name,
+                created_at,
+                parent_codex_id,
+                collapsed: collapsed != 0,
+            })
         })?;
         Ok(codex)
     }
@@ -2387,20 +2576,16 @@ impl Database {
             params![id.to_string()],
         )?;
         // el ON DELETE SET NULL del schema ya desagrupa las notas — no hace falta UPDATE manual aquí
-        self.conn.execute(
-            "DELETE FROM codices WHERE id = ?1",
-            params![id.to_string()],
-        )?;
+        self.conn
+            .execute("DELETE FROM codices WHERE id = ?1", params![id.to_string()])?;
         let _ = self.log_change("codex", &id.to_string(), "delete");
         Ok(())
     }
 
     pub fn count_codices(&self) -> Result<i32> {
-        let count: i32 = self.conn.query_row(
-            "SELECT count(*) FROM codices",
-            [],
-            |row| row.get(0),
-        )?;
+        let count: i32 = self
+            .conn
+            .query_row("SELECT count(*) FROM codices", [], |row| row.get(0))?;
         Ok(count)
     }
 
@@ -2487,7 +2672,12 @@ impl Database {
     }
 
     /// Aplica un registro de dispositivo recibido desde otro nodo — upsert seguro.
-    pub fn upsert_remote_device(&self, device_id: &str, device_name: &str, last_sync: Option<&str>) -> Result<()> {
+    pub fn upsert_remote_device(
+        &self,
+        device_id: &str,
+        device_name: &str,
+        last_sync: Option<&str>,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO devices (device_id, device_name, created_at, last_sync)
              VALUES (?1, ?2, ?3, ?4)
@@ -2530,18 +2720,30 @@ impl Database {
         if ids.is_empty() {
             return Ok(());
         }
-        let placeholders = ids.iter().enumerate().map(|(i, _)| format!("?{}", i + 1)).collect::<Vec<_>>().join(",");
-        let sql = format!("UPDATE sync_log SET synced = 1 WHERE id IN ({})", placeholders);
+        let placeholders = ids
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "UPDATE sync_log SET synced = 1 WHERE id IN ({})",
+            placeholders
+        );
         let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> =
+            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
         stmt.execute(params.as_slice())?;
         Ok(())
     }
 
     /// Carga todos los IDs de eventos remotos ya procesados en un HashSet para dedup O(1) durante el pull.
     pub fn load_processed_remote_ids(&self) -> Result<std::collections::HashSet<String>> {
-        let mut stmt = self.conn.prepare("SELECT id FROM processed_remote_events")?;
-        let ids = stmt.query_map([], |r| r.get::<_, String>(0))?
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id FROM processed_remote_events")?;
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(ids)
@@ -2549,7 +2751,9 @@ impl Database {
 
     /// Registra los IDs de eventos remotos recién aplicados para no repetirlos en futuros syncs.
     pub fn mark_remote_events_processed(&self, ids: &[String]) -> Result<()> {
-        if ids.is_empty() { return Ok(()); }
+        if ids.is_empty() {
+            return Ok(());
+        }
         let now = Utc::now().to_rfc3339();
         for id in ids {
             let _ = self.conn.execute(
@@ -2607,7 +2811,9 @@ impl Database {
         ];
 
         for (entity_type, table, id_col) in simple_tables {
-            let mut stmt = self.conn.prepare(&format!("SELECT {} FROM {}", id_col, table))?;
+            let mut stmt = self
+                .conn
+                .prepare(&format!("SELECT {} FROM {}", id_col, table))?;
             let ids = stmt
                 .query_map([], |row| row.get::<_, String>(0))?
                 .filter_map(|row| row.ok())
@@ -2871,11 +3077,14 @@ impl Database {
         // The backup's device_id belongs to the source machine and must never replace ours —
         // if it did, the server pull filter (device_id != ?) would silently drop all of the
         // source machine's events on this device after the next restart.
-        let pre_import_device_id: Option<String> = self.conn.query_row(
-            "SELECT value FROM settings WHERE key = 'device_id'",
-            [],
-            |r| r.get(0),
-        ).ok();
+        let pre_import_device_id: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'device_id'",
+                [],
+                |r| r.get(0),
+            )
+            .ok();
 
         // FK off para importar sin importar el orden de tablas — se reactiva al final pase lo que pase
         self.conn.execute("PRAGMA foreign_keys = OFF;", [])?;
@@ -2900,9 +3109,10 @@ impl Database {
                 }
 
                 // Obtiene las columnas que realmente existen en la tabla del schema actual
-                let mut col_stmt = self.conn.prepare(
-                    &format!("SELECT name FROM pragma_table_info('{}')", table_name),
-                )?;
+                let mut col_stmt = self.conn.prepare(&format!(
+                    "SELECT name FROM pragma_table_info('{}')",
+                    table_name
+                ))?;
                 let existing_cols: std::collections::HashSet<String> = col_stmt
                     .query_map([], |r| r.get::<_, String>(0))?
                     .filter_map(|r| r.ok())
@@ -2983,18 +3193,16 @@ impl Database {
                 None => {
                     // This machine had no device_id before the import either; let App::new()
                     // generate a fresh one on next launch.
-                    let _ = self.conn.execute(
-                        "DELETE FROM settings WHERE key = 'device_id'",
-                        [],
-                    );
+                    let _ = self
+                        .conn
+                        .execute("DELETE FROM settings WHERE key = 'device_id'", []);
                 }
             }
             // Reset the pull cursor — the restored machine must pull the full event history
             // so it reaches the same state as the backup source.
-            let _ = self.conn.execute(
-                "DELETE FROM settings WHERE key = 'last_pull_seq'",
-                [],
-            );
+            let _ = self
+                .conn
+                .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", []);
             // Clear dedup IDs from the backup source — they belong to a different device's
             // view of the event stream and would cause this machine to skip events it has
             // never actually applied.
@@ -3348,7 +3556,17 @@ impl Database {
         &self,
         project_id: &str,
         limit: usize,
-    ) -> Result<Vec<(String, Option<String>, String, String, String, String, String)>> {
+    ) -> Result<
+        Vec<(
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+            String,
+            String,
+        )>,
+    > {
         let mut stmt = self.conn.prepare(
             "SELECT id, project_id, event_type, description, user_identity, user_username, timestamp FROM activity_log WHERE project_id = ?1 ORDER BY timestamp DESC LIMIT ?2",
         )?;
@@ -3762,26 +3980,42 @@ impl Database {
             if a.1 != b.1 {
                 a.1.cmp(&b.1)
             } else if a.1 == "World" {
-                let a_num = a.0.strip_prefix("world_chapter_")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(999);
-                let b_num = b.0.strip_prefix("world_chapter_")
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .unwrap_or(999);
+                let a_num =
+                    a.0.strip_prefix("world_chapter_")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(999);
+                let b_num =
+                    b.0.strip_prefix("world_chapter_")
+                        .and_then(|s| s.parse::<usize>().ok())
+                        .unwrap_or(999);
                 a_num.cmp(&b_num)
             } else if a.1 == "Class" {
                 // Ordena por clase primero (shared al inicio y al final), luego por nivel
                 let class_sort_key = |id: &str| -> (usize, usize) {
-                    if id == "class_six_orders" { return (0, 0); }
-                    if id == "class_council_orders" { return (99, 0); }
-                    let class_order = if id.starts_with("class_warlock_") { 1 }
-                        else if id.starts_with("class_paladin_") { 2 }
-                        else if id.starts_with("class_sage_") { 3 }
-                        else if id.starts_with("class_architect_") { 4 }
-                        else if id.starts_with("class_chronomancer_") { 5 }
-                        else if id.starts_with("class_accountant_") { 6 }
-                        else { 50 };
-                    let level = id.split('_').last()
+                    if id == "class_six_orders" {
+                        return (0, 0);
+                    }
+                    if id == "class_council_orders" {
+                        return (99, 0);
+                    }
+                    let class_order = if id.starts_with("class_warlock_") {
+                        1
+                    } else if id.starts_with("class_paladin_") {
+                        2
+                    } else if id.starts_with("class_sage_") {
+                        3
+                    } else if id.starts_with("class_architect_") {
+                        4
+                    } else if id.starts_with("class_chronomancer_") {
+                        5
+                    } else if id.starts_with("class_accountant_") {
+                        6
+                    } else {
+                        50
+                    };
+                    let level = id
+                        .split('_')
+                        .last()
                         .and_then(|s| s.parse::<usize>().ok())
                         .unwrap_or(0);
                     (class_order, level)
@@ -3861,7 +4095,11 @@ impl Database {
         Ok(())
     }
 
-    pub fn discover_memory_fragment(&self, trigger: &str, chance_multiplier: f64) -> Result<Option<(String, String)>> {
+    pub fn discover_memory_fragment(
+        &self,
+        trigger: &str,
+        chance_multiplier: f64,
+    ) -> Result<Option<(String, String)>> {
         use rand::Rng;
         let mut rng = rand::thread_rng();
 
@@ -3893,8 +4131,16 @@ impl Database {
             "legendary" => &["memory_999"],
             "rare" => &["memory_077", "memory_112", "memory_144", "memory_188"],
             _ => &[
-                "memory_001", "memory_002", "memory_003", "memory_004", "memory_005",
-                "memory_006", "memory_007", "memory_008", "memory_009", "memory_010",
+                "memory_001",
+                "memory_002",
+                "memory_003",
+                "memory_004",
+                "memory_005",
+                "memory_006",
+                "memory_007",
+                "memory_008",
+                "memory_009",
+                "memory_010",
             ],
         };
 
@@ -4034,21 +4280,30 @@ impl Database {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT user_username FROM project_members WHERE user_username IS NOT NULL AND user_username != ''",
         )?;
-        for row in stmt.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+        for row in stmt
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+        {
             names.insert(row.to_lowercase());
         }
 
         let mut stmt2 = self.conn.prepare(
             "SELECT DISTINCT hero_name FROM global_chronicle WHERE hero_name IS NOT NULL AND hero_name != ''",
         )?;
-        for row in stmt2.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+        for row in stmt2
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+        {
             names.insert(row.to_lowercase());
         }
 
         let mut stmt3 = self.conn.prepare(
             "SELECT DISTINCT username FROM users WHERE username IS NOT NULL AND username != ''",
         )?;
-        for row in stmt3.query_map([], |r| r.get::<_, String>(0))?.filter_map(Result::ok) {
+        for row in stmt3
+            .query_map([], |r| r.get::<_, String>(0))?
+            .filter_map(Result::ok)
+        {
             names.insert(row.to_lowercase());
         }
 
@@ -4086,11 +4341,17 @@ impl Database {
     }
 
     pub fn get_global_chronicle_entries(&self) -> Result<Vec<GlobalChronicleEntry>> {
+        let cutoff = (Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let _ = self.cleanup_global_chronicle_entries(1);
         let mut stmt = self.conn.prepare(
-            "SELECT id, hero_name, event_type, description, timestamp, hero_class FROM global_chronicle ORDER BY timestamp DESC LIMIT 500",
+            "SELECT id, hero_name, event_type, description, timestamp, hero_class
+             FROM global_chronicle
+             WHERE timestamp >= ?1
+             ORDER BY timestamp DESC
+             LIMIT 500",
         )?;
         let entries = stmt
-            .query_map([], |row| {
+            .query_map(params![cutoff], |row| {
                 Ok(GlobalChronicleEntry {
                     id: row.get(0)?,
                     hero_name: row.get(1)?,
@@ -4105,25 +4366,43 @@ impl Database {
         Ok(entries)
     }
 
+    pub fn cleanup_global_chronicle_entries(&self, days: i64) -> Result<usize> {
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let deleted = self.conn.execute(
+            "DELETE FROM global_chronicle WHERE timestamp < ?1",
+            params![cutoff],
+        )?;
+        Ok(deleted)
+    }
+
     // el owner_identity filtra las tareas para que los pulls de proyectos compartidos no inflen el delta del capítulo
-    pub fn get_contribution_snapshot(&self, owner_identity: &str) -> Result<std::collections::HashMap<String, u64>> {
+    pub fn get_contribution_snapshot(
+        &self,
+        owner_identity: &str,
+    ) -> Result<std::collections::HashMap<String, u64>> {
         let mut map = std::collections::HashMap::new();
 
-        let tasks: u64 = self.conn.query_row(
-            // sólo tareas raíz propias — las subtareas y las de otros colaboradores no cuentan para el capítulo
-            "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL
+        let tasks: u64 = self
+            .conn
+            .query_row(
+                // sólo tareas raíz propias — las subtareas y las de otros colaboradores no cuentan para el capítulo
+                "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NULL
              AND (owner_identity IS NULL OR owner_identity = ?1)",
-            params![owner_identity],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+                params![owner_identity],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
         map.insert("tasks_completed".to_string(), tasks);
 
-        let subtasks: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL
+        let subtasks: u64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL
              AND (owner_identity IS NULL OR owner_identity = ?1)",
-            params![owner_identity],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+                params![owner_identity],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
         map.insert("subtasks_completed".to_string(), subtasks);
 
         let focus: u64 = self.conn.query_row(
@@ -4133,51 +4412,63 @@ impl Database {
         ).unwrap_or(0) as u64;
         map.insert("focus_sessions".to_string(), focus);
 
-        let waterings: u64 = self.conn.query_row(
-            "SELECT COALESCE(total_waterings, 0) FROM zen_tree LIMIT 1",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+        let waterings: u64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(total_waterings, 0) FROM zen_tree LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64;
         map.insert("tree_waterings".to_string(), waterings);
 
-        let rituals: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM ritual_history",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+        let rituals: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM ritual_history", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as u64;
         map.insert("rituals_completed".to_string(), rituals);
 
-        let reflections: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM reflections",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+        let reflections: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM reflections", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap_or(0) as u64;
         map.insert("reflections_written".to_string(), reflections);
 
-        let scrolls: u64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM notes",
-            [],
-            |row| row.get::<_, i64>(0),
-        ).unwrap_or(0) as u64;
+        let scrolls: u64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get::<_, i64>(0))
+            .unwrap_or(0) as u64;
         map.insert("scrolls_created".to_string(), scrolls);
 
         Ok(map)
     }
 
     // sin este log estaríamos mandando el total acumulado en cada sync en vez del delta — doble-conteo en el servidor
-    pub fn get_last_sent_contributions(&self, chapter_id: &str) -> Result<std::collections::HashMap<String, u64>> {
+    pub fn get_last_sent_contributions(
+        &self,
+        chapter_id: &str,
+    ) -> Result<std::collections::HashMap<String, u64>> {
         let mut stmt = self.conn.prepare(
             "SELECT objective_type, last_sent_total FROM chapter_contribution_log WHERE chapter_id = ?1",
         )?;
-        let entries = stmt.query_map(params![chapter_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
-        })?
-        .filter_map(Result::ok)
-        .collect::<std::collections::HashMap<_, _>>();
+        let entries = stmt
+            .query_map(params![chapter_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
+            })?
+            .filter_map(Result::ok)
+            .collect::<std::collections::HashMap<_, _>>();
         Ok(entries)
     }
 
-    pub fn save_sent_contributions(&self, chapter_id: &str, totals: &std::collections::HashMap<String, u64>) -> Result<()> {
+    pub fn save_sent_contributions(
+        &self,
+        chapter_id: &str,
+        totals: &std::collections::HashMap<String, u64>,
+    ) -> Result<()> {
         for (obj_type, &total) in totals {
             // INSERT OR REPLACE en vez de ON CONFLICT DO UPDATE — este último requiere SQLite ≥ 3.24
             // y en algunas builds de rusqlite falla silenciosamente, lo que causaría que el delta
@@ -4190,5 +4481,4 @@ impl Database {
         }
         Ok(())
     }
-
 }

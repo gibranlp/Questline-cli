@@ -115,7 +115,9 @@ fn build_call_to_arms_lines<'a>(chapter: &'a Chapter, theme: &'a Theme) -> Vec<L
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Call to Arms",
-        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from("  "));
     for para in chapter.call_to_arms.split('\n') {
@@ -171,7 +173,9 @@ fn build_completion_card_lines<'a>(
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "  Chapter Completion",
-        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD),
     )));
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
@@ -182,7 +186,9 @@ fn build_completion_card_lines<'a>(
         Span::raw("  "),
         Span::styled(
             format!("{}%", pct),
-            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::styled(
@@ -268,7 +274,9 @@ fn build_objectives_lines<'a>(
         if prog.completed {
             lines.push(Line::from(Span::styled(
                 "  Chapter Complete",
-                Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
             )));
             if let Some(ref ts) = prog.completed_at {
                 lines.push(Line::from(vec![
@@ -294,10 +302,7 @@ fn build_objectives_lines<'a>(
 }
 
 // historial de capítulos completados — muestra título, cuándo se completó y la contribución personal
-fn build_history_lines<'a>(
-    app: &'a App,
-    theme: &'a Theme,
-) -> Vec<Line<'a>> {
+fn build_history_lines<'a>(app: &'a App, theme: &'a Theme) -> Vec<Line<'a>> {
     if app.chapter_history.is_empty() {
         return vec![
             Line::from(""),
@@ -319,7 +324,9 @@ fn build_history_lines<'a>(
             Span::raw("  "),
             Span::styled(
                 entry.title.clone(),
-                Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -386,11 +393,26 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
             Style::default().fg(theme.muted),
         ),
         Span::styled("  |", Style::default().fg(theme.border)),
-        Span::styled(share_hint, Style::default().fg(share_color).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            share_hint,
+            Style::default()
+                .fg(share_color)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  |  ", Style::default().fg(theme.border)),
-        Span::styled(chapter_indicator, Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            chapter_indicator,
+            Style::default()
+                .fg(theme.secondary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled("  |  ", Style::default().fg(theme.border)),
-        Span::styled("[X]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[X]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" story so far  ", Style::default().fg(theme.muted)),
     ]))
     .block(
@@ -404,10 +426,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
     // Body: horizontal split — left feed / right chapter panel
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Percentage(55),
-        ])
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(chunks[1]);
 
     // el borde activo se ilumina con primary — así el usuario sabe dónde está el focus
@@ -462,18 +481,12 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
 
         let right_vert = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(42),
-                Constraint::Percentage(58),
-            ])
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(body_chunks[1]);
 
         let top_cols = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([
-                Constraint::Percentage(60),
-                Constraint::Percentage(40),
-            ])
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
             .split(right_vert[0]);
 
         // Call to Arms (top-left)
@@ -486,7 +499,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                     .border_style(right_border_style)
                     .title(Span::styled(
                         chapter_title_str,
-                        Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.secondary)
+                            .add_modifier(Modifier::BOLD),
                     )),
             )
             .wrap(Wrap { trim: false });
@@ -550,7 +565,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                 .border_style(right_border_style)
                 .title(Span::styled(
                     " No Active Chapter ",
-                    Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.secondary)
+                        .add_modifier(Modifier::BOLD),
                 )),
         )
         .wrap(Wrap { trim: false });
@@ -559,41 +576,82 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
 
     // footer dinámico — los hints cambian según si el focus está en el feed o en el panel del capítulo
     let tab_hint = if app.chapter_panel_focused {
-        if app.chapter_tab == 0 { "Active Chapter" } else { "Chapter History" }
+        if app.chapter_tab == 0 {
+            "Active Chapter"
+        } else {
+            "Chapter History"
+        }
     } else {
         ""
     };
 
     let mut footer_spans = vec![
-        Span::styled("[↑↓]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[↑↓]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" scroll  ", Style::default().fg(theme.muted)),
     ];
 
     if app.chapter_panel_focused {
-        footer_spans.push(Span::styled("[←]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+        footer_spans.push(Span::styled(
+            "[←]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
         footer_spans.push(Span::styled(" feed  ", Style::default().fg(theme.muted)));
-        footer_spans.push(Span::styled("[Tab]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
-        footer_spans.push(Span::styled(format!(" {} | history  ", tab_hint), Style::default().fg(theme.muted)));
+        footer_spans.push(Span::styled(
+            "[Tab]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
+        footer_spans.push(Span::styled(
+            format!(" {} | history  ", tab_hint),
+            Style::default().fg(theme.muted),
+        ));
     } else {
-        footer_spans.push(Span::styled("[→]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+        footer_spans.push(Span::styled(
+            "[→]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ));
         footer_spans.push(Span::styled(" chapter  ", Style::default().fg(theme.muted)));
     }
 
     footer_spans.extend_from_slice(&[
-        Span::styled("[R]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[R]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" refresh  ", Style::default().fg(theme.muted)),
-        Span::styled("[P]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[P]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" privacy  ", Style::default().fg(theme.muted)),
-        Span::styled("[Esc]", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "[Esc]",
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::styled(" back", Style::default().fg(theme.muted)),
     ]);
 
-    let footer = Paragraph::new(Line::from(footer_spans))
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border)),
-        );
+    let footer = Paragraph::new(Line::from(footer_spans)).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.border)),
+    );
     f.render_widget(footer, chunks[2]);
 }

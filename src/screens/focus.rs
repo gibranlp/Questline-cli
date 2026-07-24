@@ -9,11 +9,11 @@ use crate::services::bonsai::BonsaiGrid;
 use crate::theme::Theme;
 use chrono::Utc;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
-    Frame,
 };
 
 // Punto de entrada — decide si mostrar la sesión activa o la pantalla de config
@@ -31,7 +31,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     if let ModalType::CustomFocusDuration { input } = &app.modal_state {
         let area = centered_rect(40, 25, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
@@ -60,8 +63,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             Line::from(""),
             Line::from(Span::styled(
                 " [Enter] Start Session  |  [Esc] Cancel ",
-                Style::default()
-                    .fg(theme.muted),
+                Style::default().fg(theme.muted),
             )),
         ];
         let p = Paragraph::new(text)
@@ -119,15 +121,14 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
 
     // Jala la tarea de la DB — puede fallar si el DB está ocupado, no manches
     let task_title = if let Some(t_id) = active.task_id {
-        match app.db.get_tasks() { Ok(all_tasks) => {
-            all_tasks
+        match app.db.get_tasks() {
+            Ok(all_tasks) => all_tasks
                 .into_iter()
                 .find(|t| t.id == t_id)
                 .map(|t| t.title)
-                .unwrap_or_else(|| "Unknown Quest".to_string())
-        } _ => {
-            "Unknown Quest".to_string()
-        }}
+                .unwrap_or_else(|| "Unknown Quest".to_string()),
+            _ => "Unknown Quest".to_string(),
+        }
     } else {
         "General Mind Cleansing".to_string()
     };
@@ -236,22 +237,20 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         );
         f.render_widget(Paragraph::new(grid.into_lines()), tree_sections[0]);
 
-        let tree_stats = Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("Stage: ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    zen_tree.stage_name(),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  Growth: ", Style::default().fg(theme.muted)),
-                Span::styled(
-                    format!("{} pts", zen_tree.growth),
-                    Style::default().fg(theme.success),
-                ),
-            ]),
-        ])
+        let tree_stats = Paragraph::new(vec![Line::from(vec![
+            Span::styled("Stage: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                zen_tree.stage_name(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Growth: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} pts", zen_tree.growth),
+                Style::default().fg(theme.success),
+            ),
+        ])])
         .alignment(Alignment::Center);
         f.render_widget(tree_stats, tree_sections[1]);
     }
@@ -269,9 +268,7 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         Line::from(""),
         Line::from(Span::styled(
             format!("— {}", app.quote_author),
-            Style::default()
-                .fg(theme.text)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
         )),
     ];
     let quote_box = Paragraph::new(quote_text)
@@ -585,21 +582,14 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         Line::from(vec![
             Span::styled("   • Duration: ", Style::default().fg(theme.muted)),
             Span::styled(duration_str, Style::default().fg(Color::White)),
-            Span::styled(
-                "  |  Potential Reward: ",
-                Style::default().fg(theme.muted),
-            ),
+            Span::styled("  |  Potential Reward: ", Style::default().fg(theme.muted)),
             Span::styled(
                 format!("+{} XP", reward_xp),
                 Style::default()
                     .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " (Increases tree growth)",
-                Style::default()
-                    .fg(theme.muted),
-            ),
+            Span::styled(" (Increases tree growth)", Style::default().fg(theme.muted)),
         ]),
         Line::from(vec![
             Span::styled("   • Target Campaign: ", Style::default().fg(theme.muted)),
@@ -647,10 +637,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
                     .fg(theme.success)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                " start deep work focus ",
-                Style::default().fg(theme.muted),
-            ),
+            Span::styled(" start deep work focus ", Style::default().fg(theme.muted)),
         ]),
     ];
     let footer = Paragraph::new(footer_text).alignment(Alignment::Center);
@@ -731,17 +718,17 @@ fn draw_visualizer(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     };
 
     let vis_text = vec![Line::from(""), Line::from(bar_spans)];
-    let vis = Paragraph::new(vis_text)
-        .alignment(Alignment::Center)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(title_color))
-                .title(Span::styled(
-                    title_str,
-                    Style::default().fg(title_color).add_modifier(Modifier::BOLD),
-                )),
-        );
+    let vis = Paragraph::new(vis_text).alignment(Alignment::Center).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(title_color))
+            .title(Span::styled(
+                title_str,
+                Style::default()
+                    .fg(title_color)
+                    .add_modifier(Modifier::BOLD),
+            )),
+    );
     f.render_widget(vis, area);
 }

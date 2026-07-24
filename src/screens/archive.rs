@@ -4,11 +4,11 @@
 use crate::models::Project;
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
-    Frame,
 };
 
 // Renders the Archive Screen listing archived items from SQLite.
@@ -17,7 +17,10 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
     let accent_color = theme.primary;
 
     // archived=true OR completed=true — cacha proyectos huérfanos (e.g. conquered en versión anterior y restaurados a medias)
-    let archived_projects: Vec<&Project> = projects.iter().filter(|p| p.archived || p.completed).collect();
+    let archived_projects: Vec<&Project> = projects
+        .iter()
+        .filter(|p| p.archived || p.completed)
+        .collect();
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -77,7 +80,11 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
             .description
             .as_deref()
             .unwrap_or("No description provided.");
-        let date_str = p.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string();
+        let date_str = p
+            .created_at
+            .with_timezone(&chrono::Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
 
         let text = vec![
             Line::from(""),
@@ -105,7 +112,9 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
             Line::from(""),
             Line::from(Span::styled(
                 "  Press [r] to Restore or [Delete] to Slay permanently.",
-                Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.danger)
+                    .add_modifier(Modifier::BOLD),
             )),
         ];
 
@@ -140,12 +149,11 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
         Span::styled(" Restore Campaign | ", Style::default().fg(theme.muted)),
         Span::styled(
             "Delete",
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " Delete Permanently | ",
-            Style::default().fg(theme.muted),
-        ),
+        Span::styled(" Delete Permanently | ", Style::default().fg(theme.muted)),
         Span::styled("ESC", Style::default().fg(theme.text)),
         Span::styled(" Back ", Style::default().fg(theme.muted)),
     ])];

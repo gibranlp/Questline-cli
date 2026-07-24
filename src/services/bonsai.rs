@@ -13,8 +13,8 @@ const BRANCH_CHARS: [char; 4] = ['~', ';', ':', '='];
 const LEAF_CHARS: [char; 4] = ['&', '%', '#', '@'];
 const CHAR_HEIGHT: f64 = 2.0;
 const ANGLE_MEAN: f64 = 0.698; // ~40 grados — dispersión lateral del árbol
-const ANGLE_STD: f64 = 0.140;  // ~8 grados de ruido por rama
-const LEN_SCALE: f64 = 0.75;   // cada capa de ramas es 75% más corta que la anterior
+const ANGLE_STD: f64 = 0.140; // ~8 grados de ruido por rama
+const LEN_SCALE: f64 = 0.75; // cada capa de ramas es 75% más corta que la anterior
 const MEAN_BRANCHES: f64 = 2.0;
 const BRANCH_STD: f64 = 0.5;
 const NUM_LEAVES: usize = 4;
@@ -76,22 +76,14 @@ impl BonsaiGrid {
     }
 
     fn branch_color(rng: &mut StdRng) -> Color {
-        Color::Rgb(
-            rng.gen_range(95_u8..=155),
-            rng.gen_range(50_u8..=85),
-            0,
-        )
+        Color::Rgb(rng.gen_range(95_u8..=155), rng.gen_range(50_u8..=85), 0)
     }
 
     // El color de la hoja depende de la salud: a menor salud, mayor probabilidad de tono muerto
     fn leaf_color(health: i32, rng: &mut StdRng) -> Color {
         let die_prob = ((100 - health.clamp(0, 100)) as f64 / 100.0).powi(2) * 2.0;
         if rng.gen_range(0.0_f64..1.0) < die_prob.min(0.97) {
-            Color::Rgb(
-                rng.gen_range(120_u8..=190),
-                rng.gen_range(45_u8..=95),
-                0,
-            )
+            Color::Rgb(rng.gen_range(120_u8..=190), rng.gen_range(45_u8..=95), 0)
         } else {
             Color::Rgb(
                 rng.gen_range(0_u8..=25),
