@@ -4,11 +4,11 @@
 
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
-    Frame,
 };
 
 // ── Mode ──────────────────────────────────────────────────────────────────────
@@ -1071,11 +1071,7 @@ fn line_sel_range(line_i: usize, line: &str, state: &EditorState) -> Option<(usi
         floor_char_boundary(line, sx.min(line.len()))
     };
     let end = if line_i < ey {
-        if line.is_empty() {
-            1
-        } else {
-            line.len()
-        }
+        if line.is_empty() { 1 } else { line.len() }
     } else {
         // inclusive end — include the char at ex
         let clamped = floor_char_boundary(line, ex.min(line.len().saturating_sub(1)));
@@ -1090,7 +1086,7 @@ fn line_sel_range(line_i: usize, line: &str, state: &EditorState) -> Option<(usi
 }
 
 // Build styled spans for one editor body line
-fn render_body_line<'a>(
+pub(crate) fn render_body_line<'a>(
     line: &'a str,
     line_i: usize,
     state: &EditorState,

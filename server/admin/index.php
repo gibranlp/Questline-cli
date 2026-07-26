@@ -183,7 +183,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
                     $u['milestone_id'] = trim($_POST['unlock_milestone_id'] ?? '');
                 }
                 if ($type === 'chapter_reward') {
-                    $u['chapter_id'] = trim($_POST['unlock_chapter_id'] ?? '');
+                    $chapter_id = trim($_POST['unlock_chapter_id'] ?? '');
+                    if ($chapter_id === '') {
+                        throw new Exception("Chapter ID is required for chapter reward lore.");
+                    }
+                    $u['chapter_id'] = $chapter_id;
                 }
                 return $u;
             };

@@ -77,12 +77,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
     let active = app.active_focus_session.as_ref().unwrap();
     let total_seconds = (active.duration_mins * 60) as i64;
-    let elapsed_seconds = (Utc::now() - active.start_time).num_seconds();
+    let now = active.paused_at.unwrap_or_else(Utc::now);
+    let elapsed_seconds = (now - active.start_time).num_seconds();
     // remaining nunca baja de 0, por si el timer se pasa un poco
     let remaining = std::cmp::max(0, total_seconds - elapsed_seconds);
     let mins = remaining / 60;
     let secs = remaining % 60;
     let timer_str = format!("{:02}:{:02}", mins, secs);
+    let is_paused = active.paused_at.is_some();
+    let pauses_left = (active.pause_limit - active.pauses_used).max(0);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -139,6 +142,22 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             Span::styled(
                 format!("{} mins", active.duration_mins),
                 Style::default().fg(theme.warning),
+            ),
+            Span::styled("  |  Status: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                if is_paused { "PAUSED" } else { "RUNNING" },
+                Style::default()
+                    .fg(if is_paused {
+                        theme.warning
+                    } else {
+                        theme.success
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |  Pauses: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{}/{}", pauses_left, active.pause_limit),
+                Style::default().fg(theme.primary),
             ),
         ]),
         Line::from(vec![
@@ -200,7 +219,7 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
 
     // Animación del árbol: crece lentamente de etapa 1 a la actual, luego espera
     // 160 ticks/etapa = 8 segundos por transición; 18 000 ticks = 15 minutos en la etapa final
-    let zen_tree = app.db.get_zen_tree().unwrap();
+    let zen_tree = &app.stats_cache.zen_tree;
     let current_stage = zen_tree.stage.max(1) as usize;
     const STAGE_TICKS: usize = 160;
     const HOLD_TICKS: usize = 18_000;
@@ -282,6 +301,32 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         .alignment(Alignment::Center)
         .wrap(Wrap { trim: true });
     f.render_widget(quote_box, mid_chunks[1]);
+
+    let pause_hint = if is_paused { "resume" } else { "pause" };
+    let footer_text = vec![
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "p",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {} session | ", pause_hint),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                "q/Esc",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" cancel focus", Style::default().fg(theme.muted)),
+        ]),
+    ];
+    let footer = Paragraph::new(footer_text).alignment(Alignment::Center);
+    f.render_widget(footer, chunks[4]);
 }
 
 // Pantalla de configuración — el user elige duración, proyecto, tarea y soundscape antes de arrancar

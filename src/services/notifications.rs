@@ -76,14 +76,7 @@ pub fn send_system_notification_with_icon(
     std::thread::spawn(move || {
         #[cfg(target_os = "linux")]
         {
-            let urgency = if urgent { "critical" } else { "normal" };
-            let mut cmd = std::process::Command::new("notify-send");
-            cmd.arg("--app-name=Questline")
-                .arg(format!("--urgency={}", urgency));
-            if let Some(path) = icon_path.as_ref() {
-                cmd.arg("--icon").arg(path);
-            }
-            let _ = cmd.arg(&title).arg(&message).status();
+            send_linux_notification(&title, &message, urgent, icon_path.as_ref());
         }
 
         #[cfg(target_os = "macos")]
@@ -172,6 +165,127 @@ pub fn send_system_notification_with_icon(
                 .status();
         }
     });
+}
+
+#[cfg(target_os = "linux")]
+fn send_linux_notification(title: &str, message: &str, urgent: bool, icon_path: Option<&PathBuf>) {
+    // notify-send talks to the Freedesktop notification portal/server and works with
+    // Dunst, Mako, SwayNC, GNOME Shell, KDE Plasma, Xfce, Cinnamon, and similar desktops.
+    if send_with_notify_send(title, message, urgent, icon_path) {
+        return;
+    }
+
+    // Dunst users may have dunstify even when notify-send/libnotify is not installed.
+    if send_with_dunstify(title, message, urgent, icon_path) {
+        return;
+    }
+
+    // gdbus is commonly present on GNOME/GTK systems and calls the same notification API directly.
+    if send_with_gdbus(title, message, urgent, icon_path) {
+        return;
+    }
+
+    // KDE and GTK fallbacks. These are less featureful but still give the user a visible alert.
+    if send_with_kdialog(title, message) {
+        return;
+    }
+    let _ = send_with_zenity(title, message, icon_path);
+}
+
+#[cfg(target_os = "linux")]
+fn command_succeeded(cmd: &mut std::process::Command) -> bool {
+    cmd.status().map(|status| status.success()).unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn send_with_notify_send(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon_path: Option<&PathBuf>,
+) -> bool {
+    let urgency = if urgent { "critical" } else { "normal" };
+    let mut cmd = std::process::Command::new("notify-send");
+    cmd.arg("--app-name=Questline")
+        .arg(format!("--urgency={}", urgency));
+    if let Some(path) = icon_path {
+        cmd.arg("--icon").arg(path);
+    }
+    command_succeeded(cmd.arg(title).arg(message))
+}
+
+#[cfg(target_os = "linux")]
+fn send_with_dunstify(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon_path: Option<&PathBuf>,
+) -> bool {
+    let urgency = if urgent { "critical" } else { "normal" };
+    let mut cmd = std::process::Command::new("dunstify");
+    cmd.arg("--appname")
+        .arg("Questline")
+        .arg("--urgency")
+        .arg(urgency);
+    if let Some(path) = icon_path {
+        cmd.arg("--icon").arg(path);
+    }
+    command_succeeded(cmd.arg(title).arg(message))
+}
+
+#[cfg(target_os = "linux")]
+fn send_with_gdbus(title: &str, message: &str, urgent: bool, icon_path: Option<&PathBuf>) -> bool {
+    let hints = format!("{{'urgency': <{}>}}", if urgent { 2 } else { 1 });
+    let timeout_ms = if urgent { "0" } else { "6000" };
+    let icon = icon_path
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "questline".to_string());
+
+    command_succeeded(
+        std::process::Command::new("gdbus")
+            .arg("call")
+            .arg("--session")
+            .arg("--dest")
+            .arg("org.freedesktop.Notifications")
+            .arg("--object-path")
+            .arg("/org/freedesktop/Notifications")
+            .arg("--method")
+            .arg("org.freedesktop.Notifications.Notify")
+            .arg("Questline")
+            .arg("0")
+            .arg(icon)
+            .arg(title)
+            .arg(message)
+            .arg("[]")
+            .arg(hints)
+            .arg(timeout_ms),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn send_with_kdialog(title: &str, message: &str) -> bool {
+    command_succeeded(
+        std::process::Command::new("kdialog")
+            .arg("--title")
+            .arg(title)
+            .arg("--passivepopup")
+            .arg(message)
+            .arg("6"),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn send_with_zenity(title: &str, message: &str, icon_path: Option<&PathBuf>) -> bool {
+    let mut cmd = std::process::Command::new("zenity");
+    cmd.arg("--notification")
+        .arg("--title")
+        .arg(title)
+        .arg("--text")
+        .arg(message);
+    if let Some(path) = icon_path {
+        cmd.arg("--window-icon").arg(path);
+    }
+    command_succeeded(&mut cmd)
 }
 
 fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {

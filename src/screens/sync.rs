@@ -6,11 +6,11 @@ use crate::app::{App, ModalType};
 use crate::models::Achievement;
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
-    Frame,
 };
 
 // pantalla gorda de sync — aquí va todo: identidad, dispositivos, stats y los modales
@@ -90,11 +90,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
             Span::styled("  [a] toggle", Style::default().fg(theme.muted)),
         ]),
-        Line::from(vec![
-            Span::styled("   Alerts:     ", Style::default().fg(theme.muted)),
-            Span::styled("Managed in Settings [9]", Style::default().fg(theme.text)),
-        ]),
-        Line::from(""),
         Line::from(vec![Span::styled(
             "   === Chronicle Sync State ===",
             Style::default()
@@ -161,7 +156,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity (new device: use this first) | [p] Prune | [9] Settings",
+            "   [i] Restore Identity (adding a new device: use this first) | [p] Prune",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -207,7 +202,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     f.render_widget(left_panel, left_chunks[0]);
 
     // pues hay que mostrar las estadísticas de trabajo del héroe — tasks, notas, journals, etc.
-    let stats = app.db.get_statistics().unwrap();
+    let stats = &app.stats_cache.statistics;
     let stats_left_text = vec![
         Line::from(""),
         Line::from(vec![

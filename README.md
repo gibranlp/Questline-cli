@@ -238,6 +238,25 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v1.1.2 — The Command Center Holds
+*Released 2026-07-26*
+
+- **Today's Command Center:** Replaced Today's Workload with Today's Command Center, giving the dashboard tighter control over important tasks, quick wins, sidequests, and daily work.
+- **Settings tab:** Added the `[9] Settings` screen for themes, alerts, audio, and Oath Calendar configuration.
+- **Timezone handling:** Questline now distinguishes the user's local time from UTC server time, improving date handling across sync and shared systems.
+- **Sync shortcut changed:** Global sync now uses `Ctrl+Y`.
+- **Vim-like task descriptions:** Task and step descriptions now support vim-like editing controls.
+- **Task save shortcut:** `Ctrl+S` now saves tasks and steps.
+- **New themes:** Added new theme options, including Terminal Default, Pywal-compatible themes, and additional visual styles.
+- **Step unmarking:** Steps can now be unmarked from the task editing window.
+- **Word deletion shortcut:** `Ctrl+Backspace` now erases complete words.
+- **OS notification icons:** Added icons for OS notifications through `notify-send`, `dunstify`, `gdbus`, `kdialog`, and `zenity`.
+- **Oath Calendar:** Configure active streak days so rest days, such as Sundays off, do not break your streak.
+- **Focus pause shortcut:** Active focus sessions can now be paused. You start with 1 pause, then unlock 2 at level 10, 3 at level 20, 4 at level 30, and 5 at level 40.
+- **Quest burst setting:** Added a Settings option to choose the ambient effect used when finishing a quest or sidequest, including an Off option.
+
+---
+
 ### v1.1.1 — The World Before the Swarm
 *Released 2026-07-23*
 

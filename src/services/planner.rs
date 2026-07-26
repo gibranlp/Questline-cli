@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use chrono::{Duration, NaiveDate};
+use std::collections::HashSet;
 
 use crate::models::{Project, Task, TaskPriority};
 
@@ -90,6 +91,12 @@ fn score_task(task: &Task, today: NaiveDate) -> (i32, &'static str) {
     (score, reason)
 }
 
+fn is_available_today(task: &Task, today: NaiveDate) -> bool {
+    task.set_date
+        .map(|d| d.date_naive() <= today)
+        .unwrap_or(true)
+}
+
 // Genera el plan del día: quest principal, siguiente quest, victorias rápidas y carga total
 pub fn generate_plan(
     all_tasks: &[Task],
@@ -110,7 +117,12 @@ pub fn generate_plan(
 
     let parent_tasks: Vec<&Task> = all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none())
+        .filter(|t| !t.completed && t.parent_task_id.is_none() && is_available_today(t, today))
+        .collect();
+    let parents_with_open_steps: HashSet<uuid::Uuid> = all_tasks
+        .iter()
+        .filter(|s| !s.completed)
+        .filter_map(|s| s.parent_task_id)
         .collect();
 
     let total_quest_count = parent_tasks.len();
@@ -155,10 +167,9 @@ pub fn generate_plan(
     let quick_wins: Vec<Task> = parent_tasks
         .iter()
         .filter(|t| {
-            let has_pending_steps = all_tasks
-                .iter()
-                .any(|s| s.parent_task_id == Some(t.id) && !s.completed);
-            !has_pending_steps && Some(t.id) != main_id && Some(t.id) != next_id
+            !parents_with_open_steps.contains(&t.id)
+                && Some(t.id) != main_id
+                && Some(t.id) != next_id
         })
         .take(5)
         .map(|t| (*t).clone())
@@ -198,7 +209,7 @@ pub fn generate_plan(
 pub fn find_main_quest(all_tasks: &[Task], today: NaiveDate) -> Option<Task> {
     let mut candidates: Vec<&Task> = all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none())
+        .filter(|t| !t.completed && t.parent_task_id.is_none() && is_available_today(t, today))
         .collect();
     candidates.sort_by(|a, b| {
         let (sa, _) = score_task(a, today);

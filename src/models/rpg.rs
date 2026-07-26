@@ -106,7 +106,7 @@ impl DailyAdventure {
 }
 
 // Este struct fue creciendo por etapas del roadmap — los campos de Stage 4 y 5A se agregaron después, no son legacy
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Statistics {
     pub tasks_completed: i32,
     pub notes_created: i32,

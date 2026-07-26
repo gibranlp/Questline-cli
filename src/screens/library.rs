@@ -36,6 +36,14 @@ impl LibraryCategory {
     }
 }
 
+fn masked_world_history_title(title: &str, unlocked: bool) -> String {
+    if unlocked {
+        return title.to_string();
+    }
+
+    "?".repeat(title.chars().count().max(8))
+}
+
 // Renderiza arte compacto de fragmentos para el panel de detalles de la biblioteca.
 fn fragment_detail_art(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
     let frame = (ticks / 5) % 4;
@@ -278,7 +286,11 @@ pub fn draw(
         }
         _ => {
             for entry in &filtered_lore_entries {
-                items_lines.push(entry.2.clone());
+                if cur_cat == LibraryCategory::WorldHistory {
+                    items_lines.push(masked_world_history_title(&entry.2, entry.4));
+                } else {
+                    items_lines.push(entry.2.clone());
+                }
                 items_unlocked.push(entry.4);
             }
         }
@@ -569,7 +581,9 @@ pub fn draw(
             if !entry.4 {
                 // Entrada bloqueada — ni modo, hay que ganársela primero
                 // Para Class Stories de otra clase, el mensaje explica que solo ese orden puede leerla
-                let lock_reason = if cur_cat == LibraryCategory::ClassStories {
+                let lock_reason = if cur_cat == LibraryCategory::WorldHistory {
+                    "Requirement: Complete the chapter objectives to reveal this World History record.".to_string()
+                } else if cur_cat == LibraryCategory::ClassStories {
                     if let Some((cls_name, _)) = class_label_from_id(&entry.0) {
                         let is_user_class = !user_class_key.is_empty()
                             && entry.0.starts_with(&format!("class_{}_", user_class_key));
