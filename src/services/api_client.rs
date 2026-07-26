@@ -39,7 +39,11 @@ impl ApiClient {
                 Err(e) => {
                     let msg = e.to_string();
                     // No reintentes errores de auth (401/403) ni errores del cliente (4xx)
-                    if msg.contains("401") || msg.contains("403") || msg.contains("400") || msg.contains("422") {
+                    if msg.contains("401")
+                        || msg.contains("403")
+                        || msg.contains("400")
+                        || msg.contains("422")
+                    {
                         return Err(e);
                     }
                     last_err = e;
@@ -56,7 +60,7 @@ impl ApiClient {
 
         // Encodeamos el body en base64 para que el WAF/ModSecurity no nos bloquee (error 406)
         let body_to_send = if method == "POST" && !body.is_empty() {
-            use base64::{engine::general_purpose::STANDARD, Engine as _};
+            use base64::{Engine as _, engine::general_purpose::STANDARD};
             STANDARD.encode(body.as_bytes())
         } else {
             body.to_string()
@@ -134,7 +138,8 @@ impl ApiClient {
         let body = serde_json::json!({
             "chapter_id": chapter_id,
             "contributions": contributions,
-        }).to_string();
+        })
+        .to_string();
         let resp = self.send_request("POST", "chapter/contribute", &body)?;
         Ok(serde_json::from_str(&resp)?)
     }
@@ -145,7 +150,10 @@ impl ApiClient {
         Ok(serde_json::from_str(&resp)?)
     }
 
-    pub fn fetch_my_chapter_contributions(&self, chapter_id: &str) -> Result<std::collections::HashMap<String, u64>> {
+    pub fn fetch_my_chapter_contributions(
+        &self,
+        chapter_id: &str,
+    ) -> Result<std::collections::HashMap<String, u64>> {
         let path = format!("chapter/my-contributions?chapter_id={}", chapter_id);
         let resp = self.send_request("GET", &path, "")?;
         let val: Value = serde_json::from_str(&resp)?;

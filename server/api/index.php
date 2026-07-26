@@ -98,12 +98,16 @@ try {
         CREATE TABLE IF NOT EXISTS global_chronicle (
             id VARCHAR(64) PRIMARY KEY,
             hero_name VARCHAR(100) NOT NULL DEFAULT '',
+            hero_class VARCHAR(50) NULL,
             event_type VARCHAR(50) NOT NULL DEFAULT '',
             description TEXT NOT NULL DEFAULT '',
             timestamp VARCHAR(50) NOT NULL DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_gc_timestamp (timestamp)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
     ");
+    try { $pdo->exec("ALTER TABLE global_chronicle ADD COLUMN hero_class VARCHAR(50) NULL"); } catch (PDOException $e) {}
+    try { $pdo->exec("ALTER TABLE global_chronicle ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"); } catch (PDOException $e) {}
     // Tabla temporal para los códigos OAuth de Spotify — se autolimpian a los 5 minutos
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS spotify_auth_codes (
@@ -1423,12 +1427,18 @@ try {
         // ── Global Chronicle — el feed mundial de eventos de todos los héroes ────
         case 'global_chronicle':
             if ($_SERVER['REQUEST_METHOD'] === 'GET') {
+                $pdo->exec("DELETE FROM global_chronicle WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
                 $stmt = $pdo->prepare(
-                    "SELECT id, hero_name, event_type, description, timestamp FROM global_chronicle ORDER BY timestamp DESC LIMIT 200"
+                    "SELECT id, hero_name, event_type, description, timestamp, hero_class
+                     FROM global_chronicle
+                     WHERE created_at >= DATE_SUB(NOW(), INTERVAL 1 DAY)
+                     ORDER BY timestamp DESC
+                     LIMIT 200"
                 );
                 $stmt->execute();
                 echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
             } elseif ($_SERVER['REQUEST_METHOD'] === 'POST') {
+                $pdo->exec("DELETE FROM global_chronicle WHERE created_at < DATE_SUB(NOW(), INTERVAL 1 DAY)");
                 $data = json_decode($body, true);
                 if (!$data || empty($data['id']) || empty($data['hero_name']) || empty($data['event_type']) || empty($data['description'])) {
                     http_response_code(400);
@@ -1446,12 +1456,16 @@ try {
                 $allowed_types = ['LevelUp','RealmComplete','Milestone','Relic','Streak','Memory','MemoryFragment','Legend','DailyAdventure','ZenTree','TreeWatering','QuestComplete','FocusSession','SidequestComplete','ReflectionWritten','ScrollCreated','StepsComplete','ChapterComplete','ClassQuest','ClassStory','WorldLore','Achievement'];
                 $event_type = in_array($data['event_type'], $allowed_types) ? $data['event_type'] : 'LevelUp';
                 $description = substr(strip_tags($data['description']), 0, 255);
+                $hero_class = isset($data['hero_class'])
+                    ? substr(preg_replace('/[^a-zA-Z0-9 _\-]/', '', $data['hero_class']), 0, 50)
+                    : null;
+                if ($hero_class === '') { $hero_class = null; }
                 $ts = isset($data['timestamp']) ? substr($data['timestamp'], 0, 50) : date('c');
                 $id = preg_replace('/[^a-zA-Z0-9\-]/', '', $data['id']);
                 $stmt = $pdo->prepare(
-                    "INSERT IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp) VALUES (?, ?, ?, ?, ?)"
+                    "INSERT IGNORE INTO global_chronicle (id, hero_name, hero_class, event_type, description, timestamp) VALUES (?, ?, ?, ?, ?, ?)"
                 );
-                $stmt->execute([$id, $hero, $event_type, $description, $ts]);
+                $stmt->execute([$id, $hero, $hero_class, $event_type, $description, $ts]);
                 trigger_global_webhook($hero, $event_type, $description);
                 echo json_encode(["ok" => true]);
             } else {
@@ -1527,6 +1541,22 @@ try {
             }
 
             $allowed_types = ['tasks_completed', 'subtasks_completed', 'focus_sessions', 'tree_waterings', 'rituals_completed', 'reflections_written', 'scrolls_created'];
+            $chapter_one_objectives = [
+                'tasks_completed'     => 1000,
+                'subtasks_completed'  => 2000,
+                'focus_sessions'      => 500,
+                'tree_waterings'      => 2000,
+                'rituals_completed'   => 300,
+                'reflections_written' => 750,
+                'scrolls_created'     => 1000,
+            ];
+            if ($chapter_id === 'chapter_one') {
+                $pdo->exec("INSERT IGNORE INTO chapter_progress (chapter_id, completed) VALUES ('chapter_one', 0)");
+                foreach ($chapter_one_objectives as $obj_type => $target) {
+                    $stmt = $pdo->prepare("INSERT IGNORE INTO chapter_objectives (chapter_id, objective_type, current_value, target_value) VALUES (?, ?, 0, ?)");
+                    $stmt->execute(['chapter_one', $obj_type, $target]);
+                }
+            }
 
             $pdo->beginTransaction();
             $newly_completed = false;
@@ -2008,9 +2038,11 @@ function setup_tables($pdo) {
     CREATE TABLE IF NOT EXISTS global_chronicle (
         id VARCHAR(64) PRIMARY KEY,
         hero_name VARCHAR(100) NOT NULL DEFAULT '',
+        hero_class VARCHAR(50) NULL,
         event_type VARCHAR(50) NOT NULL DEFAULT '',
         description TEXT NOT NULL DEFAULT '',
         timestamp VARCHAR(50) NOT NULL DEFAULT '',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         INDEX idx_gc_timestamp (timestamp)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

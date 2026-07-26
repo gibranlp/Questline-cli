@@ -5,11 +5,11 @@
 use crate::models::ClassType;
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph},
-    Frame,
 };
 
 // cuál sección tiene el foco — el nombre o la lista de clases, sencillo pero necesario
@@ -94,7 +94,11 @@ pub fn draw(
 
     // 2b. Render error message (if any)
     let error_p = Paragraph::new(error.unwrap_or(""))
-        .style(Style::default().fg(class_theme.danger).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(class_theme.danger)
+                .add_modifier(Modifier::BOLD),
+        )
         .alignment(Alignment::Center);
     f.render_widget(error_p, chunks[2]);
 
@@ -223,9 +227,7 @@ pub fn draw(
     // 4. Render Bottom Help
     let help_text = match focus {
         OnboardingFocus::NameInput => "Press [Tab] to switch to class selection.",
-        OnboardingFocus::ClassSelect => {
-            "Use [Up/Down] to navigate classes, [Enter] to embark."
-        }
+        OnboardingFocus::ClassSelect => "Use [Up/Down] to navigate classes, [Enter] to embark.",
     };
     let help = Paragraph::new(help_text)
         .style(Style::default().fg(class_theme.muted))

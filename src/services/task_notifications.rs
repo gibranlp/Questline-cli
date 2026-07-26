@@ -79,7 +79,10 @@ pub fn collect_task_notifications(
     }
 
     if settings.due || settings.overdue {
-        for task in tasks.iter().filter(|t| !t.completed && t.parent_task_id.is_none()) {
+        for task in tasks
+            .iter()
+            .filter(|t| !t.completed && t.parent_task_id.is_none())
+        {
             if task.recurrence.is_some() {
                 continue;
             }
@@ -191,7 +194,11 @@ fn overdue_event(
         }));
     }
 
-    let daily_key = task_key("overdue_daily", task.id, &today.format("%Y-%m-%d").to_string());
+    let daily_key = task_key(
+        "overdue_daily",
+        task.id,
+        &today.format("%Y-%m-%d").to_string(),
+    );
     if mark_once(db, &daily_key)? {
         return Ok(Some(TaskNotificationEvent {
             title: "Overdue quest".to_string(),
@@ -221,7 +228,11 @@ fn daily_summary_event(
 
     Ok(Some(TaskNotificationEvent {
         title: "Today's quests".to_string(),
-        message: format!("{} quest{} due today.", count, if count == 1 { "" } else { "s" }),
+        message: format!(
+            "{} quest{} due today.",
+            count,
+            if count == 1 { "" } else { "s" }
+        ),
         urgent: false,
         icon: NotificationIcon::TaskDailySummary,
     }))

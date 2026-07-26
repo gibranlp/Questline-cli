@@ -45,13 +45,41 @@ pub struct ChapterHistoryEntry {
 }
 
 static CHAPTER_ONE_OBJECTIVES: &[ChapterObjectiveDef] = &[
-    ChapterObjectiveDef { id: "tasks_completed",     name: "Complete Quests",          target: 1000 },
-    ChapterObjectiveDef { id: "subtasks_completed",  name: "Complete Steps",           target: 2000 },
-    ChapterObjectiveDef { id: "scrolls_created",     name: "Create Scrolls",           target: 1000 },
-    ChapterObjectiveDef { id: "focus_sessions",      name: "Focus Sessions",           target: 500  },
-    ChapterObjectiveDef { id: "tree_waterings",      name: "Water The Evergrowth",       target: 2000 },
-    ChapterObjectiveDef { id: "rituals_completed",   name: "Complete Sidequests",      target: 300  },
-    ChapterObjectiveDef { id: "reflections_written", name: "Write Reflections",        target: 750  },
+    ChapterObjectiveDef {
+        id: "tasks_completed",
+        name: "Complete Quests",
+        target: 1000,
+    },
+    ChapterObjectiveDef {
+        id: "subtasks_completed",
+        name: "Complete Steps",
+        target: 2000,
+    },
+    ChapterObjectiveDef {
+        id: "scrolls_created",
+        name: "Create Scrolls",
+        target: 1000,
+    },
+    ChapterObjectiveDef {
+        id: "focus_sessions",
+        name: "Focus Sessions",
+        target: 500,
+    },
+    ChapterObjectiveDef {
+        id: "tree_waterings",
+        name: "Water The Evergrowth",
+        target: 2000,
+    },
+    ChapterObjectiveDef {
+        id: "rituals_completed",
+        name: "Complete Sidequests",
+        target: 300,
+    },
+    ChapterObjectiveDef {
+        id: "reflections_written",
+        name: "Write Reflections",
+        target: 750,
+    },
 ];
 
 static CHAPTER_ONE_REWARD_IDS: &[&str] = &["world_chapter_11", "memory_ch1_001"];

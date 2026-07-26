@@ -16,11 +16,67 @@ use crate::models::{
     ClassType, DailyAdventure, DailyQuest, DailyReflection, FocusSession, JournalEntry, Milestone,
     Note, Project, RecurrenceType, Ritual, Task, TaskPriority, User, ZenTree,
 };
+use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
 use crate::screens::onboarding::OnboardingFocus;
-use crate::screens::ActiveScreen;
 use crate::services::{ThemeService, XPService};
 use crate::theme::ThemeChoice;
+
+pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
+
+fn delete_word_before_cursor(input: &mut String, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    if cursor == 0 {
+        return 0;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+
+    input.drain(start..cursor);
+    start
+}
+
+fn delete_last_word(input: &mut String) {
+    let cursor = input.len();
+    delete_word_before_cursor(input, cursor);
+}
+
+fn is_ctrl_backspace(key: KeyEvent) -> bool {
+    let ctrl_word_delete = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Backspace
+                | KeyCode::Char('h')
+                | KeyCode::Char('H')
+                | KeyCode::Char('w')
+                | KeyCode::Char('W')
+        );
+    let modified_backspace = key.code == KeyCode::Backspace
+        && (key.modifiers.contains(KeyModifiers::ALT)
+            || key.modifiers.contains(KeyModifiers::SHIFT));
+    ctrl_word_delete || modified_backspace
+}
+
+fn normalize_ctrl_backspace(mut key: KeyEvent) -> KeyEvent {
+    if is_ctrl_backspace(key) {
+        key.code = KeyCode::Backspace;
+    }
+    key
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DueDateType {
@@ -318,7 +374,7 @@ pub enum ModalType {
     HydrationReminder,
     // Settings de hidratación — intervalo, horario activo, objetivo diario
     HydrationSettings {
-        interval_idx: usize,   // 0=30 1=45 2=60 3=90 4=120 mins
+        interval_idx: usize, // 0=30 1=45 2=60 3=90 4=120 mins
         from_hour: u32,
         to_hour: u32,
         target: i32,
@@ -331,26 +387,47 @@ pub enum ModalType {
 pub enum NotificationKind {
     Info,    // azul  — informativo, todo bien
     Warning, // amarillo — advertencia, algo que el héroe debe saber
-    Swarm,   // rojo  — los Notification Sprites atacan
+    Swarm,   // púrpura — los Notification Sprites atacan
 }
 
 #[derive(Debug, Clone)]
 pub struct Notification {
     pub message: String,
-    pub kind:    NotificationKind,
-    pub title:   String,
+    pub kind: NotificationKind,
+    pub title: String,
     pub unlocked_at: std::time::Instant,
 }
 
 impl Notification {
     pub fn info(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: NotificationKind::Info, title: "Realm Bulletin".to_string(), unlocked_at: std::time::Instant::now() }
+        Self {
+            message: msg.into(),
+            kind: NotificationKind::Info,
+            title: "Realm Bulletin".to_string(),
+            unlocked_at: std::time::Instant::now(),
+        }
     }
     pub fn warning(msg: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: NotificationKind::Warning, title: "Realm Warning".to_string(), unlocked_at: std::time::Instant::now() }
+        Self {
+            message: msg.into(),
+            kind: NotificationKind::Warning,
+            title: "Realm Warning".to_string(),
+            unlocked_at: std::time::Instant::now(),
+        }
     }
     pub fn swarm(msg: impl Into<String>, title: impl Into<String>) -> Self {
-        Self { message: msg.into(), kind: NotificationKind::Swarm, title: title.into(), unlocked_at: std::time::Instant::now() }
+        let title = title.into();
+        let title = if title.contains("Notification Swarm") {
+            title
+        } else {
+            format!("Notification Swarm — {}", title)
+        };
+        Self {
+            message: msg.into(),
+            kind: NotificationKind::Swarm,
+            title,
+            unlocked_at: std::time::Instant::now(),
+        }
     }
 }
 
@@ -475,27 +552,41 @@ const SPRITE_MSG_RARE_CHRONICLE: &[&str] = &[
 
 // cada pool de Sprites tiene su título absurdo — el título combina con el tono del mensaje
 fn pick_sprite_message() -> (String, &'static str) {
-    use rand::seq::SliceRandom;
     use rand::Rng;
+    use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
     if rng.r#gen::<f64>() < 0.008 {
-        let msg = SPRITE_MSG_RARE_CHRONICLE.choose(&mut rng).copied().unwrap_or("").to_string();
+        let msg = SPRITE_MSG_RARE_CHRONICLE
+            .choose(&mut rng)
+            .copied()
+            .unwrap_or("")
+            .to_string();
         return (msg, "Final Reminder (Probably)");
     }
     let pools: &[(&[&str], &str)] = &[
-        (SPRITE_MSG_USELESS,    "Notification Swarm"),
-        (SPRITE_MSG_SATIRE,     "Important Notification"),
+        (SPRITE_MSG_USELESS, "Notification Swarm"),
+        (SPRITE_MSG_SATIRE, "Important Notification"),
         (SPRITE_MSG_CLASS_LORE, "Follow-up Notification"),
-        (SPRITE_MSG_SPEAKING,   "Extremely Important Notification"),
+        (SPRITE_MSG_SPEAKING, "Extremely Important Notification"),
     ];
-    let (pool, title) = pools.choose(&mut rng).copied().unwrap_or((SPRITE_MSG_SPEAKING, "Important Notification"));
-    (pool.choose(&mut rng).copied().unwrap_or("").to_string(), title)
+    let (pool, title) = pools
+        .choose(&mut rng)
+        .copied()
+        .unwrap_or((SPRITE_MSG_SPEAKING, "Important Notification"));
+    (
+        pool.choose(&mut rng).copied().unwrap_or("").to_string(),
+        title,
+    )
 }
 
 fn pick_task_completion_sprite_message() -> (String, &'static str) {
     use rand::seq::SliceRandom;
     let mut rng = rand::thread_rng();
-    let msg = SPRITE_MSG_TASK_COMPLETE.choose(&mut rng).copied().unwrap_or("").to_string();
+    let msg = SPRITE_MSG_TASK_COMPLETE
+        .choose(&mut rng)
+        .copied()
+        .unwrap_or("")
+        .to_string();
     (msg, "Reminder About Previous Notification")
 }
 
@@ -697,6 +788,10 @@ pub struct App {
     pub library_active_col: usize,
     pub library_scroll_offset: u16,
     pub selected_relic_idx: usize,
+    pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Sound Volume
+    pub selected_settings_theme_idx: usize,
+    pub sound_effects_enabled: bool,
+    pub sound_effects_volume: f32,
     pub ambient_effects_enabled: bool,
     pub active_ambient_effect: usize,
     pub ambient_particles: Vec<Particle>,
@@ -706,6 +801,8 @@ pub struct App {
     pub quit_confirm_ticks: usize,
     pub intro_ticks: usize,
     pub music_scroll_ticks: usize,
+    pub last_pywal_check: Option<std::time::Instant>,
+    pub last_pywal_modified: Option<std::time::SystemTime>,
 
     // El hilo de fondo escribe aquí cuando termina de checar la versión más reciente
     pub update_check: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -744,8 +841,8 @@ pub struct App {
 
     pub chapter_progress: Option<crate::models::chapter::ChapterProgressData>,
     pub chapter_panel_scroll: usize,
-    pub chapter_tab: usize,           // 0 = Active Chapter, 1 = Chapter History
-    pub chapter_panel_focused: bool,  // false = left feed, true = right chapter panel
+    pub chapter_tab: usize,          // 0 = Active Chapter, 1 = Chapter History
+    pub chapter_panel_focused: bool, // false = left feed, true = right chapter panel
     pub chapter_history: Vec<crate::models::chapter::ChapterHistoryEntry>,
     pub chapter_completion_seen: bool,
     pub chapter_progress_refreshed: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -756,12 +853,12 @@ pub struct App {
     pub last_task_notification_tick: Option<std::time::Instant>,
 
     // Prologue — pantallas de historia con efecto typewriter que se muestran después del login
-    pub prologue_page: u8,           // 0 = The Story So Far, 1 = Chapter One
-    pub prologue_line_idx: usize,    // which line is currently being typed
-    pub prologue_char_in_line: usize,// chars revealed in that line
+    pub prologue_page: u8,            // 0 = The Story So Far, 1 = Chapter One
+    pub prologue_line_idx: usize,     // which line is currently being typed
+    pub prologue_char_in_line: usize, // chars revealed in that line
     pub prologue_next_is_onboarding: bool, // where to go when prologue finishes
-    pub prologue_delay_ticks: usize, // ticks to wait before typewriter starts (audio warm-up)
-    pub prologue_skip_checked: bool, // "don't show again" checkbox state
+    pub prologue_delay_ticks: usize,  // ticks to wait before typewriter starts (audio warm-up)
+    pub prologue_skip_checked: bool,  // "don't show again" checkbox state
 
     // Gateway — pantalla de selección inicial para nuevos aventureros sin usuario registrado
     pub gateway_selected_idx: usize,
@@ -776,15 +873,17 @@ pub struct App {
     pub hydration_glasses: i32,
     pub hydration_target: i32,
     pub hydration_interval_mins: i32,
-    pub hydration_active_from: u32,  // inclusive start hour (0-23)
-    pub hydration_active_to: u32,    // exclusive end hour (1-24)
+    pub hydration_active_from: u32, // inclusive start hour (0-23)
+    pub hydration_active_to: u32,   // exclusive end hour (1-24)
     pub hydration_pause_focus: bool,
     pub hydration_reward_xp: i32,
     pub hydration_next_reminder_at: Option<std::time::Instant>,
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
-    content.split_whitespace().find(|w| w.starts_with("http://") || w.starts_with("https://"))
+    content
+        .split_whitespace()
+        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
 }
 
 pub fn open_url(url: &str) {
@@ -957,10 +1056,7 @@ impl App {
                 "The road to greatness begins with answering that email.",
                 "Questline",
             ),
-            (
-                "The hero's journey, but with spreadsheets.",
-                "Questline",
-            ),
+            ("The hero's journey, but with spreadsheets.", "Questline"),
             (
                 "No chosen one. No destiny. Just consistent effort and decent note-taking.",
                 "Questline",
@@ -1001,18 +1097,12 @@ impl App {
                 "Remember: the backlog is doing pushups while you read this.",
                 "Questline",
             ),
-            (
-                "You could be working right now.",
-                "Questline",
-            ),
+            ("You could be working right now.", "Questline"),
             (
                 "Eventually the tasks finish themselves. This is not that strategy.",
                 "Questline",
             ),
-            (
-                "Achievement unlocked: Doing the thing.",
-                "Questline",
-            ),
+            ("Achievement unlocked: Doing the thing.", "Questline"),
             (
                 "Leveling up your character because improving yourself sounded like too much work.",
                 "Questline",
@@ -1041,14 +1131,8 @@ impl App {
                 "An RPG for the greatest battle of all: opening the document and actually starting.",
                 "Questline",
             ),
-            (
-                "I can absolutely handle that tomorrow.",
-                "Past You",
-            ),
-            (
-                "I inherited this disaster.",
-                "Future You",
-            ),
+            ("I can absolutely handle that tomorrow.", "Past You"),
+            ("I inherited this disaster.", "Future You"),
             (
                 "You said five minutes three hours ago.",
                 "The Coffee Machine",
@@ -1065,10 +1149,7 @@ impl App {
                 "Warning: may cause accidental self-improvement.",
                 "System Notification",
             ),
-            (
-                "We both know why you opened the app.",
-                "Future You",
-            ),
+            ("We both know why you opened the app.", "Future You"),
         ];
 
         let questline_choice = questline_pool
@@ -1332,38 +1413,42 @@ impl App {
         // The server filters pulls with `device_id != current_device`, so cloned IDs make both PCs
         // hide each other's events. Bind the id to the first hostname that used it and repair copies.
         let device_id = match db.get_setting("device_id")? {
-            Some(id) => {
-                match db.get_setting("device_bound_name")? {
-                    Some(bound_name) if bound_name != device_name => {
+            Some(id) => match db.get_setting("device_bound_name")? {
+                Some(bound_name) if bound_name != device_name => {
+                    let new_id = Uuid::new_v4().to_string();
+                    db.set_setting("device_id", &new_id)?;
+                    db.set_setting("device_bound_name", &device_name)?;
+                    let _ = db.set_setting("last_pull_seq", "0");
+                    let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                    new_id
+                }
+                Some(_) => id,
+                None => {
+                    let stored_device_name = db
+                        .conn
+                        .query_row(
+                            "SELECT device_name FROM devices WHERE device_id = ?1",
+                            params![id.as_str()],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .ok();
+
+                    if stored_device_name
+                        .as_deref()
+                        .is_some_and(|name| name != device_name)
+                    {
                         let new_id = Uuid::new_v4().to_string();
                         db.set_setting("device_id", &new_id)?;
                         db.set_setting("device_bound_name", &device_name)?;
                         let _ = db.set_setting("last_pull_seq", "0");
                         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                         new_id
-                    }
-                    Some(_) => id,
-                    None => {
-                        let stored_device_name = db.conn.query_row(
-                            "SELECT device_name FROM devices WHERE device_id = ?1",
-                            params![id.as_str()],
-                            |row| row.get::<_, String>(0),
-                        ).ok();
-
-                        if stored_device_name.as_deref().is_some_and(|name| name != device_name) {
-                            let new_id = Uuid::new_v4().to_string();
-                            db.set_setting("device_id", &new_id)?;
-                            db.set_setting("device_bound_name", &device_name)?;
-                            let _ = db.set_setting("last_pull_seq", "0");
-                            let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
-                            new_id
-                        } else {
-                            db.set_setting("device_bound_name", &device_name)?;
-                            id
-                        }
+                    } else {
+                        db.set_setting("device_bound_name", &device_name)?;
+                        id
                     }
                 }
-            }
+            },
             None => {
                 let id = Uuid::new_v4().to_string();
                 db.set_setting("device_id", &id)?;
@@ -1388,11 +1473,21 @@ impl App {
                 .map(|s| s == "true")
                 .unwrap_or(false)
         };
-        let external_notifications = db.get_setting("external_notifications")?
+        let external_notifications = db
+            .get_setting("external_notifications")?
             .map(|s| s == "true")
             .unwrap_or(true);
         let task_notifications_enabled =
             crate::services::task_notifications::task_notifications_enabled(&db);
+        let sound_effects_enabled = db
+            .get_setting("sound_effects_enabled")?
+            .map(|s| s == "true")
+            .unwrap_or(true);
+        let sound_effects_volume = db
+            .get_setting("sound_effects_volume")?
+            .and_then(|s| s.parse::<f32>().ok())
+            .unwrap_or(1.0)
+            .clamp(0.0, 1.0);
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -1408,8 +1503,9 @@ impl App {
             );
             if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
                 if !json.trim().is_empty() {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
-                    let decoded = STANDARD.decode(json.trim())
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    let decoded = STANDARD
+                        .decode(json.trim())
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
@@ -1433,12 +1529,16 @@ impl App {
                 &device_id,
             );
             let d_name = device_name.clone();
-            let u_name = user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+            let u_name = user
+                .as_ref()
+                .map(|u| u.username.clone())
+                .unwrap_or_default();
             let _ = std::thread::spawn(move || {
                 let body = serde_json::json!({
                     "device_name": d_name,
                     "username": u_name
-                }).to_string();
+                })
+                .to_string();
                 let _ = client.send_request("POST", "devices/register", &body);
             });
         }
@@ -1562,6 +1662,10 @@ impl App {
             library_active_col: 0,
             library_scroll_offset: 0,
             selected_relic_idx: 0,
+            selected_settings_focus_idx: 0,
+            selected_settings_theme_idx: 0,
+            sound_effects_enabled,
+            sound_effects_volume,
             ambient_effects_enabled: true,
             active_ambient_effect: 1,
             ambient_particles: Vec::new(),
@@ -1571,6 +1675,8 @@ impl App {
             quit_confirm_ticks: 0,
             intro_ticks: 0,
             music_scroll_ticks: 0,
+            last_pywal_check: None,
+            last_pywal_modified: None,
             update_check: std::sync::Arc::new(std::sync::Mutex::new(None)),
             update_check_done: false,
             run_installer_on_exit: false,
@@ -1604,7 +1710,9 @@ impl App {
             chapter_panel_focused: false,
             chapter_history: Vec::new(),
             chapter_completion_seen: false,
-            chapter_progress_refreshed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            chapter_progress_refreshed: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                false,
+            )),
             sprite_notifications_shown_this_session: 0,
             last_sprite_notification_time: None,
             last_sprite_check_time: None,
@@ -1669,7 +1777,11 @@ impl App {
                         .into_string()
                         .ok()
                         .and_then(|b| serde_json::from_str::<serde_json::Value>(&b).ok())
-                        .and_then(|j| j["tag_name"].as_str().map(|s| s.trim_start_matches('v').to_string()))
+                        .and_then(|j| {
+                            j["tag_name"]
+                                .as_str()
+                                .map(|s| s.trim_start_matches('v').to_string())
+                        })
                         .filter(|v| is_newer(current, v))
                         .unwrap_or_default(),
                     Err(_) => String::new(),
@@ -1686,9 +1798,16 @@ impl App {
                 app.audio_player.set_volume(vol);
             }
         }
+        app.audio_player
+            .set_sound_effects_enabled(app.sound_effects_enabled);
+        app.audio_player
+            .set_sound_effects_volume(app.sound_effects_volume);
         if let Ok(Some(last_source)) = app.db.get_setting("last_music_source") {
             if !last_source.is_empty() && last_source != "Silent" && last_source != "None" {
-                if let Some(idx) = crate::audio::SOUNDSCAPES.iter().position(|s| s.name == last_source) {
+                if let Some(idx) = crate::audio::SOUNDSCAPES
+                    .iter()
+                    .position(|s| s.name == last_source)
+                {
                     app.selected_soundscape_idx = idx;
                 }
                 app.audio_player.init_soundscape(&last_source);
@@ -1873,15 +1992,14 @@ impl App {
             }
 
             if let Some(theme_choice_str) = self.db.get_setting("equipped_theme")? {
-                let choice = match theme_choice_str.as_str() {
-                    "Forest" => ThemeChoice::Forest,
-                    "AncientLibrary" => ThemeChoice::AncientLibrary,
-                    "MountainFortress" => ThemeChoice::MountainFortress,
-                    "ArcaneWorkshop" => ThemeChoice::ArcaneWorkshop,
-                    "OceanTemple" => ThemeChoice::OceanTemple,
-                    _ => ThemeChoice::ClassDefault,
-                };
+                let choice = crate::theme::Theme::choice_from_key(&theme_choice_str);
                 self.theme_service.set_theme_choice(choice);
+                if self.active_screen != ActiveScreen::Settings {
+                    self.selected_settings_theme_idx = crate::theme::Theme::all_choices()
+                        .iter()
+                        .position(|c| *c == choice)
+                        .unwrap_or(0);
+                }
             }
 
             self.ambient_effects_enabled = self
@@ -1889,6 +2007,21 @@ impl App {
                 .get_setting("ambient_effects_enabled")?
                 .and_then(|s| s.parse::<bool>().ok())
                 .unwrap_or(true);
+            self.sound_effects_enabled = self
+                .db
+                .get_setting("sound_effects_enabled")?
+                .and_then(|s| s.parse::<bool>().ok())
+                .unwrap_or(true);
+            self.sound_effects_volume = self
+                .db
+                .get_setting("sound_effects_volume")?
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0)
+                .clamp(0.0, 1.0);
+            self.audio_player
+                .set_sound_effects_enabled(self.sound_effects_enabled);
+            self.audio_player
+                .set_sound_effects_volume(self.sound_effects_volume);
 
             self.active_ambient_effect = self
                 .db
@@ -1897,14 +2030,20 @@ impl App {
                 .unwrap_or(1);
 
             self.projects = self.db.get_projects()?;
-            self.projects.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+            self.projects
+                .sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
 
             // Load all data into caches — used by renderer and key handlers instead of per-frame/per-key DB queries
             self.all_tasks = self.db.get_tasks()?;
             self.all_notes = self.db.get_notes().unwrap_or_default();
             self.all_journals = self.db.get_journal_entries().unwrap_or_default();
             let today = Utc::now().date_naive();
-            self.tasks_due_today = self.all_tasks.iter().filter(|t| !t.completed).cloned().collect();
+            self.tasks_due_today = self
+                .all_tasks
+                .iter()
+                .filter(|t| !t.completed)
+                .cloned()
+                .collect();
 
             self.daily_quests = self.db.get_daily_quests_for_date(today)?;
 
@@ -1918,6 +2057,8 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        let key = normalize_ctrl_backspace(key);
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.notifications.push(Notification::info(
                 "Use [q] to quit — seals the Chronicle and syncs before exit.",
@@ -1975,8 +2116,10 @@ impl App {
         }
 
         // Ctrl+S sincroniza en cualquier pantalla excepto el editor y los modales de task/step (ahí guarda)
-        let task_modal_open = matches!(self.modal_state, ModalType::NewTask { .. } | ModalType::EditTask { .. })
-            || matches!(self.overlay_modal, ModalType::NewTask { .. });
+        let task_modal_open = matches!(
+            self.modal_state,
+            ModalType::NewTask { .. } | ModalType::EditTask { .. }
+        ) || matches!(self.overlay_modal, ModalType::NewTask { .. });
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && key.code == KeyCode::Char('s')
             && self.active_screen != ActiveScreen::Editor
@@ -2109,8 +2252,14 @@ impl App {
                     ];
                     use rand::seq::SliceRandom;
                     let mut rng = rand::thread_rng();
-                    let chosen_quote = quotes.choose(&mut rng).copied().unwrap_or("Even heroes must rest between journeys.").to_string();
-                    self.modal_state = ModalType::QuitConfirm { quote: chosen_quote };
+                    let chosen_quote = quotes
+                        .choose(&mut rng)
+                        .copied()
+                        .unwrap_or("Even heroes must rest between journeys.")
+                        .to_string();
+                    self.modal_state = ModalType::QuitConfirm {
+                        quote: chosen_quote,
+                    };
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
@@ -2127,9 +2276,12 @@ impl App {
                 KeyCode::Char('p') => {
                     if self.active_screen == ActiveScreen::Dashboard {
                         open_url("https://ko-fi.com/Y4H021XN7F");
-                        self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
+                        self.notifications
+                            .push(Notification::info("Opening Ko-fi in your browser..."));
                         return Ok(());
-                    } else if self.active_screen != ActiveScreen::Fellowship && self.active_screen != ActiveScreen::SyncSettings {
+                    } else if self.active_screen != ActiveScreen::Fellowship
+                        && self.active_screen != ActiveScreen::SyncSettings
+                    {
                         use crate::audio::SOUNDSCAPES;
                         if self.active_screen == ActiveScreen::Soundscapes
                             && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
@@ -2146,7 +2298,10 @@ impl App {
                     let is_character_spec = self.active_screen == ActiveScreen::Character;
                     let is_task_sort = self.active_screen == ActiveScreen::Workspace
                         && self.workspace_tab_idx == 0;
-                    if !is_character_spec && !is_task_sort {
+                    if !is_character_spec
+                        && !is_task_sort
+                        && self.active_screen != ActiveScreen::Settings
+                    {
                         self.audio_player.stop();
                         let _ = self.db.set_setting("last_music_source", "Silent");
                         return Ok(());
@@ -2166,11 +2321,22 @@ impl App {
                         && self.active_screen != ActiveScreen::Workspace
                         && self.active_screen != ActiveScreen::Fellowship
                         && self.active_screen != ActiveScreen::SyncSettings
+                        && self.active_screen != ActiveScreen::Settings
                     {
                         let current = self.audio_player.get_state().current_soundscape;
                         let idx = SOUNDSCAPES
                             .iter()
-                            .position(|s| s.name == current || (s.name == "Music For Programming" && (current.starts_with("MFP:") || current.to_lowercase().contains("music for programming") || current.to_lowercase().contains("music_for_programming"))))
+                            .position(|s| {
+                                s.name == current
+                                    || (s.name == "Music For Programming"
+                                        && (current.starts_with("MFP:")
+                                            || current
+                                                .to_lowercase()
+                                                .contains("music for programming")
+                                            || current
+                                                .to_lowercase()
+                                                .contains("music_for_programming")))
+                            })
                             .unwrap_or(SOUNDSCAPES.len() - 1);
                         let next_idx = (idx + 1) % SOUNDSCAPES.len();
                         self.audio_player.play(SOUNDSCAPES[next_idx].name);
@@ -2178,32 +2344,50 @@ impl App {
                     }
                 }
                 KeyCode::Char('+') => {
-                    self.audio_player.volume_up();
-                    let vol = self.audio_player.get_state().volume;
-                    let _ = self.db.set_setting("last_music_volume", &vol.to_string());
-                    return Ok(());
+                    if self.active_screen != ActiveScreen::Settings {
+                        self.audio_player.volume_up();
+                        let vol = self.audio_player.get_state().volume;
+                        let _ = self.db.set_setting("last_music_volume", &vol.to_string());
+                        return Ok(());
+                    }
                 }
                 KeyCode::Char('*') => {
-                    self.audio_player.set_volume(0.5);
-                    let _ = self.db.set_setting("last_music_volume", "0.5");
-                    return Ok(());
+                    if self.active_screen != ActiveScreen::Settings {
+                        self.audio_player.set_volume(0.5);
+                        let _ = self.db.set_setting("last_music_volume", "0.5");
+                        return Ok(());
+                    }
                 }
                 KeyCode::Char('-') => {
-                    self.audio_player.volume_down();
-                    let vol = self.audio_player.get_state().volume;
-                    let _ = self.db.set_setting("last_music_volume", &vol.to_string());
-                    return Ok(());
+                    if self.active_screen != ActiveScreen::Settings {
+                        self.audio_player.volume_down();
+                        let vol = self.audio_player.get_state().volume;
+                        let _ = self.db.set_setting("last_music_volume", &vol.to_string());
+                        return Ok(());
+                    }
                 }
                 KeyCode::Char('f') => {
-                    if self.active_screen == ActiveScreen::Soundscapes && self.modal_state == ModalType::None {
-                        let current_val = self.db.get_setting("local_music_folder").unwrap_or_default().unwrap_or_default();
+                    if self.active_screen == ActiveScreen::Soundscapes
+                        && self.modal_state == ModalType::None
+                    {
+                        let current_val = self
+                            .db
+                            .get_setting("local_music_folder")
+                            .unwrap_or_default()
+                            .unwrap_or_default();
                         let sugs = App::path_suggestions(&current_val);
-                        self.modal_state = ModalType::LocalMusicFolder { input: current_val, suggestions: sugs, selected: 0 };
+                        self.modal_state = ModalType::LocalMusicFolder {
+                            input: current_val,
+                            suggestions: sugs,
+                            selected: 0,
+                        };
                         return Ok(());
                     }
                 }
                 KeyCode::Char('b') => {
-                    if self.active_screen == ActiveScreen::Soundscapes && self.modal_state == ModalType::None {
+                    if self.active_screen == ActiveScreen::Soundscapes
+                        && self.modal_state == ModalType::None
+                    {
                         use crate::audio::SOUNDSCAPES;
                         if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
                             crate::audio::mpris_player::prev_track();
@@ -2228,8 +2412,11 @@ impl App {
                     self.active_screen = ActiveScreen::Gateway;
                 } else {
                     // Usuario existente — respeta la preferencia de skip del prólogo
-                    let skip = self.db.get_setting("prologue_skip")
-                        .ok().flatten()
+                    let skip = self
+                        .db
+                        .get_setting("prologue_skip")
+                        .ok()
+                        .flatten()
                         .map(|v| v == "1")
                         .unwrap_or(false);
                     if skip {
@@ -2320,15 +2507,35 @@ impl App {
         if self.overlay_modal != ModalType::None {
             if let Some(project_id) = self.active_project_id {
                 if let ModalType::NewTask {
-                    ref title, ref desc, desc_cursor, priority, due_date_type,
-                    ref due_date_val, ref set_date_val, focus_idx, parent_task_id, recurrence,
+                    ref title,
+                    ref desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    ref due_date_val,
+                    ref set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    recurrence,
                 } = self.overlay_modal.clone()
                 {
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                     self.handle_task_modal_key(
-                        key, project_id, None,
-                        title.clone(), desc.clone(), desc_cursor, priority, due_date_type,
-                        due_date_val.clone(), set_date_val.clone(), focus_idx, parent_task_id, 0, true, recurrence,
+                        key,
+                        project_id,
+                        None,
+                        title.clone(),
+                        desc.clone(),
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val.clone(),
+                        set_date_val.clone(),
+                        focus_idx,
+                        parent_task_id,
+                        0,
+                        true,
+                        recurrence,
                     )?;
                     std::mem::swap(&mut self.modal_state, &mut self.overlay_modal);
                 }
@@ -2350,32 +2557,40 @@ impl App {
                                 if let Ok((_, reward_given)) = self.db.hydration_get_today() {
                                     if !reward_given {
                                         let _ = self.db.hydration_mark_reward_given();
-                                        let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
-                                        let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
-                                        self.notifications.push(Notification::info(
-                                            format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
-                                        ));
+                                        let _ = self.grant_xp(
+                                            "hydration_daily_target",
+                                            self.hydration_reward_xp,
+                                        );
+                                        let _ = self
+                                            .update_daily_adventure_progress("hydrate_fully", 1);
+                                        self.notifications.push(Notification::info(format!(
+                                            "Daily hydration goal reached! +{} XP",
+                                            self.hydration_reward_xp
+                                        )));
                                     }
                                 }
-	                            } else {
-	                                self.notifications.push(Notification::info(
-	                                    format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
-	                                ));
-	                            }
-	                            let _ = self.check_action_achievements();
-	                            let _ = self.increment_quest_progress(40, 1);
-	                        }
+                            } else {
+                                self.notifications.push(Notification::info(format!(
+                                    "Drank a glass! {}/{} today",
+                                    new_count, self.hydration_target
+                                )));
+                            }
+                            let _ = self.check_action_achievements();
+                            let _ = self.increment_quest_progress(40, 1);
+                        }
                         // Rearm reminder
                         self.hydration_next_reminder_at = Some(
                             std::time::Instant::now()
-                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                                + std::time::Duration::from_secs(
+                                    self.hydration_interval_mins as u64 * 60,
+                                ),
                         );
                     }
                     // s = snooze 15 min
                     KeyCode::Char('s') | KeyCode::Char('S') => {
                         self.modal_state = ModalType::None;
                         self.hydration_next_reminder_at = Some(
-                            std::time::Instant::now() + std::time::Duration::from_secs(15 * 60)
+                            std::time::Instant::now() + std::time::Duration::from_secs(15 * 60),
                         );
                     }
                     // x / Esc = dismiss without snooze (rearms at full interval)
@@ -2383,7 +2598,9 @@ impl App {
                         self.modal_state = ModalType::None;
                         self.hydration_next_reminder_at = Some(
                             std::time::Instant::now()
-                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                                + std::time::Duration::from_secs(
+                                    self.hydration_interval_mins as u64 * 60,
+                                ),
                         );
                     }
                     _ => {}
@@ -2398,7 +2615,8 @@ impl App {
                     ref mut target,
                     ref mut pause_focus,
                     ref mut focus_idx,
-                } = self.modal_state {
+                } = self.modal_state
+                {
                     match key.code {
                         KeyCode::Tab => {
                             *focus_idx = (*focus_idx + 1) % 6;
@@ -2407,17 +2625,45 @@ impl App {
                             *focus_idx = focus_idx.saturating_sub(1);
                         }
                         KeyCode::Left => match *focus_idx {
-                            0 => { *interval_idx = interval_idx.saturating_sub(1); }
-                            1 => { if *from_hour > 0 { *from_hour -= 1; } }
-                            2 => { if *to_hour > 1 { *to_hour -= 1; } }
-                            3 => { if *target > 1 { *target -= 1; } }
+                            0 => {
+                                *interval_idx = interval_idx.saturating_sub(1);
+                            }
+                            1 => {
+                                if *from_hour > 0 {
+                                    *from_hour -= 1;
+                                }
+                            }
+                            2 => {
+                                if *to_hour > 1 {
+                                    *to_hour -= 1;
+                                }
+                            }
+                            3 => {
+                                if *target > 1 {
+                                    *target -= 1;
+                                }
+                            }
                             _ => {}
                         },
                         KeyCode::Right => match *focus_idx {
-                            0 => { if *interval_idx < 4 { *interval_idx += 1; } }
-                            1 => { if *from_hour < 23 { *from_hour += 1; } }
-                            2 => { if *to_hour < 24 { *to_hour += 1; } }
-                            3 => { *target += 1; }
+                            0 => {
+                                if *interval_idx < 4 {
+                                    *interval_idx += 1;
+                                }
+                            }
+                            1 => {
+                                if *from_hour < 23 {
+                                    *from_hour += 1;
+                                }
+                            }
+                            2 => {
+                                if *to_hour < 24 {
+                                    *to_hour += 1;
+                                }
+                            }
+                            3 => {
+                                *target += 1;
+                            }
                             _ => {}
                         },
                         KeyCode::Char(' ') if *focus_idx == 4 => {
@@ -2439,19 +2685,32 @@ impl App {
                             self.hydration_pause_focus = chosen_pause;
 
                             let _ = self.db.set_setting("hydration_enabled", "true");
-                            let _ = self.db.set_setting("hydration_interval_mins", &chosen_interval.to_string());
-                            let _ = self.db.set_setting("hydration_active_from", &chosen_from.to_string());
-                            let _ = self.db.set_setting("hydration_active_to", &chosen_to.to_string());
-                            let _ = self.db.set_setting("hydration_target", &chosen_target.to_string());
-                            let _ = self.db.set_setting("hydration_pause_focus", if chosen_pause { "true" } else { "false" });
+                            let _ = self.db.set_setting(
+                                "hydration_interval_mins",
+                                &chosen_interval.to_string(),
+                            );
+                            let _ = self
+                                .db
+                                .set_setting("hydration_active_from", &chosen_from.to_string());
+                            let _ = self
+                                .db
+                                .set_setting("hydration_active_to", &chosen_to.to_string());
+                            let _ = self
+                                .db
+                                .set_setting("hydration_target", &chosen_target.to_string());
+                            let _ = self.db.set_setting(
+                                "hydration_pause_focus",
+                                if chosen_pause { "true" } else { "false" },
+                            );
 
                             // Arm first reminder
                             self.hydration_next_reminder_at = Some(
                                 std::time::Instant::now()
-                                    + std::time::Duration::from_secs(chosen_interval as u64 * 60)
+                                    + std::time::Duration::from_secs(chosen_interval as u64 * 60),
                             );
                             self.modal_state = ModalType::None;
-                            self.notifications.push(Notification::info("Hydration reminders enabled!"));
+                            self.notifications
+                                .push(Notification::info("Hydration reminders enabled!"));
                         }
                         KeyCode::Char('x') | KeyCode::Char('X') => {
                             // Disable hydration
@@ -2459,7 +2718,8 @@ impl App {
                             self.hydration_next_reminder_at = None;
                             let _ = self.db.set_setting("hydration_enabled", "false");
                             self.modal_state = ModalType::None;
-                            self.notifications.push(Notification::info("Hydration reminders disabled."));
+                            self.notifications
+                                .push(Notification::info("Hydration reminders disabled."));
                         }
                         KeyCode::Esc => {
                             self.modal_state = ModalType::None;
@@ -2471,7 +2731,10 @@ impl App {
             }
             ModalType::QuitConfirm { .. } => {
                 match key.code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    KeyCode::Char('y')
+                    | KeyCode::Char('Y')
+                    | KeyCode::Char('q')
+                    | KeyCode::Char('Q') => {
                         if self.auto_sync && self.config.sync_enabled && !self.sync_in_progress {
                             // Sincroniza antes de salir — el loop detecta cuando termina y cierra
                             self.start_background_sync();
@@ -2587,10 +2850,14 @@ impl App {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         match self.db.prune_completed_tasks(d) {
                             Ok(pruned) => {
-                                self.sync_status_msg = format!("Pruned {} completed quest(s) older than {} days.", pruned, d);
-                                self.notifications.push(Notification::info(
-                                    format!("{} old completed quests pruned from the Chronicle.", pruned)
-                                ));
+                                self.sync_status_msg = format!(
+                                    "Pruned {} completed quest(s) older than {} days.",
+                                    pruned, d
+                                );
+                                self.notifications.push(Notification::info(format!(
+                                    "{} old completed quests pruned from the Chronicle.",
+                                    pruned
+                                )));
                                 self.reload_data()?;
                             }
                             Err(e) => {
@@ -2606,7 +2873,10 @@ impl App {
                 }
                 Ok(true)
             }
-            ModalType::RefileScroll { note_id, selected_idx } => {
+            ModalType::RefileScroll {
+                note_id,
+                selected_idx,
+            } => {
                 let nid = note_id;
                 let mut sel = selected_idx;
                 let total = self.codices.len() + 1; // 0 = Ungrouped, 1..=n = codices
@@ -2616,11 +2886,17 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         sel = if sel > 0 { sel - 1 } else { total - 1 };
-                        self.modal_state = ModalType::RefileScroll { note_id: nid, selected_idx: sel };
+                        self.modal_state = ModalType::RefileScroll {
+                            note_id: nid,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         sel = (sel + 1) % total;
-                        self.modal_state = ModalType::RefileScroll { note_id: nid, selected_idx: sel };
+                        self.modal_state = ModalType::RefileScroll {
+                            note_id: nid,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Enter => {
                         if let Some(mut note) = self.db.get_note_by_id(nid).ok() {
@@ -2641,7 +2917,10 @@ impl App {
                 }
                 Ok(true)
             }
-            ModalType::RefileCodex { codex_id, selected_idx } => {
+            ModalType::RefileCodex {
+                codex_id,
+                selected_idx,
+            } => {
                 let cid = codex_id;
                 let mut sel = selected_idx;
                 let targets = self.refile_codex_targets(cid);
@@ -2652,11 +2931,17 @@ impl App {
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         sel = if sel > 0 { sel - 1 } else { total - 1 };
-                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx: sel };
+                        self.modal_state = ModalType::RefileCodex {
+                            codex_id: cid,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         sel = (sel + 1) % total;
-                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx: sel };
+                        self.modal_state = ModalType::RefileCodex {
+                            codex_id: cid,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Enter => {
                         let new_parent = if sel == 0 {
@@ -2687,7 +2972,11 @@ impl App {
                         }
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::CustomFocusDuration { input: val };
                     }
                     KeyCode::Enter => {
@@ -2714,7 +3003,11 @@ impl App {
                         self.modal_state = ModalType::EditServerUrl { input: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::EditServerUrl { input: val };
                     }
                     KeyCode::Enter => {
@@ -2732,11 +3025,17 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Char('c') => {
-                        if let ModalType::ExportProfile { ref transfer_code, .. } = self.modal_state.clone() {
+                        if let ModalType::ExportProfile {
+                            ref transfer_code, ..
+                        } = self.modal_state.clone()
+                        {
                             match crate::services::identity::copy_to_clipboard(transfer_code) {
                                 Ok(_) => {
-                                    self.sync_status_msg = "Transfer Code copied to clipboard!".to_string();
-                                    self.notifications.push(Notification::info("Transfer Code copied!".to_string()));
+                                    self.sync_status_msg =
+                                        "Transfer Code copied to clipboard!".to_string();
+                                    self.notifications.push(Notification::info(
+                                        "Transfer Code copied!".to_string(),
+                                    ));
                                 }
                                 Err(e) => {
                                     self.sync_status_msg = format!("Copy Failed: {}", e);
@@ -2759,16 +3058,22 @@ impl App {
                         self.modal_state = ModalType::RestoreIdentity { input: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::RestoreIdentity { input: val };
                     }
                     KeyCode::Enter => {
-                        use base64::{engine::general_purpose::STANDARD, Engine as _};
+                        use base64::{Engine as _, engine::general_purpose::STANDARD};
                         let trimmed = val.trim().to_string();
                         match STANDARD.decode(&trimmed) {
-                            Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
+                            Ok(decoded_bytes)
+                                if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 =>
+                            {
                                 use ed25519_dalek::{SigningKey, VerifyingKey};
-                                
+
                                 let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
                                     let mut uuid_bytes = [0u8; 16];
                                     uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
@@ -2784,13 +3089,19 @@ impl App {
 
                                 let signing_key = SigningKey::from_bytes(&secret_arr);
                                 let verifying_key: VerifyingKey = signing_key.verifying_key();
-                                let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
-                                let public_hex: String = verifying_key.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+                                let secret_hex: String =
+                                    secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
+                                let public_hex: String = verifying_key
+                                    .to_bytes()
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect();
 
                                 let storage_dir = crate::storage::get_storage_dir()?;
                                 let db_path = storage_dir.join("questline.db");
                                 let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-                                let backup_path = storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
+                                let backup_path = storage_dir
+                                    .join(format!("questline_backup_prerestore_{}.db", ts));
                                 let _ = std::fs::copy(&db_path, &backup_path);
 
                                 let new_identity = crate::services::identity::Identity {
@@ -2813,24 +3124,33 @@ impl App {
                                         self.identity.clone(),
                                         &self.device_id,
                                     );
-                                    if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
+                                    if let Ok(json) =
+                                        client.send_request("GET", "recovery/latest", "")
+                                    {
                                         if !json.trim().is_empty() {
-                                            use base64::{engine::general_purpose::STANDARD, Engine as _};
-                                            let decoded = STANDARD.decode(json.trim())
+                                            use base64::{
+                                                Engine as _, engine::general_purpose::STANDARD,
+                                            };
+                                            let decoded = STANDARD
+                                                .decode(json.trim())
                                                 .ok()
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
-                                                let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                                                let _ = App::set_pull_cursor_to_remote_head(
+                                                    &self.db, &client,
+                                                );
                                                 self.notifications.push(Notification::info(
-                                                    "Data restored from cloud backup!".to_string()
+                                                    "Data restored from cloud backup!".to_string(),
                                                 ));
                                                 // If we had a 32-byte code (where we didn't know the user_uuid beforehand),
                                                 // now that the database has been imported, we can extract the correct
                                                 // user_uuid and update identity.key so they match!
                                                 if let Ok(Some(u)) = self.db.get_user() {
                                                     self.identity.user_uuid = u.id;
-                                                    if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                                    if let Ok(json_str) =
+                                                        serde_json::to_string_pretty(&self.identity)
+                                                    {
                                                         let _ = std::fs::write(&key_path, json_str);
                                                     }
                                                 }
@@ -2843,14 +3163,18 @@ impl App {
                                 let _ = self.db.set_setting("conflict_count", "0");
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored.".to_string();
-                                self.notifications.push(Notification::info("Identity Restored from Transfer Code!".to_string()));
+                                self.notifications.push(Notification::info(
+                                    "Identity Restored from Transfer Code!".to_string(),
+                                ));
                                 self.reload_data()?;
                             }
                             Ok(_) => {
-                                self.sync_status_msg = "Invalid transfer code: wrong key length".to_string();
+                                self.sync_status_msg =
+                                    "Invalid transfer code: wrong key length".to_string();
                             }
                             Err(_) => {
-                                self.sync_status_msg = "Invalid transfer code: not valid base64".to_string();
+                                self.sync_status_msg =
+                                    "Invalid transfer code: not valid base64".to_string();
                             }
                         }
                     }
@@ -2871,7 +3195,11 @@ impl App {
                 }
                 Ok(true)
             }
-            ModalType::LocalMusicFolder { ref input, ref suggestions, ref selected } => {
+            ModalType::LocalMusicFolder {
+                ref input,
+                ref suggestions,
+                ref selected,
+            } => {
                 let mut val = input.clone();
                 let mut sel = *selected;
                 let mut sugs = suggestions.clone();
@@ -2883,13 +3211,25 @@ impl App {
                         val.push(c);
                         sugs = App::path_suggestions(&val);
                         sel = 0;
-                        self.modal_state = ModalType::LocalMusicFolder { input: val, suggestions: sugs, selected: sel };
+                        self.modal_state = ModalType::LocalMusicFolder {
+                            input: val,
+                            suggestions: sugs,
+                            selected: sel,
+                        };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         sugs = App::path_suggestions(&val);
                         sel = 0;
-                        self.modal_state = ModalType::LocalMusicFolder { input: val, suggestions: sugs, selected: sel };
+                        self.modal_state = ModalType::LocalMusicFolder {
+                            input: val,
+                            suggestions: sugs,
+                            selected: sel,
+                        };
                     }
                     KeyCode::Tab | KeyCode::Down => {
                         if !sugs.is_empty() {
@@ -2897,7 +3237,11 @@ impl App {
                             val = format!("{}/", sugs[sel]);
                             sugs = App::path_suggestions(&val);
                             sel = 0;
-                            self.modal_state = ModalType::LocalMusicFolder { input: val, suggestions: sugs, selected: sel };
+                            self.modal_state = ModalType::LocalMusicFolder {
+                                input: val,
+                                suggestions: sugs,
+                                selected: sel,
+                            };
                         }
                     }
                     KeyCode::BackTab | KeyCode::Up => {
@@ -2906,7 +3250,11 @@ impl App {
                             val = format!("{}/", sugs[sel]);
                             sugs = App::path_suggestions(&val);
                             sel = 0;
-                            self.modal_state = ModalType::LocalMusicFolder { input: val, suggestions: sugs, selected: sel };
+                            self.modal_state = ModalType::LocalMusicFolder {
+                                input: val,
+                                suggestions: sugs,
+                                selected: sel,
+                            };
                         }
                     }
                     KeyCode::Enter => {
@@ -2914,7 +3262,10 @@ impl App {
                         self.audio_player.set_local_music_folder(&val);
                         self.modal_state = ModalType::None;
                         let current_sc = self.audio_player.get_state().current_soundscape;
-                        if current_sc == "Local Folder" || current_sc.starts_with("Local:") || current_sc.starts_with("Local Music:") {
+                        if current_sc == "Local Folder"
+                            || current_sc.starts_with("Local:")
+                            || current_sc.starts_with("Local Music:")
+                        {
                             self.audio_player.play("Local Folder");
                         }
                     }
@@ -2969,9 +3320,17 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if idx == 0 {
-                            well.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut well);
+                            } else {
+                                well.pop();
+                            }
                         } else {
-                            improve.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut improve);
+                            } else {
+                                improve.pop();
+                            }
                         }
                         self.modal_state = ModalType::DailyReflection {
                             what_went_well: well,
@@ -2995,7 +3354,11 @@ impl App {
                             };
                             self.db.insert_reflection(&ref_obj)?;
                             self.mark_dirty();
-                            self.push_great_chronicle_async("ReflectionWritten", "wrote a daily reflection.", true);
+                            self.push_great_chronicle_async(
+                                "ReflectionWritten",
+                                "wrote a daily reflection.",
+                                true,
+                            );
                             self.grant_xp("Daily Reflection Logged", 25)?;
                             self.complete_productive_action()?;
                             self.reload_data()?;
@@ -3066,7 +3429,10 @@ impl App {
                                 true,
                             )?;
 
-                            self.notifications.push(Notification::info(format!("Specialization Unlocked: {}!", selected_spec)));
+                            self.notifications.push(Notification::info(format!(
+                                "Specialization Unlocked: {}!",
+                                selected_spec
+                            )));
                         }
                         self.mark_dirty();
                         self.reload_data()?;
@@ -3155,11 +3521,23 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if idx == 0 {
-                            r_name.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut r_name);
+                            } else {
+                                r_name.pop();
+                            }
                         } else if idx == 1 {
-                            r_desc.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut r_desc);
+                            } else {
+                                r_desc.pop();
+                            }
                         } else if idx == 3 {
-                            xp_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut xp_str);
+                            } else {
+                                xp_str.pop();
+                            }
                         }
                         self.modal_state = ModalType::NewRitual {
                             name: r_name,
@@ -3181,7 +3559,10 @@ impl App {
                             };
                         } else {
                             if !r_name.trim().is_empty() {
-                                let freqs = ["Daily", "2x Daily", "3x Daily", "5x Daily", "Weekdays", "Weekly", "Monthly"];
+                                let freqs = [
+                                    "Daily", "2x Daily", "3x Daily", "5x Daily", "Weekdays",
+                                    "Weekly", "Monthly",
+                                ];
                                 let freq = freqs[freq_idx].to_string();
                                 let daily_target = match freq.as_str() {
                                     "2x Daily" => 2,
@@ -3191,7 +3572,9 @@ impl App {
                                 };
                                 let xp_val = xp_str.parse::<i32>().unwrap_or(20);
                                 if xp_val > 100 {
-                                    self.notifications.push(Notification::warning("Sidequest reward cannot exceed 100 XP!"));
+                                    self.notifications.push(Notification::warning(
+                                        "Sidequest reward cannot exceed 100 XP!",
+                                    ));
                                 } else {
                                     let rit = Ritual {
                                         id: Uuid::new_v4().to_string(),
@@ -3262,7 +3645,7 @@ impl App {
                 tier,
                 selected_idx,
             } => {
-                use crate::milestone_templates::{Tier, templates_for_tier, get_template_by_id};
+                use crate::milestone_templates::{Tier, get_template_by_id, templates_for_tier};
                 let tier_enum = Tier::from_u8(tier).unwrap_or(Tier::Initiate);
                 let templates: Vec<&'static crate::milestone_templates::MilestoneTemplate> =
                     templates_for_tier(tier_enum).collect();
@@ -3316,9 +3699,9 @@ impl App {
                             self.reload_data()?;
                             self.modal_state = ModalType::None;
                             self.notifications.push(Notification::info(format!(
-                                    "Milestone unlocked: {}! Complete requirements to claim {} XP.",
-                                    tmpl.name, tmpl.xp_reward
-                                )));
+                                "Milestone unlocked: {}! Complete requirements to claim {} XP.",
+                                tmpl.name, tmpl.xp_reward
+                            )));
                         }
                     }
                     _ => {}
@@ -3345,7 +3728,11 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Tab => {
-                        if f_idx == 1 && id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled {
+                        if f_idx == 1
+                            && id_str.len() == 64
+                            && name_str.is_empty()
+                            && self.config.sync_enabled
+                        {
                             let client = crate::services::api_client::ApiClient::new(
                                 &self.server_url,
                                 self.identity.clone(),
@@ -3365,7 +3752,11 @@ impl App {
                         };
                     }
                     KeyCode::BackTab => {
-                        if f_idx == 1 && id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled {
+                        if f_idx == 1
+                            && id_str.len() == 64
+                            && name_str.is_empty()
+                            && self.config.sync_enabled
+                        {
                             let client = crate::services::api_client::ApiClient::new(
                                 &self.server_url,
                                 self.identity.clone(),
@@ -3386,9 +3777,14 @@ impl App {
                     }
                     KeyCode::Left => {
                         if f_idx == 0 {
-                            let active_projects: Vec<_> = self.projects.iter().filter(|p| !p.archived).collect();
+                            let active_projects: Vec<_> =
+                                self.projects.iter().filter(|p| !p.archived).collect();
                             if !active_projects.is_empty() {
-                                p_idx = if p_idx > 0 { p_idx - 1 } else { active_projects.len() - 1 };
+                                p_idx = if p_idx > 0 {
+                                    p_idx - 1
+                                } else {
+                                    active_projects.len() - 1
+                                };
                             }
                             self.modal_state = ModalType::InviteMember {
                                 identity: id_str,
@@ -3410,7 +3806,8 @@ impl App {
                     }
                     KeyCode::Right => {
                         if f_idx == 0 {
-                            let active_projects: Vec<_> = self.projects.iter().filter(|p| !p.archived).collect();
+                            let active_projects: Vec<_> =
+                                self.projects.iter().filter(|p| !p.archived).collect();
                             if !active_projects.is_empty() {
                                 p_idx = (p_idx + 1) % active_projects.len();
                             }
@@ -3438,7 +3835,8 @@ impl App {
                                 id_str.push(c);
                             }
                             // Auto-fill companion name when key is complete
-                            if id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled {
+                            if id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled
+                            {
                                 let client = crate::services::api_client::ApiClient::new(
                                     &self.server_url,
                                     self.identity.clone(),
@@ -3461,9 +3859,17 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         if f_idx == 1 {
-                            id_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut id_str);
+                            } else {
+                                id_str.pop();
+                            }
                         } else if f_idx == 2 {
-                            name_str.pop();
+                            if is_ctrl_backspace(key) {
+                                delete_last_word(&mut name_str);
+                            } else {
+                                name_str.pop();
+                            }
                         }
                         self.modal_state = ModalType::InviteMember {
                             identity: id_str,
@@ -3475,7 +3881,11 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if f_idx < 3 {
-                            if f_idx == 1 && id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled {
+                            if f_idx == 1
+                                && id_str.len() == 64
+                                && name_str.is_empty()
+                                && self.config.sync_enabled
+                            {
                                 let client = crate::services::api_client::ApiClient::new(
                                     &self.server_url,
                                     self.identity.clone(),
@@ -3539,10 +3949,15 @@ impl App {
                                     .to_string();
                                     match client.send_request("POST", "invite", &body) {
                                         Ok(_) => {
-                                            self.notifications.push(Notification::info(format!("Invitation sent to {}!", name_str)));
+                                            self.notifications.push(Notification::info(format!(
+                                                "Invitation sent to {}!",
+                                                name_str
+                                            )));
                                         }
                                         Err(e) => {
-                                            self.notifications.push(Notification::warning(format!("Failed to send invitation: {}", e)));
+                                            self.notifications.push(Notification::warning(
+                                                format!("Failed to send invitation: {}", e),
+                                            ));
                                         }
                                     }
                                 } else {
@@ -3574,7 +3989,9 @@ impl App {
                                     self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'mentor' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()])?;
                                 }
                             } else {
-                                self.notifications.push(Notification::warning("No campaign selected for invitation!"));
+                                self.notifications.push(Notification::warning(
+                                    "No campaign selected for invitation!",
+                                ));
                             }
                             self.mark_dirty();
                             self.modal_state = ModalType::None;
@@ -3598,7 +4015,11 @@ impl App {
                         self.modal_state = ModalType::PostMessage { content: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::PostMessage { content: val };
                     }
                     KeyCode::Enter => {
@@ -3755,7 +4176,11 @@ impl App {
                         self.modal_state = ModalType::SearchMessages { query: val };
                     }
                     KeyCode::Backspace => {
-                        val.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut val);
+                        } else {
+                            val.pop();
+                        }
                         self.modal_state = ModalType::SearchMessages { query: val };
                     }
                     KeyCode::Enter => {
@@ -3810,73 +4235,80 @@ impl App {
                 selected_member_idx,
             } => {
                 let mut sel = selected_member_idx;
-                match self.db.get_task_by_id(task_id) { Ok(task) => {
-                    if let Some(proj_id) = task.project_id {
-                        let members = self
-                            .db
-                            .get_project_members(&proj_id.to_string())
-                            .unwrap_or_default();
-                        if members.is_empty() {
-                            self.modal_state = ModalType::None;
-                            return Ok(true);
-                        }
-                        match key.code {
-                            KeyCode::Esc => {
+                match self.db.get_task_by_id(task_id) {
+                    Ok(task) => {
+                        if let Some(proj_id) = task.project_id {
+                            let members = self
+                                .db
+                                .get_project_members(&proj_id.to_string())
+                                .unwrap_or_default();
+                            if members.is_empty() {
                                 self.modal_state = ModalType::None;
+                                return Ok(true);
                             }
-                            KeyCode::Up => {
-                                sel = if sel > 0 { sel - 1 } else { members.len() - 1 };
-                                self.modal_state = ModalType::AssignTask {
-                                    task_id,
-                                    selected_member_idx: sel,
-                                };
-                            }
-                            KeyCode::Down => {
-                                sel = (sel + 1) % members.len();
-                                self.modal_state = ModalType::AssignTask {
-                                    task_id,
-                                    selected_member_idx: sel,
-                                };
-                            }
-                            KeyCode::Enter => {
-                                let member = &members[sel];
-                                let existing = self
-                                    .db
-                                    .get_task_assignments(&task_id.to_string())
-                                    .unwrap_or_default();
-                                if existing.iter().any(|a| a.0 == member.0) {
-                                    self.db.conn.execute("DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2", params![task_id.to_string(), member.0])?;
-                                    let compound_id = format!("{}__{}", task_id, member.0);
-                                    let _ = self.db.log_change("task_assignment", &compound_id, "delete");
-                                } else {
-                                    self.db.assign_task(
-                                        &task_id.to_string(),
-                                        &member.0,
-                                        &member.1,
-                                    )?;
-                                    if member.0 != self.identity.public_key {
-                                        self.db.create_notification(
-                                            "task_assignment",
-                                            "Quest Assigned",
-                                            &format!(
-                                                "You have been assigned to quest: {}",
-                                                task.title
-                                            ),
-                                            Some(&proj_id.to_string()),
-                                        )?;
-                                    }
+                            match key.code {
+                                KeyCode::Esc => {
+                                    self.modal_state = ModalType::None;
                                 }
-                                self.modal_state = ModalType::None;
-                                self.reload_data()?;
+                                KeyCode::Up => {
+                                    sel = if sel > 0 { sel - 1 } else { members.len() - 1 };
+                                    self.modal_state = ModalType::AssignTask {
+                                        task_id,
+                                        selected_member_idx: sel,
+                                    };
+                                }
+                                KeyCode::Down => {
+                                    sel = (sel + 1) % members.len();
+                                    self.modal_state = ModalType::AssignTask {
+                                        task_id,
+                                        selected_member_idx: sel,
+                                    };
+                                }
+                                KeyCode::Enter => {
+                                    let member = &members[sel];
+                                    let existing = self
+                                        .db
+                                        .get_task_assignments(&task_id.to_string())
+                                        .unwrap_or_default();
+                                    if existing.iter().any(|a| a.0 == member.0) {
+                                        self.db.conn.execute("DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2", params![task_id.to_string(), member.0])?;
+                                        let compound_id = format!("{}__{}", task_id, member.0);
+                                        let _ = self.db.log_change(
+                                            "task_assignment",
+                                            &compound_id,
+                                            "delete",
+                                        );
+                                    } else {
+                                        self.db.assign_task(
+                                            &task_id.to_string(),
+                                            &member.0,
+                                            &member.1,
+                                        )?;
+                                        if member.0 != self.identity.public_key {
+                                            self.db.create_notification(
+                                                "task_assignment",
+                                                "Quest Assigned",
+                                                &format!(
+                                                    "You have been assigned to quest: {}",
+                                                    task.title
+                                                ),
+                                                Some(&proj_id.to_string()),
+                                            )?;
+                                        }
+                                    }
+                                    self.modal_state = ModalType::None;
+                                    self.reload_data()?;
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                        } else {
+                            self.modal_state = ModalType::None;
                         }
-                    } else {
+                    }
+                    _ => {
                         self.modal_state = ModalType::None;
                     }
-                } _ => {
-                    self.modal_state = ModalType::None;
-                }}
+                }
                 Ok(true)
             }
             ModalType::JournalVisibility {
@@ -3941,19 +4373,8 @@ impl App {
                     }
                     KeyCode::Enter => {
                         let selected_choice = &choices[sel];
-                        self.db.set_setting("equipped_theme", selected_choice)?;
-
-                        let choice = match selected_choice.as_str() {
-                            "Forest" => ThemeChoice::Forest,
-                            "AncientLibrary" => ThemeChoice::AncientLibrary,
-                            "MountainFortress" => ThemeChoice::MountainFortress,
-                            "ArcaneWorkshop" => ThemeChoice::ArcaneWorkshop,
-                            "OceanTemple" => ThemeChoice::OceanTemple,
-                            _ => ThemeChoice::ClassDefault,
-                        };
-                        self.theme_service.set_theme_choice(choice);
-
-                        self.notifications.push(Notification::info(format!("Theme Equipped: {}!", selected_choice)));
+                        let choice = crate::theme::Theme::choice_from_key(selected_choice);
+                        self.apply_theme_choice(choice)?;
                         self.modal_state = ModalType::None;
                         self.reload_data()?;
                     }
@@ -3971,7 +4392,11 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Up => {
-                        sel = if sel > 0 { sel - 1 } else { usernames.len() - 1 };
+                        sel = if sel > 0 {
+                            sel - 1
+                        } else {
+                            usernames.len() - 1
+                        };
                         self.modal_state = ModalType::MentionSelect {
                             selected_idx: sel,
                             usernames: usernames.clone(),
@@ -3986,7 +4411,8 @@ impl App {
                     }
                     KeyCode::Enter => {
                         let selected_username = &usernames[sel];
-                        self.fellowship_chat_input.push_str(&format!("@{}", selected_username));
+                        self.fellowship_chat_input
+                            .push_str(&format!("@{}", selected_username));
                         self.modal_state = ModalType::None;
                     }
                     _ => {}
@@ -4065,7 +4491,11 @@ impl App {
                         };
                     }
                     KeyCode::Backspace => {
-                        q.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut q);
+                        } else {
+                            q.pop();
+                        }
                         res = self.perform_unified_search(&q);
                         self.modal_state = ModalType::SearchEverywhere {
                             query: q,
@@ -4123,7 +4553,11 @@ impl App {
                         };
                     }
                     KeyCode::Backspace => {
-                        q.pop();
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut q);
+                        } else {
+                            q.pop();
+                        }
                         act = self.get_available_command_actions(&q);
                         self.modal_state = ModalType::CommandPalette {
                             query: q,
@@ -4139,8 +4573,13 @@ impl App {
                 }
                 Ok(true)
             }
-            ModalType::SelectProjectForAction { action_id, selected_idx } => {
-                let projects: Vec<&Project> = self.projects.iter()
+            ModalType::SelectProjectForAction {
+                action_id,
+                selected_idx,
+            } => {
+                let projects: Vec<&Project> = self
+                    .projects
+                    .iter()
                     .filter(|p| !p.archived && !p.completed)
                     .collect();
                 let mut sel = selected_idx;
@@ -4149,14 +4588,24 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        sel = if sel > 0 { sel - 1 } else { projects.len().saturating_sub(1) };
-                        self.modal_state = ModalType::SelectProjectForAction { action_id, selected_idx: sel };
+                        sel = if sel > 0 {
+                            sel - 1
+                        } else {
+                            projects.len().saturating_sub(1)
+                        };
+                        self.modal_state = ModalType::SelectProjectForAction {
+                            action_id,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         if !projects.is_empty() {
                             sel = (sel + 1) % projects.len();
                         }
-                        self.modal_state = ModalType::SelectProjectForAction { action_id, selected_idx: sel };
+                        self.modal_state = ModalType::SelectProjectForAction {
+                            action_id,
+                            selected_idx: sel,
+                        };
                     }
                     KeyCode::Enter if !projects.is_empty() => {
                         let project = projects[sel];
@@ -4247,11 +4696,15 @@ impl App {
                 self.restore_error = None;
             }
             KeyCode::Backspace => {
-                self.restore_input.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut self.restore_input);
+                } else {
+                    self.restore_input.pop();
+                }
                 self.restore_error = None;
             }
             KeyCode::Enter => {
-                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
                 let trimmed = self.restore_input.trim().to_string();
                 match STANDARD.decode(&trimmed) {
                     Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
@@ -4270,15 +4723,21 @@ impl App {
                             (self.identity.user_uuid, secret_bytes)
                         };
 
-                        let signing_key   = SigningKey::from_bytes(&secret_arr);
+                        let signing_key = SigningKey::from_bytes(&secret_arr);
                         let verifying_key: VerifyingKey = signing_key.verifying_key();
-                        let secret_hex: String = secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
-                        let public_hex: String = verifying_key.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
+                        let secret_hex: String =
+                            secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
+                        let public_hex: String = verifying_key
+                            .to_bytes()
+                            .iter()
+                            .map(|b| format!("{:02x}", b))
+                            .collect();
 
                         let storage_dir = crate::storage::get_storage_dir()?;
-                        let db_path     = storage_dir.join("questline.db");
-                        let ts          = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-                        let backup_path = storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
+                        let db_path = storage_dir.join("questline.db");
+                        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
+                        let backup_path =
+                            storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
                         let _ = std::fs::copy(&db_path, &backup_path);
 
                         let new_identity = crate::services::identity::Identity {
@@ -4302,17 +4761,21 @@ impl App {
                             );
                             if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
                                 if !json.trim().is_empty() {
-                                    use base64::{engine::general_purpose::STANDARD, Engine as _};
-                                    let decoded = STANDARD.decode(json.trim())
+                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                                    let decoded = STANDARD
+                                        .decode(json.trim())
                                         .ok()
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
-                                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                                        let _ =
+                                            App::set_pull_cursor_to_remote_head(&self.db, &client);
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
-                                            if let Ok(json_str) = serde_json::to_string_pretty(&self.identity) {
+                                            if let Ok(json_str) =
+                                                serde_json::to_string_pretty(&self.identity)
+                                            {
                                                 let _ = std::fs::write(&key_path, json_str);
                                             }
                                         }
@@ -4328,18 +4791,21 @@ impl App {
                         } else {
                             "Identity restored. No cloud backup was found; sync will only pull future changes."
                         };
-                        self.notifications.push(Notification::info(message.to_string()));
+                        self.notifications
+                            .push(Notification::info(message.to_string()));
                         self.active_screen = ActiveScreen::Dashboard;
                         self.active_tab_idx = 0;
                     }
                     Ok(_) => {
                         self.restore_error = Some(
-                            "Invalid code — wrong key length. Did you type it by hand? Bold move.".to_string(),
+                            "Invalid code — wrong key length. Did you type it by hand? Bold move."
+                                .to_string(),
                         );
                     }
                     Err(_) => {
                         self.restore_error = Some(
-                            "That is not valid base64. The Encoding Grimoire weeps for you.".to_string(),
+                            "That is not valid base64. The Encoding Grimoire weeps for you."
+                                .to_string(),
                         );
                     }
                 }
@@ -4359,7 +4825,11 @@ impl App {
                     }
                 }
                 KeyCode::Backspace => {
-                    self.onboarding_username.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.onboarding_username);
+                    } else {
+                        self.onboarding_username.pop();
+                    }
                     self.onboarding_error = None;
                 }
                 KeyCode::Tab | KeyCode::Enter => {
@@ -4652,25 +5122,35 @@ impl App {
         Ok(())
     }
 
-    fn fellowship_current_messages(&self) -> Vec<(String, String, String, String, String, String, String)> {
+    fn fellowship_current_messages(
+        &self,
+    ) -> Vec<(String, String, String, String, String, String, String)> {
         let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
         if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
             return vec![];
         }
         let proj = shared[self.selected_fellowship_project_idx];
-        self.db.get_chronicle_messages(&proj.id.to_string()).unwrap_or_default()
+        self.db
+            .get_chronicle_messages(&proj.id.to_string())
+            .unwrap_or_default()
     }
 
     fn send_fellowship_message(&mut self) -> Result<()> {
         let content = self.fellowship_chat_input.trim().to_string();
-        if content.is_empty() { return Ok(()); }
+        if content.is_empty() {
+            return Ok(());
+        }
 
         let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
         if shared.is_empty() || self.selected_fellowship_project_idx >= shared.len() {
             return Ok(());
         }
         let proj = shared[self.selected_fellowship_project_idx].clone();
-        let my_name = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+        let my_name = self
+            .user
+            .as_ref()
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
 
         let msg_id = self.db.add_chronicle_message(
             &proj.id.to_string(),
@@ -4682,14 +5162,17 @@ impl App {
 
         if self.config.sync_enabled {
             let client = crate::services::api_client::ApiClient::new(
-                &self.server_url, self.identity.clone(), &self.device_id,
+                &self.server_url,
+                self.identity.clone(),
+                &self.device_id,
             );
             let body = serde_json::json!({
                 "id": msg_id,
                 "project_id": proj.id.to_string(),
                 "content": content,
                 "message_type": "text"
-            }).to_string();
+            })
+            .to_string();
             let _ = client.send_request("POST", "chronicle/message", &body);
         }
 
@@ -4718,12 +5201,15 @@ impl App {
         match key.code {
             KeyCode::Up => {
                 let msgs = self.fellowship_current_messages();
-                if msgs.is_empty() { return Ok(false); }
-                self.fellowship_selected_msg_idx = if browsing && self.fellowship_selected_msg_idx > 0 {
-                    self.fellowship_selected_msg_idx - 1
-                } else {
-                    msgs.len() - 1
-                };
+                if msgs.is_empty() {
+                    return Ok(false);
+                }
+                self.fellowship_selected_msg_idx =
+                    if browsing && self.fellowship_selected_msg_idx > 0 {
+                        self.fellowship_selected_msg_idx - 1
+                    } else {
+                        msgs.len() - 1
+                    };
                 return Ok(true);
             }
             KeyCode::Down => {
@@ -4753,7 +5239,8 @@ impl App {
                     let content = &msgs[self.fellowship_selected_msg_idx].4;
                     let to_copy = extract_url(content).unwrap_or(content.as_str()).to_string();
                     let _ = crate::services::identity::copy_to_clipboard(&to_copy);
-                    self.notifications.push(Notification::info("Copied to clipboard.".to_string()));
+                    self.notifications
+                        .push(Notification::info("Copied to clipboard.".to_string()));
                 }
                 return Ok(true);
             }
@@ -4779,7 +5266,11 @@ impl App {
                     return Ok(true);
                 }
                 KeyCode::Backspace => {
-                    self.fellowship_chat_input.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.fellowship_chat_input);
+                    } else {
+                        self.fellowship_chat_input.pop();
+                    }
                     return Ok(true);
                 }
                 KeyCode::Left => {
@@ -4792,10 +5283,16 @@ impl App {
                 }
                 KeyCode::Char('@') => {
                     let mut usernames = Vec::new();
-                    let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-                    if !shared_projects.is_empty() && self.selected_fellowship_project_idx < shared_projects.len() {
+                    let shared_projects: Vec<_> =
+                        self.projects.iter().filter(|p| p.is_shared).collect();
+                    if !shared_projects.is_empty()
+                        && self.selected_fellowship_project_idx < shared_projects.len()
+                    {
                         let proj = &shared_projects[self.selected_fellowship_project_idx];
-                        let members = self.db.get_project_members(&proj.id.to_string()).unwrap_or_default();
+                        let members = self
+                            .db
+                            .get_project_members(&proj.id.to_string())
+                            .unwrap_or_default();
                         for m in members {
                             usernames.push(m.1);
                         }
@@ -4845,7 +5342,10 @@ impl App {
         Ok(false)
     }
 
-    pub fn refresh_companions(&self, client: &crate::services::api_client::ApiClient) -> Result<()> {
+    pub fn refresh_companions(
+        &self,
+        client: &crate::services::api_client::ApiClient,
+    ) -> Result<()> {
         if let Ok(resp_str) = client.send_request("GET", "project/companions", "") {
             if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp_str) {
                 if let Some(companions) = arr.as_array() {
@@ -4856,7 +5356,8 @@ impl App {
                             continue;
                         }
                         let last_seen_raw = comp["last_seen"].as_str().unwrap_or_default();
-                        let (is_online, last_seen_display) = Self::parse_companion_last_seen(last_seen_raw);
+                        let (is_online, last_seen_display) =
+                            Self::parse_companion_last_seen(last_seen_raw);
                         let _ = self.db.update_presence(
                             identity,
                             username,
@@ -4865,7 +5366,7 @@ impl App {
                             None,
                             if is_online { "Visible" } else { "Offline" },
                         );
-                                        // Corregir el username en project_members — puede quedar como 'Accepted Companion' si el sync llegó antes del perfil
+                        // Corregir el username en project_members — puede quedar como 'Accepted Companion' si el sync llegó antes del perfil
                         let _ = self.db.conn.execute(
                             "UPDATE project_members SET user_username = ?1 WHERE user_identity = ?2 AND user_username = 'Accepted Companion'",
                             rusqlite::params![username, identity],
@@ -4934,10 +5435,15 @@ impl App {
                 self.db.update_note(&note)?;
                 if let Some(ref mut u) = self.user {
                     let mut xp_gain = 2;
-                    if word_count > 500 { xp_gain += 10; }
+                    if word_count > 500 {
+                        xp_gain += 10;
+                    }
                     let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
                     if leveled_up {
-                        self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
+                        self.notifications.push(Notification::info(format!(
+                            "LEVEL UP! You reached Level {}!",
+                            u.level
+                        )));
                     }
                 }
             } else {
@@ -4956,10 +5462,15 @@ impl App {
                 self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
                 if let Some(ref mut u) = self.user {
                     let mut xp_gain = 5;
-                    if word_count > 500 { xp_gain += 10; }
+                    if word_count > 500 {
+                        xp_gain += 10;
+                    }
                     let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
                     if leveled_up {
-                        self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
+                        self.notifications.push(Notification::info(format!(
+                            "LEVEL UP! You reached Level {}!",
+                            u.level
+                        )));
                     }
                 }
                 self.complete_productive_action()?;
@@ -4967,7 +5478,11 @@ impl App {
                 self.check_action_achievements()?;
             }
             self.mark_dirty();
-            let note_trigger = if is_new_note { "note_create" } else { "note_edit" };
+            let note_trigger = if is_new_note {
+                "note_create"
+            } else {
+                "note_edit"
+            };
             self.apply_class_passive(note_trigger, word_count)?;
             self.reload_data()?;
             self.editor_state = None;
@@ -4995,9 +5510,17 @@ impl App {
                     state.cursor_x = 0;
                     state.mode = EditorMode::Insert;
                 }
-                KeyCode::Backspace => { state.title.pop(); }
+                KeyCode::Backspace => {
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut state.title);
+                    } else {
+                        state.title.pop();
+                    }
+                }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if state.title.len() < 50 { state.title.push(c); }
+                    if state.title.len() < 50 {
+                        state.title.push(c);
+                    }
                 }
                 _ => {}
             }
@@ -5029,17 +5552,22 @@ impl App {
 
         if state.mode == EditorMode::Insert {
             match key.code {
-                KeyCode::Up        => state.move_up(),
-                KeyCode::Down      => state.move_down(),
-                KeyCode::Left      => state.move_left(),
-                KeyCode::Right     => state.move_right(),
+                KeyCode::Up => state.move_up(),
+                KeyCode::Down => state.move_down(),
+                KeyCode::Left => state.move_left(),
+                KeyCode::Right => state.move_right(),
+                KeyCode::Backspace if is_ctrl_backspace(key) => state.handle_ctrl_backspace(),
                 KeyCode::Backspace => state.handle_backspace(),
-                KeyCode::Delete    => state.handle_delete(),
-                KeyCode::Enter     => state.handle_enter(),
-                KeyCode::Tab       => state.handle_tab(),
-                KeyCode::BackTab   => { state.editing_title = true; }
+                KeyCode::Delete => state.handle_delete(),
+                KeyCode::Enter => state.handle_enter(),
+                KeyCode::Tab => state.handle_tab(),
+                KeyCode::BackTab => {
+                    state.editing_title = true;
+                }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => state.insert_char(c),
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    state.insert_char(c)
+                }
                 _ => {}
             }
             return Ok(());
@@ -5047,32 +5575,45 @@ impl App {
 
         if let EditorMode::Visual { .. } = state.mode.clone() {
             match key.code {
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    match c {
-                        'h' => state.normal_h(),
-                        'l' => state.normal_l(),
-                        'j' => state.normal_j(),
-                        'k' => state.normal_k(),
-                        'w' => state.word_forward(),
-                        'b' => state.word_backward(),
-                        'e' => state.word_end(),
-                        '0' => state.goto_line_start(),
-                        '$' => state.goto_line_end(),
-                        'G' => state.goto_file_end(),
-                        'y' | 'Y' => state.yank_visual(),
-                        'd' | 'x' => { state.push_undo(); state.delete_visual(); }
-                        'c' => { state.push_undo(); state.change_visual(); }
-                        'v' | 'V' => {
-                            if let EditorMode::Visual { anchor_y, anchor_x, line_mode } = state.mode {
-                                state.mode = EditorMode::Visual { anchor_y, anchor_x, line_mode: !line_mode };
-                            }
-                        }
-                        _ => {}
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => match c {
+                    'h' => state.normal_h(),
+                    'l' => state.normal_l(),
+                    'j' => state.normal_j(),
+                    'k' => state.normal_k(),
+                    'w' => state.word_forward(),
+                    'b' => state.word_backward(),
+                    'e' => state.word_end(),
+                    '0' => state.goto_line_start(),
+                    '$' => state.goto_line_end(),
+                    'G' => state.goto_file_end(),
+                    'y' | 'Y' => state.yank_visual(),
+                    'd' | 'x' => {
+                        state.push_undo();
+                        state.delete_visual();
                     }
-                }
-                KeyCode::Up    => state.normal_k(),
-                KeyCode::Down  => state.normal_j(),
-                KeyCode::Left  => state.normal_h(),
+                    'c' => {
+                        state.push_undo();
+                        state.change_visual();
+                    }
+                    'v' | 'V' => {
+                        if let EditorMode::Visual {
+                            anchor_y,
+                            anchor_x,
+                            line_mode,
+                        } = state.mode
+                        {
+                            state.mode = EditorMode::Visual {
+                                anchor_y,
+                                anchor_x,
+                                line_mode: !line_mode,
+                            };
+                        }
+                    }
+                    _ => {}
+                },
+                KeyCode::Up => state.normal_k(),
+                KeyCode::Down => state.normal_j(),
+                KeyCode::Left => state.normal_h(),
                 KeyCode::Right => state.normal_l(),
                 _ => {}
             }
@@ -5087,19 +5628,50 @@ impl App {
 
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
                 match (pending.as_str(), c) {
-                    ("g", 'g')  => state.goto_file_start(),
-                    ("d", 'd')  => { state.push_undo(); state.delete_line(); }
-                    ("d", 'w')  => { state.push_undo(); state.delete_word(); }
-                    ("d", '$')  => { state.push_undo(); state.delete_to_end(); }
-                    ("d", 'i')  => { state.pending_cmd = "di".to_string(); }
-                    ("di", 'w') => { state.push_undo(); state.delete_inner_word(); }
-                    ("c", 'c')  => { state.push_undo(); state.change_line(); }
-                    ("c", 'w')  => { state.push_undo(); state.change_word(); }
-                    ("c", '$')  => { state.push_undo(); state.change_to_end(); }
-                    ("c", 'i')  => { state.pending_cmd = "ci".to_string(); }
-                    ("ci", 'w') => { state.push_undo(); state.change_inner_word(); }
-                    ("y", 'y')  => state.yank_line(),
-                    ("r", _)    => { state.push_undo(); state.replace_char(c); }
+                    ("g", 'g') => state.goto_file_start(),
+                    ("d", 'd') => {
+                        state.push_undo();
+                        state.delete_line();
+                    }
+                    ("d", 'w') => {
+                        state.push_undo();
+                        state.delete_word();
+                    }
+                    ("d", '$') => {
+                        state.push_undo();
+                        state.delete_to_end();
+                    }
+                    ("d", 'i') => {
+                        state.pending_cmd = "di".to_string();
+                    }
+                    ("di", 'w') => {
+                        state.push_undo();
+                        state.delete_inner_word();
+                    }
+                    ("c", 'c') => {
+                        state.push_undo();
+                        state.change_line();
+                    }
+                    ("c", 'w') => {
+                        state.push_undo();
+                        state.change_word();
+                    }
+                    ("c", '$') => {
+                        state.push_undo();
+                        state.change_to_end();
+                    }
+                    ("c", 'i') => {
+                        state.pending_cmd = "ci".to_string();
+                    }
+                    ("ci", 'w') => {
+                        state.push_undo();
+                        state.change_inner_word();
+                    }
+                    ("y", 'y') => state.yank_line(),
+                    ("r", _) => {
+                        state.push_undo();
+                        state.replace_char(c);
+                    }
 
                     (_, 'h') => state.normal_h(),
                     (_, 'l') => state.normal_l(),
@@ -5111,33 +5683,79 @@ impl App {
                     (_, '0') => state.goto_line_start(),
                     (_, '$') => state.goto_line_end(),
                     (_, 'G') => state.goto_file_end(),
-                    (_, 'i') => { state.push_undo(); state.enter_insert(); }
-                    (_, 'a') => { state.push_undo(); state.enter_insert_after(); }
-                    (_, 'I') => { state.push_undo(); state.enter_insert_line_start(); }
-                    (_, 'A') => { state.push_undo(); state.enter_insert_line_end(); }
-                    (_, 'o') => { state.push_undo(); state.open_line_below(); }
-                    (_, 'O') => { state.push_undo(); state.open_line_above(); }
-                    (_, 'x') => { state.push_undo(); state.delete_char(); }
-                    (_, 'X') => { state.push_undo(); state.delete_char_before(); }
-                    (_, 'D') => { state.push_undo(); state.delete_to_end(); }
-                    (_, 'C') => { state.push_undo(); state.change_to_end(); }
-                    (_, 'p') => { state.push_undo(); state.paste_after(); }
-                    (_, 'P') => { state.push_undo(); state.paste_before(); }
+                    (_, 'i') => {
+                        state.push_undo();
+                        state.enter_insert();
+                    }
+                    (_, 'a') => {
+                        state.push_undo();
+                        state.enter_insert_after();
+                    }
+                    (_, 'I') => {
+                        state.push_undo();
+                        state.enter_insert_line_start();
+                    }
+                    (_, 'A') => {
+                        state.push_undo();
+                        state.enter_insert_line_end();
+                    }
+                    (_, 'o') => {
+                        state.push_undo();
+                        state.open_line_below();
+                    }
+                    (_, 'O') => {
+                        state.push_undo();
+                        state.open_line_above();
+                    }
+                    (_, 'x') => {
+                        state.push_undo();
+                        state.delete_char();
+                    }
+                    (_, 'X') => {
+                        state.push_undo();
+                        state.delete_char_before();
+                    }
+                    (_, 'D') => {
+                        state.push_undo();
+                        state.delete_to_end();
+                    }
+                    (_, 'C') => {
+                        state.push_undo();
+                        state.change_to_end();
+                    }
+                    (_, 'p') => {
+                        state.push_undo();
+                        state.paste_after();
+                    }
+                    (_, 'P') => {
+                        state.push_undo();
+                        state.paste_before();
+                    }
                     (_, 'Y') => state.yank_line(),
                     (_, 'u') => state.undo(),
                     (_, 'v') => state.enter_visual_char(),
                     (_, 'V') => state.enter_visual_line(),
-                    (_, 'g') => { state.pending_cmd = "g".to_string(); }
-                    (_, 'd') => { state.pending_cmd = "d".to_string(); }
-                    (_, 'c') => { state.pending_cmd = "c".to_string(); }
-                    (_, 'y') => { state.pending_cmd = "y".to_string(); }
-                    (_, 'r') => { state.pending_cmd = "r".to_string(); }
+                    (_, 'g') => {
+                        state.pending_cmd = "g".to_string();
+                    }
+                    (_, 'd') => {
+                        state.pending_cmd = "d".to_string();
+                    }
+                    (_, 'c') => {
+                        state.pending_cmd = "c".to_string();
+                    }
+                    (_, 'y') => {
+                        state.pending_cmd = "y".to_string();
+                    }
+                    (_, 'r') => {
+                        state.pending_cmd = "r".to_string();
+                    }
                     _ => {} // unknown key — pending already cleared
                 }
             }
-            KeyCode::Up    => state.normal_k(),
-            KeyCode::Down  => state.normal_j(),
-            KeyCode::Left  => state.normal_h(),
+            KeyCode::Up => state.normal_k(),
+            KeyCode::Down => state.normal_j(),
+            KeyCode::Left => state.normal_h(),
             KeyCode::Right => state.normal_l(),
             _ => {}
         }
@@ -5187,31 +5805,35 @@ impl App {
                         .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
                     self.sync_status_msg = format!(
                         "Auto Sync {}",
-                        if self.auto_sync { "Enabled" } else { "Disabled" }
+                        if self.auto_sync {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
                     );
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
-                    self.external_notifications = !self.external_notifications;
-                    let _ = self.db.set_setting(
-                        "external_notifications",
-                        if self.external_notifications { "true" } else { "false" },
-                    );
+                    self.toggle_external_notifications()?;
                     self.sync_status_msg = format!(
                         "System Notifications {}",
-                        if self.external_notifications { "Enabled" } else { "Disabled" }
+                        if self.external_notifications {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
                     );
                     return Ok(());
                 }
                 KeyCode::Char('t') => {
-                    self.task_notifications_enabled = !self.task_notifications_enabled;
-                    let _ = crate::services::task_notifications::set_task_notifications_enabled(
-                        &self.db,
-                        self.task_notifications_enabled,
-                    );
+                    self.toggle_task_notifications()?;
                     self.sync_status_msg = format!(
                         "Task Alerts {}",
-                        if self.task_notifications_enabled { "Enabled" } else { "Disabled" }
+                        if self.task_notifications_enabled {
+                            "Enabled"
+                        } else {
+                            "Disabled"
+                        }
                     );
                     return Ok(());
                 }
@@ -5256,14 +5878,21 @@ impl App {
                                 let db_path = storage_dir.join("questline.db");
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
-                                let json = db.export_to_json()
+                                let json = db
+                                    .export_to_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
                                 let client = crate::services::api_client::ApiClient::new(
-                                    &server_url, identity, &device_id,
+                                    &server_url,
+                                    identity,
+                                    &device_id,
                                 );
-                                client.send_request("POST", "recovery", &json)
+                                client
+                                    .send_request("POST", "recovery", &json)
                                     .map_err(|e| format!("Upload failed: {}", e))?;
-                                let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                                let _ = db.set_setting(
+                                    "last_auto_backup",
+                                    &chrono::Utc::now().to_rfc3339(),
+                                );
                                 Ok("Cloud Backup Successful!".to_string())
                             })();
                             if let Ok(mut slot) = result_slot.lock() {
@@ -5289,7 +5918,9 @@ impl App {
                         std::thread::spawn(move || {
                             let outcome: Result<String, String> = (|| {
                                 let client = crate::services::api_client::ApiClient::new(
-                                    &server_url, identity, &device_id,
+                                    &server_url,
+                                    identity,
+                                    &device_id,
                                 );
                                 let json = client.send_request("GET", "recovery/latest", "")
                                     .map_err(|e| {
@@ -5314,13 +5945,15 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('e') => {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let storage_dir = crate::storage::get_storage_dir()?;
                     let db_path = storage_dir.join("questline.db");
                     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                     let backup_path = storage_dir.join(format!("questline_backup_{}.db", ts));
 
-                    let secret_bytes: Vec<u8> = self.identity.secret_key
+                    let secret_bytes: Vec<u8> = self
+                        .identity
+                        .secret_key
                         .as_bytes()
                         .chunks(2)
                         .filter_map(|c| {
@@ -5350,9 +5983,17 @@ impl App {
                                             identity,
                                             &device_id,
                                         );
-                                        let outcome = match client.send_request("POST", "recovery", &json) {
-                                            Ok(_) => Ok(format!("Profile exported & cloud backup saved! Local: {}", backup_display)),
-                                            Err(e) => Err(format!("Profile exported to {} (cloud backup failed: {})", backup_display, e)),
+                                        let outcome = match client
+                                            .send_request("POST", "recovery", &json)
+                                        {
+                                            Ok(_) => Ok(format!(
+                                                "Profile exported & cloud backup saved! Local: {}",
+                                                backup_display
+                                            )),
+                                            Err(e) => Err(format!(
+                                                "Profile exported to {} (cloud backup failed: {})",
+                                                backup_display, e
+                                            )),
                                         };
                                         if let Ok(mut slot) = result_slot.lock() {
                                             *slot = Some(outcome);
@@ -5360,16 +6001,32 @@ impl App {
                                     });
                                     (true, "Sealing your chronicle into the Æther... do not import on the new device until the backup completes.".to_string())
                                 } else {
-                                    (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
+                                    (
+                                        false,
+                                        format!(
+                                            "Profile exported! Backup saved to {}",
+                                            backup_path.display()
+                                        ),
+                                    )
                                 }
                             } else {
-                                (false, format!("Profile exported! Backup saved to {}", backup_path.display()))
+                                (
+                                    false,
+                                    format!(
+                                        "Profile exported! Backup saved to {}",
+                                        backup_path.display()
+                                    ),
+                                )
                             };
 
                             if !backup_in_progress {
                                 self.sync_status_msg = backup_message.clone();
                             }
-                            self.modal_state = ModalType::ExportProfile { transfer_code, backup_in_progress, backup_message };
+                            self.modal_state = ModalType::ExportProfile {
+                                transfer_code,
+                                backup_in_progress,
+                                backup_message,
+                            };
                         }
                         Err(e) => {
                             self.sync_status_msg = format!("Export Failed: {}", e);
@@ -5378,13 +6035,18 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('i') => {
-                    self.modal_state = ModalType::RestoreIdentity { input: String::new() };
+                    self.modal_state = ModalType::RestoreIdentity {
+                        input: String::new(),
+                    };
                     return Ok(());
                 }
                 KeyCode::Char('p') => {
                     const PRUNE_DAYS: i64 = 30;
                     let count = self.db.count_prunable_tasks(PRUNE_DAYS).unwrap_or(0);
-                    self.modal_state = ModalType::ConfirmPruneTasks { days: PRUNE_DAYS, count };
+                    self.modal_state = ModalType::ConfirmPruneTasks {
+                        days: PRUNE_DAYS,
+                        count,
+                    };
                     return Ok(());
                 }
                 _ => {}
@@ -5425,7 +6087,9 @@ impl App {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
-                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                let _ = self
+                    .db
+                    .set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                 self.reload_data()?;
                 // Sync inmediato al abrir Fellowship — muestra datos frescos sin esperar el intervalo
                 if !self.sync_in_progress && self.config.sync_enabled {
@@ -5447,6 +6111,10 @@ impl App {
             KeyCode::Char('8') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::SyncSettings;
                 self.active_tab_idx = 12;
+            }
+            KeyCode::Char('9') if self.active_screen != ActiveScreen::Workspace => {
+                self.active_screen = ActiveScreen::Settings;
+                self.active_tab_idx = 15;
             }
             KeyCode::Char('d') => {
                 if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
@@ -5480,7 +6148,10 @@ impl App {
                                     let _ = client.send_request("POST", "decline", &body);
                                 });
                             }
-                            self.notifications.push(Notification::info(format!("Declined invitation to '{}'", invite.2)));
+                            self.notifications.push(Notification::info(format!(
+                                "Declined invitation to '{}'",
+                                invite.2
+                            )));
                             self.reload_data()?;
                         }
                     }
@@ -5495,23 +6166,31 @@ impl App {
                             if let Ok((_, reward_given)) = self.db.hydration_get_today() {
                                 if !reward_given {
                                     let _ = self.db.hydration_mark_reward_given();
-                                    let _ = self.grant_xp("hydration_daily_target", self.hydration_reward_xp);
-                                    let _ = self.update_daily_adventure_progress("hydrate_fully", 1);
-                                    self.notifications.push(Notification::info(
-                                        format!("Daily hydration goal reached! +{} XP", self.hydration_reward_xp)
-                                    ));
+                                    let _ = self.grant_xp(
+                                        "hydration_daily_target",
+                                        self.hydration_reward_xp,
+                                    );
+                                    let _ =
+                                        self.update_daily_adventure_progress("hydrate_fully", 1);
+                                    self.notifications.push(Notification::info(format!(
+                                        "Daily hydration goal reached! +{} XP",
+                                        self.hydration_reward_xp
+                                    )));
                                 }
                             }
-	                        } else {
-	                            self.notifications.push(Notification::info(
-	                                format!("Drank a glass! {}/{} today", new_count, self.hydration_target)
-	                            ));
-	                        }
-	                        let _ = self.check_action_achievements();
-	                        let _ = self.increment_quest_progress(40, 1);
-	                        self.hydration_next_reminder_at = Some(
+                        } else {
+                            self.notifications.push(Notification::info(format!(
+                                "Drank a glass! {}/{} today",
+                                new_count, self.hydration_target
+                            )));
+                        }
+                        let _ = self.check_action_achievements();
+                        let _ = self.increment_quest_progress(40, 1);
+                        self.hydration_next_reminder_at = Some(
                             std::time::Instant::now()
-                                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                                + std::time::Duration::from_secs(
+                                    self.hydration_interval_mins as u64 * 60,
+                                ),
                         );
                     }
                 }
@@ -5529,10 +6208,13 @@ impl App {
                     self.selected_fellowship_tab = 2;
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     open_url("https://ko-fi.com/Y4H021XN7F");
-                    self.notifications.push(Notification::info("Opening Ko-fi in your browser..."));
+                    self.notifications
+                        .push(Notification::info("Opening Ko-fi in your browser..."));
                 }
             }
-            KeyCode::Char('f') | KeyCode::Char('F') if self.active_screen == ActiveScreen::Projects => {
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if self.active_screen == ActiveScreen::Projects =>
+            {
                 self.active_screen = ActiveScreen::Focus;
                 self.active_tab_idx = 6;
             }
@@ -5540,7 +6222,9 @@ impl App {
                 self.active_screen = ActiveScreen::Archive;
                 self.active_tab_idx = 10;
             }
-            KeyCode::Char('g') | KeyCode::Char('G') if self.active_screen == ActiveScreen::Library => {
+            KeyCode::Char('g') | KeyCode::Char('G')
+                if self.active_screen == ActiveScreen::Library =>
+            {
                 self.active_screen = ActiveScreen::Legends;
                 self.active_tab_idx = 5;
             }
@@ -5555,7 +6239,8 @@ impl App {
                     && matches!(self.modal_state, ModalType::None) =>
             {
                 let intervals = [30i32, 45, 60, 90, 120];
-                let interval_idx = intervals.iter()
+                let interval_idx = intervals
+                    .iter()
                     .position(|&m| m == self.hydration_interval_mins)
                     .unwrap_or(2);
                 self.modal_state = ModalType::HydrationSettings {
@@ -5572,7 +6257,9 @@ impl App {
                 if self.active_screen == ActiveScreen::Dashboard =>
             {
                 let today = chrono::Local::now().date_naive();
-                if let Some(task) = crate::services::planner::find_main_quest(&self.all_tasks, today) {
+                if let Some(task) =
+                    crate::services::planner::find_main_quest(&self.all_tasks, today)
+                {
                     if let Some(p_id) = task.project_id {
                         self.active_project_id = Some(p_id);
                         self.active_screen = ActiveScreen::Workspace;
@@ -5586,7 +6273,8 @@ impl App {
                             .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
                             .collect();
                         sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                        self.selected_task_idx = sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
+                        self.selected_task_idx =
+                            sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
                         self.reload_data()?;
                     }
                 }
@@ -5604,24 +6292,33 @@ impl App {
                     )?;
                     self.trigger_ambient_particles();
                     self.notifications.push(Notification::info(format!(
-                            "Ambient Effect: {}",
-                            match self.active_ambient_effect {
-                                0 => "Off",
-                                1 => "Falling Leaves",
-                                2 => "Stars",
-                                3 => "Rain",
-                                4 => "Snow",
-                                5 => "Glowing Runes",
-                                6 => "Matrix Rain",
-                                _ => "Off",
-                            }
-                        )));
+                        "Ambient Effect: {}",
+                        match self.active_ambient_effect {
+                            0 => "Off",
+                            1 => "Falling Leaves",
+                            2 => "Stars",
+                            3 => "Rain",
+                            4 => "Snow",
+                            5 => "Glowing Runes",
+                            6 => "Matrix Rain",
+                            _ => "Off",
+                        }
+                    )));
                 }
             }
             KeyCode::Left => {
-                if self.active_screen == ActiveScreen::Dashboard {
+                if self.active_screen == ActiveScreen::Settings {
+                    match self.selected_settings_focus_idx {
+                        1 => self.toggle_external_notifications()?,
+                        2 => self.toggle_task_notifications()?,
+                        3 => self.toggle_sound_effects()?,
+                        4 => self.adjust_sound_effects_volume(-0.05)?,
+                        _ => {}
+                    }
+                } else if self.active_screen == ActiveScreen::Dashboard {
                     self.dashboard_task_focus = false;
-                } else if self.active_screen == ActiveScreen::Library && self.library_active_col > 0 {
+                } else if self.active_screen == ActiveScreen::Library && self.library_active_col > 0
+                {
                     self.library_active_col -= 1;
                     self.library_scroll_offset = 0;
                 } else if self.active_screen == ActiveScreen::Character {
@@ -5631,9 +6328,18 @@ impl App {
                 }
             }
             KeyCode::Right => {
-                if self.active_screen == ActiveScreen::Dashboard {
+                if self.active_screen == ActiveScreen::Settings {
+                    match self.selected_settings_focus_idx {
+                        1 => self.toggle_external_notifications()?,
+                        2 => self.toggle_task_notifications()?,
+                        3 => self.toggle_sound_effects()?,
+                        4 => self.adjust_sound_effects_volume(0.05)?,
+                        _ => {}
+                    }
+                } else if self.active_screen == ActiveScreen::Dashboard {
                     self.dashboard_task_focus = true;
-                } else if self.active_screen == ActiveScreen::Library && self.library_active_col < 2 {
+                } else if self.active_screen == ActiveScreen::Library && self.library_active_col < 2
+                {
                     self.library_active_col += 1;
                     self.library_scroll_offset = 0;
                 } else if self.active_screen == ActiveScreen::Character {
@@ -5644,7 +6350,9 @@ impl App {
                 }
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
-                if self.active_screen == ActiveScreen::Character {
+                if self.active_screen == ActiveScreen::Settings {
+                    self.toggle_task_notifications()?;
+                } else if self.active_screen == ActiveScreen::Character {
                     let achievements = self.db.get_achievements()?;
                     let mut choices = vec!["Class Default".to_string()];
                     let has_forest = achievements
@@ -5691,7 +6399,9 @@ impl App {
                 }
             }
             KeyCode::Char('s') | KeyCode::Char('S') => {
-                if self.active_screen == ActiveScreen::Character {
+                if self.active_screen == ActiveScreen::Settings {
+                    self.toggle_sound_effects()?;
+                } else if self.active_screen == ActiveScreen::Character {
                     if let Some(ref u) = self.user {
                         if u.level >= 10 && u.specialization.is_none() {
                             let specs = u.class.specializations();
@@ -5703,7 +6413,9 @@ impl App {
                             };
                         }
                     }
-                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
+                } else if self.active_screen == ActiveScreen::Projects
+                    && !self.projects_all_selected
+                {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -5766,6 +6478,70 @@ impl App {
                     self.character_focus -= 1;
                 }
             }
+            KeyCode::Tab if self.active_screen == ActiveScreen::Settings => {
+                self.selected_settings_focus_idx = (self.selected_settings_focus_idx + 1) % 5;
+            }
+            KeyCode::BackTab if self.active_screen == ActiveScreen::Settings => {
+                self.selected_settings_focus_idx = if self.selected_settings_focus_idx > 0 {
+                    self.selected_settings_focus_idx - 1
+                } else {
+                    4
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') if self.active_screen == ActiveScreen::Settings => {
+                if self.selected_settings_focus_idx == 0 {
+                    let choices_len = crate::theme::Theme::all_choices().len();
+                    self.selected_settings_theme_idx = if self.selected_settings_theme_idx > 0 {
+                        self.selected_settings_theme_idx - 1
+                    } else {
+                        choices_len.saturating_sub(1)
+                    };
+                } else if self.selected_settings_focus_idx == 4 {
+                    self.adjust_sound_effects_volume(0.05)?;
+                } else {
+                    self.selected_settings_focus_idx =
+                        self.selected_settings_focus_idx.saturating_sub(1).max(1);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') if self.active_screen == ActiveScreen::Settings => {
+                if self.selected_settings_focus_idx == 0 {
+                    let choices_len = crate::theme::Theme::all_choices().len();
+                    if choices_len > 0 {
+                        self.selected_settings_theme_idx =
+                            (self.selected_settings_theme_idx + 1) % choices_len;
+                    }
+                } else if self.selected_settings_focus_idx == 4 {
+                    self.adjust_sound_effects_volume(-0.05)?;
+                } else if self.selected_settings_focus_idx < 4 {
+                    self.selected_settings_focus_idx += 1;
+                }
+            }
+            KeyCode::Enter if self.active_screen == ActiveScreen::Settings => {
+                match self.selected_settings_focus_idx {
+                    0 => {
+                        if let Some(choice) = crate::theme::Theme::all_choices()
+                            .get(self.selected_settings_theme_idx)
+                            .copied()
+                        {
+                            self.apply_theme_choice(choice)?;
+                            self.reload_data()?;
+                        }
+                    }
+                    1 => self.toggle_external_notifications()?,
+                    2 => self.toggle_task_notifications()?,
+                    3 => self.toggle_sound_effects()?,
+                    _ => {}
+                }
+            }
+            KeyCode::Char('n') if self.active_screen == ActiveScreen::Settings => {
+                self.toggle_external_notifications()?;
+            }
+            KeyCode::Char('+') if self.active_screen == ActiveScreen::Settings => {
+                self.adjust_sound_effects_volume(0.05)?;
+            }
+            KeyCode::Char('-') if self.active_screen == ActiveScreen::Settings => {
+                self.adjust_sound_effects_volume(-0.05)?;
+            }
             // Screen specific arrows and edits
             KeyCode::Up => {
                 if self.active_screen == ActiveScreen::Character {
@@ -5806,7 +6582,11 @@ impl App {
                         self.projects_all_selected = true;
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
+                    let archive_len = self
+                        .projects
+                        .iter()
+                        .filter(|p| p.archived || p.completed)
+                        .count();
                     if archive_len > 0 {
                         if self.selected_archive_idx > 0 {
                             self.selected_archive_idx -= 1;
@@ -5819,21 +6599,27 @@ impl App {
                         let tasks = self.db.get_tasks().unwrap_or_default();
                         let wins = dashboard_quick_wins(&tasks);
                         if !wins.is_empty() {
-                            self.selected_dashboard_task_idx = if self.selected_dashboard_task_idx > 0 {
-                                self.selected_dashboard_task_idx - 1
-                            } else {
-                                wins.len() - 1
-                            };
+                            self.selected_dashboard_task_idx =
+                                if self.selected_dashboard_task_idx > 0 {
+                                    self.selected_dashboard_task_idx - 1
+                                } else {
+                                    wins.len() - 1
+                                };
                         }
-                    } else { match self.db.get_rituals() { Ok(rituals) => {
-                        if !rituals.is_empty() {
-                            self.selected_ritual_idx = if self.selected_ritual_idx > 0 {
-                                self.selected_ritual_idx - 1
-                            } else {
-                                rituals.len() - 1
-                            };
+                    } else {
+                        match self.db.get_rituals() {
+                            Ok(rituals) => {
+                                if !rituals.is_empty() {
+                                    self.selected_ritual_idx = if self.selected_ritual_idx > 0 {
+                                        self.selected_ritual_idx - 1
+                                    } else {
+                                        rituals.len() - 1
+                                    };
+                                }
+                            }
+                            _ => {}
                         }
-                    } _ => {}}}
+                    }
                 } else if self.active_screen == ActiveScreen::About {
                     self.about_scroll = self.about_scroll.saturating_sub(1);
                 } else if self.active_screen == ActiveScreen::GreatChronicle {
@@ -5877,11 +6663,12 @@ impl App {
                         } else if self.selected_fellowship_tab == 0 {
                             let notifications = self.db.get_notifications().unwrap_or_default();
                             if !notifications.is_empty() {
-                                self.selected_notification_idx = if self.selected_notification_idx > 0 {
-                                    self.selected_notification_idx - 1
-                                } else {
-                                    notifications.len() - 1
-                                };
+                                self.selected_notification_idx =
+                                    if self.selected_notification_idx > 0 {
+                                        self.selected_notification_idx - 1
+                                    } else {
+                                        notifications.len() - 1
+                                    };
                             }
                         }
                     }
@@ -5981,7 +6768,11 @@ impl App {
                         }
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archive_len = self.projects.iter().filter(|p| p.archived || p.completed).count();
+                    let archive_len = self
+                        .projects
+                        .iter()
+                        .filter(|p| p.archived || p.completed)
+                        .count();
                     if archive_len > 0 {
                         if self.selected_archive_idx < archive_len - 1 {
                             self.selected_archive_idx += 1;
@@ -5997,12 +6788,17 @@ impl App {
                             self.selected_dashboard_task_idx =
                                 (self.selected_dashboard_task_idx + 1) % wins.len();
                         }
-                    } else { match self.db.get_rituals() { Ok(rituals) => {
-                        if !rituals.is_empty() {
-                            self.selected_ritual_idx =
-                                (self.selected_ritual_idx + 1) % rituals.len();
+                    } else {
+                        match self.db.get_rituals() {
+                            Ok(rituals) => {
+                                if !rituals.is_empty() {
+                                    self.selected_ritual_idx =
+                                        (self.selected_ritual_idx + 1) % rituals.len();
+                                }
+                            }
+                            _ => {}
                         }
-                    } _ => {}}}
+                    }
                 } else if self.active_screen == ActiveScreen::About {
                     let content = self.about_content_lines.get();
                     let visible = self.terminal_height.saturating_sub(5);
@@ -6029,7 +6825,8 @@ impl App {
                         let shared_projects: Vec<_> =
                             self.projects.iter().filter(|p| p.is_shared).collect();
                         if !shared_projects.is_empty() {
-                            let new_idx = (self.selected_fellowship_project_idx + 1) % shared_projects.len();
+                            let new_idx =
+                                (self.selected_fellowship_project_idx + 1) % shared_projects.len();
                             if new_idx != self.selected_fellowship_project_idx {
                                 self.fellowship_selected_msg_idx = usize::MAX;
                                 self.fellowship_chat_input.clear();
@@ -6121,7 +6918,9 @@ impl App {
                     if self.dashboard_task_focus {
                         let tasks = self.db.get_tasks().unwrap_or_default();
                         let wins = dashboard_quick_wins(&tasks);
-                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        let sel = self
+                            .selected_dashboard_task_idx
+                            .min(wins.len().saturating_sub(1));
                         if let Some(task) = wins.get(sel).cloned() {
                             if let Some(p_id) = task.project_id {
                                 self.active_project_id = Some(p_id);
@@ -6131,21 +6930,32 @@ impl App {
                                 self.workspace_sidebar_focused = false;
                                 self.task_filter = "All".to_string();
                                 let proj_tasks = self.db.get_tasks().unwrap_or_default();
-                                let mut proj_tasks_sorted: Vec<&Task> = proj_tasks.iter()
-                                    .filter(|t| t.project_id == Some(p_id) && t.parent_task_id.is_none())
+                                let mut proj_tasks_sorted: Vec<&Task> = proj_tasks
+                                    .iter()
+                                    .filter(|t| {
+                                        t.project_id == Some(p_id) && t.parent_task_id.is_none()
+                                    })
                                     .collect();
                                 proj_tasks_sorted.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-                                self.selected_task_idx = proj_tasks_sorted.iter().position(|t| t.id == task.id).unwrap_or(0);
+                                self.selected_task_idx = proj_tasks_sorted
+                                    .iter()
+                                    .position(|t| t.id == task.id)
+                                    .unwrap_or(0);
                                 self.dashboard_task_focus = false;
                                 self.reload_data()?;
                             }
                         }
-                    } else { match self.db.get_rituals() { Ok(rituals) => {
-                        if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
-                            let r_id = rituals[self.selected_ritual_idx].id.clone();
-                            self.complete_ritual(&r_id)?;
+                    } else {
+                        match self.db.get_rituals() {
+                            Ok(rituals) => {
+                                if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
+                                    let r_id = rituals[self.selected_ritual_idx].id.clone();
+                                    self.complete_ritual(&r_id)?;
+                                }
+                            }
+                            _ => {}
                         }
-                    } _ => {}}}
+                    }
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     use crate::audio::SOUNDSCAPES;
                     let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
@@ -6154,9 +6964,17 @@ impl App {
                         return Ok(());
                     }
                     if s_name == "Local Folder" {
-                        let folder = self.db.get_setting("local_music_folder").unwrap_or_default().unwrap_or_default();
+                        let folder = self
+                            .db
+                            .get_setting("local_music_folder")
+                            .unwrap_or_default()
+                            .unwrap_or_default();
                         if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder { input: String::new(), suggestions: vec![], selected: 0 };
+                            self.modal_state = ModalType::LocalMusicFolder {
+                                input: String::new(),
+                                suggestions: vec![],
+                                selected: 0,
+                            };
                             return Ok(());
                         }
                     }
@@ -6176,12 +6994,17 @@ impl App {
                                         &self.device_id,
                                     );
                                     let invite_id_clone = invite.0.clone();
-                                    let my_username = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+                                    let my_username = self
+                                        .user
+                                        .as_ref()
+                                        .map(|u| u.username.clone())
+                                        .unwrap_or_default();
                                     let _ = std::thread::spawn(move || {
                                         let body = serde_json::json!({
                                             "invite_id": invite_id_clone,
                                             "username": my_username
-                                        }).to_string();
+                                        })
+                                        .to_string();
                                         let _ = client.send_request("POST", "accept", &body);
                                     });
                                 }
@@ -6212,7 +7035,10 @@ impl App {
 
                                 let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
 
-                                self.notifications.push(Notification::info(format!("Accepted invitation to '{}'", invite.2)));
+                                self.notifications.push(Notification::info(format!(
+                                    "Accepted invitation to '{}'",
+                                    invite.2
+                                )));
 
                                 let shared_projs_count =
                                     self.projects.iter().filter(|p| p.is_shared).count() + 1;
@@ -6245,7 +7071,9 @@ impl App {
                         // Victorias rápidas: tareas sin pasos pendientes, siempre son tareas padre
                         let all_tasks = self.db.get_tasks().unwrap_or_default();
                         let wins = dashboard_quick_wins(&all_tasks);
-                        let sel = self.selected_dashboard_task_idx.min(wins.len().saturating_sub(1));
+                        let sel = self
+                            .selected_dashboard_task_idx
+                            .min(wins.len().saturating_sub(1));
                         if let Some(task) = wins.get(sel).cloned() {
                             let already_awarded = task.xp_awarded;
                             let total_steps = all_tasks
@@ -6261,32 +7089,58 @@ impl App {
                             if !already_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let val = if is_high { 50 } else { 25 };
-                                let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
+                                let title = if is_high {
+                                    "Resolve Hero Quest"
+                                } else {
+                                    "Complete Quest"
+                                };
                                 self.grant_xp(title, val)?;
-                                let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
+                                let passive_trigger = if is_high {
+                                    "high_priority_task"
+                                } else {
+                                    "task_complete"
+                                };
                                 self.apply_class_passive(passive_trigger, 0)?;
+                                self.increment_quest_progress(10, 1)?;
+                                let frag_trigger = if t.priority == TaskPriority::High {
+                                    "high_priority_task"
+                                } else {
+                                    "task"
+                                };
+                                self.simulate_memory_fragment_unlock(frag_trigger)?;
+                                self.complete_productive_action()?;
+                                let growth = if t.priority == TaskPriority::High {
+                                    4
+                                } else {
+                                    2
+                                };
+                                self.grow_tree(growth)?;
+                                self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                if t.priority == TaskPriority::High {
+                                    self.update_daily_adventure_progress(
+                                        "complete_high_priority_task",
+                                        1,
+                                    )?;
+                                }
                             }
                             self.trigger_ambient_particles();
-	                                self.increment_quest_progress(10, 1)?;
-                            let frag_trigger = if t.priority == TaskPriority::High { "high_priority_task" } else { "task" };
-                            self.simulate_memory_fragment_unlock(frag_trigger)?;
-                            self.complete_productive_action()?;
-                            let growth = if t.priority == TaskPriority::High { 4 } else { 2 };
-                            self.grow_tree(growth)?;
-                            self.update_daily_adventure_progress("complete_tasks", 1)?;
-                            if t.priority == TaskPriority::High {
-                                self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
-                            }
                             self.check_action_achievements()?;
                             let chronicle_desc = if total_steps > 0 {
-                                format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
+                                format!(
+                                    "completed 1 quest with {} step{}.",
+                                    total_steps,
+                                    if total_steps == 1 { "" } else { "s" }
+                                )
                             } else {
                                 "completed 1 quest.".to_string()
                             };
                             self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
                             self.maybe_spawn_task_completion_sprite();
                             if let Some(recurrence) = t.recurrence {
-                                let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
+                                let next_due = Self::advance_recurrence_date(
+                                    t.set_date.or(t.due_date),
+                                    recurrence,
+                                );
                                 let next_task = Task {
                                     id: Uuid::new_v4(),
                                     project_id: t.project_id,
@@ -6306,19 +7160,27 @@ impl App {
                                 };
                                 let _ = self.db.insert_task(&next_task);
                             }
-                            let new_wins = dashboard_quick_wins(&self.db.get_tasks().unwrap_or_default());
-                            if self.selected_dashboard_task_idx >= new_wins.len() && !new_wins.is_empty() {
+                            let new_wins =
+                                dashboard_quick_wins(&self.db.get_tasks().unwrap_or_default());
+                            if self.selected_dashboard_task_idx >= new_wins.len()
+                                && !new_wins.is_empty()
+                            {
                                 self.selected_dashboard_task_idx = new_wins.len() - 1;
                             }
                             self.reload_data()?;
                             self.maybe_show_support_realm_prompt()?;
                         }
-                    } else { match self.db.get_rituals() { Ok(rituals) => {
-                        if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
-                            let r_id = rituals[self.selected_ritual_idx].id.clone();
-                            self.complete_ritual(&r_id)?;
+                    } else {
+                        match self.db.get_rituals() {
+                            Ok(rituals) => {
+                                if !rituals.is_empty() && self.selected_ritual_idx < rituals.len() {
+                                    let r_id = rituals[self.selected_ritual_idx].id.clone();
+                                    self.complete_ritual(&r_id)?;
+                                }
+                            }
+                            _ => {}
                         }
-                    } _ => {}}}
+                    }
                 } else if self.active_screen == ActiveScreen::Library {
                     self.handle_library_action()?;
                 }
@@ -6329,8 +7191,11 @@ impl App {
                 // Re-open the prologue (Story So Far → Chapter One) from Tab 8.
                 // Reflect the current saved "don't show again" state so the checkbox
                 // appears as the user last left it.
-                self.prologue_skip_checked = self.db.get_setting("prologue_skip")
-                    .ok().flatten()
+                self.prologue_skip_checked = self
+                    .db
+                    .get_setting("prologue_skip")
+                    .ok()
+                    .flatten()
                     .map(|v| v == "1")
                     .unwrap_or(false);
                 self.prologue_page = 0;
@@ -6355,14 +7220,30 @@ impl App {
                     if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
                         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                             if let Some(entries) = arr.as_array() {
+                                let _ = self.db.cleanup_global_chronicle_entries(1);
                                 for e in entries {
                                     let entry = crate::models::GlobalChronicleEntry {
                                         id: e["id"].as_str().unwrap_or_default().to_string(),
-                                        hero_name: e["hero_name"].as_str().unwrap_or_default().to_string(),
-                                        event_type: e["event_type"].as_str().unwrap_or_default().to_string(),
-                                        description: e["description"].as_str().unwrap_or_default().to_string(),
-                                        timestamp: e["timestamp"].as_str().unwrap_or_default().to_string(),
-                                        hero_class: e["hero_class"].as_str().filter(|s| !s.is_empty()).map(str::to_string),
+                                        hero_name: e["hero_name"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        event_type: e["event_type"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        description: e["description"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        timestamp: e["timestamp"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string(),
+                                        hero_class: e["hero_class"]
+                                            .as_str()
+                                            .filter(|s| !s.is_empty())
+                                            .map(str::to_string),
                                     };
                                     if !entry.id.is_empty() {
                                         let _ = self.db.upsert_chronicle_entry(&entry);
@@ -6375,7 +7256,10 @@ impl App {
                 self.great_chronicle_entries =
                     self.db.get_global_chronicle_entries().unwrap_or_default();
                 self.pull_chapter_progress_async();
-                self.notifications.push(Notification::info(format!("Realm Activity refreshed — {} entries.", self.great_chronicle_entries.len())));
+                self.notifications.push(Notification::info(format!(
+                    "Realm Activity refreshed — {} entries.",
+                    self.great_chronicle_entries.len()
+                )));
             }
             KeyCode::Char('r') => {
                 if self.active_screen == ActiveScreen::Fellowship
@@ -6388,7 +7272,9 @@ impl App {
                         &self.device_id,
                     );
                     let _ = self.refresh_companions(&client);
-                    self.notifications.push(Notification::info("Companion presence refreshed.".to_string()));
+                    self.notifications.push(Notification::info(
+                        "Companion presence refreshed.".to_string(),
+                    ));
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     let today = chrono::Local::now().date_naive();
                     let already_reflected = self
@@ -6397,7 +7283,9 @@ impl App {
                         .unwrap_or(None)
                         .is_some();
                     if already_reflected {
-                        self.notifications.push(Notification::warning("You have already reflected today. Come back tomorrow."));
+                        self.notifications.push(Notification::warning(
+                            "You have already reflected today. Come back tomorrow.",
+                        ));
                     } else {
                         self.modal_state = ModalType::DailyReflection {
                             what_went_well: String::new(),
@@ -6406,8 +7294,11 @@ impl App {
                         };
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archived: Vec<&Project> =
-                        self.projects.iter().filter(|p| p.archived || p.completed).collect();
+                    let archived: Vec<&Project> = self
+                        .projects
+                        .iter()
+                        .filter(|p| p.archived || p.completed)
+                        .collect();
                     if !archived.is_empty() && self.selected_archive_idx < archived.len() {
                         let mut p = archived[self.selected_archive_idx].clone();
                         p.archived = false;
@@ -6485,7 +7376,9 @@ impl App {
             }
             KeyCode::Char('a') => {
                 if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 0 && self.projects.iter().filter(|p| p.is_shared).count() == 0 {
+                    if self.selected_fellowship_tab == 0
+                        && self.projects.iter().filter(|p| p.is_shared).count() == 0
+                    {
                         self.db.mark_all_notifications_read()?;
                         self.reload_data()?;
                     } else {
@@ -6501,19 +7394,26 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('m') => {
-            }
+            KeyCode::Char('m') => {}
             KeyCode::Char('v') => {
                 if self.active_screen == ActiveScreen::Fellowship
                     && self.selected_fellowship_tab == 0
                 {
-                    let active_projects: Vec<_> = self.projects.iter().filter(|p| !p.archived).collect();
-                    let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+                    let active_projects: Vec<_> =
+                        self.projects.iter().filter(|p| !p.archived).collect();
+                    let shared_projects: Vec<_> =
+                        self.projects.iter().filter(|p| p.is_shared).collect();
 
                     let mut default_proj_idx = 0;
-                    if !shared_projects.is_empty() && self.selected_fellowship_project_idx < shared_projects.len() {
-                        let selected_shared_id = shared_projects[self.selected_fellowship_project_idx].id;
-                        if let Some(pos) = active_projects.iter().position(|p| p.id == selected_shared_id) {
+                    if !shared_projects.is_empty()
+                        && self.selected_fellowship_project_idx < shared_projects.len()
+                    {
+                        let selected_shared_id =
+                            shared_projects[self.selected_fellowship_project_idx].id;
+                        if let Some(pos) = active_projects
+                            .iter()
+                            .position(|p| p.id == selected_shared_id)
+                        {
                             default_proj_idx = pos;
                         }
                     }
@@ -6537,7 +7437,9 @@ impl App {
                         let p = shared_projects[self.selected_fellowship_project_idx];
                         self.modal_state = ModalType::ProjectSharing { project_id: p.id };
                     }
-                } else if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
+                } else if self.active_screen == ActiveScreen::Projects
+                    && !self.projects_all_selected
+                {
                     let active: Vec<&Project> =
                         self.projects.iter().filter(|p| !p.archived).collect();
                     if !active.is_empty() && self.selected_project_idx < active.len() {
@@ -6561,7 +7463,9 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     if let Ok(rituals) = self.db.get_rituals() {
                         if rituals.len() <= 1 {
-                            self.notifications.push(Notification::warning("You must maintain at least one active sidequest!"));
+                            self.notifications.push(Notification::warning(
+                                "You must maintain at least one active sidequest!",
+                            ));
                         } else if self.selected_ritual_idx < rituals.len() {
                             let ritual_name = rituals[self.selected_ritual_idx].name.clone();
                             let r_id = rituals[self.selected_ritual_idx].id.clone();
@@ -6569,7 +7473,10 @@ impl App {
                             self.audio_player.play_delete();
                             self.mark_dirty();
                             self.selected_ritual_idx = self.selected_ritual_idx.saturating_sub(1);
-                            self.notifications.push(Notification::info(format!("Sidequest '{}' removed.", ritual_name)));
+                            self.notifications.push(Notification::info(format!(
+                                "Sidequest '{}' removed.",
+                                ritual_name
+                            )));
                             self.reload_data()?;
                         }
                     }
@@ -6585,24 +7492,41 @@ impl App {
     }
 
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
-        let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) = match self.modal_state {
-            ModalType::NewProject {
-                ref name,
-                name_cursor,
-                ref desc,
-                desc_cursor,
-                focus_idx,
-            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, false, None),
-            ModalType::EditProject {
-                id,
-                ref name,
-                name_cursor,
-                ref desc,
-                desc_cursor,
-                focus_idx,
-            } => (name.clone(), name_cursor, desc.clone(), desc_cursor, focus_idx, true, Some(id)),
-            _ => return Ok(()),
-        };
+        let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) =
+            match self.modal_state {
+                ModalType::NewProject {
+                    ref name,
+                    name_cursor,
+                    ref desc,
+                    desc_cursor,
+                    focus_idx,
+                } => (
+                    name.clone(),
+                    name_cursor,
+                    desc.clone(),
+                    desc_cursor,
+                    focus_idx,
+                    false,
+                    None,
+                ),
+                ModalType::EditProject {
+                    id,
+                    ref name,
+                    name_cursor,
+                    ref desc,
+                    desc_cursor,
+                    focus_idx,
+                } => (
+                    name.clone(),
+                    name_cursor,
+                    desc.clone(),
+                    desc_cursor,
+                    focus_idx,
+                    true,
+                    Some(id),
+                ),
+                _ => return Ok(()),
+            };
 
         name_cursor = name_cursor.min(name.len());
         desc_cursor = desc_cursor.min(desc.len());
@@ -6811,7 +7735,9 @@ impl App {
             }
             KeyCode::Backspace => {
                 if focus_idx == 0 {
-                    if name_cursor > 0 {
+                    if is_ctrl_backspace(key) {
+                        name_cursor = delete_word_before_cursor(&mut name, name_cursor);
+                    } else if name_cursor > 0 {
                         let mut prev = name_cursor - 1;
                         while prev > 0 && !name.is_char_boundary(prev) {
                             prev -= 1;
@@ -6820,7 +7746,9 @@ impl App {
                         name_cursor = prev;
                     }
                 } else {
-                    if desc_cursor > 0 {
+                    if is_ctrl_backspace(key) {
+                        desc_cursor = delete_word_before_cursor(&mut desc, desc_cursor);
+                    } else if desc_cursor > 0 {
                         let mut prev = desc_cursor - 1;
                         while prev > 0 && !desc.is_char_boundary(prev) {
                             prev -= 1;
@@ -6918,8 +7846,9 @@ impl App {
             return Ok(());
         }
         let project_desc = {
-            let trimmed = desc.trim_start_matches(|c: char| c.is_whitespace() && c != '\n')
-                               .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
+            let trimmed = desc
+                .trim_start_matches(|c: char| c.is_whitespace() && c != '\n')
+                .trim_end_matches(|c: char| c.is_whitespace() && c != '\n');
             if trimmed.is_empty() {
                 None
             } else {
@@ -6960,20 +7889,30 @@ impl App {
 
     // Lista plana para el tab de notas: (Some, None)=encabezado codex | (_, Some)=nota | (None, None)=divisor
     // Árbol DFS completo — todos los codices y sus hijos a cualquier profundidad, siempre expandidos
-    fn build_notes_flat(notes: &[Note], codices: &[crate::models::Codex], project_id: Uuid) -> Vec<(Option<Uuid>, Option<usize>)> {
+    fn build_notes_flat(
+        notes: &[Note],
+        codices: &[crate::models::Codex],
+        project_id: Uuid,
+    ) -> Vec<(Option<Uuid>, Option<usize>)> {
         let mut flat: Vec<(Option<Uuid>, Option<usize>)> = Vec::new();
-        let proj_notes: Vec<(usize, &Note)> = notes.iter().enumerate()
+        let proj_notes: Vec<(usize, &Note)> = notes
+            .iter()
+            .enumerate()
             .filter(|(_, n)| n.project_id == Some(project_id))
             .collect();
 
         Self::append_codex_subtree(&mut flat, &proj_notes, codices, None);
 
         // grouped includes ALL notes in a codex, even inside collapsed ones (so they don't appear as ungrouped)
-        let grouped: std::collections::HashSet<usize> = proj_notes.iter()
-            .filter(|(_, n)| n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id))
+        let grouped: std::collections::HashSet<usize> = proj_notes
+            .iter()
+            .filter(|(_, n)| {
+                n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id)
+            })
             .map(|(i, _)| *i)
             .collect();
-        let mut ungrouped: Vec<(usize, &Note)> = proj_notes.iter()
+        let mut ungrouped: Vec<(usize, &Note)> = proj_notes
+            .iter()
             .filter(|(i, _)| !grouped.contains(i))
             .map(|(i, n)| (*i, *n))
             .collect();
@@ -6987,15 +7926,22 @@ impl App {
         flat
     }
 
-    fn append_codex_subtree(flat: &mut Vec<(Option<Uuid>, Option<usize>)>, proj_notes: &[(usize, &Note)], codices: &[crate::models::Codex], parent: Option<Uuid>) {
-        let children: Vec<&crate::models::Codex> = codices.iter()
+    fn append_codex_subtree(
+        flat: &mut Vec<(Option<Uuid>, Option<usize>)>,
+        proj_notes: &[(usize, &Note)],
+        codices: &[crate::models::Codex],
+        parent: Option<Uuid>,
+    ) {
+        let children: Vec<&crate::models::Codex> = codices
+            .iter()
             .filter(|c| c.parent_codex_id == parent)
             .collect();
         for codex in children {
             flat.push((Some(codex.id), None)); // header always visible
             if !codex.collapsed {
                 Self::append_codex_subtree(flat, proj_notes, codices, Some(codex.id));
-                let mut notes: Vec<(usize, &Note)> = proj_notes.iter()
+                let mut notes: Vec<(usize, &Note)> = proj_notes
+                    .iter()
                     .filter(|(_, n)| n.codex_id == Some(codex.id))
                     .map(|(i, n)| (*i, *n))
                     .collect();
@@ -7012,7 +7958,11 @@ impl App {
         let mut result = std::collections::HashSet::new();
         let mut queue = vec![codex_id];
         while let Some(id) = queue.pop() {
-            for c in self.codices.iter().filter(|c| c.parent_codex_id == Some(id)) {
+            for c in self
+                .codices
+                .iter()
+                .filter(|c| c.parent_codex_id == Some(id))
+            {
                 if result.insert(c.id) {
                     queue.push(c.id);
                 }
@@ -7023,7 +7973,8 @@ impl App {
 
     pub fn refile_codex_targets(&self, codex_id: Uuid) -> Vec<Uuid> {
         let descendants = self.codex_descendants(codex_id);
-        self.codices.iter()
+        self.codices
+            .iter()
             .filter(|c| c.id != codex_id && !descendants.contains(&c.id))
             .map(|c| c.id)
             .collect()
@@ -7034,7 +7985,7 @@ impl App {
             id
         } else {
             self.active_screen = ActiveScreen::Projects;
-                self.projects_all_selected = true;
+            self.projects_all_selected = true;
             return Ok(());
         };
 
@@ -7057,7 +8008,11 @@ impl App {
                     self.searching = false;
                 }
                 KeyCode::Backspace => {
-                    self.search_query.pop();
+                    if is_ctrl_backspace(key) {
+                        delete_last_word(&mut self.search_query);
+                    } else {
+                        self.search_query.pop();
+                    }
                 }
                 KeyCode::Char(c) if self.search_query.len() < 30 => {
                     self.search_query.push(c);
@@ -7081,17 +8036,19 @@ impl App {
                 .cloned()
                 .collect();
             steps.sort_by(|a, b| {
-                a.completed.cmp(&b.completed).then_with(|| match self.task_sort.as_str() {
-                    "DueDate" => match (a.due_date, b.due_date) {
-                        (Some(d1), Some(d2)) => d1.cmp(&d2),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.created_at.cmp(&b.created_at),
-                    },
-                    "Priority" => b.priority.cmp(&a.priority),
-                    "Alphabetical" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                    _ => b.created_at.cmp(&a.created_at),
-                })
+                a.completed
+                    .cmp(&b.completed)
+                    .then_with(|| match self.task_sort.as_str() {
+                        "DueDate" => match (a.due_date, b.due_date) {
+                            (Some(d1), Some(d2)) => d1.cmp(&d2),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.created_at.cmp(&b.created_at),
+                        },
+                        "Priority" => b.priority.cmp(&a.priority),
+                        "Alphabetical" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                        _ => b.created_at.cmp(&a.created_at),
+                    })
             });
             steps
         } else {
@@ -7117,23 +8074,28 @@ impl App {
 
             match self.task_sort.as_str() {
                 "DueDate" => parents.sort_by(|a, b| {
-                    a.completed.cmp(&b.completed).then_with(|| match (a.due_date, b.due_date) {
-                        (Some(d1), Some(d2)) => d1.cmp(&d2),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.created_at.cmp(&b.created_at),
-                    })
+                    a.completed
+                        .cmp(&b.completed)
+                        .then_with(|| match (a.due_date, b.due_date) {
+                            (Some(d1), Some(d2)) => d1.cmp(&d2),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => a.created_at.cmp(&b.created_at),
+                        })
                 }),
                 "Priority" => parents.sort_by(|a, b| {
-                    a.completed.cmp(&b.completed)
+                    a.completed
+                        .cmp(&b.completed)
                         .then_with(|| b.priority.cmp(&a.priority))
                 }),
                 "Alphabetical" => parents.sort_by(|a, b| {
-                    a.completed.cmp(&b.completed)
+                    a.completed
+                        .cmp(&b.completed)
                         .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
                 }),
                 _ => parents.sort_by(|a, b| {
-                    a.completed.cmp(&b.completed)
+                    a.completed
+                        .cmp(&b.completed)
                         .then_with(|| b.created_at.cmp(&a.created_at))
                 }),
             }
@@ -7169,7 +8131,8 @@ impl App {
             self.selected_task_idx = proj_tasks.len() - 1;
         }
 
-        let proj_notes: Vec<Note> = self.all_notes
+        let proj_notes: Vec<Note> = self
+            .all_notes
             .iter()
             .filter(|n| n.project_id == Some(p_id))
             .filter(|n| {
@@ -7184,7 +8147,8 @@ impl App {
             .cloned()
             .collect();
 
-        let proj_journals: Vec<JournalEntry> = self.all_journals
+        let proj_journals: Vec<JournalEntry> = self
+            .all_journals
             .iter()
             .filter(|j| j.project_id == p_id)
             .filter(|j| {
@@ -7209,7 +8173,7 @@ impl App {
                 } else {
                     self.active_project_id = None;
                     self.active_screen = ActiveScreen::Projects;
-                self.projects_all_selected = true;
+                    self.projects_all_selected = true;
                     self.workspace_sidebar_focused = false;
                     self.reload_data()?;
                 }
@@ -7218,19 +8182,42 @@ impl App {
                 self.searching = true;
                 self.search_query.clear();
             }
-            KeyCode::Char('1') => { self.workspace_tab_idx = 0; self.workspace_sidebar_focused = false; }
-            KeyCode::Char('2') => { self.workspace_tab_idx = 1; self.workspace_sidebar_focused = false; }
-            KeyCode::Char('3') => { self.workspace_tab_idx = 2; self.workspace_sidebar_focused = false; }
-            KeyCode::Char('4') => { self.workspace_tab_idx = 3; self.workspace_sidebar_focused = false; }
-            KeyCode::Tab => { self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4; self.workspace_sidebar_focused = false; }
+            KeyCode::Char('1') => {
+                self.workspace_tab_idx = 0;
+                self.workspace_sidebar_focused = false;
+            }
+            KeyCode::Char('2') => {
+                self.workspace_tab_idx = 1;
+                self.workspace_sidebar_focused = false;
+            }
+            KeyCode::Char('3') => {
+                self.workspace_tab_idx = 2;
+                self.workspace_sidebar_focused = false;
+            }
+            KeyCode::Char('4') => {
+                self.workspace_tab_idx = 3;
+                self.workspace_sidebar_focused = false;
+            }
+            KeyCode::Tab => {
+                self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
+                self.workspace_sidebar_focused = false;
+            }
             KeyCode::BackTab => {
-                self.workspace_tab_idx = if self.workspace_tab_idx > 0 { self.workspace_tab_idx - 1 } else { 3 };
+                self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
+                    self.workspace_tab_idx - 1
+                } else {
+                    3
+                };
                 self.workspace_sidebar_focused = false;
             }
             KeyCode::Left if self.note_preview_focused => {
                 self.note_preview_focused = false;
             }
-            KeyCode::Left if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_some() && self.workspace_tab_idx == 0 => {
+            KeyCode::Left
+                if !self.workspace_sidebar_focused
+                    && self.viewing_step_for_task.is_some()
+                    && self.workspace_tab_idx == 0 =>
+            {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
             }
@@ -7238,12 +8225,20 @@ impl App {
                 self.workspace_sidebar_focused = true;
             }
             // → en tab de notas mueve el foco al panel de preview
-            KeyCode::Right if !self.workspace_sidebar_focused && self.workspace_tab_idx == 1 && !self.note_preview_focused => {
+            KeyCode::Right
+                if !self.workspace_sidebar_focused
+                    && self.workspace_tab_idx == 1
+                    && !self.note_preview_focused =>
+            {
                 self.note_preview_focused = true;
                 self.note_preview_scroll = 0;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
-            KeyCode::Right if !self.workspace_sidebar_focused && self.viewing_step_for_task.is_none() && self.workspace_tab_idx == 0 => {
+            KeyCode::Right
+                if !self.workspace_sidebar_focused
+                    && self.viewing_step_for_task.is_none()
+                    && self.workspace_tab_idx == 0 =>
+            {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = &proj_tasks[self.selected_task_idx];
                     if task.parent_task_id.is_none() {
@@ -7257,7 +8252,11 @@ impl App {
                 self.workspace_sidebar_focused = false;
             }
             KeyCode::Up if self.workspace_sidebar_focused => {
-                self.workspace_tab_idx = if self.workspace_tab_idx > 0 { self.workspace_tab_idx - 1 } else { 3 };
+                self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
+                    self.workspace_tab_idx - 1
+                } else {
+                    3
+                };
             }
             KeyCode::Down if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
@@ -7393,21 +8392,27 @@ impl App {
                             if !task.xp_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let xp = if is_high { 50 } else { 25 };
-                                let label = if is_high { "Resolve Hero Step Quest" } else { "Complete Step Quest" };
+                                let label = if is_high {
+                                    "Resolve Hero Step Quest"
+                                } else {
+                                    "Complete Step Quest"
+                                };
                                 self.grant_xp(label, xp)?;
                                 self.apply_class_passive("task_complete", 0)?;
+                                self.complete_productive_action()?;
+                                self.grow_tree(2)?;
+                                self.update_daily_adventure_progress("complete_tasks", 1)?;
                             }
                             self.trigger_ambient_particles();
-                            self.complete_productive_action()?;
-                            self.grow_tree(2)?;
-                            self.update_daily_adventure_progress("complete_tasks", 1)?;
                             self.check_action_achievements()?;
                             self.reload_data()?;
                         }
                     } else {
                         if task.completed {
                             // Reabrir quest — los pasos también se reabren
-                            let steps: Vec<Task> = self.all_tasks.iter()
+                            let steps: Vec<Task> = self
+                                .all_tasks
+                                .iter()
                                 .filter(|t| t.parent_task_id == Some(task.id))
                                 .cloned()
                                 .collect();
@@ -7425,7 +8430,9 @@ impl App {
                             self.notifications.push(Notification::info("Quest unsealed. XP already claimed — the path forward is yours to walk again.".to_string()));
                             self.reload_data()?;
                         } else {
-                            let incomplete_steps: Vec<Task> = self.all_tasks.iter()
+                            let incomplete_steps: Vec<Task> = self
+                                .all_tasks
+                                .iter()
                                 .filter(|t| t.parent_task_id == Some(task.id) && !t.completed)
                                 .cloned()
                                 .collect();
@@ -7434,11 +8441,16 @@ impl App {
                                 let msg = if n == 1 {
                                     "One trial remains unsealed. Face it before this quest can be closed.".to_string()
                                 } else {
-                                    format!("{} trials remain unsealed. Resolve them before this quest can be claimed.", n)
+                                    format!(
+                                        "{} trials remain unsealed. Resolve them before this quest can be claimed.",
+                                        n
+                                    )
                                 };
                                 self.notifications.push(Notification::warning(msg));
                             } else {
-                                let total_steps = self.all_tasks.iter()
+                                let total_steps = self
+                                    .all_tasks
+                                    .iter()
                                     .filter(|t| t.parent_task_id == Some(task.id))
                                     .count();
                                 let mut t = task.clone();
@@ -7450,33 +8462,63 @@ impl App {
                                 if !task.xp_awarded {
                                     let is_high = t.priority == TaskPriority::High;
                                     let val = if is_high { 50 } else { 25 };
-                                    let title = if is_high { "Resolve Hero Quest" } else { "Complete Quest" };
+                                    let title = if is_high {
+                                        "Resolve Hero Quest"
+                                    } else {
+                                        "Complete Quest"
+                                    };
                                     self.grant_xp(title, val)?;
-                                    let passive_trigger = if is_high { "high_priority_task" } else { "task_complete" };
+                                    let passive_trigger = if is_high {
+                                        "high_priority_task"
+                                    } else {
+                                        "task_complete"
+                                    };
                                     self.apply_class_passive(passive_trigger, 0)?;
+                                    self.increment_quest_progress(10, 1)?;
+                                    let frag_trigger = if task.priority == TaskPriority::High {
+                                        "high_priority_task"
+                                    } else {
+                                        "task"
+                                    };
+                                    self.simulate_memory_fragment_unlock(frag_trigger)?;
+                                    self.complete_productive_action()?;
+                                    let growth = if task.priority == TaskPriority::High {
+                                        4
+                                    } else {
+                                        2
+                                    };
+                                    self.grow_tree(growth)?;
+                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                    if task.priority == TaskPriority::High {
+                                        self.update_daily_adventure_progress(
+                                            "complete_high_priority_task",
+                                            1,
+                                        )?;
+                                    }
                                 }
                                 self.trigger_ambient_particles();
-	                                self.increment_quest_progress(10, 1)?;
-                                let frag_trigger = if task.priority == TaskPriority::High { "high_priority_task" } else { "task" };
-                                self.simulate_memory_fragment_unlock(frag_trigger)?;
-                                self.complete_productive_action()?;
-                                let growth = if task.priority == TaskPriority::High { 4 } else { 2 };
-                                self.grow_tree(growth)?;
-                                self.update_daily_adventure_progress("complete_tasks", 1)?;
-                                if task.priority == TaskPriority::High {
-                                    self.update_daily_adventure_progress("complete_high_priority_task", 1)?;
-                                }
                                 self.check_action_achievements()?;
                                 let chronicle_desc = if total_steps > 0 {
-                                    format!("completed 1 quest with {} step{}.", total_steps, if total_steps == 1 { "" } else { "s" })
+                                    format!(
+                                        "completed 1 quest with {} step{}.",
+                                        total_steps,
+                                        if total_steps == 1 { "" } else { "s" }
+                                    )
                                 } else {
                                     "completed 1 quest.".to_string()
                                 };
-                                self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
+                                self.push_great_chronicle_async(
+                                    "QuestComplete",
+                                    &chronicle_desc,
+                                    true,
+                                );
                                 self.maybe_spawn_task_completion_sprite();
                                 // Tarea recurrente — genera la siguiente ocurrencia automáticamente
                                 if let Some(recurrence) = t.recurrence {
-                                    let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
+                                    let next_due = Self::advance_recurrence_date(
+                                        t.set_date.or(t.due_date),
+                                        recurrence,
+                                    );
                                     let next_task = Task {
                                         id: Uuid::new_v4(),
                                         project_id: t.project_id,
@@ -7496,7 +8538,11 @@ impl App {
                                     };
                                     let _ = self.db.insert_task(&next_task);
                                     let recur_label = recurrence.name();
-                                    self.notifications.push(Notification::info(format!("Quest recurring! Next {} occurrence queued for {}.", recur_label, next_due.format("%Y-%m-%d"))));
+                                    self.notifications.push(Notification::info(format!(
+                                        "Quest recurring! Next {} occurrence queued for {}.",
+                                        recur_label,
+                                        next_due.format("%Y-%m-%d")
+                                    )));
                                 }
                                 self.reload_data()?;
                             }
@@ -7537,13 +8583,22 @@ impl App {
                             .and_then(|cid| self.codices.iter().position(|c| c.id == cid))
                             .map(|pos| pos + 1)
                             .unwrap_or(0);
-                        self.modal_state = ModalType::RefileScroll { note_id, selected_idx };
+                        self.modal_state = ModalType::RefileScroll {
+                            note_id,
+                            selected_idx,
+                        };
                     }
                     Some((Some(codex_id), None)) => {
                         let cid = *codex_id;
                         let descendants = self.codex_descendants(cid);
-                        let current_parent = self.codices.iter().find(|c| c.id == cid).and_then(|c| c.parent_codex_id);
-                        let eligible: Vec<Uuid> = self.codices.iter()
+                        let current_parent = self
+                            .codices
+                            .iter()
+                            .find(|c| c.id == cid)
+                            .and_then(|c| c.parent_codex_id);
+                        let eligible: Vec<Uuid> = self
+                            .codices
+                            .iter()
                             .filter(|c| c.id != cid && !descendants.contains(&c.id))
                             .map(|c| c.id)
                             .collect();
@@ -7551,12 +8606,17 @@ impl App {
                             .and_then(|pid| eligible.iter().position(|&id| id == pid))
                             .map(|pos| pos + 1)
                             .unwrap_or(0);
-                        self.modal_state = ModalType::RefileCodex { codex_id: cid, selected_idx };
+                        self.modal_state = ModalType::RefileCodex {
+                            codex_id: cid,
+                            selected_idx,
+                        };
                     }
                     _ => {}
                 }
             }
-            KeyCode::Char('+') if self.workspace_tab_idx == 0 && self.viewing_step_for_task.is_none() => {
+            KeyCode::Char('+')
+                if self.workspace_tab_idx == 0 && self.viewing_step_for_task.is_none() =>
+            {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = &proj_tasks[self.selected_task_idx];
                     let parent_id = task.parent_task_id.unwrap_or(task.id);
@@ -7591,7 +8651,8 @@ impl App {
                     };
                 } else if self.workspace_tab_idx == 1 && key.code == KeyCode::Char('n') {
                     let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    let codex_id = flat.get(self.selected_notes_flat_idx)
+                    let codex_id = flat
+                        .get(self.selected_notes_flat_idx)
                         .and_then(|(cid, _)| *cid);
                     let mut state = EditorState::new(p_id, None, String::new(), String::new());
                     state.codex_id = codex_id;
@@ -7642,7 +8703,10 @@ impl App {
                         priority: t.priority,
                         due_date_type: due_type,
                         due_date_val: due_val,
-                        set_date_val: t.set_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                        set_date_val: t
+                            .set_date
+                            .map(|d| d.format("%Y-%m-%d").to_string())
+                            .unwrap_or_default(),
                         focus_idx: 0,
                         step_selected_idx: 0,
                         is_step: t.parent_task_id.is_some(),
@@ -7653,14 +8717,24 @@ impl App {
                     match flat.get(self.selected_notes_flat_idx) {
                         Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                             let n = &proj_notes[*note_idx];
-                            let is_mine = n.owner_identity.as_deref()
+                            let is_mine = n
+                                .owner_identity
+                                .as_deref()
                                 .map(|oi| oi == self.identity.public_key.as_str())
                                 .unwrap_or(true);
                             if n.sharing_permission == "read_only" && !is_mine {
-                                self.notifications.push(Notification::warning("This scroll is sealed — you may read but not inscribe.".to_string()));
+                                self.notifications.push(Notification::warning(
+                                    "This scroll is sealed — you may read but not inscribe."
+                                        .to_string(),
+                                ));
                                 return Ok(());
                             }
-                            let mut state = EditorState::new(p_id, Some(n.id), n.title.clone(), n.markdown_content.clone());
+                            let mut state = EditorState::new(
+                                p_id,
+                                Some(n.id),
+                                n.title.clone(),
+                                n.markdown_content.clone(),
+                            );
                             state.codex_id = n.codex_id;
                             self.editor_state = Some(state);
                             self.active_screen = ActiveScreen::Editor;
@@ -7668,7 +8742,9 @@ impl App {
                         Some((Some(codex_id), None)) => {
                             let cid = *codex_id;
                             if key.code == KeyCode::Char('e') {
-                                let current_name = self.codices.iter()
+                                let current_name = self
+                                    .codices
+                                    .iter()
                                     .find(|c| c.id == cid)
                                     .map(|c| c.name.clone())
                                     .unwrap_or_default();
@@ -7683,7 +8759,8 @@ impl App {
                                     let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
                                 }
                                 // Clamp selection in case previously visible items are now hidden
-                                let new_flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                                let new_flat =
+                                    Self::build_notes_flat(&proj_notes, &self.codices, p_id);
                                 if self.selected_notes_flat_idx >= new_flat.len() {
                                     self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
                                 }
@@ -7719,7 +8796,9 @@ impl App {
                         }
                         Some((Some(codex_id), None)) => {
                             let cid = *codex_id;
-                            let name = self.codices.iter()
+                            let name = self
+                                .codices
+                                .iter()
                                 .find(|c| c.id == cid)
                                 .map(|c| c.name.clone())
                                 .unwrap_or_default();
@@ -7886,7 +8965,8 @@ impl App {
                 recurrence,
             } => {
                 // índice del bloque de steps — depende de si hay campo de valor de fecha
-                let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
+                let has_due_value =
+                    matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
                 let set_date_focus = if has_due_value { 5usize } else { 4usize };
                 let recurrence_focus = set_date_focus + 1;
                 let steps_focus = recurrence_focus + 1;
@@ -7897,17 +8977,33 @@ impl App {
                     let desc_c = desc.clone();
                     let due_val_c = due_date_val.clone();
                     let set_val_c = set_date_val.clone();
-                    let steps: Vec<Task> = self.db.get_tasks()
+                    let steps: Vec<Task> = self
+                        .db
+                        .get_tasks()
                         .unwrap_or_default()
                         .into_iter()
                         .filter(|t| t.parent_task_id == Some(id))
                         .collect();
                     match key.code {
                         KeyCode::Up => {
-                            let new_idx = if step_selected_idx > 0 { step_selected_idx - 1 } else { 0 };
+                            let new_idx = if step_selected_idx > 0 {
+                                step_selected_idx - 1
+                            } else {
+                                0
+                            };
                             self.modal_state = ModalType::EditTask {
-                                id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                id,
+                                title: title_c,
+                                desc: desc_c,
+                                desc_cursor,
+                                priority,
+                                due_date_type,
+                                due_date_val: due_val_c,
+                                set_date_val: set_val_c,
+                                focus_idx: steps_focus,
+                                step_selected_idx: new_idx,
+                                is_step,
+                                recurrence,
                             };
                             return Ok(());
                         }
@@ -7915,8 +9011,18 @@ impl App {
                             let max = steps.len().saturating_sub(1);
                             let new_idx = (step_selected_idx + 1).min(max);
                             self.modal_state = ModalType::EditTask {
-                                id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                id,
+                                title: title_c,
+                                desc: desc_c,
+                                desc_cursor,
+                                priority,
+                                due_date_type,
+                                due_date_val: due_val_c,
+                                set_date_val: set_val_c,
+                                focus_idx: steps_focus,
+                                step_selected_idx: new_idx,
+                                is_step,
+                                recurrence,
                             };
                             return Ok(());
                         }
@@ -7925,25 +9031,42 @@ impl App {
                                 if !step.completed {
                                     let mut s = step.clone();
                                     s.completed = true;
+                                    s.xp_awarded = true;
                                     self.db.update_task(&s)?;
                                     self.mark_dirty();
                                     self.audio_player.play_task_complete();
-                                    let is_high = s.priority == TaskPriority::High;
-                                    let xp = if is_high { 50 } else { 25 };
-                                    let label = if is_high { "Resolve Hero Step Quest" } else { "Complete Step Quest" };
-                                    self.grant_xp(label, xp)?;
-                                    self.apply_class_passive("task_complete", 0)?;
+                                    if !step.xp_awarded {
+                                        let is_high = s.priority == TaskPriority::High;
+                                        let xp = if is_high { 50 } else { 25 };
+                                        let label = if is_high {
+                                            "Resolve Hero Step Quest"
+                                        } else {
+                                            "Complete Step Quest"
+                                        };
+                                        self.grant_xp(label, xp)?;
+                                        self.apply_class_passive("task_complete", 0)?;
+                                        self.complete_productive_action()?;
+                                        self.grow_tree(2)?;
+                                        self.update_daily_adventure_progress("complete_tasks", 1)?;
+                                    }
                                     self.trigger_ambient_particles();
-                                    self.complete_productive_action()?;
-                                    self.grow_tree(2)?;
-                                    self.update_daily_adventure_progress("complete_tasks", 1)?;
                                     self.check_action_achievements()?;
                                     self.reload_data()?;
                                 }
                             }
                             self.modal_state = ModalType::EditTask {
-                                id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx, is_step, recurrence,
+                                id,
+                                title: title_c,
+                                desc: desc_c,
+                                desc_cursor,
+                                priority,
+                                due_date_type,
+                                due_date_val: due_val_c,
+                                set_date_val: set_val_c,
+                                focus_idx: steps_focus,
+                                step_selected_idx,
+                                is_step,
+                                recurrence,
                             };
                             return Ok(());
                         }
@@ -7954,10 +9077,24 @@ impl App {
                                 self.mark_dirty();
                                 self.reload_data()?;
                             }
-                            let new_idx = if step_selected_idx > 0 { step_selected_idx - 1 } else { 0 };
+                            let new_idx = if step_selected_idx > 0 {
+                                step_selected_idx - 1
+                            } else {
+                                0
+                            };
                             self.modal_state = ModalType::EditTask {
-                                id, title: title_c, desc: desc_c, desc_cursor, priority, due_date_type,
-                                due_date_val: due_val_c, set_date_val: set_val_c, focus_idx: steps_focus, step_selected_idx: new_idx, is_step, recurrence,
+                                id,
+                                title: title_c,
+                                desc: desc_c,
+                                desc_cursor,
+                                priority,
+                                due_date_type,
+                                due_date_val: due_val_c,
+                                set_date_val: set_val_c,
+                                focus_idx: steps_focus,
+                                step_selected_idx: new_idx,
+                                is_step,
+                                recurrence,
                             };
                             return Ok(());
                         }
@@ -7990,7 +9127,10 @@ impl App {
                                             } else if d_naive == today + chrono::Duration::days(1) {
                                                 (DueDateType::Tomorrow, String::new())
                                             } else {
-                                                (DueDateType::Specific, d.format("%Y-%m-%d").to_string())
+                                                (
+                                                    DueDateType::Specific,
+                                                    d.format("%Y-%m-%d").to_string(),
+                                                )
                                             }
                                         }
                                     };
@@ -8004,7 +9144,10 @@ impl App {
                                         priority: step.priority,
                                         due_date_type: due_type,
                                         due_date_val: due_val,
-                                        set_date_val: step.set_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+                                        set_date_val: step
+                                            .set_date
+                                            .map(|d| d.format("%Y-%m-%d").to_string())
+                                            .unwrap_or_default(),
                                         focus_idx: 0,
                                         step_selected_idx: 0,
                                         is_step: true,
@@ -8038,7 +9181,10 @@ impl App {
             ModalType::NewJournalEntry { ref content } => {
                 self.handle_journal_modal_key(key, project_id, content.clone())?;
             }
-            ModalType::NewCodex { ref name, parent_codex_id } => {
+            ModalType::NewCodex {
+                ref name,
+                parent_codex_id,
+            } => {
                 let name = name.clone();
                 let pcid = parent_codex_id;
                 match key.code {
@@ -8063,14 +9209,24 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         let mut n = name.clone();
-                        n.pop();
-                        self.modal_state = ModalType::NewCodex { name: n, parent_codex_id: pcid };
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut n);
+                        } else {
+                            n.pop();
+                        }
+                        self.modal_state = ModalType::NewCodex {
+                            name: n,
+                            parent_codex_id: pcid,
+                        };
                     }
                     KeyCode::Char(c) => {
                         if name.len() < 40 {
                             let mut n = name.clone();
                             n.push(c);
-                            self.modal_state = ModalType::NewCodex { name: n, parent_codex_id: pcid };
+                            self.modal_state = ModalType::NewCodex {
+                                name: n,
+                                parent_codex_id: pcid,
+                            };
                         }
                     }
                     _ => {}
@@ -8091,14 +9247,24 @@ impl App {
                     }
                     KeyCode::Backspace => {
                         let mut n = name.clone();
-                        n.pop();
-                        self.modal_state = ModalType::RenameCodex { codex_id: cid, name: n };
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut n);
+                        } else {
+                            n.pop();
+                        }
+                        self.modal_state = ModalType::RenameCodex {
+                            codex_id: cid,
+                            name: n,
+                        };
                     }
                     KeyCode::Char(c) => {
                         if name.len() < 40 {
                             let mut n = name.clone();
                             n.push(c);
-                            self.modal_state = ModalType::RenameCodex { codex_id: cid, name: n };
+                            self.modal_state = ModalType::RenameCodex {
+                                codex_id: cid,
+                                name: n,
+                            };
                         }
                     }
                     _ => {}
@@ -8146,16 +9312,16 @@ impl App {
         } else {
             set_date_focus
         };
-        let next_focus = |idx: usize| -> usize {
-            (idx + 1) % (max_fields + 1)
-        };
-        let prev_focus = |idx: usize| -> usize {
-            if idx > 0 { idx - 1 } else { max_fields }
-        };
+        let next_focus = |idx: usize| -> usize { (idx + 1) % (max_fields + 1) };
+        let prev_focus = |idx: usize| -> usize { if idx > 0 { idx - 1 } else { max_fields } };
         // Ctrl+S — guarda y cierra desde cualquier campo, igual que Enter pero sin reabrir el form de steps
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
             if !title.trim().is_empty() {
-                let task_desc = if desc.trim().is_empty() { None } else { Some(desc.trim().to_string()) };
+                let task_desc = if desc.trim().is_empty() {
+                    None
+                } else {
+                    Some(desc.trim().to_string())
+                };
                 let due_str = match due_date_type {
                     DueDateType::None => String::new(),
                     DueDateType::Today => "today".to_string(),
@@ -8189,7 +9355,12 @@ impl App {
                         created_at: Utc::now(),
                         updated_at: Utc::now(),
                         owner_identity: Some(self.identity.public_key.clone()),
-                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        owner_username: Some(
+                            self.user
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or_default(),
+                        ),
                         parent_task_id: None,
                         xp_awarded: false,
                         recurrence,
@@ -8219,14 +9390,23 @@ impl App {
                         created_at: Utc::now(),
                         updated_at: Utc::now(),
                         owner_identity: Some(self.identity.public_key.clone()),
-                        owner_username: Some(self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default()),
+                        owner_username: Some(
+                            self.user
+                                .as_ref()
+                                .map(|u| u.username.clone())
+                                .unwrap_or_default(),
+                        ),
                         parent_task_id,
                         xp_awarded: false,
                         recurrence: if is_step_new { None } else { recurrence },
                     };
                     self.db.insert_task(&t)?;
                     self.audio_player.play_task_creation();
-                    let xp_label = if is_step_new { "Spawn Step" } else { "Spawn Quest" };
+                    let xp_label = if is_step_new {
+                        "Spawn Step"
+                    } else {
+                        "Spawn Quest"
+                    };
                     if let Some(ref mut u) = self.user {
                         xp_service.grant_xp(u, xp_label, 5)?;
                     }
@@ -8245,15 +9425,37 @@ impl App {
             KeyCode::Tab => {
                 focus_idx = next_focus(focus_idx);
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::BackTab => {
                 focus_idx = prev_focus(focus_idx);
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::Left => {
@@ -8295,8 +9497,19 @@ impl App {
                     }
                 }
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::Right => {
@@ -8338,24 +9551,50 @@ impl App {
                     }
                 }
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::Up => {
                 if focus_idx == 1 {
                     // Move cursor up one line in description
                     let before = &desc[..desc_cursor];
-                    let col = before.rfind('\n').map(|i| desc_cursor - i - 1).unwrap_or(desc_cursor);
+                    let col = before
+                        .rfind('\n')
+                        .map(|i| desc_cursor - i - 1)
+                        .unwrap_or(desc_cursor);
                     if let Some(prev_nl) = before.rfind('\n') {
                         let prev_line_end = prev_nl;
-                        let prev_line_start = desc[..prev_nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                        let prev_line_start =
+                            desc[..prev_nl].rfind('\n').map(|i| i + 1).unwrap_or(0);
                         let prev_line_len = prev_line_end - prev_line_start;
                         desc_cursor = prev_line_start + col.min(prev_line_len);
                     }
                     self.update_task_modal_state(
-                        task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
                     );
                 }
                 // For other fields: Up does nothing (Tab handles cycling)
@@ -8364,18 +9603,33 @@ impl App {
                 if focus_idx == 1 {
                     // Move cursor down one line in description
                     let before = &desc[..desc_cursor];
-                    let col = before.rfind('\n').map(|i| desc_cursor - i - 1).unwrap_or(desc_cursor);
+                    let col = before
+                        .rfind('\n')
+                        .map(|i| desc_cursor - i - 1)
+                        .unwrap_or(desc_cursor);
                     if let Some(next_nl) = desc[desc_cursor..].find('\n') {
                         let next_line_start = desc_cursor + next_nl + 1;
-                        let next_line_end = desc[next_line_start..].find('\n')
+                        let next_line_end = desc[next_line_start..]
+                            .find('\n')
                             .map(|i| next_line_start + i)
                             .unwrap_or(desc.len());
                         let next_line_len = next_line_end - next_line_start;
                         desc_cursor = next_line_start + col.min(next_line_len);
                     }
                     self.update_task_modal_state(
-                        task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
                     );
                 }
                 // For other fields: Down does nothing
@@ -8385,20 +9639,43 @@ impl App {
                     // Jump to start of current line
                     desc_cursor = desc[..desc_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
                     self.update_task_modal_state(
-                        task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
                     );
                 }
             }
             KeyCode::End => {
                 if focus_idx == 1 {
                     // Jump to end of current line
-                    desc_cursor = desc[desc_cursor..].find('\n')
+                    desc_cursor = desc[desc_cursor..]
+                        .find('\n')
                         .map(|i| desc_cursor + i)
                         .unwrap_or(desc.len());
                     self.update_task_modal_state(
-                        task_id, title, desc, desc_cursor, priority, due_date_type,
-                        due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
                     );
                 }
             }
@@ -8454,29 +9731,75 @@ impl App {
                     _ => {}
                 }
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::Backspace => {
                 match focus_idx {
-                    0 => { title.pop(); }
+                    0 => {
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut title);
+                        } else {
+                            title.pop();
+                        }
+                    }
                     1 => {
-                        if desc_cursor > 0 {
+                        if is_ctrl_backspace(key) {
+                            desc_cursor = delete_word_before_cursor(&mut desc, desc_cursor);
+                        } else if desc_cursor > 0 {
                             let cursor = desc_cursor.min(desc.len());
                             // find start of previous char
-                            let prev = desc[..cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                            let prev = desc[..cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(i, _)| i)
+                                .unwrap_or(0);
                             desc.remove(prev);
                             desc_cursor = prev;
                         }
                     }
-                    4 if has_due_value => { due_date_val.pop(); }
-                    _ if focus_idx == set_date_focus => { set_date_val.pop(); }
+                    4 if has_due_value => {
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut due_date_val);
+                        } else {
+                            due_date_val.pop();
+                        }
+                    }
+                    _ if focus_idx == set_date_focus => {
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut set_date_val);
+                        } else {
+                            set_date_val.pop();
+                        }
+                    }
                     _ => {}
                 }
                 self.update_task_modal_state(
-                    task_id, title, desc, desc_cursor, priority, due_date_type,
-                    due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
                 );
             }
             KeyCode::Enter => {
@@ -8486,8 +9809,19 @@ impl App {
                         desc.insert(cursor, '\n');
                         desc_cursor = cursor + 1;
                         self.update_task_modal_state(
-                            task_id, title, desc, desc_cursor, priority, due_date_type,
-                            due_date_val, set_date_val, focus_idx, parent_task_id, step_selected_idx, is_step, recurrence,
+                            task_id,
+                            title,
+                            desc,
+                            desc_cursor,
+                            priority,
+                            due_date_type,
+                            due_date_val,
+                            set_date_val,
+                            focus_idx,
+                            parent_task_id,
+                            step_selected_idx,
+                            is_step,
+                            recurrence,
                         );
                     }
                 } else if !title.trim().is_empty() {
@@ -8557,11 +9891,12 @@ impl App {
                         self.mark_dirty();
                     } else {
                         // Create Task (or Step when parent_task_id is set)
-                        let parent_id = if let ModalType::NewTask { parent_task_id, .. } = self.modal_state {
-                            parent_task_id
-                        } else {
-                            None
-                        };
+                        let parent_id =
+                            if let ModalType::NewTask { parent_task_id, .. } = self.modal_state {
+                                parent_task_id
+                            } else {
+                                None
+                            };
                         let is_step = parent_id.is_some();
                         let t = Task {
                             id: Uuid::new_v4(),
@@ -8682,17 +10017,25 @@ impl App {
                 self.modal_state = ModalType::None;
             }
             KeyCode::Char(c) => {
-                if content.len() < 120 {
+                if content.chars().count() < JOURNAL_ENTRY_CHAR_LIMIT {
                     content.push(c);
                 }
                 self.modal_state = ModalType::NewJournalEntry { content };
             }
             KeyCode::Backspace => {
-                content.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut content);
+                } else {
+                    content.pop();
+                }
                 self.modal_state = ModalType::NewJournalEntry { content };
             }
             KeyCode::Enter if !content.trim().is_empty() => {
-                let author = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+                let author = self
+                    .user
+                    .as_ref()
+                    .map(|u| u.username.clone())
+                    .unwrap_or_default();
                 let entry = JournalEntry {
                     id: Uuid::new_v4(),
                     project_id,
@@ -8704,12 +10047,12 @@ impl App {
                 };
                 self.db.insert_journal_entry(&entry)?;
                 self.mark_dirty();
-	                self.apply_class_passive("journal_create", 0)?;
+                self.apply_class_passive("journal_create", 0)?;
 
-	                // Stage 3 Integration:
-	                self.complete_productive_action()?;
-	                self.increment_quest_progress(60, 1)?;
-	                self.update_daily_adventure_progress("write_journal", 1)?;
+                // Stage 3 Integration:
+                self.complete_productive_action()?;
+                self.increment_quest_progress(60, 1)?;
+                self.update_daily_adventure_progress("write_journal", 1)?;
                 self.check_action_achievements()?;
 
                 self.reload_data()?;
@@ -8735,7 +10078,7 @@ impl App {
                 self.pull_invitations_async();
                 ActiveScreen::Fellowship
             }
-            9 => ActiveScreen::Dashboard,
+            9 => ActiveScreen::Settings,
             10 => ActiveScreen::Archive,
             11 => ActiveScreen::Dashboard,
             12 => ActiveScreen::SyncSettings,
@@ -8761,14 +10104,21 @@ impl App {
     }
 
     // Calcula la siguiente fecha de una tarea recurrente — avanza por el período correcto
-    fn advance_recurrence_date(due_date: Option<DateTime<Utc>>, recurrence: RecurrenceType) -> DateTime<Utc> {
+    fn advance_recurrence_date(
+        due_date: Option<DateTime<Utc>>,
+        recurrence: RecurrenceType,
+    ) -> DateTime<Utc> {
         use chrono::Months;
         let base = due_date.unwrap_or_else(Utc::now);
         match recurrence {
             RecurrenceType::Daily => base + chrono::Duration::days(1),
             RecurrenceType::Weekly => base + chrono::Duration::days(7),
-            RecurrenceType::Monthly => base.checked_add_months(Months::new(1)).unwrap_or(base + chrono::Duration::days(30)),
-            RecurrenceType::Yearly => base.checked_add_months(Months::new(12)).unwrap_or(base + chrono::Duration::days(365)),
+            RecurrenceType::Monthly => base
+                .checked_add_months(Months::new(1))
+                .unwrap_or(base + chrono::Duration::days(30)),
+            RecurrenceType::Yearly => base
+                .checked_add_months(Months::new(12))
+                .unwrap_or(base + chrono::Duration::days(365)),
         }
     }
 
@@ -8844,9 +10194,9 @@ impl App {
                     if missed_days > 0 {
                         tree.health = (tree.health - missed_days as i32).max(10);
                         self.notifications.push(Notification::info(format!(
-                                "You missed {} days. Tree health declined to {}%",
-                                missed_days, tree.health
-                            )));
+                            "You missed {} days. Tree health declined to {}%",
+                            missed_days, tree.health
+                        )));
                     }
                     streak.current_streak = 0;
                     self.db.update_streak(&streak)?;
@@ -8854,7 +10204,8 @@ impl App {
                     // Consecutive login: the tree recovers slightly from your return
                     tree.health = (tree.health + 1).min(100);
                     self.notifications.push(Notification::info(format!(
-                        "You returned. Tree health +1 ({}%)", tree.health
+                        "You returned. Tree health +1 ({}%)",
+                        tree.health
                     )));
                 }
             }
@@ -8880,16 +10231,21 @@ impl App {
         Ok(())
     }
 
-    pub fn is_watering_allowed_at(&self, now_local: chrono::DateTime<chrono::Local>) -> Result<Result<(), String>> {
+    pub fn is_watering_allowed_at(
+        &self,
+        now_local: chrono::DateTime<chrono::Local>,
+    ) -> Result<Result<(), String>> {
         let tree = self.db.get_zen_tree()?;
         if tree.water_today >= 2 {
-            return Ok(Err("Your tree is already fully watered for today!".to_string()));
+            return Ok(Err(
+                "Your tree is already fully watered for today!".to_string()
+            ));
         }
-        
+
         let today = now_local.date_naive();
         let current_hour = now_local.hour();
         let is_morning = current_hour < 12;
-        
+
         if tree.water_today > 0 {
             if let Some(last_utc) = tree.last_watered {
                 let last_local = last_utc.with_timezone(&chrono::Local);
@@ -8916,7 +10272,7 @@ impl App {
 
     pub fn water_tree_at(&mut self, now_local: chrono::DateTime<chrono::Local>) -> Result<()> {
         match self.is_watering_allowed_at(now_local)? {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(msg) => {
                 self.notifications.push(Notification::info(msg));
                 return Ok(());
@@ -8935,14 +10291,22 @@ impl App {
         tree.growth += amount;
         tree.last_watered = Some(now_local.with_timezone(&Utc));
 
-        let hp_gain = if tree.health < 100 { (2_i32).min(100 - tree.health) } else { 0 };
+        let hp_gain = if tree.health < 100 {
+            (2_i32).min(100 - tree.health)
+        } else {
+            0
+        };
         tree.health = (tree.health + hp_gain).min(100);
-        let hp_note = if hp_gain > 0 { format!(", Health +{}", hp_gain) } else { String::new() };
+        let hp_note = if hp_gain > 0 {
+            format!(", Health +{}", hp_gain)
+        } else {
+            String::new()
+        };
 
         self.notifications.push(Notification::info(format!(
-                "Tree Watered! Growth +{}{} (Today: {}/2)",
-                amount, hp_note, tree.water_today
-            )));
+            "Tree Watered! Growth +{}{} (Today: {}/2)",
+            amount, hp_note, tree.water_today
+        )));
 
         self.db.update_zen_tree(&tree)?;
         self.push_great_chronicle_async("TreeWatering", "watered The Evergrowth.", true);
@@ -8951,7 +10315,7 @@ impl App {
         self.update_daily_adventure_progress("water_tree", 1)?;
 
         // Stage 6 quest progress increment
-	        self.increment_quest_progress(50, 1)?;
+        self.increment_quest_progress(50, 1)?;
         self.simulate_memory_fragment_unlock("zen_water")?;
 
         self.check_tree_evolution(&mut tree)?;
@@ -8991,7 +10355,9 @@ impl App {
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|n| !n.starts_with('.') && n.to_lowercase().starts_with(&prefix.to_lowercase()))
+                    .map(|n| {
+                        !n.starts_with('.') && n.to_lowercase().starts_with(&prefix.to_lowercase())
+                    })
                     .unwrap_or(false)
             })
             .map(|e| {
@@ -9022,7 +10388,10 @@ impl App {
         tree.growth += final_amount;
         self.db.update_zen_tree(&tree)?;
 
-        self.notifications.push(Notification::info(format!("Zen Tree Growth +{}!", final_amount)));
+        self.notifications.push(Notification::info(format!(
+            "Zen Tree Growth +{}!",
+            final_amount
+        )));
 
         self.check_tree_evolution(&mut tree)?;
         self.reload_data()?;
@@ -9059,15 +10428,19 @@ impl App {
             }
             self.push_great_chronicle_async(
                 "ZenTree",
-                &format!("reached Zen Tree Stage {}: {}.", new_stage, tree.stage_name()),
+                &format!(
+                    "reached Zen Tree Stage {}: {}.",
+                    new_stage,
+                    tree.stage_name()
+                ),
                 true,
             );
 
             self.notifications.push(Notification::info(format!(
-                    "Zen Tree Evolved! Stage {}: {}",
-                    new_stage,
-                    tree.stage_name()
-                )));
+                "Zen Tree Evolved! Stage {}: {}",
+                new_stage,
+                tree.stage_name()
+            )));
 
             if new_stage == 5 {
                 self.unlock_achievement("ancient_gardener")?;
@@ -9097,16 +10470,24 @@ impl App {
                     completed_any = true;
 
                     self.notifications.push(Notification::info(format!(
-                            "Daily Adventure Complete: {}! (+75 XP, +5 Growth)",
-                            adv.title
-                        )));
+                        "Daily Adventure Complete: {}! (+75 XP, +5 Growth)",
+                        adv.title
+                    )));
+                    self.push_great_chronicle_async(
+                        "DailyAdventure",
+                        &format!("completed daily adventure: {}.", adv.title),
+                        true,
+                    );
 
                     if let Some(ref mut u) = self.user {
                         let xp_service = XPService::new(&self.db);
                         let leveled_up =
                             xp_service.grant_xp(u, &format!("Daily Quest: {}", adv.title), 75)?;
                         if leveled_up {
-                            self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
+                            self.notifications.push(Notification::info(format!(
+                                "LEVEL UP! You reached Level {}!",
+                                u.level
+                            )));
                         }
                     }
 
@@ -9114,10 +10495,10 @@ impl App {
                     tree.growth += 5;
                     self.check_tree_evolution(&mut tree)?;
                     self.db.update_zen_tree(&tree)?;
-	                    self.simulate_memory_fragment_unlock("daily_adventure")?;
-	                    self.apply_class_passive("daily_adventure_complete", 0)?;
-	                    self.increment_quest_progress(20, 1)?;
-	                }
+                    self.simulate_memory_fragment_unlock("daily_adventure")?;
+                    self.apply_class_passive("daily_adventure_complete", 0)?;
+                    self.increment_quest_progress(20, 1)?;
+                }
                 self.db.update_daily_adventure(adv)?;
             }
         }
@@ -9126,13 +10507,18 @@ impl App {
             let new_advs = self.db.get_daily_adventures()?;
             let is_all_completed = new_advs.iter().all(|a| a.completed);
             if is_all_completed && !was_all_completed {
-                self.notifications.push(Notification::info("Quest Chain Completed! (+150 XP Bonus)".to_string()));
+                self.notifications.push(Notification::info(
+                    "Quest Chain Completed! (+150 XP Bonus)".to_string(),
+                ));
 
                 if let Some(ref mut u) = self.user {
                     let xp_service = XPService::new(&self.db);
                     let leveled_up = xp_service.grant_xp(u, "Quest Chain Completed", 150)?;
                     if leveled_up {
-                        self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
+                        self.notifications.push(Notification::info(format!(
+                            "LEVEL UP! You reached Level {}!",
+                            u.level
+                        )));
                     }
                 }
                 self.apply_class_passive("daily_adventure_chain", 0)?;
@@ -9159,18 +10545,21 @@ impl App {
                         streak.best_streak = streak.current_streak;
                     }
                     streak.last_active_day = Some(today);
-	                    self.db.update_streak(&streak)?;
-	                    increased = true;
-	                    self.apply_class_passive("streak_maintain", 0)?;
-	                    self.increment_quest_progress(100, 1)?;
+                    self.db.update_streak(&streak)?;
+                    increased = true;
+                    self.apply_class_passive("streak_maintain", 0)?;
+                    self.increment_quest_progress(100, 1)?;
 
-                    self.notifications.push(Notification::info(format!("Streak increased to {} days!", streak.current_streak)));
+                    self.notifications.push(Notification::info(format!(
+                        "Streak increased to {} days!",
+                        streak.current_streak
+                    )));
 
                     if streak.current_streak % 7 == 0 {
                         self.notifications.push(Notification::info(format!(
-                                "{}-Day Streak Reward! (+100 XP)",
-                                streak.current_streak
-                            )));
+                            "{}-Day Streak Reward! (+100 XP)",
+                            streak.current_streak
+                        )));
                         self.push_great_chronicle_async(
                             "Streak",
                             &format!("achieved a {}-day streak.", streak.current_streak),
@@ -9180,7 +10569,10 @@ impl App {
                             let xp_service = XPService::new(&self.db);
                             let leveled_up = xp_service.grant_xp(u, "Streak Bonus XP", 100)?;
                             if leveled_up {
-                                self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", u.level)));
+                                self.notifications.push(Notification::info(format!(
+                                    "LEVEL UP! You reached Level {}!",
+                                    u.level
+                                )));
                             }
                         }
                     }
@@ -9191,22 +10583,26 @@ impl App {
                 } else {
                     streak.current_streak = 1;
                     streak.last_active_day = Some(today);
-	                    self.db.update_streak(&streak)?;
-	                    increased = true;
-	                    self.increment_quest_progress(100, 1)?;
+                    self.db.update_streak(&streak)?;
+                    increased = true;
+                    self.increment_quest_progress(100, 1)?;
 
-                    self.notifications.push(Notification::info("Starting a new streak! Day 1".to_string()));
+                    self.notifications.push(Notification::info(
+                        "Starting a new streak! Day 1".to_string(),
+                    ));
                 }
             }
             None => {
-	                streak.current_streak = 1;
-	                streak.best_streak = 1;
-	                streak.last_active_day = Some(today);
-	                self.db.update_streak(&streak)?;
-	                increased = true;
-	                self.increment_quest_progress(100, 1)?;
+                streak.current_streak = 1;
+                streak.best_streak = 1;
+                streak.last_active_day = Some(today);
+                self.db.update_streak(&streak)?;
+                increased = true;
+                self.increment_quest_progress(100, 1)?;
 
-                self.notifications.push(Notification::info("First action! Day 1 streak started".to_string()));
+                self.notifications.push(Notification::info(
+                    "First action! Day 1 streak started".to_string(),
+                ));
             }
         }
 
@@ -9260,7 +10656,10 @@ impl App {
                 true,
             );
 
-            self.notifications.push(Notification::info(format!("LEVEL UP! You reached Level {}!", new_level)));
+            self.notifications.push(Notification::info(format!(
+                "LEVEL UP! You reached Level {}!",
+                new_level
+            )));
 
             self.simulate_memory_fragment_unlock("level_up")?;
 
@@ -9458,7 +10857,10 @@ impl App {
 
                         self.apply_class_quest_rewards(class_name, quest_level, &q.2, &q.7)?;
 
-                        self.notifications.push(Notification::info(format!("QUEST SUCCESS: {} completed!", q.2)));
+                        self.notifications.push(Notification::info(format!(
+                            "QUEST SUCCESS: {} completed!",
+                            q.2
+                        )));
                         self.push_great_chronicle_async(
                             "ClassQuest",
                             "accomplished a class quest.",
@@ -9498,7 +10900,9 @@ impl App {
             .any(|a| a.id == "scholar" && a.unlocked_at.is_some());
         if scholar_unlocked && self.db.unlock_relic("ancient_quill")? {
             self.db.add_chronicle_entry(day_number, "Acquired legendary relic: the Ancient Quill. It writes with invisible ink that glows only under moonlight.")?;
-            self.notifications.push(Notification::info("Relic Unlocked: Ancient Quill!".to_string()));
+            self.notifications.push(Notification::info(
+                "Relic Unlocked: Ancient Quill!".to_string(),
+            ));
             self.push_great_chronicle_async("Relic", "unlocked the Ancient Quill.", true);
         }
 
@@ -9507,25 +10911,33 @@ impl App {
             .any(|a| a.id == "project_master" && a.unlocked_at.is_some());
         if proj_master_unlocked && self.db.unlock_relic("crystal_compass")? {
             self.db.add_chronicle_entry(day_number, "Found legendary relic: the Crystal Compass. Its needle points toward the nearest unfinished task.")?;
-            self.notifications.push(Notification::info("Relic Unlocked: Crystal Compass!".to_string()));
+            self.notifications.push(Notification::info(
+                "Relic Unlocked: Crystal Compass!".to_string(),
+            ));
             self.push_great_chronicle_async("Relic", "unlocked the Crystal Compass.", true);
         }
 
         if user_ref.level >= 50 && self.db.unlock_relic("rune_tablet")? {
             self.db.add_chronicle_entry(day_number, "Discovered legendary relic: the Rune Tablet. An ancient stone slab pulsing with tree energy.")?;
-            self.notifications.push(Notification::info("Relic Unlocked: Rune Tablet!".to_string()));
+            self.notifications.push(Notification::info(
+                "Relic Unlocked: Rune Tablet!".to_string(),
+            ));
             self.push_great_chronicle_async("Relic", "unlocked the Rune Tablet.", true);
         }
 
         if streak_obj.best_streak >= 30 && self.db.unlock_relic("explorers_map")? {
             self.db.add_chronicle_entry(day_number, "Retrieved legendary relic: the Explorer's Map. A parchment depicting shifting paths.")?;
-            self.notifications.push(Notification::info("Relic Unlocked: Explorer's Map!".to_string()));
+            self.notifications.push(Notification::info(
+                "Relic Unlocked: Explorer's Map!".to_string(),
+            ));
             self.push_great_chronicle_async("Relic", "unlocked the Explorer's Map.", true);
         }
 
         if stats.sessions_completed >= 50 && self.db.unlock_relic("clock_of_focus")? {
             self.db.add_chronicle_entry(day_number, "Secured legendary relic: the Clock of Focus. A watch that ticks slower when you concentrate.")?;
-            self.notifications.push(Notification::info("Relic Unlocked: Clock of Focus!".to_string()));
+            self.notifications.push(Notification::info(
+                "Relic Unlocked: Clock of Focus!".to_string(),
+            ));
             self.push_great_chronicle_async("Relic", "unlocked the Clock of Focus.", true);
         }
 
@@ -9533,8 +10945,14 @@ impl App {
         if streak_obj.best_streak >= 30 && self.db.unlock_legendary_title("relentless")? {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: The Relentless.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: The Relentless!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as The Relentless.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: The Relentless!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as The Relentless.",
+                true,
+            );
         }
 
         let chronicler_unlocked = achievements
@@ -9545,8 +10963,14 @@ impl App {
         {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: The Archivist.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: The Archivist!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as The Archivist.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: The Archivist!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as The Archivist.",
+                true,
+            );
         }
 
         let deep_worker_unlocked = achievements
@@ -9557,8 +10981,14 @@ impl App {
         {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: The Focused.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: The Focused!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as The Focused.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: The Focused!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as The Focused.",
+                true,
+            );
         }
 
         let master_atmosphere = achievements
@@ -9567,8 +10997,14 @@ impl App {
         if master_atmosphere && self.db.unlock_legendary_title("master_seasons")? {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: Master of Seasons.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: Master of Seasons!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as Master of Seasons.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: Master of Seasons!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as Master of Seasons.",
+                true,
+            );
         }
 
         let ancient_gardener = achievements
@@ -9579,16 +11015,28 @@ impl App {
         {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: The Ancient Gardener.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: The Ancient Gardener!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as The Ancient Gardener.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: The Ancient Gardener!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as The Ancient Gardener.",
+                true,
+            );
         }
 
         let entries = self.db.get_chronicle_entries()?;
         if entries.len() >= 50 && self.db.unlock_legendary_title("keeper_chronicles")? {
             self.db
                 .add_chronicle_entry(day_number, "Earned Legendary Title: Keeper of Chronicles.")?;
-            self.notifications.push(Notification::info("Legendary Title Unlocked: Keeper of Chronicles!".to_string()));
-            self.push_great_chronicle_async("Legend", "entered the Hall of Legends as Keeper of Chronicles.", true);
+            self.notifications.push(Notification::info(
+                "Legendary Title Unlocked: Keeper of Chronicles!".to_string(),
+            ));
+            self.push_great_chronicle_async(
+                "Legend",
+                "entered the Hall of Legends as Keeper of Chronicles.",
+                true,
+            );
         }
 
         // --- LORE LIBRARY UNLOCK CHECKS ---
@@ -9608,7 +11056,10 @@ impl App {
                 if self.db.get_setting(&notif_key)?.is_none() {
                     if self.db.unlock_lore_entry(&class_key)? {
                         let _ = self.db.set_setting(&notif_key, "1");
-                        self.notifications.push(Notification::info(format!("New Class Lore Unlocked in Library! (Level {})", lvl)));
+                        self.notifications.push(Notification::info(format!(
+                            "New Class Lore Unlocked in Library! (Level {})",
+                            lvl
+                        )));
                         self.push_great_chronicle_async(
                             "ClassStory",
                             &format!("unlocked a class story at Level {}.", lvl),
@@ -9623,10 +11074,18 @@ impl App {
         }
 
         if user_ref.level >= 40 {
-            if self.db.get_setting("lore_notified_class_council_orders")?.is_none() {
+            if self
+                .db
+                .get_setting("lore_notified_class_council_orders")?
+                .is_none()
+            {
                 if self.db.unlock_lore_entry("class_council_orders")? {
-                    let _ = self.db.set_setting("lore_notified_class_council_orders", "1");
-                    self.notifications.push(Notification::info("The Council of Orders Unlocked in Library!".to_string()));
+                    let _ = self
+                        .db
+                        .set_setting("lore_notified_class_council_orders", "1");
+                    self.notifications.push(Notification::info(
+                        "The Council of Orders Unlocked in Library!".to_string(),
+                    ));
                 }
             } else {
                 // notif_key set but entry may still be locked (e.g. backup restore) — silently repair
@@ -9642,7 +11101,10 @@ impl App {
                 if self.db.get_setting(&notif_key)?.is_none() {
                     if self.db.unlock_lore_entry(&world_key)? {
                         let _ = self.db.set_setting(&notif_key, "1");
-                        self.notifications.push(Notification::info(format!("World History Chapter {} Unlocked in Library!", i)));
+                        self.notifications.push(Notification::info(format!(
+                            "World History Chapter {} Unlocked in Library!",
+                            i
+                        )));
                         self.push_great_chronicle_async(
                             "WorldLore",
                             &format!("uncovered World History Chapter {}.", i),
@@ -9692,7 +11154,10 @@ impl App {
                     quest_name, class_name
                 ),
             )?;
-            self.notifications.push(Notification::info(format!("Embarked on quest: {}!", quest_name)));
+            self.notifications.push(Notification::info(format!(
+                "Embarked on quest: {}!",
+                quest_name
+            )));
             self.reload_data()?;
         } else if status == "Active" && progress >= target {
             self.db.complete_class_quest(class_name, unlock_level)?;
@@ -9714,7 +11179,10 @@ impl App {
                 "VICTORY",
             );
 
-            self.notifications.push(Notification::info(format!("Quest Completed: {}!", quest_name)));
+            self.notifications.push(Notification::info(format!(
+                "Quest Completed: {}!",
+                quest_name
+            )));
             self.check_action_achievements()?;
             self.reload_data()?;
         }
@@ -9731,28 +11199,44 @@ impl App {
         // Puntaje por relevancia: coincidencia exacta > empieza con > contiene en título > contiene en cuerpo
         let score_match = |title: &str, content: Option<&str>| -> Option<u8> {
             let t = title.to_lowercase();
-            if t == q { return Some(100); }
-            if t.starts_with(&q) { return Some(80); }
-            if t.contains(&q) { return Some(60); }
-            if content.map(|c| c.to_lowercase().contains(&q)).unwrap_or(false) { return Some(30); }
+            if t == q {
+                return Some(100);
+            }
+            if t.starts_with(&q) {
+                return Some(80);
+            }
+            if t.contains(&q) {
+                return Some(60);
+            }
+            if content
+                .map(|c| c.to_lowercase().contains(&q))
+                .unwrap_or(false)
+            {
+                return Some(30);
+            }
             None
         };
 
         let projects = self.db.get_projects().unwrap_or_default();
-        let project_name: std::collections::HashMap<uuid::Uuid, &str> = projects.iter()
-            .map(|p| (p.id, p.name.as_str()))
-            .collect();
+        let project_name: std::collections::HashMap<uuid::Uuid, &str> =
+            projects.iter().map(|p| (p.id, p.name.as_str())).collect();
 
         // 1. Proyectos
         for p in &projects {
             if let Some(s) = score_match(&p.name, p.description.as_deref()) {
-                scored.push((s, SearchResult {
-                    result_type: SearchResultType::Project,
-                    title: p.name.clone(),
-                    details: p.description.clone().unwrap_or_else(|| "No description".to_string()),
-                    project_id: Some(p.id),
-                    item_id: p.id.to_string(),
-                }));
+                scored.push((
+                    s,
+                    SearchResult {
+                        result_type: SearchResultType::Project,
+                        title: p.name.clone(),
+                        details: p
+                            .description
+                            .clone()
+                            .unwrap_or_else(|| "No description".to_string()),
+                        project_id: Some(p.id),
+                        item_id: p.id.to_string(),
+                    },
+                ));
             }
         }
 
@@ -9760,23 +11244,33 @@ impl App {
         if let Ok(tasks) = self.db.get_tasks() {
             for t in &tasks {
                 if let Some(s) = score_match(&t.title, t.description.as_deref()) {
-                    let proj = t.project_id.and_then(|id| project_name.get(&id)).copied().unwrap_or("—");
+                    let proj = t
+                        .project_id
+                        .and_then(|id| project_name.get(&id))
+                        .copied()
+                        .unwrap_or("—");
                     if t.parent_task_id.is_none() {
-                        scored.push((s, SearchResult {
-                            result_type: SearchResultType::Task,
-                            title: t.title.clone(),
-                            details: format!("{} · {} priority", proj, t.priority.name()),
-                            project_id: t.project_id,
-                            item_id: t.id.to_string(),
-                        }));
+                        scored.push((
+                            s,
+                            SearchResult {
+                                result_type: SearchResultType::Task,
+                                title: t.title.clone(),
+                                details: format!("{} · {} priority", proj, t.priority.name()),
+                                project_id: t.project_id,
+                                item_id: t.id.to_string(),
+                            },
+                        ));
                     } else {
-                        scored.push((s, SearchResult {
-                            result_type: SearchResultType::Step,
-                            title: t.title.clone(),
-                            details: format!("{} · subquest", proj),
-                            project_id: t.project_id,
-                            item_id: t.id.to_string(),
-                        }));
+                        scored.push((
+                            s,
+                            SearchResult {
+                                result_type: SearchResultType::Step,
+                                title: t.title.clone(),
+                                details: format!("{} · subquest", proj),
+                                project_id: t.project_id,
+                                item_id: t.id.to_string(),
+                            },
+                        ));
                     }
                 }
             }
@@ -9787,15 +11281,22 @@ impl App {
             if let Ok(notes) = self.db.get_notes_for_project(p.id) {
                 for n in &notes {
                     if let Some(s) = score_match(&n.title, Some(&n.markdown_content)) {
-                        let snippet: String = n.markdown_content
-                            .chars().take(50).collect::<String>().replace('\n', " ");
-                        scored.push((s, SearchResult {
-                            result_type: SearchResultType::Note,
-                            title: n.title.clone(),
-                            details: format!("{} · {}", p.name, snippet),
-                            project_id: Some(p.id),
-                            item_id: n.id.to_string(),
-                        }));
+                        let snippet: String = n
+                            .markdown_content
+                            .chars()
+                            .take(50)
+                            .collect::<String>()
+                            .replace('\n', " ");
+                        scored.push((
+                            s,
+                            SearchResult {
+                                result_type: SearchResultType::Note,
+                                title: n.title.clone(),
+                                details: format!("{} · {}", p.name, snippet),
+                                project_id: Some(p.id),
+                                item_id: n.id.to_string(),
+                            },
+                        ));
                     }
                 }
             }
@@ -9807,13 +11308,16 @@ impl App {
                 for j in &journals {
                     if j.content.to_lowercase().contains(&q) {
                         let snippet: String = j.content.chars().take(50).collect();
-                        scored.push((30, SearchResult {
-                            result_type: SearchResultType::JournalEntry,
-                            title: format!("Journal - {}", j.entry_date),
-                            details: format!("{} · {}", p.name, snippet),
-                            project_id: Some(p.id),
-                            item_id: j.id.to_string(),
-                        }));
+                        scored.push((
+                            30,
+                            SearchResult {
+                                result_type: SearchResultType::JournalEntry,
+                                title: format!("Journal - {}", j.entry_date),
+                                details: format!("{} · {}", p.name, snippet),
+                                project_id: Some(p.id),
+                                item_id: j.id.to_string(),
+                            },
+                        ));
                     }
                 }
             }
@@ -9824,14 +11328,21 @@ impl App {
             if let Ok(milestones) = self.db.get_milestones_for_project(p.id) {
                 for m in &milestones {
                     if let Some(s) = score_match(&m.name, m.description.as_deref()) {
-                        let status = if m.completed { "Completed" } else { "In Progress" };
-                        scored.push((s, SearchResult {
-                            result_type: SearchResultType::Milestone,
-                            title: m.name.clone(),
-                            details: format!("{} · {}", p.name, status),
-                            project_id: Some(p.id),
-                            item_id: m.id.to_string(),
-                        }));
+                        let status = if m.completed {
+                            "Completed"
+                        } else {
+                            "In Progress"
+                        };
+                        scored.push((
+                            s,
+                            SearchResult {
+                                result_type: SearchResultType::Milestone,
+                                title: m.name.clone(),
+                                details: format!("{} · {}", p.name, status),
+                                project_id: Some(p.id),
+                                item_id: m.id.to_string(),
+                            },
+                        ));
                     }
                 }
             }
@@ -9841,14 +11352,21 @@ impl App {
         if let Ok(achievements) = self.db.get_achievements() {
             for a in &achievements {
                 if let Some(s) = score_match(&a.name, Some(&a.description)) {
-                    let status = if a.unlocked_at.is_some() { "Unlocked" } else { "Locked" };
-                    scored.push((s, SearchResult {
-                        result_type: SearchResultType::Achievement,
-                        title: format!("Achievement: {}", a.name),
-                        details: format!("{} ({})", a.description, status),
-                        project_id: None,
-                        item_id: a.id.clone(),
-                    }));
+                    let status = if a.unlocked_at.is_some() {
+                        "Unlocked"
+                    } else {
+                        "Locked"
+                    };
+                    scored.push((
+                        s,
+                        SearchResult {
+                            result_type: SearchResultType::Achievement,
+                            title: format!("Achievement: {}", a.name),
+                            details: format!("{} ({})", a.description, status),
+                            project_id: None,
+                            item_id: a.id.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -9857,13 +11375,20 @@ impl App {
         if let Ok(lore) = self.db.get_lore_entries() {
             for l in &lore {
                 if let Some(s) = score_match(&l.2, Some(&l.3)) {
-                    scored.push((s, SearchResult {
-                        result_type: SearchResultType::Lore,
-                        title: format!("Lore: {}", l.2),
-                        details: format!("Category: {} - {}", l.1, if l.4 { "Unlocked" } else { "Locked" }),
-                        project_id: None,
-                        item_id: l.0.clone(),
-                    }));
+                    scored.push((
+                        s,
+                        SearchResult {
+                            result_type: SearchResultType::Lore,
+                            title: format!("Lore: {}", l.2),
+                            details: format!(
+                                "Category: {} - {}",
+                                l.1,
+                                if l.4 { "Unlocked" } else { "Locked" }
+                            ),
+                            project_id: None,
+                            item_id: l.0.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -9872,13 +11397,16 @@ impl App {
         if let Ok(entries) = self.db.get_chronicle_entries() {
             for e in &entries {
                 if e.2.to_lowercase().contains(&q) {
-                    scored.push((30, SearchResult {
-                        result_type: SearchResultType::ChronicleEntry,
-                        title: format!("Chronicle Day {}", e.1),
-                        details: e.2.clone(),
-                        project_id: None,
-                        item_id: e.0.clone(),
-                    }));
+                    scored.push((
+                        30,
+                        SearchResult {
+                            result_type: SearchResultType::ChronicleEntry,
+                            title: format!("Chronicle Day {}", e.1),
+                            details: e.2.clone(),
+                            project_id: None,
+                            item_id: e.0.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -9890,13 +11418,19 @@ impl App {
                 if let Some(s) = score_match(&r.name, r.description.as_deref()) {
                     let streak = streaks.get(&r.id).copied().unwrap_or(0);
                     let desc = r.description.clone().unwrap_or_else(|| r.frequency.clone());
-                    scored.push((s, SearchResult {
-                        result_type: SearchResultType::Ritual,
-                        title: r.name.clone(),
-                        details: format!("{} · {} XP · {} day streak", desc, r.reward_xp, streak),
-                        project_id: None,
-                        item_id: r.id.clone(),
-                    }));
+                    scored.push((
+                        s,
+                        SearchResult {
+                            result_type: SearchResultType::Ritual,
+                            title: r.name.clone(),
+                            details: format!(
+                                "{} · {} XP · {} day streak",
+                                desc, r.reward_xp, streak
+                            ),
+                            project_id: None,
+                            item_id: r.id.clone(),
+                        },
+                    ));
                 }
             }
         }
@@ -9930,34 +11464,43 @@ impl App {
                         self.reload_data()?;
                         // Construye la lista plana idéntica al renderer para encontrar la posición correcta
                         let tasks = self.db.get_tasks_for_project(p_id).unwrap_or_default();
-                        let mut parents: Vec<&crate::models::Task> = tasks.iter()
+                        let mut parents: Vec<&crate::models::Task> = tasks
+                            .iter()
                             .filter(|t| t.parent_task_id.is_none())
                             .collect();
                         match self.task_sort.as_str() {
                             "DueDate" => parents.sort_by(|a, b| {
-                                a.completed.cmp(&b.completed).then_with(|| match (a.due_date, b.due_date) {
-                                    (Some(d1), Some(d2)) => d1.cmp(&d2),
-                                    (Some(_), None) => std::cmp::Ordering::Less,
-                                    (None, Some(_)) => std::cmp::Ordering::Greater,
-                                    (None, None) => a.created_at.cmp(&b.created_at),
+                                a.completed.cmp(&b.completed).then_with(|| {
+                                    match (a.due_date, b.due_date) {
+                                        (Some(d1), Some(d2)) => d1.cmp(&d2),
+                                        (Some(_), None) => std::cmp::Ordering::Less,
+                                        (None, Some(_)) => std::cmp::Ordering::Greater,
+                                        (None, None) => a.created_at.cmp(&b.created_at),
+                                    }
                                 })
                             }),
                             "Priority" => parents.sort_by(|a, b| {
-                                a.completed.cmp(&b.completed).then_with(|| b.priority.cmp(&a.priority))
+                                a.completed
+                                    .cmp(&b.completed)
+                                    .then_with(|| b.priority.cmp(&a.priority))
                             }),
                             "Alphabetical" => parents.sort_by(|a, b| {
-                                a.completed.cmp(&b.completed)
-                                    .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
+                                a.completed.cmp(&b.completed).then_with(|| {
+                                    a.title.to_lowercase().cmp(&b.title.to_lowercase())
+                                })
                             }),
                             _ => parents.sort_by(|a, b| {
-                                a.completed.cmp(&b.completed).then_with(|| b.created_at.cmp(&a.created_at))
+                                a.completed
+                                    .cmp(&b.completed)
+                                    .then_with(|| b.created_at.cmp(&a.created_at))
                             }),
                         }
                         let mut flat_ids: Vec<uuid::Uuid> = Vec::new();
                         for parent in &parents {
                             flat_ids.push(parent.id);
                             if !parent.completed {
-                                let mut steps: Vec<&crate::models::Task> = tasks.iter()
+                                let mut steps: Vec<&crate::models::Task> = tasks
+                                    .iter()
                                     .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
                                     .collect();
                                 steps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -9985,17 +11528,21 @@ impl App {
                     if let Ok(step_uuid) = uuid::Uuid::parse_str(&result.item_id) {
                         self.reload_data()?;
                         let tasks = self.db.get_tasks_for_project(p_id).unwrap_or_default();
-                        let mut parents: Vec<&crate::models::Task> = tasks.iter()
+                        let mut parents: Vec<&crate::models::Task> = tasks
+                            .iter()
                             .filter(|t| t.parent_task_id.is_none())
                             .collect();
                         parents.sort_by(|a, b| {
-                            a.completed.cmp(&b.completed).then_with(|| b.created_at.cmp(&a.created_at))
+                            a.completed
+                                .cmp(&b.completed)
+                                .then_with(|| b.created_at.cmp(&a.created_at))
                         });
                         let mut flat_ids: Vec<uuid::Uuid> = Vec::new();
                         for parent in &parents {
                             flat_ids.push(parent.id);
                             if !parent.completed {
-                                let mut steps: Vec<&crate::models::Task> = tasks.iter()
+                                let mut steps: Vec<&crate::models::Task> = tasks
+                                    .iter()
                                     .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
                                     .collect();
                                 steps.sort_by(|a, b| b.created_at.cmp(&a.created_at));
@@ -10022,10 +11569,13 @@ impl App {
                         let codices = self.db.get_codices_for_project(p_id).unwrap_or_default();
                         // Full tree is always visible — just find the note's position
                         let flat = Self::build_notes_flat(&notes, &codices, p_id);
-                        let flat_note_ids: Vec<Option<uuid::Uuid>> = flat.iter().map(|(_, ni)| {
-                            ni.and_then(|i| notes.get(i)).map(|n| n.id)
-                        }).collect();
-                        if let Some(pos) = flat_note_ids.iter().position(|id| *id == Some(note_uuid)) {
+                        let flat_note_ids: Vec<Option<uuid::Uuid>> = flat
+                            .iter()
+                            .map(|(_, ni)| ni.and_then(|i| notes.get(i)).map(|n| n.id))
+                            .collect();
+                        if let Some(pos) =
+                            flat_note_ids.iter().position(|id| *id == Some(note_uuid))
+                        {
                             self.selected_notes_flat_idx = pos;
                         }
                         return Ok(());
@@ -10037,7 +11587,10 @@ impl App {
                     self.active_project_id = Some(p_id);
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 2;
-                    let journal = self.db.get_journal_entries_for_project(p_id).unwrap_or_default();
+                    let journal = self
+                        .db
+                        .get_journal_entries_for_project(p_id)
+                        .unwrap_or_default();
                     if let Ok(journal_uuid) = uuid::Uuid::parse_str(&result.item_id) {
                         if let Some(pos) = journal.iter().position(|j| j.id == journal_uuid) {
                             self.selected_journal_idx = pos;
@@ -10091,89 +11644,96 @@ impl App {
         Ok(())
     }
 
-fn parse_companion_last_seen(last_seen_raw: &str) -> (bool, String) {
-    if last_seen_raw.is_empty() {
-        return (false, "Never".to_string());
-    }
-    // MySQL TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
-    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(last_seen_raw, "%Y-%m-%d %H:%M:%S") {
-        let dt = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
-        let diff = chrono::Utc::now().signed_duration_since(dt);
-        let online = diff.num_minutes() < 15;
-        let display = if diff.num_minutes() < 1 {
-            "Just now".to_string()
-        } else if diff.num_hours() < 1 {
-            format!("{} min ago", diff.num_minutes())
-        } else if diff.num_days() < 1 {
-            format!("{} hr ago", diff.num_hours())
-        } else {
-            format!("{} days ago", diff.num_days())
-        };
-        (online, display)
-    } else {
-        (false, last_seen_raw.to_string())
-    }
-}
-
-fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
-    if query.is_empty() {
-        return Some(0);
-    }
-    let q_lower = query.to_lowercase();
-    let t_lower = target.to_lowercase();
-
-    // Check if the query is a substring
-    if let Some(idx) = t_lower.find(&q_lower) {
-        let mut score = 1000 - (idx as i32);
-        if idx == 0 {
-            score += 500; // starts with query bonus
+    fn parse_companion_last_seen(last_seen_raw: &str) -> (bool, String) {
+        if last_seen_raw.is_empty() {
+            return (false, "Never".to_string());
         }
-        return Some(score);
+        // MySQL TIMESTAMP format: "YYYY-MM-DD HH:MM:SS"
+        if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(last_seen_raw, "%Y-%m-%d %H:%M:%S")
+        {
+            let dt = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc);
+            let diff = chrono::Utc::now().signed_duration_since(dt);
+            let online = diff.num_minutes() < 15;
+            let display = if diff.num_minutes() < 1 {
+                "Just now".to_string()
+            } else if diff.num_hours() < 1 {
+                format!("{} min ago", diff.num_minutes())
+            } else if diff.num_days() < 1 {
+                format!("{} hr ago", diff.num_hours())
+            } else {
+                format!("{} days ago", diff.num_days())
+            };
+            (online, display)
+        } else {
+            (false, last_seen_raw.to_string())
+        }
     }
 
-    // Fuzzy sequence matching
-    let mut q_chars = q_lower.chars().peekable();
-    let mut score = 0;
-    let mut last_match_idx: Option<usize> = None;
+    fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
+        if query.is_empty() {
+            return Some(0);
+        }
+        let q_lower = query.to_lowercase();
+        let t_lower = target.to_lowercase();
 
-    for (idx, t_char) in t_lower.chars().enumerate() {
-        if let Some(&q_char) = q_chars.peek() {
-            if t_char == q_char {
-                q_chars.next();
-                
-                // Add points for matching
-                score += 10;
-
-                // Consecutive match bonus
-                if let Some(prev) = last_match_idx {
-                    if idx == prev + 1 {
-                        score += 30;
-                    } else {
-                        score -= (idx - prev) as i32; // gap penalty
-                    }
-                } else {
-                    // First character match penalty based on how far it is from the start
-                    score -= idx as i32;
-                }
-
-                // Word boundary bonus: if target character is preceded by a space/delimiter
-                if idx == 0 || t_lower.chars().nth(idx - 1).map(|c| !c.is_alphanumeric()).unwrap_or(false) {
-                    score += 50;
-                }
-
-                last_match_idx = Some(idx);
+        // Check if the query is a substring
+        if let Some(idx) = t_lower.find(&q_lower) {
+            let mut score = 1000 - (idx as i32);
+            if idx == 0 {
+                score += 500; // starts with query bonus
             }
+            return Some(score);
+        }
+
+        // Fuzzy sequence matching
+        let mut q_chars = q_lower.chars().peekable();
+        let mut score = 0;
+        let mut last_match_idx: Option<usize> = None;
+
+        for (idx, t_char) in t_lower.chars().enumerate() {
+            if let Some(&q_char) = q_chars.peek() {
+                if t_char == q_char {
+                    q_chars.next();
+
+                    // Add points for matching
+                    score += 10;
+
+                    // Consecutive match bonus
+                    if let Some(prev) = last_match_idx {
+                        if idx == prev + 1 {
+                            score += 30;
+                        } else {
+                            score -= (idx - prev) as i32; // gap penalty
+                        }
+                    } else {
+                        // First character match penalty based on how far it is from the start
+                        score -= idx as i32;
+                    }
+
+                    // Word boundary bonus: if target character is preceded by a space/delimiter
+                    if idx == 0
+                        || t_lower
+                            .chars()
+                            .nth(idx - 1)
+                            .map(|c| !c.is_alphanumeric())
+                            .unwrap_or(false)
+                    {
+                        score += 50;
+                    }
+
+                    last_match_idx = Some(idx);
+                }
+            } else {
+                break;
+            }
+        }
+
+        if q_chars.peek().is_none() {
+            Some(score)
         } else {
-            break;
+            None
         }
     }
-
-    if q_chars.peek().is_none() {
-        Some(score)
-    } else {
-        None
-    }
-}
 
     pub fn get_available_command_actions(&self, filter: &str) -> Vec<CommandAction> {
         let all_actions = vec![
@@ -10224,6 +11784,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 description: "Navigate to Sync Settings",
                 shortcut: "8",
                 id: "open_sync",
+            },
+            CommandAction {
+                name: "Open Settings",
+                description: "Theme Questline and configure app preferences",
+                shortcut: "9",
+                id: "open_settings",
             },
             CommandAction {
                 name: "Open Focus",
@@ -10325,7 +11891,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 })
                 .collect();
             scored_actions.sort_by(|a, b| b.0.cmp(&a.0));
-            scored_actions.into_iter().map(|(_, action)| action).collect()
+            scored_actions
+                .into_iter()
+                .map(|(_, action)| action)
+                .collect()
         }
     }
 
@@ -10354,6 +11923,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.active_screen = ActiveScreen::SyncSettings;
                 self.active_tab_idx = 12;
             }
+            "open_settings" => {
+                self.active_screen = ActiveScreen::Settings;
+                self.active_tab_idx = 15;
+            }
             "open_stats" => {
                 self.active_screen = ActiveScreen::Legends;
                 self.active_tab_idx = 5;
@@ -10362,7 +11935,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.active_screen = ActiveScreen::Fellowship;
                 self.active_tab_idx = 8;
                 self.pull_invitations_async();
-                let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                let _ = self
+                    .db
+                    .set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                 self.reload_data()?;
             }
             "open_chronicle" => {
@@ -10499,8 +12074,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         let (bonus_xp, label): (i32, &str) = match (class, trigger) {
             // Task Paladin
             (ClassType::TaskPaladin, "task_complete") => (5, "Passive: Paladin Task Zeal"),
-            (ClassType::TaskPaladin, "high_priority_task") => (10, "Passive: Paladin Priority Strike"),
-            (ClassType::TaskPaladin, "daily_adventure_chain") => (15, "Passive: Paladin Oath Fulfilled"),
+            (ClassType::TaskPaladin, "high_priority_task") => {
+                (10, "Passive: Paladin Priority Strike")
+            }
+            (ClassType::TaskPaladin, "daily_adventure_chain") => {
+                (15, "Passive: Paladin Oath Fulfilled")
+            }
 
             // Code Warlock
             (ClassType::CodeWarlock, "note_create") => (5, "Passive: Warlock Scroll Conjured"),
@@ -10509,24 +12088,44 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             (ClassType::CodeWarlock, "sync_complete") => (3, "Passive: Warlock Daemon Sync"),
 
             // Mind Sage
-            (ClassType::MindSage, "note_create") if word_count > 500 => (10, "Passive: Sage Deep Knowledge"),
-            (ClassType::MindSage, "note_edit") if word_count > 500 => (10, "Passive: Sage Deep Knowledge"),
+            (ClassType::MindSage, "note_create") if word_count > 500 => {
+                (10, "Passive: Sage Deep Knowledge")
+            }
+            (ClassType::MindSage, "note_edit") if word_count > 500 => {
+                (10, "Passive: Sage Deep Knowledge")
+            }
             (ClassType::MindSage, "journal_create") => (5, "Passive: Sage Wisdom Recorded"),
             (ClassType::MindSage, "memory_fragment") => (5, "Passive: Sage Fragment Insight"),
 
             // Systems Architect
-            (ClassType::SystemsArchitect, "project_create") => (10, "Passive: Architect Blueprint Drawn"),
-            (ClassType::SystemsArchitect, "project_archive") => (15, "Passive: Architect Order Sealed"),
-            (ClassType::SystemsArchitect, "project_restore") => (5, "Passive: Architect System Restored"),
+            (ClassType::SystemsArchitect, "project_create") => {
+                (10, "Passive: Architect Blueprint Drawn")
+            }
+            (ClassType::SystemsArchitect, "project_archive") => {
+                (15, "Passive: Architect Order Sealed")
+            }
+            (ClassType::SystemsArchitect, "project_restore") => {
+                (5, "Passive: Architect System Restored")
+            }
 
             // Time Chronomancer
-            (ClassType::TimeChronomancer, "focus_session") => (10, "Passive: Chronomancer Hour Mastered"),
-            (ClassType::TimeChronomancer, "focus_pomodoro") => (25, "Passive: Chronomancer Cycle Complete"),
-            (ClassType::TimeChronomancer, "daily_adventure_complete") => (5, "Passive: Chronomancer Time Invested"),
+            (ClassType::TimeChronomancer, "focus_session") => {
+                (10, "Passive: Chronomancer Hour Mastered")
+            }
+            (ClassType::TimeChronomancer, "focus_pomodoro") => {
+                (25, "Passive: Chronomancer Cycle Complete")
+            }
+            (ClassType::TimeChronomancer, "daily_adventure_complete") => {
+                (5, "Passive: Chronomancer Time Invested")
+            }
 
             // Arch Accountant (event-specific; global bonus is in xp.rs)
-            (ClassType::ArchAccountant, "daily_adventure_chain") => (10, "Passive: Accountant Full Ledger"),
-            (ClassType::ArchAccountant, "streak_maintain") => (5, "Passive: Accountant Compound Returns"),
+            (ClassType::ArchAccountant, "daily_adventure_chain") => {
+                (10, "Passive: Accountant Full Ledger")
+            }
+            (ClassType::ArchAccountant, "streak_maintain") => {
+                (5, "Passive: Accountant Compound Returns")
+            }
 
             _ => return Ok(()),
         };
@@ -10542,13 +12141,22 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return Ok(());
         }
 
-        self.notifications.push(Notification::info(format!("{} +{} XP", label.trim_start_matches("Passive: "), bonus_xp)));
+        self.notifications.push(Notification::info(format!(
+            "{} +{} XP",
+            label.trim_start_matches("Passive: "),
+            bonus_xp
+        )));
 
         Ok(())
     }
 
     pub fn simulate_memory_fragment_unlock(&mut self, trigger: &str) -> Result<()> {
-        let multiplier = if self.user.as_ref().map(|u| u.class == ClassType::MindSage).unwrap_or(false) {
+        let multiplier = if self
+            .user
+            .as_ref()
+            .map(|u| u.class == ClassType::MindSage)
+            .unwrap_or(false)
+        {
             1.1
         } else {
             1.0
@@ -10617,7 +12225,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             self.prologue_delay_ticks -= 1;
             return;
         }
-        use crate::screens::prologue::{page_lines, LineKind};
+        use crate::screens::prologue::{LineKind, page_lines};
         let lines = page_lines(self.prologue_page);
         let total = lines.len();
 
@@ -10674,16 +12282,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
         }
 
-        use rand::prelude::SliceRandom;
         use rand::Rng;
+        use rand::prelude::SliceRandom;
         let mut rng = rand::thread_rng();
 
         let max_particles = match effect {
-            3 => 120, // Rain
-            6 => 120, // Matrix Rain
-            4 => 60,  // Snow
+            3 => 120,    // Rain
+            6 => 120,    // Matrix Rain
+            4 => 60,     // Snow
             1 | 5 => 50, // Leaves, Runes
-            2 => 40,  // Stars
+            2 => 40,     // Stars
             _ => 30,
         };
         let max_particles = if burst_active {
@@ -10696,8 +12304,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             1.0
         } else {
             match effect {
-            3 | 6 => 0.5, // High spawn rate for rain/matrix
-            _ => 0.25,
+                3 | 6 => 0.5, // High spawn rate for rain/matrix
+                _ => 0.25,
             }
         };
 
@@ -10714,9 +12322,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 5 => *['A', '7', '@', '#', '!', 'Z', '$', '%']
                     .choose(&mut rng)
                     .unwrap_or(&'*'),
-                6 => *['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z', '@', '#', '$', '%', '&', '*', '+', '=', '<', '>', '?']
-                    .choose(&mut rng)
-                    .unwrap_or(&'1'),
+                6 => *[
+                    '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f',
+                    'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v',
+                    'w', 'x', 'y', 'z', '@', '#', '$', '%', '&', '*', '+', '=', '<', '>', '?',
+                ]
+                .choose(&mut rng)
+                .unwrap_or(&'1'),
                 _ => '*',
             };
 
@@ -10754,7 +12366,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
             self.ambient_particles.push(Particle {
                 x: rng.gen_range(0..200),
-                y: if burst_active { rng.gen_range(1.0..18.0) } else { 0.0 },
+                y: if burst_active {
+                    rng.gen_range(1.0..18.0)
+                } else {
+                    0.0
+                },
                 speed,
                 symbol,
                 color,
@@ -10798,13 +12414,25 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if self.db.count_completed_tasks_where("priority = 'High'")? >= 25 {
             self.unlock_achievement("high_priority_slayer")?;
         }
-        if self.db.count_completed_tasks_where("parent_task_id IS NOT NULL")? >= 50 {
+        if self
+            .db
+            .count_completed_tasks_where("parent_task_id IS NOT NULL")?
+            >= 50
+        {
             self.unlock_achievement("step_sweeper")?;
         }
-        if self.db.count_completed_tasks_where("recurrence IS NOT NULL")? >= 25 {
+        if self
+            .db
+            .count_completed_tasks_where("recurrence IS NOT NULL")?
+            >= 25
+        {
             self.unlock_achievement("recurring_keeper")?;
         }
-        if self.db.count_completed_tasks_where("due_date IS NOT NULL")? >= 50 {
+        if self
+            .db
+            .count_completed_tasks_where("due_date IS NOT NULL")?
+            >= 50
+        {
             self.unlock_achievement("deadline_dodger")?;
         }
 
@@ -10888,14 +12516,18 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if silent_count >= 50 {
             self.unlock_achievement("silent_adept")?;
         }
-        let forest_count = self.db.count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
+        let forest_count = self
+            .db
+            .count_focus_sessions_with_soundscape(&["Forest Sounds"])?;
         if forest_count >= 50 {
             self.unlock_achievement("forest_wanderer")?;
         }
         if forest_count >= 100 {
             self.unlock_achievement("forest_warden")?;
         }
-        let rain_count = self.db.count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
+        let rain_count = self
+            .db
+            .count_focus_sessions_with_soundscape(&["Rain Sounds"])?;
         if rain_count >= 50 {
             self.unlock_achievement("rain_listener")?;
         }
@@ -10914,10 +12546,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
 
         let codex_count = self.db.count_codices().unwrap_or(0);
-        for (id, target) in [
-            ("archivist", 3),
-            ("grand_archivist", 10),
-        ] {
+        for (id, target) in [("archivist", 3), ("grand_archivist", 10)] {
             if codex_count >= target {
                 self.unlock_achievement(id)?;
             }
@@ -11072,13 +12701,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     &format!("Unlocked Achievement: {} - {}", ach.name, ach.description),
                 )?;
 
-                self.notifications.push(Notification::info(format!("ACHIEVEMENT UNLOCKED: {} ({})", ach.name, ach.description)));
+                self.notifications.push(Notification::info(format!(
+                    "ACHIEVEMENT UNLOCKED: {} ({})",
+                    ach.name, ach.description
+                )));
                 self.trigger_ambient_particles();
-                self.push_great_chronicle_async(
-                    "Achievement",
-                    "unlocked an achievement.",
-                    true,
-                );
+                self.push_great_chronicle_async("Achievement", "unlocked an achievement.", true);
             }
         }
         Ok(())
@@ -11087,7 +12715,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     pub fn tick_auto_sync(&mut self) -> Result<()> {
         // Apply result from completed background sync
         if self.sync_in_progress {
-            if let ModalType::SyncProgress { ref mut step, ref mut message } = self.modal_state {
+            if let ModalType::SyncProgress {
+                ref mut step,
+                ref mut message,
+            } = self.modal_state
+            {
                 if *step == 0 && self.intro_ticks % 12 == 0 {
                     *step = 1;
                     *message = "Publishing full local state and pulling new changes...".to_string();
@@ -11146,7 +12778,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
         let debounce = std::time::Duration::from_secs(2);
         let is_shared_workspace = self.active_screen == ActiveScreen::Workspace
-            && self.active_project_id
+            && self
+                .active_project_id
                 .and_then(|pid| self.projects.iter().find(|p| p.id == pid))
                 .map(|p| p.is_shared)
                 .unwrap_or(false);
@@ -11155,18 +12788,27 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         } else {
             std::time::Duration::from_secs(30)
         };
-        let mutation_ready = self.last_mutation
+        let mutation_ready = self
+            .last_mutation
             .map(|t| t.elapsed() >= debounce)
             .unwrap_or(false);
 
         // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días
-        let last_cleanup = self.db.get_setting("last_sync_cleanup").ok().flatten()
+        let last_cleanup = self
+            .db
+            .get_setting("last_sync_cleanup")
+            .ok()
+            .flatten()
             .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
             .map(|d| d.with_timezone(&chrono::Utc));
-        let cleanup_due = last_cleanup.map(|d| (chrono::Utc::now() - d).num_seconds() > 86400).unwrap_or(true);
+        let cleanup_due = last_cleanup
+            .map(|d| (chrono::Utc::now() - d).num_seconds() > 86400)
+            .unwrap_or(true);
         if cleanup_due {
             let _ = self.db.cleanup_old_sync_logs(30);
-            let _ = self.db.set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+            let _ = self
+                .db
+                .set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
         }
 
         if mutation_ready || self.last_auto_sync.elapsed() >= interval {
@@ -11196,7 +12838,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 Err(m) => m,
             };
             self.sync_status_msg = msg.clone();
-            if let ModalType::ExportProfile { ref mut backup_in_progress, ref mut backup_message, .. } = self.modal_state {
+            if let ModalType::ExportProfile {
+                ref mut backup_in_progress,
+                ref mut backup_message,
+                ..
+            } = self.modal_state
+            {
                 *backup_in_progress = false;
                 *backup_message = msg;
             }
@@ -11213,7 +12860,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             return;
         }
 
-        if let ModalType::CloudBackupProgress { ref mut step, ref mut message } = self.modal_state {
+        if let ModalType::CloudBackupProgress {
+            ref mut step,
+            ref mut message,
+        } = self.modal_state
+        {
             if *step == 0 && self.intro_ticks % 12 == 0 {
                 *step = 1;
                 *message = "Uploading backup to cloud...".to_string();
@@ -11225,12 +12876,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         } else {
             return;
         };
-        let Some(result) = outcome else { return; };
+        let Some(result) = outcome else {
+            return;
+        };
 
         match result {
             Ok(msg) => {
                 self.sync_status_msg = msg.clone();
-                self.notifications.push(Notification::info("Cloud Backup Saved!".to_string()));
+                self.notifications
+                    .push(Notification::info("Cloud Backup Saved!".to_string()));
                 self.modal_state = ModalType::CloudBackupProgress {
                     step: 2,
                     message: msg,
@@ -11286,7 +12940,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         } else {
             return Ok(());
         };
-        let Some(result) = outcome else { return Ok(()); };
+        let Some(result) = outcome else {
+            return Ok(());
+        };
 
         match result {
             Err(msg) => {
@@ -11302,8 +12958,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     message: "Importing chronicle data...".to_string(),
                 };
                 let decoded_json = {
-                    use base64::{engine::general_purpose::STANDARD, Engine as _};
-                    STANDARD.decode(json.trim())
+                    use base64::{Engine as _, engine::general_purpose::STANDARD};
+                    STANDARD
+                        .decode(json.trim())
                         .ok()
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json)
@@ -11317,10 +12974,14 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         );
                         let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                         self.reload_data()?;
-                        self.notifications.push(Notification::info("Chronicle restored from cloud!".to_string()));
+                        self.notifications.push(Notification::info(
+                            "Chronicle restored from cloud!".to_string(),
+                        ));
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
-                            message: "Restore complete! Future sync starts from the current cloud state.".to_string(),
+                            message:
+                                "Restore complete! Future sync starts from the current cloud state."
+                                    .to_string(),
                         };
                         // Backup restore is a full snapshot. Set the cursor to server HEAD first
                         // so old event-log history cannot replay over the restored database.
@@ -11342,10 +13003,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if !self.config.sync_enabled {
             return Ok(());
         }
-        let in_fellowship_chat = self.active_screen == ActiveScreen::Fellowship
-            && self.selected_fellowship_tab == 0;
+        let in_fellowship_chat =
+            self.active_screen == ActiveScreen::Fellowship && self.selected_fellowship_tab == 0;
         let in_shared_workspace = self.active_screen == ActiveScreen::Workspace
-            && self.active_project_id
+            && self
+                .active_project_id
                 .and_then(|id| self.projects.iter().find(|p| p.id == id))
                 .map(|p| p.is_shared)
                 .unwrap_or(false);
@@ -11363,9 +13025,14 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         self.last_chat_timestamp.insert(poll.project_id.clone(), ts);
                     }
                     if poll.new_message_count > 0 {
-                        let _ = self.db.set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
+                        let _ = self.db.set_setting(
+                            "last_viewed_fellowship",
+                            &chrono::Utc::now().to_rfc3339(),
+                        );
                         // Notificar si el usuario está en Workspace (no en la pestaña del chat)
-                        if self.active_screen != ActiveScreen::Fellowship || self.selected_fellowship_tab != 0 {
+                        if self.active_screen != ActiveScreen::Fellowship
+                            || self.selected_fellowship_tab != 0
+                        {
                             self.notifications.push(Notification::info(format!(
                                 "{} new message(s) from your fellowship.",
                                 poll.new_message_count
@@ -11408,7 +13075,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         };
 
         // Validar que el proyecto sea compartido antes de hacer llamadas de red
-        if !self.projects.iter().any(|p| p.id.to_string() == proj_id && p.is_shared) {
+        if !self
+            .projects
+            .iter()
+            .any(|p| p.id.to_string() == proj_id && p.is_shared)
+        {
             return Ok(());
         }
 
@@ -11422,7 +13093,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     |r| r.get(0),
                 ).unwrap_or_default();
                 if !max_ts.is_empty() {
-                    self.last_chat_timestamp.insert(proj_id.clone(), max_ts.clone());
+                    self.last_chat_timestamp
+                        .insert(proj_id.clone(), max_ts.clone());
                 }
                 max_ts
             }
@@ -11441,9 +13113,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
         let _ = std::thread::spawn(move || {
             let make_result = || -> anyhow::Result<ChatPollResult> {
-                let client = crate::services::api_client::ApiClient::new(
-                    &server_url, identity, &device_id,
-                );
+                let client =
+                    crate::services::api_client::ApiClient::new(&server_url, identity, &device_id);
                 let storage_dir = crate::storage::get_storage_dir()?;
                 let db = crate::database::Database::new(&storage_dir.join("questline.db"))?;
                 let _ = db.conn.execute_batch("PRAGMA busy_timeout = 1000;");
@@ -11453,7 +13124,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let path = if since_thread.is_empty() {
                     format!("chronicle/messages?project_id={}", proj_id_thread)
                 } else {
-                    format!("chronicle/messages?project_id={}&since={}", proj_id_thread, since_encoded)
+                    format!(
+                        "chronicle/messages?project_id={}&since={}",
+                        proj_id_thread, since_encoded
+                    )
                 };
 
                 let mut new_count = 0usize;
@@ -11465,12 +13139,22 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                             new_count = msgs.len();
                             for msg in msgs {
                                 let id = msg["id"].as_str().unwrap_or_default().to_string();
-                                let pid = msg["project_id"].as_str().unwrap_or_default().to_string();
-                                let sender_identity = msg["sender_identity"].as_str().unwrap_or_default().to_string();
-                                let sender_username = msg["sender_username"].as_str().unwrap_or_default().to_string();
-                                let content = msg["content"].as_str().unwrap_or_default().to_string();
-                                let message_type = msg["message_type"].as_str().unwrap_or("text").to_string();
-                                let timestamp = msg["timestamp"].as_str().unwrap_or_default().to_string();
+                                let pid =
+                                    msg["project_id"].as_str().unwrap_or_default().to_string();
+                                let sender_identity = msg["sender_identity"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let sender_username = msg["sender_username"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let content =
+                                    msg["content"].as_str().unwrap_or_default().to_string();
+                                let message_type =
+                                    msg["message_type"].as_str().unwrap_or("text").to_string();
+                                let timestamp =
+                                    msg["timestamp"].as_str().unwrap_or_default().to_string();
                                 if !timestamp.is_empty() {
                                     last_ts = Some(timestamp.clone());
                                 }
@@ -11492,7 +13176,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                                 let identity_key = m["user_identity"].as_str().unwrap_or_default();
                                 let username = m["user_username"].as_str().unwrap_or_default();
                                 let last_seen_raw = m["last_seen"].as_str().unwrap_or_default();
-                                let is_online = m["is_online"].as_i64().map(|n| n != 0).unwrap_or(false);
+                                let is_online =
+                                    m["is_online"].as_i64().map(|n| n != 0).unwrap_or(false);
                                 let display = if is_online {
                                     "Just now".to_string()
                                 } else if last_seen_raw.is_empty() {
@@ -11502,7 +13187,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                                 };
                                 if !identity_key.is_empty() {
                                     let _ = db.update_presence(
-                                        identity_key, username, is_online, &display,
+                                        identity_key,
+                                        username,
+                                        is_online,
+                                        &display,
                                         Some(&proj_id_thread),
                                         if is_online { "Visible" } else { "Offline" },
                                     );
@@ -11572,7 +13260,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
 
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
-                    &db, &identity, &device_id, Some(server_url.as_str()),
+                    &db,
+                    &identity,
+                    &device_id,
+                    Some(server_url.as_str()),
                 )?;
                 if include_contributions {
                     let _ = db.queue_full_state_sync();
@@ -11598,7 +13289,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let _ = db.set_setting("last_sync", &now_str);
 
                 let client = crate::services::api_client::ApiClient::new(
-                    &server_url, identity.clone(), &device_id,
+                    &server_url,
+                    identity.clone(),
+                    &device_id,
                 );
 
                 // Pull pending invitations
@@ -11607,14 +13300,27 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         if let Some(list) = arr.as_array() {
                             for inv in list {
                                 let id = inv["id"].as_str().unwrap_or_default().to_string();
-                                let project_id = inv["project_id"].as_str().unwrap_or_default().to_string();
-                                let project_name = inv["project_name"].as_str().unwrap_or_default().to_string();
-                                let inviter_identity = inv["inviter_identity"].as_str().unwrap_or_default().to_string();
-                                let inviter_username = inv["inviter_username"].as_str().unwrap_or_default().to_string();
-                                let invitee_identity = inv["invitee_identity"].as_str().unwrap_or_default().to_string();
+                                let project_id =
+                                    inv["project_id"].as_str().unwrap_or_default().to_string();
+                                let project_name =
+                                    inv["project_name"].as_str().unwrap_or_default().to_string();
+                                let inviter_identity = inv["inviter_identity"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let inviter_username = inv["inviter_username"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let invitee_identity = inv["invitee_identity"]
+                                    .as_str()
+                                    .unwrap_or_default()
+                                    .to_string();
                                 let role = inv["role"].as_str().unwrap_or_default().to_string();
-                                let status = inv["status"].as_str().unwrap_or("Pending").to_string();
-                                let created_at = inv["created_at"].as_str().unwrap_or_default().to_string();
+                                let status =
+                                    inv["status"].as_str().unwrap_or("Pending").to_string();
+                                let created_at =
+                                    inv["created_at"].as_str().unwrap_or_default().to_string();
                                 let _ = db.conn.execute(
                                     "INSERT OR IGNORE INTO invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                                     rusqlite::params![id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at],
@@ -11633,12 +13339,28 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                                 if let Some(msgs) = arr.as_array() {
                                     for msg in msgs {
                                         let id = msg["id"].as_str().unwrap_or_default().to_string();
-                                        let proj_id = msg["project_id"].as_str().unwrap_or_default().to_string();
-                                        let sender_identity = msg["sender_identity"].as_str().unwrap_or_default().to_string();
-                                        let sender_username = msg["sender_username"].as_str().unwrap_or_default().to_string();
-                                        let content = msg["content"].as_str().unwrap_or_default().to_string();
-                                        let message_type = msg["message_type"].as_str().unwrap_or("text").to_string();
-                                        let timestamp = msg["timestamp"].as_str().unwrap_or_default().to_string();
+                                        let proj_id = msg["project_id"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let sender_identity = msg["sender_identity"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let sender_username = msg["sender_username"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let content =
+                                            msg["content"].as_str().unwrap_or_default().to_string();
+                                        let message_type = msg["message_type"]
+                                            .as_str()
+                                            .unwrap_or("text")
+                                            .to_string();
+                                        let timestamp = msg["timestamp"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
                                         let _ = db.conn.execute(
                                             "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)",
                                             rusqlite::params![id, proj_id, sender_identity, sender_username, content, message_type, timestamp],
@@ -11655,12 +13377,23 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if let Some(companions) = arr.as_array() {
                             for comp in companions {
-                                let identity_key = comp["user_identity"].as_str().unwrap_or_default();
+                                let identity_key =
+                                    comp["user_identity"].as_str().unwrap_or_default();
                                 let username = comp["user_username"].as_str().unwrap_or_default();
-                                if identity_key.is_empty() || username.is_empty() { continue; }
+                                if identity_key.is_empty() || username.is_empty() {
+                                    continue;
+                                }
                                 let last_seen_raw = comp["last_seen"].as_str().unwrap_or_default();
-                                let (is_online, last_seen_display) = App::parse_companion_last_seen(last_seen_raw);
-                                let _ = db.update_presence(identity_key, username, is_online, &last_seen_display, None, if is_online { "Visible" } else { "Offline" });
+                                let (is_online, last_seen_display) =
+                                    App::parse_companion_last_seen(last_seen_raw);
+                                let _ = db.update_presence(
+                                    identity_key,
+                                    username,
+                                    is_online,
+                                    &last_seen_display,
+                                    None,
+                                    if is_online { "Visible" } else { "Offline" },
+                                );
                                 let _ = db.conn.execute(
                                     "UPDATE project_members SET user_username = ?1 WHERE user_identity = ?2 AND user_username = 'Accepted Companion'",
                                     rusqlite::params![username, identity_key],
@@ -11674,6 +13407,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
                     if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if let Some(entries) = arr.as_array() {
+                            let _ = db.cleanup_global_chronicle_entries(1);
                             for e in entries {
                                 let id = e["id"].as_str().unwrap_or_default();
                                 let hero = e["hero_name"].as_str().unwrap_or_default();
@@ -11686,6 +13420,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                                         "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                                         rusqlite::params![id, hero, etype, desc, ts, hero_class],
                                     );
+                                    if hero_class.is_some() {
+                                        let _ = db.conn.execute(
+                                            "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
+                                            rusqlite::params![hero_class, id],
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -11698,27 +13438,47 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         // Only count tasks owned by this user — prevents shared-project
                         // pulls (other users' completed tasks) from inflating the delta.
                         if let Ok(snapshot) = db.get_contribution_snapshot(&identity.public_key) {
-                            let last_sent = db.get_last_sent_contributions(chapter.id).unwrap_or_default();
-                            if last_sent.is_empty() {
-                                // Fresh baseline: record current totals without sending so
-                                // only future actions contribute to the chapter objectives.
-                                let _ = db.save_sent_contributions(chapter.id, &snapshot);
-                            } else {
-                                let mut increments = std::collections::HashMap::new();
-                                for (key, &current) in &snapshot {
-                                    let prev = last_sent.get(key).copied().unwrap_or(0);
-                                    if current > prev {
-                                        increments.insert(key.clone(), current - prev);
-                                    }
+                            if let Ok(confirmed) = client.fetch_my_chapter_contributions(chapter.id)
+                            {
+                                let local_baseline = db
+                                    .get_last_sent_contributions(chapter.id)
+                                    .unwrap_or_default();
+                                let all_objectives = [
+                                    "tasks_completed",
+                                    "subtasks_completed",
+                                    "focus_sessions",
+                                    "tree_waterings",
+                                    "rituals_completed",
+                                    "reflections_written",
+                                    "scrolls_created",
+                                ];
+                                let mut corrected: std::collections::HashMap<String, u64> =
+                                    std::collections::HashMap::new();
+                                for &obj in &all_objectives {
+                                    let server_val = confirmed.get(obj).copied();
+                                    let local_val = local_baseline.get(obj).copied().unwrap_or(0);
+                                    corrected
+                                        .insert(obj.to_string(), server_val.unwrap_or(local_val));
                                 }
-                                if !increments.is_empty() {
-                                    // Save the new baseline FIRST (anti-cheat: if anything
-                                    // fails after this point the same delta won't replay).
-                                    // Only send if the save succeeded — better to miss one
-                                    // contribution than to double-count on every retry.
-                                    if db.save_sent_contributions(chapter.id, &snapshot).is_ok() {
-                                        let _ = client.submit_chapter_contribution(chapter.id, &increments);
-                                    }
+                                let _ = db.save_sent_contributions(chapter.id, &corrected);
+                            }
+
+                            let last_sent = db
+                                .get_last_sent_contributions(chapter.id)
+                                .unwrap_or_default();
+                            let mut increments = std::collections::HashMap::new();
+                            for (key, &current) in &snapshot {
+                                let prev = last_sent.get(key).copied().unwrap_or(0);
+                                if current > prev {
+                                    increments.insert(key.clone(), current - prev);
+                                }
+                            }
+                            if !increments.is_empty() {
+                                if client
+                                    .submit_chapter_contribution(chapter.id, &increments)
+                                    .is_ok()
+                                {
+                                    let _ = db.save_sent_contributions(chapter.id, &snapshot);
                                 }
                             }
                         }
@@ -11731,11 +13491,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 }
 
                 // Update sync and conflict counters
-                let sync_count = db.get_setting("sync_count")?.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
+                let sync_count = db
+                    .get_setting("sync_count")?
+                    .and_then(|s| s.parse::<i32>().ok())
+                    .unwrap_or(0);
                 let _ = db.set_setting("sync_count", &(sync_count + 1).to_string());
                 if !conflicts.is_empty() {
-                    let conflict_count = db.get_setting("conflict_count")?.and_then(|s| s.parse::<i32>().ok()).unwrap_or(0);
-                    let _ = db.set_setting("conflict_count", &(conflict_count + conflicts.len() as i32).to_string());
+                    let conflict_count = db
+                        .get_setting("conflict_count")?
+                        .and_then(|s| s.parse::<i32>().ok())
+                        .unwrap_or(0);
+                    let _ = db.set_setting(
+                        "conflict_count",
+                        &(conflict_count + conflicts.len() as i32).to_string(),
+                    );
                 }
 
                 // Auto-backup once every 24 h so [r] Restore always has something to fetch.
@@ -11747,7 +13516,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     } else {
                         chrono::DateTime::parse_from_rfc3339(&last_ts)
                             .map(|t| {
-                                let age = chrono::Utc::now().signed_duration_since(t.with_timezone(&chrono::Utc));
+                                let age = chrono::Utc::now()
+                                    .signed_duration_since(t.with_timezone(&chrono::Utc));
                                 age > chrono::Duration::hours(24)
                             })
                             .unwrap_or(true)
@@ -11756,7 +13526,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if should_backup {
                     if let Ok(json) = db.export_to_json() {
                         if client.send_request("POST", "recovery", &json).is_ok() {
-                            let _ = db.set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                            let _ = db
+                                .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
                         }
                     }
                 }
@@ -11765,8 +13536,18 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             })();
 
             let bg = match outcome {
-                Ok((pushed, pulled, conflicts)) => BackgroundSyncResult { pushed, pulled, conflicts, error: None },
-                Err(e) => BackgroundSyncResult { pushed: 0, pulled: 0, conflicts: Vec::new(), error: Some(e.to_string()) },
+                Ok((pushed, pulled, conflicts)) => BackgroundSyncResult {
+                    pushed,
+                    pulled,
+                    conflicts,
+                    error: None,
+                },
+                Err(e) => BackgroundSyncResult {
+                    pushed: 0,
+                    pulled: 0,
+                    conflicts: Vec::new(),
+                    error: Some(e.to_string()),
+                },
             };
             if let Ok(mut guard) = result_slot.lock() {
                 *guard = Some(bg);
@@ -11776,6 +13557,121 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     pub fn mark_dirty(&mut self) {
         self.last_mutation = Some(std::time::Instant::now());
+    }
+
+    fn apply_theme_choice(&mut self, choice: ThemeChoice) -> Result<()> {
+        self.db
+            .set_setting("equipped_theme", crate::theme::Theme::theme_key(choice))?;
+        self.theme_service.set_theme_choice(choice);
+        self.last_pywal_modified = Self::pywal_colors_modified();
+        self.last_pywal_check = Some(std::time::Instant::now());
+        self.selected_settings_theme_idx = crate::theme::Theme::all_choices()
+            .iter()
+            .position(|c| *c == choice)
+            .unwrap_or(0);
+        self.notifications.push(Notification::info(format!(
+            "Theme Equipped: {}!",
+            crate::theme::Theme::theme_label(choice)
+        )));
+        Ok(())
+    }
+
+    fn toggle_external_notifications(&mut self) -> Result<()> {
+        self.external_notifications = !self.external_notifications;
+        self.db.set_setting(
+            "external_notifications",
+            if self.external_notifications {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        self.notifications.push(Notification::info(format!(
+            "OS Alerts {}.",
+            if self.external_notifications {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )));
+        Ok(())
+    }
+
+    fn toggle_task_notifications(&mut self) -> Result<()> {
+        self.task_notifications_enabled = !self.task_notifications_enabled;
+        crate::services::task_notifications::set_task_notifications_enabled(
+            &self.db,
+            self.task_notifications_enabled,
+        )?;
+        self.notifications.push(Notification::info(format!(
+            "Task Alerts {}.",
+            if self.task_notifications_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )));
+        Ok(())
+    }
+
+    fn toggle_sound_effects(&mut self) -> Result<()> {
+        self.sound_effects_enabled = !self.sound_effects_enabled;
+        self.audio_player
+            .set_sound_effects_enabled(self.sound_effects_enabled);
+        self.db.set_setting(
+            "sound_effects_enabled",
+            if self.sound_effects_enabled {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
+        self.notifications.push(Notification::info(format!(
+            "Sound Effects {}.",
+            if self.sound_effects_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        )));
+        Ok(())
+    }
+
+    fn adjust_sound_effects_volume(&mut self, delta: f32) -> Result<()> {
+        self.sound_effects_volume = (self.sound_effects_volume + delta).clamp(0.0, 1.0);
+        self.audio_player
+            .set_sound_effects_volume(self.sound_effects_volume);
+        self.db.set_setting(
+            "sound_effects_volume",
+            &self.sound_effects_volume.to_string(),
+        )?;
+        Ok(())
+    }
+
+    fn pywal_colors_modified() -> Option<std::time::SystemTime> {
+        let home = std::env::var("HOME").ok()?;
+        std::fs::metadata(std::path::Path::new(&home).join(".cache/wal/colors.json"))
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    pub fn tick_pywal_theme(&mut self) {
+        if self.theme_service.choice() != ThemeChoice::Pywal {
+            return;
+        }
+        if let Some(last) = self.last_pywal_check {
+            if last.elapsed() < std::time::Duration::from_millis(750) {
+                return;
+            }
+        }
+        self.last_pywal_check = Some(std::time::Instant::now());
+
+        let modified = Self::pywal_colors_modified();
+        if modified != self.last_pywal_modified {
+            self.last_pywal_modified = modified;
+            self.theme_service.set_theme_choice(ThemeChoice::Pywal);
+        }
     }
 
     // Heartbeat de presencia — solo corre si estamos en un workspace compartido con sync activo
@@ -11794,7 +13690,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
 
         let identity_key = self.identity.public_key.clone();
-        let username = self.user.as_ref().map(|u| u.username.clone()).unwrap_or_default();
+        let username = self
+            .user
+            .as_ref()
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
         let now_str = chrono::Utc::now().to_rfc3339();
 
         // Determinar el proyecto activo: en Workspace usamos active_project_id, en Fellowship el proyecto seleccionado
@@ -11802,10 +13702,13 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             self.active_project_id.map(|id| id.to_string())
         } else {
             let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-            shared.get(self.selected_fellowship_project_idx).map(|p| p.id.to_string())
+            shared
+                .get(self.selected_fellowship_project_idx)
+                .map(|p| p.id.to_string())
         };
 
-        let is_relevant_project = project_id.as_deref()
+        let is_relevant_project = project_id
+            .as_deref()
             .and_then(|pid| self.projects.iter().find(|p| p.id.to_string() == pid))
             .map(|p| p.is_shared)
             .unwrap_or(in_fellowship); // en Fellowship siempre es relevante
@@ -11815,8 +13718,12 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
 
         let _ = self.db.update_presence(
-            &identity_key, &username, true, &now_str,
-            project_id.as_deref(), "Visible",
+            &identity_key,
+            &username,
+            true,
+            &now_str,
+            project_id.as_deref(),
+            "Visible",
         );
         self.last_presence_update = std::time::Instant::now();
 
@@ -11832,7 +13739,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         match &self.chapter_progress {
             Some(data) if data.completed => 1.0,
             Some(data) if !data.objectives.is_empty() => {
-                let sum: f64 = data.objectives.iter()
+                let sum: f64 = data
+                    .objectives
+                    .iter()
                     .map(|o| (o.current as f64 / o.target as f64).min(1.0))
                     .sum();
                 sum / data.objectives.len() as f64
@@ -11844,24 +13753,43 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     fn can_spawn_sprite_notification(&self) -> bool {
         if matches!(
             self.active_screen,
-            ActiveScreen::Intro | ActiveScreen::Prologue | ActiveScreen::Onboarding | ActiveScreen::Editor
-        ) { return false; }
-        if self.modal_state != ModalType::None { return false; }
-        if self.active_focus_session.is_some() { return false; }
-        if self.sync_in_progress { return false; }
+            ActiveScreen::Intro
+                | ActiveScreen::Prologue
+                | ActiveScreen::Onboarding
+                | ActiveScreen::Editor
+        ) {
+            return false;
+        }
+        if self.modal_state != ModalType::None {
+            return false;
+        }
+        if self.active_focus_session.is_some() {
+            return false;
+        }
+        if self.sync_in_progress {
+            return false;
+        }
         true
     }
 
     /// Called after a task is marked complete — occasionally spawns a Swarm response.
     pub fn maybe_spawn_task_completion_sprite(&mut self) {
-        if !self.can_spawn_sprite_notification() { return; }
-        if self.sprite_notifications_shown_this_session >= 5 { return; }
+        if !self.can_spawn_sprite_notification() {
+            return;
+        }
+        if self.sprite_notifications_shown_this_session >= 5 {
+            return;
+        }
         let progress = self.chapter_one_progress();
-        if progress >= 1.0 { return; }
+        if progress >= 1.0 {
+            return;
+        }
         // 15% chance, tapering to ~5% as the Swarm weakens
         let chance = 0.15 * (1.0 - progress * 0.7);
         use rand::Rng;
-        if rand::thread_rng().r#gen::<f64>() > chance { return; }
+        if rand::thread_rng().r#gen::<f64>() > chance {
+            return;
+        }
         let (msg, title) = pick_task_completion_sprite_message();
         self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
@@ -11872,34 +13800,58 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     /// Background idle-spawn tick — checked once per minute, very low probability.
     pub fn tick_sprite_notifications(&mut self) {
         if let Some(t) = self.last_sprite_check_time {
-            if t.elapsed().as_secs() < 60 { return; }
+            if t.elapsed().as_secs() < 60 {
+                return;
+            }
         }
         self.last_sprite_check_time = Some(std::time::Instant::now());
 
-        if !self.can_spawn_sprite_notification() { return; }
-        if self.sprite_notifications_shown_this_session >= 5 { return; }
+        if !self.can_spawn_sprite_notification() {
+            return;
+        }
+        if self.sprite_notifications_shown_this_session >= 5 {
+            return;
+        }
 
         let progress = self.chapter_one_progress();
-        if progress >= 1.0 { return; }
+        if progress >= 1.0 {
+            return;
+        }
 
         // Minimum cooldown between Sprite notifications (scales up as Swarm weakens)
-        let min_cooldown: u64 = if progress >= 0.90 { 3600 }
-            else if progress >= 0.75 { 1800 }
-            else if progress >= 0.50 { 900 }
-            else if progress >= 0.25 { 600 }
-            else { 300 };
+        let min_cooldown: u64 = if progress >= 0.90 {
+            3600
+        } else if progress >= 0.75 {
+            1800
+        } else if progress >= 0.50 {
+            900
+        } else if progress >= 0.25 {
+            600
+        } else {
+            300
+        };
         if let Some(t) = self.last_sprite_notification_time {
-            if t.elapsed().as_secs() < min_cooldown { return; }
+            if t.elapsed().as_secs() < min_cooldown {
+                return;
+            }
         }
 
         // Per-minute spawn probability (decreases as chapter progresses)
-        let spawn_chance: f64 = if progress >= 0.90 { 0.015 }
-            else if progress >= 0.75 { 0.04 }
-            else if progress >= 0.50 { 0.07 }
-            else if progress >= 0.25 { 0.12 }
-            else { 0.20 };
+        let spawn_chance: f64 = if progress >= 0.90 {
+            0.015
+        } else if progress >= 0.75 {
+            0.04
+        } else if progress >= 0.50 {
+            0.07
+        } else if progress >= 0.25 {
+            0.12
+        } else {
+            0.20
+        };
         use rand::Rng;
-        if rand::thread_rng().r#gen::<f64>() > spawn_chance { return; }
+        if rand::thread_rng().r#gen::<f64>() > spawn_chance {
+            return;
+        }
 
         let (msg, title) = pick_sprite_message();
         self.audio_player.play_notification_swarm();
@@ -11946,7 +13898,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     // Show the update modal as soon as the background check finishes and the screen is ready.
     pub fn tick_update_check(&mut self) {
-        if self.update_check_done { return; }
+        if self.update_check_done {
+            return;
+        }
         if let Ok(guard) = self.update_check.try_lock() {
             if let Some(ref ver) = *guard {
                 if ver.is_empty() {
@@ -11967,7 +13921,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     pub fn tick_chapter_progress(&mut self) {
-        if self.chapter_progress_refreshed.swap(false, std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .chapter_progress_refreshed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
+        {
             self.load_chapter_progress_from_cache();
         }
     }
@@ -11985,22 +13942,34 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             let db_path = storage_dir.join("questline.db");
             let _ = std::thread::spawn(move || {
                 if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
-                    if let Ok(arr) =
-                        serde_json::from_str::<serde_json::Value>(&resp)
-                    {
+                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if let Some(entries) = arr.as_array() {
                             if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                let cutoff =
+                                    (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+                                let _ = conn.execute(
+                                    "DELETE FROM global_chronicle WHERE timestamp < ?1",
+                                    rusqlite::params![cutoff],
+                                );
                                 for e in entries {
                                     let id = e["id"].as_str().unwrap_or_default();
                                     let hero = e["hero_name"].as_str().unwrap_or_default();
                                     let etype = e["event_type"].as_str().unwrap_or_default();
                                     let desc = e["description"].as_str().unwrap_or_default();
                                     let ts = e["timestamp"].as_str().unwrap_or_default();
+                                    let hero_class =
+                                        e["hero_class"].as_str().filter(|s| !s.is_empty());
                                     if !id.is_empty() {
                                         let _ = conn.execute(
-                                            "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp) VALUES (?1, ?2, ?3, ?4, ?5)",
-                                            rusqlite::params![id, hero, etype, desc, ts],
+                                            "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                            rusqlite::params![id, hero, etype, desc, ts, hero_class],
                                         );
+                                        if hero_class.is_some() {
+                                            let _ = conn.execute(
+                                                "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
+                                                rusqlite::params![hero_class, id],
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -12065,12 +14034,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     for obj_def in chapter.objectives {
                         let current = val["objectives"]
                             .as_array()
-                            .and_then(|arr| arr.iter().find(|o| o["type"].as_str() == Some(obj_def.id)))
+                            .and_then(|arr| {
+                                arr.iter().find(|o| o["type"].as_str() == Some(obj_def.id))
+                            })
                             .and_then(|o| o["current"].as_u64())
                             .unwrap_or(0);
                         let target = val["objectives"]
                             .as_array()
-                            .and_then(|arr| arr.iter().find(|o| o["type"].as_str() == Some(obj_def.id)))
+                            .and_then(|arr| {
+                                arr.iter().find(|o| o["type"].as_str() == Some(obj_def.id))
+                            })
                             .and_then(|o| o["target"].as_u64())
                             .unwrap_or(obj_def.target);
                         objectives.push(crate::models::chapter::ChapterObjectiveProgress {
@@ -12098,7 +14071,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         );
                         // Show the chapter complete modal once — persisted so it survives restarts
                         let modal_key = format!("chapter_complete_modal_shown_{}", chapter.id);
-                        let already_shown = self.db.get_setting(&modal_key).ok().flatten().is_some();
+                        let already_shown =
+                            self.db.get_setting(&modal_key).ok().flatten().is_some();
                         if !already_shown {
                             let _ = self.db.set_setting(&modal_key, "1");
                             self.modal_state = ModalType::ChapterComplete;
@@ -12106,7 +14080,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
                         // Grant 5 000 XP once to every user who contributed to the chapter
                         let xp_key = format!("chapter_xp_rewarded_{}", chapter.id);
-                        let xp_already_given = self.db.get_setting(&xp_key).ok().flatten().is_some();
+                        let xp_already_given =
+                            self.db.get_setting(&xp_key).ok().flatten().is_some();
                         if !xp_already_given {
                             let contributed = self.db.conn.query_row(
                                 "SELECT COUNT(*) FROM chapter_contribution_log WHERE chapter_id = ?1 AND last_sent_total > 0",
@@ -12115,7 +14090,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                             ).unwrap_or(0) > 0;
                             if contributed {
                                 let _ = self.db.set_setting(&xp_key, "1");
-                                let _ = self.grant_xp("Chapter Complete: The Notification Swarm", 5000);
+                                let _ =
+                                    self.grant_xp("Chapter Complete: The Notification Swarm", 5000);
                             }
                         }
                     }
@@ -12133,14 +14109,22 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if let Ok(Some(json)) = self.db.get_setting("chapter_history_cache") {
             if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&json) {
                 if let Some(items) = arr.as_array() {
-                    self.chapter_history = items.iter().filter_map(|item| {
-                        Some(crate::models::chapter::ChapterHistoryEntry {
-                            chapter_id: item["chapter_id"].as_str()?.to_string(),
-                            title: item["title"].as_str().unwrap_or("").to_string(),
-                            completed_at: item["completed_at"].as_str().unwrap_or("").to_string(),
-                            personal_contribution: item["personal_contribution"].as_u64().unwrap_or(0),
+                    self.chapter_history = items
+                        .iter()
+                        .filter_map(|item| {
+                            Some(crate::models::chapter::ChapterHistoryEntry {
+                                chapter_id: item["chapter_id"].as_str()?.to_string(),
+                                title: item["title"].as_str().unwrap_or("").to_string(),
+                                completed_at: item["completed_at"]
+                                    .as_str()
+                                    .unwrap_or("")
+                                    .to_string(),
+                                personal_contribution: item["personal_contribution"]
+                                    .as_u64()
+                                    .unwrap_or(0),
+                            })
                         })
-                    }).collect();
+                        .collect();
                 }
             }
         }
@@ -12154,19 +14138,23 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 Err(_) => return,
             };
 
-            // Resync local baseline from server's confirmed per-user totals.
-            // This corrects over-advanced baselines caused by the old save-before-send pattern
-            // (where the baseline was saved even when the network call failed, silently losing
-            // contributions). For each objective the server has a confirmed record, we trust
-            // that number; for objectives with no server record we keep the local baseline to
-            // avoid re-contributing something that may already be reflected in the global total.
+            // Sincroniza la base local con los totales confirmados por el servidor antes de calcular deltas.
             if let Ok(confirmed) = client.fetch_my_chapter_contributions(chapter.id) {
-                let local_baseline = self.db.get_last_sent_contributions(chapter.id).unwrap_or_default();
+                let local_baseline = self
+                    .db
+                    .get_last_sent_contributions(chapter.id)
+                    .unwrap_or_default();
                 let all_objectives = [
-                    "tasks_completed", "subtasks_completed", "focus_sessions",
-                    "tree_waterings", "rituals_completed", "reflections_written", "scrolls_created",
+                    "tasks_completed",
+                    "subtasks_completed",
+                    "focus_sessions",
+                    "tree_waterings",
+                    "rituals_completed",
+                    "reflections_written",
+                    "scrolls_created",
                 ];
-                let mut corrected: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+                let mut corrected: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
                 for &obj in &all_objectives {
                     let server_val = confirmed.get(obj).copied();
                     let local_val = local_baseline.get(obj).copied().unwrap_or(0);
@@ -12175,12 +14163,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let _ = self.db.save_sent_contributions(chapter.id, &corrected);
             }
 
-            let last_sent = self.db.get_last_sent_contributions(chapter.id).unwrap_or_default();
-
-            if last_sent.is_empty() {
-                let _ = self.db.save_sent_contributions(chapter.id, &snapshot);
-                return;
-            }
+            let last_sent = self
+                .db
+                .get_last_sent_contributions(chapter.id)
+                .unwrap_or_default();
 
             let mut increments = std::collections::HashMap::new();
             for (key, &current) in &snapshot {
@@ -12190,7 +14176,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 }
             }
             if !increments.is_empty() {
-                if client.submit_chapter_contribution(chapter.id, &increments).is_ok() {
+                if client
+                    .submit_chapter_contribution(chapter.id, &increments)
+                    .is_ok()
+                {
                     let _ = self.db.save_sent_contributions(chapter.id, &snapshot);
                 }
             }
@@ -12198,7 +14187,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
     }
 
     // Fetches chapter progress synchronously and updates app state (used after sync).
-    pub fn refresh_chapter_progress_sync(&mut self, client: &crate::services::api_client::ApiClient) {
+    pub fn refresh_chapter_progress_sync(
+        &mut self,
+        client: &crate::services::api_client::ApiClient,
+    ) {
         if let Some(chapter) = crate::models::chapter::get_active_chapter() {
             if let Ok(val) = client.fetch_chapter_progress(chapter.id) {
                 let json = serde_json::to_string(&val).unwrap_or_default();
@@ -12208,12 +14200,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         }
     }
 
-    pub fn push_great_chronicle_async(
-        &self,
-        event_type: &str,
-        description: &str,
-        show_name: bool,
-    ) {
+    pub fn push_great_chronicle_async(&self, event_type: &str, description: &str, show_name: bool) {
         if !self.config.sync_enabled {
             return;
         }
@@ -12239,18 +14226,31 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         );
         let id = uuid::Uuid::new_v4().to_string();
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let body = format!(
-            r#"{{"id":"{id}","hero_name":"{hero_name}","hero_class":"{hero_class}","event_type":"{event_type}","description":"{description}","timestamp":"{timestamp}"}}"#,
-        );
+        let body = serde_json::json!({
+            "id": id,
+            "hero_name": hero_name,
+            "hero_class": hero_class,
+            "event_type": event_type,
+            "description": description,
+            "timestamp": timestamp,
+        })
+        .to_string();
         // Guardamos localmente de inmediato con la clase incluida — el servidor no siempre regresa hero_class
-        let _ = self.db.upsert_chronicle_entry(&crate::models::GlobalChronicleEntry {
-            id: id.clone(),
-            hero_name: hero_name.clone(),
-            event_type: event_type.to_string(),
-            description: description.to_string(),
-            timestamp: timestamp.clone(),
-            hero_class: if hero_class.is_empty() { None } else { Some(hero_class.clone()) },
-        });
+        let _ = self.db.cleanup_global_chronicle_entries(1);
+        let _ = self
+            .db
+            .upsert_chronicle_entry(&crate::models::GlobalChronicleEntry {
+                id: id.clone(),
+                hero_name: hero_name.clone(),
+                event_type: event_type.to_string(),
+                description: description.to_string(),
+                timestamp: timestamp.clone(),
+                hero_class: if hero_class.is_empty() {
+                    None
+                } else {
+                    Some(hero_class.clone())
+                },
+            });
         let _ = std::thread::spawn(move || {
             let _ = client.send_request("POST", "global_chronicle", &body);
         });
@@ -12267,19 +14267,46 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let db_path = storage_dir.join("questline.db");
                 let _ = std::thread::spawn(move || {
                     if let Ok(resp_str) = client.send_request("GET", "pending", "") {
-                        if let Ok(server_invites) = serde_json::from_str::<serde_json::Value>(&resp_str) {
+                        if let Ok(server_invites) =
+                            serde_json::from_str::<serde_json::Value>(&resp_str)
+                        {
                             if let Some(arr) = server_invites.as_array() {
                                 if let Ok(conn) = rusqlite::Connection::open(&db_path) {
                                     for inv_val in arr {
-                                        let id = inv_val["id"].as_str().unwrap_or_default().to_string();
-                                        let project_id = inv_val["project_id"].as_str().unwrap_or_default().to_string();
-                                        let project_name = inv_val["project_name"].as_str().unwrap_or_default().to_string();
-                                        let inviter_identity = inv_val["inviter_identity"].as_str().unwrap_or_default().to_string();
-                                        let inviter_username = inv_val["inviter_username"].as_str().unwrap_or_default().to_string();
-                                        let invitee_identity = inv_val["invitee_identity"].as_str().unwrap_or_default().to_string();
-                                        let role = inv_val["role"].as_str().unwrap_or_default().to_string();
-                                        let status = inv_val["status"].as_str().unwrap_or_default().to_string();
-                                        let created_at = inv_val["created_at"].as_str().unwrap_or_default().to_string();
+                                        let id =
+                                            inv_val["id"].as_str().unwrap_or_default().to_string();
+                                        let project_id = inv_val["project_id"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let project_name = inv_val["project_name"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let inviter_identity = inv_val["inviter_identity"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let inviter_username = inv_val["inviter_username"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let invitee_identity = inv_val["invitee_identity"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let role = inv_val["role"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let status = inv_val["status"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
+                                        let created_at = inv_val["created_at"]
+                                            .as_str()
+                                            .unwrap_or_default()
+                                            .to_string();
 
                                         let _ = conn.execute(
                                             "INSERT OR IGNORE INTO invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -12341,10 +14368,14 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 }
 
                 self.grant_xp("Focus Session Complete", xp)?;
-                let focus_trigger = if duration == 25 { "focus_pomodoro" } else { "focus_session" };
+                let focus_trigger = if duration == 25 {
+                    "focus_pomodoro"
+                } else {
+                    "focus_session"
+                };
                 self.apply_class_passive(focus_trigger, 0)?;
-	                self.increment_quest_progress(30, duration)?;
-	                self.increment_quest_progress(25, duration)?;
+                self.increment_quest_progress(30, duration)?;
+                self.increment_quest_progress(25, duration)?;
                 self.simulate_memory_fragment_unlock("focus_session")?;
 
                 let final_duration = if active_soundscape == "White Noise" {
@@ -12373,7 +14404,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     true,
                 );
 
-                self.notifications.push(Notification::info(format!("Focus Completed! Gained +{} XP", xp)));
+                self.notifications.push(Notification::info(format!(
+                    "Focus Completed! Gained +{} XP",
+                    xp
+                )));
 
                 // Every completed focus session restores a point of tree health
                 {
@@ -12381,7 +14415,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     if tree.health < 100 {
                         tree.health = (tree.health + 1).min(100);
                         self.db.update_zen_tree(&tree)?;
-                        self.notifications.push(Notification::info(format!("Focus honored. Tree health +1 ({}%)", tree.health)));
+                        self.notifications.push(Notification::info(format!(
+                            "Focus honored. Tree health +1 ({}%)",
+                            tree.health
+                        )));
                     }
                 }
 
@@ -12396,13 +14433,15 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         tree.last_watered = Some(Utc::now());
                         self.db.update_zen_tree(&tree)?;
                         self.notifications.push(Notification::info(format!(
-                                "Rain Sounds Auto-Watered! Growth +1 (Today: {}/2)",
-                                tree.water_today
-                            )));
+                            "Rain Sounds Auto-Watered! Growth +1 (Today: {}/2)",
+                            tree.water_today
+                        )));
                         self.update_daily_adventure_progress("water_tree", 1)?;
                         self.check_tree_evolution(&mut tree)?;
                     } else {
-                        self.notifications.push(Notification::warning("Rain Sounds: Tree is already watered for this time period."));
+                        self.notifications.push(Notification::warning(
+                            "Rain Sounds: Tree is already watered for this time period.",
+                        ));
                     }
                 }
 
@@ -12462,7 +14501,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
                     self.active_focus_session = None;
-                    self.notifications.push(Notification::warning("Focus Session Cancelled"));
+                    self.notifications
+                        .push(Notification::warning("Focus Session Cancelled"));
                 }
                 _ => {}
             }
@@ -12481,7 +14521,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             && self.selected_focus_project_idx <= active_projects.len()
         {
             let selected_p_id = active_projects[self.selected_focus_project_idx - 1].id;
-            active_tasks = self.all_tasks.iter()
+            active_tasks = self
+                .all_tasks
+                .iter()
                 .filter(|t| t.project_id == Some(selected_p_id) && !t.completed)
                 .cloned()
                 .collect();
@@ -12526,7 +14568,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 3 => {
                     use crate::audio::SOUNDSCAPES;
                     let total = SOUNDSCAPES.len() + 1;
-                    self.selected_focus_soundscape_idx = if self.selected_focus_soundscape_idx == 0 {
+                    self.selected_focus_soundscape_idx = if self.selected_focus_soundscape_idx == 0
+                    {
                         total - 1
                     } else {
                         self.selected_focus_soundscape_idx - 1
@@ -12591,11 +14634,20 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                     // If Local Folder is selected but no folder is configured, prompt first
                     use crate::audio::SOUNDSCAPES;
                     let is_local_folder = self.selected_focus_soundscape_idx > 0
-                        && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name == "Local Folder";
+                        && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name
+                            == "Local Folder";
                     if is_local_folder {
-                        let folder = self.db.get_setting("local_music_folder").unwrap_or_default().unwrap_or_default();
+                        let folder = self
+                            .db
+                            .get_setting("local_music_folder")
+                            .unwrap_or_default()
+                            .unwrap_or_default();
                         if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder { input: String::new(), suggestions: vec![], selected: 0 };
+                            self.modal_state = ModalType::LocalMusicFolder {
+                                input: String::new(),
+                                suggestions: vec![],
+                                selected: 0,
+                            };
                             return Ok(());
                         }
                     }
@@ -12643,7 +14695,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 "focused_mind" => "Focused Mind",
                 _ => trait_id,
             };
-            self.notifications.push(Notification::info(format!("Trait Unlocked: {}!", display_name)));
+            self.notifications.push(Notification::info(format!(
+                "Trait Unlocked: {}!",
+                display_name
+            )));
         }
         Ok(())
     }
@@ -12655,16 +14710,19 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             None => {
                 // Already hit the daily target — nothing to do
                 let rituals = self.db.get_rituals()?;
-                let target = rituals.iter()
+                let target = rituals
+                    .iter()
                     .find(|r| r.id == ritual_id)
                     .map(|r| r.daily_target)
                     .unwrap_or(1);
                 if target > 1 {
-                    self.notifications.push(Notification::info(
-                        format!("Already completed all {} times today!", target)
-                    ));
+                    self.notifications.push(Notification::info(format!(
+                        "Already completed all {} times today!",
+                        target
+                    )));
                 } else {
-                    self.notifications.push(Notification::info("Already completed today!".to_string()));
+                    self.notifications
+                        .push(Notification::info("Already completed today!".to_string()));
                 }
             }
             Some((count, target)) => {
@@ -12680,39 +14738,49 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
                     if count < target {
                         // Partial — show progress, no streak check yet
-                        self.notifications.push(Notification::info(
-                            format!("Sidequest Progress: {} ({}/{}) +{} XP", ritual_name, count, target, xp)
-                        ));
+                        self.notifications.push(Notification::info(format!(
+                            "Sidequest Progress: {} ({}/{}) +{} XP",
+                            ritual_name, count, target, xp
+                        )));
                     } else {
                         // Fully completed for the day
-                        self.push_great_chronicle_async("SidequestComplete", "fulfilled a sidequest.", true);
-	                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
-	                        self.increment_quest_progress(70, 1)?;
+                        self.push_great_chronicle_async(
+                            "SidequestComplete",
+                            "fulfilled a sidequest.",
+                            true,
+                        );
+                        self.update_daily_adventure_progress("complete_sidequests", 1)?;
+                        self.increment_quest_progress(70, 1)?;
                         if target > 1 {
-                            self.notifications.push(Notification::info(
-                                format!("Sidequest Complete: {} (all {}) +{} XP", ritual_name, target, xp)
-                            ));
+                            self.notifications.push(Notification::info(format!(
+                                "Sidequest Complete: {} (all {}) +{} XP",
+                                ritual_name, target, xp
+                            )));
                         } else {
-                            self.notifications.push(Notification::info(
-                                format!("Sidequest Completed: {}! (+{} XP)", ritual_name, xp)
-                            ));
+                            self.notifications.push(Notification::info(format!(
+                                "Sidequest Completed: {}! (+{} XP)",
+                                ritual_name, xp
+                            )));
                         }
 
                         // Streak milestone — only on full daily completion
                         let streak = self.db.get_ritual_streak(ritual_id).unwrap_or(0);
                         let milestone = match streak {
-                            3  => Some((3,  15,  "3-Day Initiate")),
-                            7  => Some((7,  25,  "7-Day Seeker")),
-                            15 => Some((15, 50,  "15-Day Devoted")),
+                            3 => Some((3, 15, "3-Day Initiate")),
+                            7 => Some((7, 25, "7-Day Seeker")),
+                            15 => Some((15, 50, "15-Day Devoted")),
                             30 => Some((30, 100, "30-Day Champion")),
                             45 => Some((45, 150, "45-Day Veteran")),
                             60 => Some((60, 200, "60-Day Warlord")),
                             85 => Some((85, 300, "85-Day Legendary")),
                             90 => Some((90, 400, "90-Day Ascendant")),
-                            _  => None,
+                            _ => None,
                         };
                         if let Some((days, bonus_xp, title)) = milestone {
-                            self.grant_xp(&format!("Streak Milestone: {} ({})", title, ritual_name), bonus_xp)?;
+                            self.grant_xp(
+                                &format!("Streak Milestone: {} ({})", title, ritual_name),
+                                bonus_xp,
+                            )?;
                             self.trigger_celebration(
                                 &format!("STREAK MILESTONE: {} DAYS", days),
                                 &format!("{}\nYou have maintained '{}' for {} consecutive days!\n(+{} Bonus XP)", title, ritual_name, days, bonus_xp),
@@ -12724,7 +14792,10 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         if tree.health < 100 {
                             tree.health = (tree.health + 1).min(100);
                             self.db.update_zen_tree(&tree)?;
-                            self.notifications.push(Notification::info(format!("The Evergrowth stirs. Health restored to {}%", tree.health)));
+                            self.notifications.push(Notification::info(format!(
+                                "The Evergrowth stirs. Health restored to {}%",
+                                tree.health
+                            )));
                         }
 
                         self.complete_productive_action()?;
@@ -12744,7 +14815,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         let mut milestones = self.db.get_milestones_for_project(p_id)?;
         if let Some(m) = milestones.iter_mut().find(|ms| ms.id == milestone_id) {
             if m.completed {
-                self.notifications.push(Notification::warning("Milestone already achieved — it cannot be undone."));
+                self.notifications.push(Notification::warning(
+                    "Milestone already achieved — it cannot be undone.",
+                ));
                 return Ok(());
             }
 
@@ -12755,28 +14828,29 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 if age_days < 3 {
                     let days_left = 3 - age_days;
                     self.notifications.push(Notification::info(format!(
-                            "Milestone too new — wait {} more day(s) to complete it.",
-                            days_left
-                        )));
+                        "Milestone too new — wait {} more day(s) to complete it.",
+                        days_left
+                    )));
                     return Ok(());
                 }
-                let completed_tasks = self.all_tasks.iter()
+                let completed_tasks = self
+                    .all_tasks
+                    .iter()
                     .filter(|t| t.project_id == Some(p_id) && t.completed)
                     .count();
                 if completed_tasks < 3 {
                     self.notifications.push(Notification::info(format!(
-                            "Need {} more completed quest(s) in this campaign first.",
-                            3 - completed_tasks
-                        )));
+                        "Need {} more completed quest(s) in this campaign first.",
+                        3 - completed_tasks
+                    )));
                     return Ok(());
                 }
                 let all_journals = self.db.get_journal_entries().unwrap_or_default();
-                let project_journals = all_journals
-                    .iter()
-                    .filter(|j| j.project_id == p_id)
-                    .count();
+                let project_journals = all_journals.iter().filter(|j| j.project_id == p_id).count();
                 if project_journals < 1 {
-                    self.notifications.push(Notification::warning("Write at least 1 Chronicle entry for this campaign first."));
+                    self.notifications.push(Notification::warning(
+                        "Write at least 1 Chronicle entry for this campaign first.",
+                    ));
                     return Ok(());
                 }
                 true
@@ -12802,9 +14876,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                             // Report first unmet requirement
                             let r = &unmet[0];
                             self.notifications.push(Notification::info(format!(
-                                    "Requirement not met: {} ({}/{})",
-                                    r.label, r.current, r.target
-                                )));
+                                "Requirement not met: {} ({}/{})",
+                                r.label, r.current, r.target
+                            )));
                             return Ok(());
                         }
                         true
@@ -12819,8 +14893,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
                 let milestone_xp = m.xp_reward;
                 let milestone_name = m.name.clone();
-	                self.grant_xp(&format!("Milestone Met: {}", milestone_name), milestone_xp)?;
-	                self.increment_quest_progress(80, 1)?;
+                self.grant_xp(&format!("Milestone Met: {}", milestone_name), milestone_xp)?;
+                self.increment_quest_progress(80, 1)?;
                 self.trigger_ambient_particles();
 
                 if let Some(ref u) = self.user {
@@ -12830,11 +14904,16 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                         &format!("Completed Milestone: {}.", milestone_name),
                     )?;
                 }
+                self.push_great_chronicle_async(
+                    "Milestone",
+                    &format!("completed milestone: {}.", milestone_name),
+                    true,
+                );
 
                 self.notifications.push(Notification::info(format!(
-                        "Milestone Achieved: {}! (+{} XP)",
-                        milestone_name, milestone_xp
-                    )));
+                    "Milestone Achieved: {}! (+{} XP)",
+                    milestone_name, milestone_xp
+                )));
 
                 self.grow_tree(5)?;
                 self.complete_productive_action()?;
@@ -12863,8 +14942,8 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 let proj_name = existing.name.clone();
                 self.grant_xp(&format!("Complete Campaign: {}", proj_name), 200)?;
 
-	                self.increment_quest_progress(90, 1)?;
-	                self.increment_quest_progress(75, 1)?;
+                self.increment_quest_progress(90, 1)?;
+                self.increment_quest_progress(75, 1)?;
 
                 if let Some(ref u) = self.user {
                     let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
@@ -12883,9 +14962,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
                 self.grow_tree(20)?;
 
                 self.notifications.push(Notification::info(format!(
-                        "Campaign Conquered: {}! (+200 XP, +20 Growth)",
-                        existing.name
-                    )));
+                    "Campaign Conquered: {}! (+200 XP, +20 Growth)",
+                    existing.name
+                )));
 
                 self.check_action_achievements()?;
                 self.check_traits()?;
@@ -12922,7 +15001,11 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
             }
             KeyCode::Backspace => {
                 let modal = self.bug_report_modal.as_mut().unwrap();
-                modal.description.pop();
+                if is_ctrl_backspace(key) {
+                    delete_last_word(&mut modal.description);
+                } else {
+                    modal.description.pop();
+                }
             }
             KeyCode::Enter => {
                 let modal = self.bug_report_modal.as_mut().unwrap();
@@ -12955,7 +15038,9 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
         if !self.config.sync_enabled {
             if let Some(m) = self.bug_report_modal.as_mut() {
-                m.status = Some("Sync must be enabled to send reports. Enable it in [S] Sync.".to_string());
+                m.status = Some(
+                    "Sync must be enabled to send reports. Enable it in [S] Sync.".to_string(),
+                );
             }
             return Ok(());
         }
@@ -13011,18 +15096,42 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
 
     pub fn reload_hydration_config(&mut self) {
         let db = &self.db;
-        self.hydration_enabled = db.get_setting("hydration_enabled")
-            .ok().flatten().as_deref() == Some("true");
-        self.hydration_target = db.get_setting("hydration_target")
-            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(8);
-        self.hydration_interval_mins = db.get_setting("hydration_interval_mins")
-            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(60);
-        self.hydration_active_from = db.get_setting("hydration_active_from")
-            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(9);
-        self.hydration_active_to = db.get_setting("hydration_active_to")
-            .ok().flatten().and_then(|s| s.parse().ok()).unwrap_or(18);
-        self.hydration_pause_focus = db.get_setting("hydration_pause_focus")
-            .ok().flatten().as_deref() == Some("true");
+        self.hydration_enabled = db
+            .get_setting("hydration_enabled")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
+        self.hydration_target = db
+            .get_setting("hydration_target")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(8);
+        self.hydration_interval_mins = db
+            .get_setting("hydration_interval_mins")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        self.hydration_active_from = db
+            .get_setting("hydration_active_from")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(9);
+        self.hydration_active_to = db
+            .get_setting("hydration_active_to")
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(18);
+        self.hydration_pause_focus = db
+            .get_setting("hydration_pause_focus")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("true");
         self.hydration_reward_xp = 20;
 
         if let Ok((count, _)) = self.db.hydration_get_today() {
@@ -13033,7 +15142,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if self.hydration_enabled && self.hydration_next_reminder_at.is_none() {
             self.hydration_next_reminder_at = Some(
                 std::time::Instant::now()
-                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60),
             );
         }
     }
@@ -13062,7 +15171,7 @@ fn fuzzy_match(query: &str, target: &str) -> Option<i32> {
         if self.hydration_next_reminder_at.is_none() {
             self.hydration_next_reminder_at = Some(
                 std::time::Instant::now()
-                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60)
+                    + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60),
             );
         }
 
@@ -13125,12 +15234,13 @@ fn build_project_stats(
             .iter()
             .filter(|n| n.project_id == Some(p_id))
             .count() as i64,
-        journal_entries_in_project: all_journals
-            .iter()
-            .filter(|j| j.project_id == p_id)
-            .count() as i64,
+        journal_entries_in_project: all_journals.iter().filter(|j| j.project_id == p_id).count()
+            as i64,
         active_days_in_project: db.get_active_days_for_project(p_id).unwrap_or(0),
-        total_completed_tasks: all_tasks.iter().filter(|t| t.completed && t.parent_task_id.is_none()).count() as i64,
+        total_completed_tasks: all_tasks
+            .iter()
+            .filter(|t| t.completed && t.parent_task_id.is_none())
+            .count() as i64,
         current_streak: streak.current_streak as i64,
         focus_sessions_total: db.get_focus_sessions().unwrap_or_default().len() as i64,
         daily_adventures_completed: db.get_daily_adventures_completed_count().unwrap_or(0),
@@ -13142,6 +15252,60 @@ mod app_tests {
     use super::*;
     use crate::models::Season;
     use std::path::Path;
+
+    #[test]
+    fn test_delete_word_before_cursor() {
+        let mut input = "one two three".to_string();
+        let end = input.len();
+        let cursor = delete_word_before_cursor(&mut input, end);
+        assert_eq!(input, "one two ");
+        assert_eq!(cursor, input.len());
+
+        let mut input = "one two   ".to_string();
+        let end = input.len();
+        let cursor = delete_word_before_cursor(&mut input, end);
+        assert_eq!(input, "one ");
+        assert_eq!(cursor, 4);
+
+        let mut input = "alpha beta gamma".to_string();
+        let cursor = delete_word_before_cursor(&mut input, 10);
+        assert_eq!(input, "alpha  gamma");
+        assert_eq!(cursor, 6);
+    }
+
+    #[test]
+    fn test_ctrl_h_normalizes_to_ctrl_backspace() {
+        let key = KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(normalized.modifiers.contains(KeyModifiers::CONTROL));
+
+        let key = KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+
+        let key = KeyEvent::new(KeyCode::Backspace, KeyModifiers::SHIFT);
+        let normalized = normalize_ctrl_backspace(key);
+        assert_eq!(normalized.code, KeyCode::Backspace);
+        assert!(is_ctrl_backspace(normalized));
+    }
+
+    #[test]
+    fn test_swarm_notification_titles_are_labeled() {
+        let notif = Notification::swarm("Please return to scrolling.", "Important Notification");
+        assert_eq!(notif.kind, NotificationKind::Swarm);
+        assert!(notif.title.starts_with("Notification Swarm"));
+        assert!(notif.title.contains("Important Notification"));
+
+        let already_labeled = Notification::swarm("Again.", "Notification Swarm");
+        assert_eq!(already_labeled.title, "Notification Swarm");
+    }
 
     #[test]
     fn test_parse_due_date_input() {
@@ -13980,12 +16144,13 @@ mod app_tests {
         let rituals_after = app.db.get_rituals().unwrap();
         assert_eq!(rituals_after.len(), rituals_init.len());
         assert!(!app.notifications.is_empty());
-        assert!(app
-            .notifications
-            .last()
-            .unwrap()
-            .message
-            .contains("at least one"));
+        assert!(
+            app.notifications
+                .last()
+                .unwrap()
+                .message
+                .contains("at least one")
+        );
 
         // 4. Try to create a ritual with 150 XP (over 100 XP cheating limit)
         app.modal_state = ModalType::NewRitual {
@@ -14007,12 +16172,13 @@ mod app_tests {
         }
         let rituals_after_creation = app.db.get_rituals().unwrap();
         assert_eq!(rituals_after_creation.len(), rituals_init.len());
-        assert!(app
-            .notifications
-            .last()
-            .unwrap()
-            .message
-            .contains("cannot exceed 100 XP"));
+        assert!(
+            app.notifications
+                .last()
+                .unwrap()
+                .message
+                .contains("cannot exceed 100 XP")
+        );
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -14090,38 +16256,39 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Soundscapes);
         assert_eq!(app.active_tab_idx, 7);
 
-        // Key '6' -> SyncSettings
+        // Key '6' -> Fellowship
         app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::empty()))
-            .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
-        assert_eq!(app.active_tab_idx, 12);
-
-        // Key '7' -> Fellowship
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::Fellowship);
         assert_eq!(app.active_tab_idx, 8);
 
-        // Key '8' -> GreatChronicle
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::empty()))
+        // Key '7' -> GreatChronicle
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
         assert_eq!(app.active_tab_idx, 14);
 
-        // Key '9' -> should NOT switch screens
+        // Key '8' -> SyncSettings
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
+        assert_eq!(app.active_tab_idx, 12);
+
+        // Key '9' -> Settings
         app.handle_key_event(KeyEvent::new(KeyCode::Char('9'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+        assert_eq!(app.active_screen, ActiveScreen::Settings);
+        assert_eq!(app.active_tab_idx, 15);
 
         // Key '0' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+        assert_eq!(app.active_screen, ActiveScreen::Settings);
 
         // Key 'Y' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+        assert_eq!(app.active_screen, ActiveScreen::Settings);
 
         // Key 'S' -> should NOT switch screens globally anymore
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
@@ -14202,7 +16369,9 @@ mod app_tests {
         app.selected_project_idx = 0;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert!(matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0));
+        assert!(
+            matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0)
+        );
 
         let _ = std::fs::remove_file(db_file);
     }

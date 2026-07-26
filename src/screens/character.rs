@@ -5,11 +5,11 @@
 use crate::models::{DailyReflection, User, XPEvent};
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph},
-    Frame,
 };
 
 // función monstruo — recibe un chingo de parámetros para pintar todo el perfil del héroe
@@ -123,8 +123,7 @@ pub fn draw(
             } else {
                 Span::styled(
                     "Locked (Unlocks at Lvl 10)",
-                    Style::default()
-                        .fg(theme.muted),
+                    Style::default().fg(theme.muted),
                 )
             },
         ]),
@@ -180,10 +179,7 @@ pub fn draw(
     for passive in user.class.passive_description().split("  |  ") {
         passive_lines.push(Line::from(vec![
             Span::styled("  ✦ ", Style::default().fg(accent_color)),
-            Span::styled(
-                passive.trim().to_string(),
-                Style::default().fg(theme.text),
-            ),
+            Span::styled(passive.trim().to_string(), Style::default().fg(theme.text)),
         ]));
     }
     let passives_p = Paragraph::new(passive_lines)
@@ -325,10 +321,7 @@ pub fn draw(
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(
-                            format!("({}) ", time_str),
-                            Style::default().fg(theme.muted),
-                        ),
+                        Span::styled(format!("({}) ", time_str), Style::default().fg(theme.muted)),
                         Span::styled("", item_style),
                     ]));
                 } else {
@@ -345,10 +338,7 @@ pub fn draw(
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(
-                            format!("({}) ", time_str),
-                            Style::default().fg(theme.muted),
-                        ),
+                        Span::styled(format!("({}) ", time_str), Style::default().fg(theme.muted)),
                         Span::styled(lines[0].clone(), item_style),
                     ]));
                     // líneas de continuación llevan padding para alinearse con el texto de la primera
@@ -435,10 +425,7 @@ pub fn draw(
                         format!("  ○ Lvl {:>2}  ", lvl),
                         Style::default().fg(theme.muted),
                     ),
-                    Span::styled(
-                        name,
-                        Style::default().fg(theme.muted),
-                    ),
+                    Span::styled(name, Style::default().fg(theme.muted)),
                 ]))
             }
         })
@@ -593,7 +580,10 @@ pub fn draw(
     {
         let area = crate::screens::intro::centered_rect(50, 30, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Double)
@@ -640,10 +630,7 @@ pub fn draw(
                 items.push(Line::from(vec![
                     Span::styled("    ", Style::default().fg(theme.muted)),
                     Span::styled(format!("{:<22}", choice), Style::default().fg(theme.text)),
-                    Span::styled(
-                        format!(" ({})", detail),
-                        Style::default().fg(theme.muted),
-                    ),
+                    Span::styled(format!(" ({})", detail), Style::default().fg(theme.muted)),
                 ]));
             }
         }

@@ -17,7 +17,11 @@ use ratatui::{
 pub enum EditorMode {
     Normal,
     Insert,
-    Visual { anchor_y: usize, anchor_x: usize, line_mode: bool },
+    Visual {
+        anchor_y: usize,
+        anchor_x: usize,
+        line_mode: bool,
+    },
 }
 
 impl EditorMode {
@@ -25,8 +29,12 @@ impl EditorMode {
         match self {
             EditorMode::Normal => "NORMAL",
             EditorMode::Insert => "INSERT",
-            EditorMode::Visual { line_mode: false, .. } => "VISUAL",
-            EditorMode::Visual { line_mode: true, .. } => "V-LINE",
+            EditorMode::Visual {
+                line_mode: false, ..
+            } => "VISUAL",
+            EditorMode::Visual {
+                line_mode: true, ..
+            } => "V-LINE",
         }
     }
 }
@@ -66,15 +74,21 @@ pub struct EditorState {
 // ── UTF-8 helpers ─────────────────────────────────────────────────────────────
 
 fn floor_char_boundary(s: &str, idx: usize) -> usize {
-    if idx >= s.len() { return s.len(); }
+    if idx >= s.len() {
+        return s.len();
+    }
     let mut i = idx;
-    while !s.is_char_boundary(i) { i -= 1; }
+    while !s.is_char_boundary(i) {
+        i -= 1;
+    }
     i
 }
 
 // Byte index of the end of the char that starts at `idx`
 fn char_end(s: &str, idx: usize) -> usize {
-    if idx >= s.len() { return s.len(); }
+    if idx >= s.len() {
+        return s.len();
+    }
     idx + s[idx..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
 }
 
@@ -98,7 +112,11 @@ impl EditorState {
         };
         // Existing notes open in Normal mode in the body; new notes start in title
         let editing_title = note_id.is_none();
-        let mode = if note_id.is_some() { EditorMode::Normal } else { EditorMode::Insert };
+        let mode = if note_id.is_some() {
+            EditorMode::Normal
+        } else {
+            EditorMode::Insert
+        };
         Self {
             title: initial_title,
             lines,
@@ -126,7 +144,9 @@ impl EditorState {
     // ── Undo / redo ───────────────────────────────────────────────────────────
 
     pub fn push_undo(&mut self) {
-        if self.undo_history.len() >= 100 { self.undo_history.remove(0); }
+        if self.undo_history.len() >= 100 {
+            self.undo_history.remove(0);
+        }
         self.undo_history.push(EditorSnapshot {
             lines: self.lines.clone(),
             cursor_x: self.cursor_x,
@@ -137,8 +157,14 @@ impl EditorState {
 
     pub fn undo(&mut self) {
         if let Some(snap) = self.undo_history.pop() {
-            let cur = EditorSnapshot { lines: self.lines.clone(), cursor_x: self.cursor_x, cursor_y: self.cursor_y };
-            if self.redo_history.len() >= 100 { self.redo_history.remove(0); }
+            let cur = EditorSnapshot {
+                lines: self.lines.clone(),
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
+            if self.redo_history.len() >= 100 {
+                self.redo_history.remove(0);
+            }
             self.redo_history.push(cur);
             self.lines = snap.lines;
             self.cursor_x = snap.cursor_x;
@@ -150,8 +176,14 @@ impl EditorState {
 
     pub fn redo(&mut self) {
         if let Some(snap) = self.redo_history.pop() {
-            let cur = EditorSnapshot { lines: self.lines.clone(), cursor_x: self.cursor_x, cursor_y: self.cursor_y };
-            if self.undo_history.len() >= 100 { self.undo_history.remove(0); }
+            let cur = EditorSnapshot {
+                lines: self.lines.clone(),
+                cursor_x: self.cursor_x,
+                cursor_y: self.cursor_y,
+            };
+            if self.undo_history.len() >= 100 {
+                self.undo_history.remove(0);
+            }
             self.undo_history.push(cur);
             self.lines = snap.lines;
             self.cursor_x = snap.cursor_x;
@@ -168,7 +200,9 @@ impl EditorState {
 
     // In Normal mode the cursor can't sit past the last character
     pub fn clamp_to_normal(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let line = &self.lines[self.cursor_y];
         if line.is_empty() {
             self.cursor_x = 0;
@@ -185,16 +219,26 @@ impl EditorState {
     // ── Normal-mode motions ───────────────────────────────────────────────────
 
     pub fn normal_h(&mut self) {
-        if self.cursor_x == 0 { return; }
+        if self.cursor_x == 0 {
+            return;
+        }
         let line = &self.lines[self.cursor_y];
-        self.cursor_x = line[..self.cursor_x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+        self.cursor_x = line[..self.cursor_x]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
     }
 
     pub fn normal_l(&mut self) {
         let line = &self.lines[self.cursor_y];
-        if line.is_empty() { return; }
+        if line.is_empty() {
+            return;
+        }
         let next = char_end(line, self.cursor_x);
-        if next < line.len() { self.cursor_x = next; }
+        if next < line.len() {
+            self.cursor_x = next;
+        }
         // already on last char — stay
     }
 
@@ -218,11 +262,15 @@ impl EditorState {
         }
     }
 
-    pub fn goto_line_start(&mut self) { self.cursor_x = 0; }
+    pub fn goto_line_start(&mut self) {
+        self.cursor_x = 0;
+    }
 
     pub fn goto_line_end(&mut self) {
         let line = &self.lines[self.cursor_y];
-        self.cursor_x = if line.is_empty() { 0 } else {
+        self.cursor_x = if line.is_empty() {
+            0
+        } else {
             line.char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
         };
     }
@@ -251,14 +299,19 @@ impl EditorState {
             // Skip current group
             while x < line.len() {
                 let c = line[x..].chars().next().unwrap();
-                if is_word_char(c) != cur_is_word { break; }
+                if is_word_char(c) != cur_is_word {
+                    break;
+                }
                 x = char_end(line, x);
             }
             // Skip whitespace
             while x < line.len() && line[x..].chars().next().unwrap().is_whitespace() {
                 x = char_end(line, x);
             }
-            if x < line.len() { self.cursor_x = x; return; }
+            if x < line.len() {
+                self.cursor_x = x;
+                return;
+            }
         }
 
         if y + 1 < self.lines.len() {
@@ -279,26 +332,48 @@ impl EditorState {
         let mut x = self.cursor_x;
 
         if x == 0 {
-            if y == 0 { return; }
+            if y == 0 {
+                return;
+            }
             y -= 1;
             x = self.lines[y].len();
         }
 
         let line = &self.lines[y];
         // Step one char back
-        x = line[..x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+        x = line[..x]
+            .char_indices()
+            .next_back()
+            .map(|(i, _)| i)
+            .unwrap_or(0);
 
         // Skip whitespace backwards
-        while x > 0 && line[x..].chars().next().map(|c| c.is_whitespace()).unwrap_or(false) {
-            x = line[..x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+        while x > 0
+            && line[x..]
+                .chars()
+                .next()
+                .map(|c| c.is_whitespace())
+                .unwrap_or(false)
+        {
+            x = line[..x]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
         }
 
         let ch = line[x..].chars().next().unwrap_or(' ');
         let cur_is_word = is_word_char(ch);
         while x > 0 {
-            let prev = line[..x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+            let prev = line[..x]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
             let c = line[prev..].chars().next().unwrap();
-            if is_word_char(c) != cur_is_word { break; }
+            if is_word_char(c) != cur_is_word {
+                break;
+            }
             x = prev;
         }
 
@@ -313,7 +388,9 @@ impl EditorState {
         let line = &self.lines[y];
 
         // Move one forward first (skip current char)
-        if x < line.len() { x = char_end(line, x); }
+        if x < line.len() {
+            x = char_end(line, x);
+        }
 
         // Skip whitespace
         while x < line.len() && line[x..].chars().next().unwrap().is_whitespace() {
@@ -325,7 +402,9 @@ impl EditorState {
             let cur_is_word = is_word_char(ch);
             while char_end(line, x) < line.len() {
                 let c = line[char_end(line, x)..].chars().next().unwrap();
-                if is_word_char(c) != cur_is_word { break; }
+                if is_word_char(c) != cur_is_word {
+                    break;
+                }
                 x = char_end(line, x);
             }
             self.cursor_x = x;
@@ -345,7 +424,9 @@ impl EditorState {
                 let cur_is_word = is_word_char(ch);
                 while char_end(line, x) < line.len() {
                     let c = line[char_end(line, x)..].chars().next().unwrap();
-                    if is_word_char(c) != cur_is_word { break; }
+                    if is_word_char(c) != cur_is_word {
+                        break;
+                    }
                     x = char_end(line, x);
                 }
             }
@@ -364,27 +445,37 @@ impl EditorState {
 
     // x: delete char under cursor
     pub fn delete_char(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let (x, len) = {
             let line = &self.lines[self.cursor_y];
-            if line.is_empty() { return; }
+            if line.is_empty() {
+                return;
+            }
             let x = floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1)));
             let len = char_end(line, x) - x;
             (x, len)
         };
-        let text = self.lines[self.cursor_y][x..x+len].to_string();
+        let text = self.lines[self.cursor_y][x..x + len].to_string();
         self.set_yank_register(text, false);
-        self.lines[self.cursor_y].drain(x..x+len);
+        self.lines[self.cursor_y].drain(x..x + len);
         self.cursor_x = x;
         self.clamp_to_normal();
     }
 
     // X: delete char before cursor
     pub fn delete_char_before(&mut self) {
-        if self.editing_title || self.cursor_x == 0 { return; }
+        if self.editing_title || self.cursor_x == 0 {
+            return;
+        }
         let prev = {
             let line = &self.lines[self.cursor_y];
-            line[..self.cursor_x].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+            line[..self.cursor_x]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0)
         };
         let text = self.lines[self.cursor_y][prev..self.cursor_x].to_string();
         self.set_yank_register(text, false);
@@ -395,21 +486,27 @@ impl EditorState {
 
     // dd: delete line
     pub fn delete_line(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         self.set_yank_register(self.lines[self.cursor_y].clone(), true);
         if self.lines.len() == 1 {
             self.lines[0].clear();
             self.cursor_x = 0;
         } else {
             self.lines.remove(self.cursor_y);
-            if self.cursor_y >= self.lines.len() { self.cursor_y = self.lines.len() - 1; }
+            if self.cursor_y >= self.lines.len() {
+                self.cursor_y = self.lines.len() - 1;
+            }
             self.clamp_to_normal();
         }
     }
 
     // D: delete to end of line
     pub fn delete_to_end(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let x = {
             let line = &self.lines[self.cursor_y];
             floor_char_boundary(line, self.cursor_x.min(line.len()))
@@ -422,13 +519,17 @@ impl EditorState {
 
     // yy: yank line
     pub fn yank_line(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         self.set_yank_register(self.lines[self.cursor_y].clone(), true);
     }
 
     // p: paste after
     pub fn paste_after(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         if self.yank_is_line {
             let new_line = self.yank_register.clone();
             let at = (self.cursor_y + 1).min(self.lines.len());
@@ -438,18 +539,26 @@ impl EditorState {
         } else if !self.yank_register.is_empty() {
             let reg = self.yank_register.clone();
             let line = &mut self.lines[self.cursor_y];
-            let x = if line.is_empty() { 0 } else {
-                char_end(line, floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1))))
+            let x = if line.is_empty() {
+                0
+            } else {
+                char_end(
+                    line,
+                    floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1))),
+                )
             };
             line.insert_str(x, &reg);
-            self.cursor_x = floor_char_boundary(&self.lines[self.cursor_y], x + reg.len().saturating_sub(1));
+            self.cursor_x =
+                floor_char_boundary(&self.lines[self.cursor_y], x + reg.len().saturating_sub(1));
             self.clamp_to_normal();
         }
     }
 
     // P: paste before
     pub fn paste_before(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         if self.yank_is_line {
             let new_line = self.yank_register.clone();
             self.lines.insert(self.cursor_y, new_line);
@@ -459,14 +568,17 @@ impl EditorState {
             let line = &mut self.lines[self.cursor_y];
             let x = floor_char_boundary(line, self.cursor_x.min(line.len()));
             line.insert_str(x, &reg);
-            self.cursor_x = floor_char_boundary(&self.lines[self.cursor_y], x + reg.len().saturating_sub(1));
+            self.cursor_x =
+                floor_char_boundary(&self.lines[self.cursor_y], x + reg.len().saturating_sub(1));
             self.clamp_to_normal();
         }
     }
 
     // r{c}: replace char under cursor
     pub fn replace_char(&mut self, c: char) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let line = &mut self.lines[self.cursor_y];
         if line.is_empty() {
             line.push(c);
@@ -474,7 +586,7 @@ impl EditorState {
         }
         let x = floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1)));
         let len = char_end(line, x) - x;
-        line.drain(x..x+len);
+        line.drain(x..x + len);
         line.insert(x, c);
         self.cursor_x = x;
     }
@@ -483,27 +595,39 @@ impl EditorState {
 
     fn inner_word_range(&self) -> (usize, usize) {
         let line = &self.lines[self.cursor_y];
-        if line.is_empty() { return (0, 0); }
+        if line.is_empty() {
+            return (0, 0);
+        }
         let x = floor_char_boundary(line, self.cursor_x.min(line.len().saturating_sub(1)));
         let ch = line[x..].chars().next().unwrap_or(' ');
         let cur_is_word = is_word_char(ch);
         let mut start = x;
         while start > 0 {
-            let prev = line[..start].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
-            if is_word_char(line[prev..].chars().next().unwrap()) != cur_is_word { break; }
+            let prev = line[..start]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            if is_word_char(line[prev..].chars().next().unwrap()) != cur_is_word {
+                break;
+            }
             start = prev;
         }
         let mut end = x;
         while end < line.len() {
             let c = line[end..].chars().next().unwrap();
-            if is_word_char(c) != cur_is_word { break; }
+            if is_word_char(c) != cur_is_word {
+                break;
+            }
             end = char_end(line, end);
         }
         (start, end)
     }
 
     pub fn delete_inner_word(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let (s, e) = self.inner_word_range();
         self.set_yank_register(self.lines[self.cursor_y][s..e].to_string(), false);
         self.lines[self.cursor_y].drain(s..e);
@@ -512,20 +636,24 @@ impl EditorState {
     }
 
     pub fn delete_word(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let x_start = self.cursor_x;
         let y_start = self.cursor_y;
         self.word_forward();
         let (x_end, y_end) = (self.cursor_x, self.cursor_y);
         if y_start == y_end {
-            let s = floor_char_boundary(&self.lines[y_start], x_start.min(self.lines[y_start].len()));
+            let s =
+                floor_char_boundary(&self.lines[y_start], x_start.min(self.lines[y_start].len()));
             let e = floor_char_boundary(&self.lines[y_start], x_end.min(self.lines[y_start].len()));
             self.set_yank_register(self.lines[y_start][s..e].to_string(), false);
             self.lines[y_start].drain(s..e);
             self.cursor_x = s;
             self.cursor_y = y_start;
         } else {
-            let s = floor_char_boundary(&self.lines[y_start], x_start.min(self.lines[y_start].len()));
+            let s =
+                floor_char_boundary(&self.lines[y_start], x_start.min(self.lines[y_start].len()));
             self.lines[y_start].truncate(s);
             self.cursor_x = s;
             self.cursor_y = y_start;
@@ -535,7 +663,10 @@ impl EditorState {
 
     // ── Enter/exit modes ──────────────────────────────────────────────────────
 
-    pub fn enter_insert(&mut self) { self.editing_title = false; self.mode = EditorMode::Insert; }
+    pub fn enter_insert(&mut self) {
+        self.editing_title = false;
+        self.mode = EditorMode::Insert;
+    }
 
     pub fn enter_insert_after(&mut self) {
         self.editing_title = false;
@@ -575,16 +706,27 @@ impl EditorState {
     }
 
     pub fn change_line(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         self.set_yank_register(self.lines[self.cursor_y].clone(), false);
         self.lines[self.cursor_y].clear();
         self.cursor_x = 0;
         self.mode = EditorMode::Insert;
     }
 
-    pub fn change_to_end(&mut self) { self.delete_to_end(); self.mode = EditorMode::Insert; }
-    pub fn change_word(&mut self) { self.delete_word(); self.mode = EditorMode::Insert; }
-    pub fn change_inner_word(&mut self) { self.delete_inner_word(); self.mode = EditorMode::Insert; }
+    pub fn change_to_end(&mut self) {
+        self.delete_to_end();
+        self.mode = EditorMode::Insert;
+    }
+    pub fn change_word(&mut self) {
+        self.delete_word();
+        self.mode = EditorMode::Insert;
+    }
+    pub fn change_inner_word(&mut self) {
+        self.delete_inner_word();
+        self.mode = EditorMode::Insert;
+    }
 
     pub fn leave_insert(&mut self) {
         self.mode = EditorMode::Normal;
@@ -594,20 +736,37 @@ impl EditorState {
     // ── Visual mode ───────────────────────────────────────────────────────────
 
     pub fn enter_visual_char(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let (y, x) = (self.cursor_y, self.cursor_x);
-        self.mode = EditorMode::Visual { anchor_y: y, anchor_x: x, line_mode: false };
+        self.mode = EditorMode::Visual {
+            anchor_y: y,
+            anchor_x: x,
+            line_mode: false,
+        };
     }
 
     pub fn enter_visual_line(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let y = self.cursor_y;
-        self.mode = EditorMode::Visual { anchor_y: y, anchor_x: 0, line_mode: true };
+        self.mode = EditorMode::Visual {
+            anchor_y: y,
+            anchor_x: 0,
+            line_mode: true,
+        };
     }
 
     // Normalized selection bounds: (start_y, start_x, end_y, end_x, line_mode)
     pub fn visual_range(&self) -> Option<(usize, usize, usize, usize, bool)> {
-        if let EditorMode::Visual { anchor_y, anchor_x, line_mode } = &self.mode {
+        if let EditorMode::Visual {
+            anchor_y,
+            anchor_x,
+            line_mode,
+        } = &self.mode
+        {
             let (sy, sx, ey, ex) = if (*anchor_y, *anchor_x) <= (self.cursor_y, self.cursor_x) {
                 (*anchor_y, *anchor_x, self.cursor_y, self.cursor_x)
             } else {
@@ -620,60 +779,91 @@ impl EditorState {
     }
 
     pub fn get_visual_text(&self) -> String {
-        let Some((sy, sx, ey, ex, line_mode)) = self.visual_range() else { return String::new(); };
+        let Some((sy, sx, ey, ex, line_mode)) = self.visual_range() else {
+            return String::new();
+        };
         if line_mode {
             return self.lines[sy..=ey].join("\n");
         }
         if sy == ey {
             let line = &self.lines[sy];
             let s = floor_char_boundary(line, sx.min(line.len()));
-            let e = char_end(line, floor_char_boundary(line, ex.min(line.len().saturating_sub(1))));
+            let e = char_end(
+                line,
+                floor_char_boundary(line, ex.min(line.len().saturating_sub(1))),
+            );
             return line[s..e].to_string();
         }
         let mut out = String::new();
         let first = &self.lines[sy];
         let s = floor_char_boundary(first, sx.min(first.len()));
         out.push_str(&first[s..]);
-        for y in sy+1..ey {
+        for y in sy + 1..ey {
             out.push('\n');
             out.push_str(&self.lines[y]);
         }
         out.push('\n');
         let last = &self.lines[ey];
-        let e = char_end(last, floor_char_boundary(last, ex.min(last.len().saturating_sub(1))));
+        let e = char_end(
+            last,
+            floor_char_boundary(last, ex.min(last.len().saturating_sub(1))),
+        );
         out.push_str(&last[..e]);
         out
     }
 
     pub fn yank_visual(&mut self) {
-        let is_line = matches!(self.mode, EditorMode::Visual { line_mode: true, .. });
+        let is_line = matches!(
+            self.mode,
+            EditorMode::Visual {
+                line_mode: true,
+                ..
+            }
+        );
         self.set_yank_register(self.get_visual_text(), is_line);
         self.mode = EditorMode::Normal;
     }
 
     pub fn delete_visual(&mut self) {
-        let Some((sy, sx, ey, ex, line_mode)) = self.visual_range() else { return; };
+        let Some((sy, sx, ey, ex, line_mode)) = self.visual_range() else {
+            return;
+        };
         self.set_yank_register(self.get_visual_text(), line_mode);
 
         if line_mode {
-            for _ in sy..=ey { self.lines.remove(sy); }
-            if self.lines.is_empty() { self.lines.push(String::new()); }
+            for _ in sy..=ey {
+                self.lines.remove(sy);
+            }
+            if self.lines.is_empty() {
+                self.lines.push(String::new());
+            }
             self.cursor_y = sy.min(self.lines.len() - 1);
             self.cursor_x = 0;
         } else if sy == ey {
             let line = &mut self.lines[sy];
             let s = floor_char_boundary(line, sx.min(line.len()));
-            let e = char_end(line, floor_char_boundary(line, ex.min(line.len().saturating_sub(1))));
+            let e = char_end(
+                line,
+                floor_char_boundary(line, ex.min(line.len().saturating_sub(1))),
+            );
             line.drain(s..e);
             self.cursor_y = sy;
             self.cursor_x = s;
         } else {
             let head_keep = floor_char_boundary(&self.lines[sy], sx.min(self.lines[sy].len()));
-            let tail_start = char_end(&self.lines[ey], floor_char_boundary(&self.lines[ey], ex.min(self.lines[ey].len().saturating_sub(1))));
+            let tail_start = char_end(
+                &self.lines[ey],
+                floor_char_boundary(
+                    &self.lines[ey],
+                    ex.min(self.lines[ey].len().saturating_sub(1)),
+                ),
+            );
             let tail = self.lines[ey][tail_start..].to_string();
             self.lines[sy].truncate(head_keep);
             self.lines[sy].push_str(&tail);
-            for _ in sy+1..=ey { self.lines.remove(sy + 1); }
+            for _ in sy + 1..=ey {
+                self.lines.remove(sy + 1);
+            }
             self.cursor_y = sy;
             self.cursor_x = head_keep;
         }
@@ -681,7 +871,10 @@ impl EditorState {
         self.clamp_to_normal();
     }
 
-    pub fn change_visual(&mut self) { self.delete_visual(); self.mode = EditorMode::Insert; }
+    pub fn change_visual(&mut self) {
+        self.delete_visual();
+        self.mode = EditorMode::Insert;
+    }
 
     // ── Insert-mode editing (unchanged) ──────────────────────────────────────
 
@@ -711,7 +904,11 @@ impl EditorState {
     pub fn move_left(&mut self) {
         if self.cursor_x > 0 {
             let line = &self.lines[self.cursor_y];
-            let prev_len = line[..self.cursor_x].chars().next_back().map(|c| c.len_utf8()).unwrap_or(1);
+            let prev_len = line[..self.cursor_x]
+                .chars()
+                .next_back()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
             self.cursor_x -= prev_len;
         } else if self.cursor_y > 0 {
             self.cursor_y -= 1;
@@ -722,7 +919,11 @@ impl EditorState {
     pub fn move_right(&mut self) {
         let line = &self.lines[self.cursor_y];
         if self.cursor_x < line.len() {
-            let ch_len = line[self.cursor_x..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+            let ch_len = line[self.cursor_x..]
+                .chars()
+                .next()
+                .map(|c| c.len_utf8())
+                .unwrap_or(1);
             self.cursor_x += ch_len;
         } else if self.cursor_y < self.lines.len() - 1 {
             self.cursor_y += 1;
@@ -732,7 +933,9 @@ impl EditorState {
 
     pub fn insert_char(&mut self, c: char) {
         if self.editing_title {
-            if self.title.len() < 50 { self.title.push(c); }
+            if self.title.len() < 50 {
+                self.title.push(c);
+            }
         } else {
             let line = &mut self.lines[self.cursor_y];
             let x = floor_char_boundary(line, self.cursor_x.min(line.len()));
@@ -747,7 +950,11 @@ impl EditorState {
         } else if self.cursor_x > 0 {
             let line = &mut self.lines[self.cursor_y];
             let cursor = self.cursor_x.min(line.len());
-            let prev = line[..cursor].char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+            let prev = line[..cursor]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
             line.remove(prev);
             self.cursor_x = prev;
         } else if self.cursor_y > 0 {
@@ -759,8 +966,26 @@ impl EditorState {
         }
     }
 
+    pub fn handle_ctrl_backspace(&mut self) {
+        if self.editing_title {
+            let cursor = self.title.len();
+            delete_word_before_cursor(&mut self.title, cursor);
+        } else if self.cursor_x > 0 {
+            let line = &mut self.lines[self.cursor_y];
+            self.cursor_x = delete_word_before_cursor(line, self.cursor_x);
+        } else if self.cursor_y > 0 {
+            let cur = self.lines.remove(self.cursor_y);
+            self.cursor_y -= 1;
+            let prev_line = &mut self.lines[self.cursor_y];
+            self.cursor_x = prev_line.len();
+            prev_line.push_str(&cur);
+        }
+    }
+
     pub fn handle_delete(&mut self) {
-        if self.editing_title { return; }
+        if self.editing_title {
+            return;
+        }
         let line = &mut self.lines[self.cursor_y];
         let x = floor_char_boundary(line, self.cursor_x.min(line.len()));
         if x < line.len() {
@@ -800,27 +1025,65 @@ impl EditorState {
     }
 }
 
+fn delete_word_before_cursor(input: &mut String, cursor: usize) -> usize {
+    let cursor = cursor.min(input.len());
+    if cursor == 0 {
+        return 0;
+    }
+
+    let mut start = cursor;
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if !ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+    while start > 0 {
+        let (idx, ch) = input[..start].char_indices().next_back().unwrap();
+        if ch.is_whitespace() {
+            break;
+        }
+        start = idx;
+    }
+
+    input.drain(start..cursor);
+    start
+}
+
 // ── Rendering helpers ─────────────────────────────────────────────────────────
 
 // Returns (sel_start_byte, sel_end_byte_exclusive) for `line_i` in visual mode
 fn line_sel_range(line_i: usize, line: &str, state: &EditorState) -> Option<(usize, usize)> {
     let (sy, sx, ey, ex, line_mode) = state.visual_range()?;
-    if line_i < sy || line_i > ey { return None; }
+    if line_i < sy || line_i > ey {
+        return None;
+    }
 
     if line_mode {
         let end = if line.is_empty() { 1 } else { line.len() };
         return Some((0, end));
     }
 
-    let start = if line_i > sy { 0 } else {
+    let start = if line_i > sy {
+        0
+    } else {
         floor_char_boundary(line, sx.min(line.len()))
     };
     let end = if line_i < ey {
-        if line.is_empty() { 1 } else { line.len() }
+        if line.is_empty() {
+            1
+        } else {
+            line.len()
+        }
     } else {
         // inclusive end — include the char at ex
         let clamped = floor_char_boundary(line, ex.min(line.len().saturating_sub(1)));
-        if line.is_empty() { 1 } else { char_end(line, clamped) }
+        if line.is_empty() {
+            1
+        } else {
+            char_end(line, clamped)
+        }
     };
 
     Some((start, end.max(start + if line.is_empty() { 1 } else { 0 })))
@@ -845,15 +1108,23 @@ fn render_body_line<'a>(
             (line[sel_s..sel_e].to_string(), &line[sel_e..])
         } else {
             // sel_e > line.len() means empty line or end of content → show one space as cursor
-            let text = if line.len() > sel_s { line[sel_s..].to_string() } else { " ".to_string() };
+            let text = if line.len() > sel_s {
+                line[sel_s..].to_string()
+            } else {
+                " ".to_string()
+            };
             (text, "")
         };
 
         let sel_style = Style::default().fg(Color::Black).bg(theme.selection);
         let mut spans: Vec<Span<'a>> = Vec::new();
-        if !before.is_empty() { spans.push(Span::raw(before)); }
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
         spans.push(Span::styled(in_sel, sel_style));
-        if !after.is_empty() { spans.push(Span::raw(after)); }
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
         Line::from(spans)
     } else if is_cursor_line {
         // Normal/Insert cursor — single char highlighted
@@ -867,9 +1138,13 @@ fn render_body_line<'a>(
         };
         let cur_style = Style::default().fg(Color::Black).bg(theme.selection);
         let mut spans: Vec<Span<'a>> = Vec::new();
-        if !before.is_empty() { spans.push(Span::raw(before)); }
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
         spans.push(Span::styled(cursor_ch, cur_style));
-        if !after.is_empty() { spans.push(Span::raw(after)); }
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
         Line::from(spans)
     } else {
         Line::from(line)
@@ -969,9 +1244,18 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
     let pos_str = format!(" {}:{} ", state.cursor_y + 1, state.cursor_x + 1);
 
     let mode_style = match &state.mode {
-        EditorMode::Normal  => Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD),
-        EditorMode::Insert  => Style::default().fg(Color::Black).bg(theme.success).add_modifier(Modifier::BOLD),
-        EditorMode::Visual { .. } => Style::default().fg(Color::Black).bg(theme.warning).add_modifier(Modifier::BOLD),
+        EditorMode::Normal => Style::default()
+            .fg(Color::Black)
+            .bg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+        EditorMode::Insert => Style::default()
+            .fg(Color::Black)
+            .bg(theme.success)
+            .add_modifier(Modifier::BOLD),
+        EditorMode::Visual { .. } => Style::default()
+            .fg(Color::Black)
+            .bg(theme.warning)
+            .add_modifier(Modifier::BOLD),
     };
 
     let mut status_spans = vec![
@@ -979,13 +1263,25 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         Span::styled("  ", Style::default()),
     ];
     if !pending.is_empty() {
-        status_spans.push(Span::styled(format!(" {pending}_ "), Style::default().fg(theme.warning)));
+        status_spans.push(Span::styled(
+            format!(" {pending}_ "),
+            Style::default().fg(theme.warning),
+        ));
         status_spans.push(Span::styled("  ", Style::default()));
     }
     if state.editing_title {
-        let esc_label = if state.note_id.is_some() { " Body" } else { " Cancel" };
+        let esc_label = if state.note_id.is_some() {
+            " Body"
+        } else {
+            " Cancel"
+        };
         status_spans.extend([
-            Span::styled("Ctrl+S", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Ctrl+S",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Save", Style::default().fg(theme.muted)),
             Span::styled("  Enter", Style::default().fg(accent)),
             Span::styled(" Body", Style::default().fg(theme.muted)),
@@ -994,7 +1290,12 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         ]);
     } else {
         status_spans.extend([
-            Span::styled("Ctrl+S", Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "Ctrl+S",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(" Save", Style::default().fg(theme.muted)),
             Span::styled("  Esc", Style::default().fg(accent)),
             Span::styled(" Cancel", Style::default().fg(theme.muted)),
@@ -1044,14 +1345,21 @@ fn draw_help_popup(f: &mut Frame, area: Rect, theme: &Theme) {
     let popup_h: u16 = 27;
     let x = area.x + area.width.saturating_sub(popup_w) / 2;
     let y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_area = Rect { x, y, width: popup_w.min(area.width), height: popup_h.min(area.height) };
+    let popup_area = Rect {
+        x,
+        y,
+        width: popup_w.min(area.width),
+        height: popup_h.min(area.height),
+    };
 
     f.render_widget(Clear, popup_area);
 
     let accent = theme.primary;
-    let head  = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let key   = Style::default().fg(theme.success).add_modifier(Modifier::BOLD);
-    let desc  = Style::default().fg(Color::White);
+    let head = Style::default().fg(accent).add_modifier(Modifier::BOLD);
+    let key = Style::default()
+        .fg(theme.success)
+        .add_modifier(Modifier::BOLD);
+    let desc = Style::default().fg(Color::White);
     let muted = Style::default().fg(theme.muted);
 
     let kd = |k: &'static str, d: &'static str| -> Line<'static> {
@@ -1063,29 +1371,29 @@ fn draw_help_popup(f: &mut Frame, area: Rect, theme: &Theme) {
 
     let lines: Vec<Line> = vec![
         Line::from(Span::styled(" MOTION", head)),
-        kd("h j k l",           "← ↓ ↑ →"),
-        kd("w / b / e",         "next / prev / end word"),
-        kd("0  $",              "line start / end"),
-        kd("gg  G",             "file start / end"),
+        kd("h j k l", "← ↓ ↑ →"),
+        kd("w / b / e", "next / prev / end word"),
+        kd("0  $", "line start / end"),
+        kd("gg  G", "file start / end"),
         Line::from(""),
         Line::from(Span::styled(" INSERT", head)),
-        kd("i / a",             "insert before / after cursor"),
-        kd("I / A",             "insert at line start / end"),
-        kd("o / O",             "new line below / above"),
+        kd("i / a", "insert before / after cursor"),
+        kd("I / A", "insert at line start / end"),
+        kd("o / O", "new line below / above"),
         Line::from(""),
         Line::from(Span::styled(" EDIT  (Normal mode)", head)),
-        kd("x / X",             "delete char fwd / bwd"),
-        kd("r{c}",              "replace char with {c}"),
-        kd("dd  D",             "delete line / to end"),
-        kd("dw  diw",           "delete word / inner word"),
-        kd("cc  cw  ciw  C",    "change variants"),
-        kd("yy  p  P",          "yank line / paste ↓ / ↑"),
-        kd("u  Ctrl+R",         "undo / redo"),
+        kd("x / X", "delete char fwd / bwd"),
+        kd("r{c}", "replace char with {c}"),
+        kd("dd  D", "delete line / to end"),
+        kd("dw  diw", "delete word / inner word"),
+        kd("cc  cw  ciw  C", "change variants"),
+        kd("yy  p  P", "yank line / paste ↓ / ↑"),
+        kd("u  Ctrl+R", "undo / redo"),
         Line::from(""),
         Line::from(Span::styled(" VISUAL", head)),
-        kd("v",                 "char select"),
-        kd("V",                 "line select"),
-        kd("y  d  c",           "yank / delete / change"),
+        kd("v", "char select"),
+        kd("V", "line select"),
+        kd("y  d  c", "yank / delete / change"),
         Line::from(""),
         Line::from(vec![
             Span::styled("  ?", key),
@@ -1155,9 +1463,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ctrl_backspace_deletes_previous_word() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            Some(Uuid::new_v4()),
+            "Title".to_string(),
+            "alpha beta gamma".to_string(),
+        );
+        editor.mode = EditorMode::Insert;
+        editor.cursor_x = "alpha beta ".len();
+
+        editor.handle_ctrl_backspace();
+
+        assert_eq!(editor.lines[0], "alpha gamma");
+        assert_eq!(editor.cursor_x, "alpha ".len());
+    }
+
+    #[test]
     fn test_vim_undo_redo() {
         let project_id = Uuid::new_v4();
-        let mut editor = EditorState::new(project_id, None, "Title".to_string(), "hello world".to_string());
+        let mut editor = EditorState::new(
+            project_id,
+            None,
+            "Title".to_string(),
+            "hello world".to_string(),
+        );
         editor.editing_title = false;
 
         editor.push_undo();

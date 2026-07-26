@@ -10,8 +10,8 @@ pub mod lore_manager;
 pub mod notifications;
 pub mod planner;
 pub mod sync_engine;
-pub mod theme;
 pub mod task_notifications;
+pub mod theme;
 pub mod xp;
 
 pub use api_client::ApiClient;
