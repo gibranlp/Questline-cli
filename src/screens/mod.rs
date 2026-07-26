@@ -11,13 +11,14 @@ pub mod focus;
 pub mod gateway;
 pub mod great_chronicle;
 pub mod intro;
-pub mod prologue;
 pub mod legends;
 pub mod library;
 pub mod onboarding;
 pub mod project_workspace;
 pub mod projects;
+pub mod prologue;
 pub mod restore;
+pub mod settings;
 pub mod soundscapes;
 pub mod sync;
 
@@ -39,6 +40,7 @@ pub enum ActiveScreen {
     Workspace,
     Focus,
     Soundscapes,
+    Settings,
     SyncSettings,
     Fellowship,
     About,

@@ -4,18 +4,18 @@
 
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 const PALETTE: &[Color] = &[
-    Color::Rgb(168,  85, 247),
-    Color::Rgb(249, 115,  22),
-    Color::Rgb(6,  182, 212),
-    Color::Rgb(245, 158,  11),
+    Color::Rgb(168, 85, 247),
+    Color::Rgb(249, 115, 22),
+    Color::Rgb(6, 182, 212),
+    Color::Rgb(245, 158, 11),
     Color::Rgb(255, 105, 180),
 ];
 
@@ -24,10 +24,10 @@ const PALETTE: &[Color] = &[
 pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
     let size = f.size();
     let accent = PALETTE[(ticks / 8) % PALETTE.len()];
-    let muted  = Color::Rgb(70, 70, 70);
-    let dim    = Color::Rgb(50, 50, 50);
-    let body   = Color::Rgb(195, 195, 195);
-    let ghost  = Color::Rgb(110, 110, 110);
+    let muted = Color::Rgb(70, 70, 70);
+    let dim = Color::Rgb(50, 50, 50);
+    let body = Color::Rgb(195, 195, 195);
+    let ghost = Color::Rgb(110, 110, 110);
 
     f.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
@@ -86,7 +86,9 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
         )),
     ];
     f.render_widget(
-        Paragraph::new(header).alignment(Alignment::Center).wrap(Wrap { trim: true }),
+        Paragraph::new(header)
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
         center(layout[1]),
     );
 
@@ -95,16 +97,25 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
         Paragraph::new(Line::from(Span::styled(
             "─".repeat(64),
             Style::default().fg(dim),
-        ))).alignment(Alignment::Center),
+        )))
+        .alignment(Alignment::Center),
         center(layout[2]),
     );
 
     // ── Opción 0 — Nuevo Aventurero ───────────────────────────────────────────
     let sel0 = selected_idx == 0;
     let (border0, btype0, title0) = if sel0 {
-        (Style::default().fg(accent).add_modifier(Modifier::BOLD), BorderType::Double, " ▸  NEW ADVENTURER  ◂ ")
+        (
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            BorderType::Double,
+            " ▸  NEW ADVENTURER  ◂ ",
+        )
     } else {
-        (Style::default().fg(muted), BorderType::Plain, "   New Adventurer   ")
+        (
+            Style::default().fg(muted),
+            BorderType::Plain,
+            "   New Adventurer   ",
+        )
     };
 
     let opt0 = vec![
@@ -126,7 +137,12 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
                     .borders(Borders::ALL)
                     .border_type(btype0)
                     .border_style(border0)
-                    .title(Span::styled(title0, Style::default().fg(if sel0 { accent } else { muted }).add_modifier(Modifier::BOLD))),
+                    .title(Span::styled(
+                        title0,
+                        Style::default()
+                            .fg(if sel0 { accent } else { muted })
+                            .add_modifier(Modifier::BOLD),
+                    )),
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
@@ -136,9 +152,17 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
     // ── Opción 1 — Continuar la Aventura ──────────────────────────────────────
     let sel1 = selected_idx == 1;
     let (border1, btype1, title1) = if sel1 {
-        (Style::default().fg(accent).add_modifier(Modifier::BOLD), BorderType::Double, " ▸  CONTINUE THE ADVENTURE  ◂ ")
+        (
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            BorderType::Double,
+            " ▸  CONTINUE THE ADVENTURE  ◂ ",
+        )
     } else {
-        (Style::default().fg(muted), BorderType::Plain, "   Continue the Adventure   ")
+        (
+            Style::default().fg(muted),
+            BorderType::Plain,
+            "   Continue the Adventure   ",
+        )
     };
 
     let opt1 = vec![
@@ -160,7 +184,12 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
                     .borders(Borders::ALL)
                     .border_type(btype1)
                     .border_style(border1)
-                    .title(Span::styled(title1, Style::default().fg(if sel1 { accent } else { muted }).add_modifier(Modifier::BOLD))),
+                    .title(Span::styled(
+                        title1,
+                        Style::default()
+                            .fg(if sel1 { accent } else { muted })
+                            .add_modifier(Modifier::BOLD),
+                    )),
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
@@ -183,7 +212,8 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
             Span::styled("  navigate    ", Style::default().fg(dim)),
             Span::styled("[ Enter ]", Style::default().fg(ghost)),
             Span::styled("  confirm your fate", Style::default().fg(dim)),
-        ])).alignment(Alignment::Center),
+        ]))
+        .alignment(Alignment::Center),
         center(layout[7]),
     );
 }

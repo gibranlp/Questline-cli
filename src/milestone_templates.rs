@@ -153,10 +153,7 @@ pub const TEMPLATES: &[MilestoneTemplate] = &[
         description: "Demonstrate consistent focus in your work.",
         tier: Tier::Initiate,
         xp_reward: 250,
-        requirements: &[
-            Req::FocusSessionsTotal(3),
-            Req::ActiveDaysInProject(2),
-        ],
+        requirements: &[Req::FocusSessionsTotal(3), Req::ActiveDaysInProject(2)],
         flavor_text: "Clarity comes with consistent effort.",
     },
     // ─── Tier 2: Veteran ─────────────────────────────────────────────────────

@@ -41,6 +41,10 @@ impl ThemeService {
         }
     }
 
+    pub fn choice(&self) -> ThemeChoice {
+        self.choice
+    }
+
     // Accessor returning active UI layout settings.
     pub fn theme(&self) -> Theme {
         self.current_theme

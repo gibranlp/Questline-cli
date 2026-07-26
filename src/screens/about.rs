@@ -12,21 +12,11 @@ use ratatui::{
 };
 
 const FACTS: &[&[&str]] = &[
-    &[
-        "• The Great Backlog grows stronger when ignored.",
-    ],
-    &[
-        "• Scope Dragons feed on \"just one more feature.\"",
-    ],
-    &[
-        "• The Evergrowth has witnessed every excuse ever recorded.",
-    ],
-    &[
-        "• Future You has filed several complaints.",
-    ],
-    &[
-        "• The Chronicle remembers everything.",
-    ],
+    &["• The Great Backlog grows stronger when ignored."],
+    &["• Scope Dragons feed on \"just one more feature.\""],
+    &["• The Evergrowth has witnessed every excuse ever recorded."],
+    &["• Future You has filed several complaints."],
+    &["• The Chronicle remembers everything."],
     &[
         "• The Chronicle records achievements, mistakes,",
         "  and suspiciously optimistic deadlines.",
@@ -203,7 +193,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
-            "v1.1.1", "Jul 23, 2026",
+            "v1.1.1",
+            "Jul 23, 2026",
             "The World Before the Swarm",
             &[
                 "Massive World Lore expansion — roughly 200 pages of unlockable Questline history",
@@ -217,7 +208,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.1.0", "Jul 14, 2026",
+            "v1.1.0",
+            "Jul 14, 2026",
             "The Nodes Remember",
             &[
                 "Multi-device sync: processed events deduplication — no more phantom conflicts",
@@ -232,7 +224,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.9", "Jul 11, 2026",
+            "v1.0.9",
+            "Jul 11, 2026",
             "The Scrollkeeper Awakens",
             &[
                 "Vim-like editor for notes: Normal, Insert, Visual modes",
@@ -246,7 +239,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.8", "Jul 6, 2026",
+            "v1.0.8",
+            "Jul 6, 2026",
             "The Focus Session Listens Now",
             &[
                 "Music visualizer now shows real audio",
@@ -261,7 +255,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.7", "Jul 1, 2026",
+            "v1.0.7",
+            "Jul 1, 2026",
             "Music, Motion, and a New Address",
             &[
                 "Moved to questlinecli.com",
@@ -273,7 +268,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.6", "Jun 26, 2026",
+            "v1.0.6",
+            "Jun 26, 2026",
             "The Notification Swarm",
             &[
                 "Living Chapters: global cooperative quests",
@@ -294,7 +290,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.5", "Jun 24, 2026",
+            "v1.0.5",
+            "Jun 24, 2026",
             "The Instant Messenger Update",
             &[
                 "Real-time fellowship chat (4 s)",
@@ -307,7 +304,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.4", "Jun 23, 2026",
+            "v1.0.4",
+            "Jun 23, 2026",
             "The Distribution Chronicle",
             &[
                 "Cross-platform binary releases",
@@ -318,7 +316,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.3", "Jun 22, 2026",
+            "v1.0.3",
+            "Jun 22, 2026",
             "The Great Refactor",
             &[
                 "Full UI / UX overhaul",
@@ -330,7 +329,8 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.2", "Jun 21, 2026",
+            "v1.0.2",
+            "Jun 21, 2026",
             "Sync & Media",
             &[
                 "Shared key display in Sync pane",
@@ -339,15 +339,14 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
             ],
         ),
         (
-            "v1.0.1", "Jun 20, 2026",
+            "v1.0.1",
+            "Jun 20, 2026",
             "First Patch",
-            &[
-                "Post-launch stability fixes",
-                "Release engineering setup",
-            ],
+            &["Post-launch stability fixes", "Release engineering setup"],
         ),
         (
-            "v1.0.0", "Jun 20, 2026",
+            "v1.0.0",
+            "Jun 20, 2026",
             "The First Chronicle",
             &[
                 "Initial public release",
@@ -367,7 +366,9 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
         Line::from(""),
         Line::from(Span::styled(
             "  CHANGELOG",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         cl_div(),
@@ -377,13 +378,18 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
-            Span::styled(*ver, Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                *ver,
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            ),
             Span::styled("  ·  ", Style::default().fg(Color::DarkGray)),
             Span::styled(*date, Style::default().fg(theme.muted)),
         ]));
         lines.push(Line::from(Span::styled(
             format!("  {}", codename),
-            Style::default().fg(Color::White).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::ITALIC),
         )));
         lines.push(Line::from(""));
         for change in *changes {
@@ -416,7 +422,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         divider(accent),
         Line::from(Span::styled(
             "                         ABOUT QUESTLINE",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         divider(accent),
         Line::from(""),
@@ -457,7 +465,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  Features include:",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ];
@@ -485,7 +495,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  The World of Questline",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -513,14 +525,18 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  The war continues.",
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         divider(accent),
         Line::from(""),
         Line::from(Span::styled(
             "  The Creator",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -554,7 +570,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  Help Defeat the Great Backlog (Support)",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -582,7 +600,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  Future You has already voted in favor of this decision.",
-            Style::default().fg(theme.muted).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.muted)
+                .add_modifier(Modifier::ITALIC),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -597,7 +617,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  Technical Information",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ]);
@@ -629,11 +651,15 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  \"Motivation is temporary.",
-            Style::default().fg(Color::White).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::ITALIC),
         )),
         Line::from(Span::styled(
             "   The Chronicle is forever.\"",
-            Style::default().fg(Color::White).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::ITALIC),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -645,7 +671,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         Line::from(""),
         Line::from(Span::styled(
             "  Did You Know?",
-            Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
     ]);
@@ -653,15 +681,13 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
     for fact_line in fact_group {
         lines.push(Line::from(Span::styled(
             format!("  {fact_line}"),
-            Style::default().fg(theme.text).add_modifier(Modifier::ITALIC),
+            Style::default()
+                .fg(theme.text)
+                .add_modifier(Modifier::ITALIC),
         )));
     }
 
-    lines.extend([
-        Line::from(""),
-        divider(accent),
-        Line::from(""),
-    ]);
+    lines.extend([Line::from(""), divider(accent), Line::from("")]);
 
     // Cell::set() — se guarda aquí para que el caller pueda calcular el scroll máximo sin re-contar
     app.about_content_lines.set(lines.len() as u16);
@@ -684,11 +710,15 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                 .title(Line::from(vec![
                     Span::styled(
                         " About Questline  [↑↓] scroll  [R] Send Report  ",
-                        Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         "[Support] ",
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ])),
         );
@@ -705,7 +735,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                 .border_style(Style::default().fg(theme.border))
                 .title(Span::styled(
                     " Version History ",
-                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
                 )),
         );
     f.render_widget(right, cols[1]);

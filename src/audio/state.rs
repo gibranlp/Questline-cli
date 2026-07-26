@@ -13,6 +13,8 @@ pub struct AudioState {
     pub current_soundscape: String,
     pub status: PlaybackStatus,
     pub volume: f32, // 0.0 to 1.0
+    pub sound_effects_enabled: bool,
+    pub sound_effects_volume: f32, // 0.0 to 1.0
     pub local_music_folder: String,
 }
 
@@ -28,6 +30,8 @@ impl AudioState {
             current_soundscape: "Silent".to_string(),
             status: PlaybackStatus::Stopped,
             volume: 0.5,
+            sound_effects_enabled: true,
+            sound_effects_volume: 1.0,
             local_music_folder: String::new(),
         }
     }

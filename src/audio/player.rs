@@ -5,9 +5,9 @@
 use crate::audio::state::{AudioState, PlaybackStatus};
 use crate::audio::streams::build_source;
 use rodio::{OutputStream, Sink, Source};
-use std::sync::{Arc, Mutex};
 #[cfg(not(target_os = "windows"))]
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+use std::sync::{Arc, Mutex};
 
 pub struct AudioPlayer {
     _stream: Option<OutputStream>,
@@ -33,35 +33,41 @@ impl AudioPlayer {
         let mut handle = None;
         let mut sink = None;
 
-        match OutputStream::try_default() { Ok((s, h)) => {
-            match Sink::try_new(&h) { Ok(sk) => {
-                _stream = Some(s);
-                handle = Some(h);
-                // volumen default al 50%, ni muy alto ni muy bajo
-                sk.set_volume(0.5);
-                sink = Some(sk);
+        match OutputStream::try_default() {
+            Ok((s, h)) => {
+                match Sink::try_new(&h) {
+                    Ok(sk) => {
+                        _stream = Some(s);
+                        handle = Some(h);
+                        // volumen default al 50%, ni muy alto ni muy bajo
+                        sk.set_volume(0.5);
+                        sink = Some(sk);
+                        crate::services::log_structured(
+                            "INFO",
+                            "audio_init",
+                            "Audio output stream initialized successfully.",
+                            None,
+                        );
+                    }
+                    _ => {
+                        crate::services::log_structured(
+                            "ERROR",
+                            "audio_init",
+                            "Failed to create audio playback sink.",
+                            None,
+                        );
+                    }
+                }
+            }
+            _ => {
                 crate::services::log_structured(
-                    "INFO",
+                    "WARNING",
                     "audio_init",
-                    "Audio output stream initialized successfully.",
+                    "Failed to initialize default audio output stream. Running in silent mode.",
                     None,
                 );
-            } _ => {
-                crate::services::log_structured(
-                    "ERROR",
-                    "audio_init",
-                    "Failed to create audio playback sink.",
-                    None,
-                );
-            }}
-        } _ => {
-            crate::services::log_structured(
-                "WARNING",
-                "audio_init",
-                "Failed to initialize default audio output stream. Running in silent mode.",
-                None,
-            );
-        }}
+            }
+        }
 
         let player = Self {
             _stream,
@@ -82,8 +88,12 @@ impl AudioPlayer {
     pub fn play_effect_bytes(&self, bytes: &'static [u8]) {
         if let Some(ref handle) = self.handle {
             let handle = handle.clone();
-            // efectos al 20% del volumen maestro — pues no queremos que asusten al usuario
-            let volume = self.get_state().volume * 0.20;
+            let state = self.get_state();
+            if !state.sound_effects_enabled {
+                return;
+            }
+            // Calcula el volumen efectivo de los efectos sin alterar el volumen del soundscape activo.
+            let volume = state.volume * 0.20 * state.sound_effects_volume;
             std::thread::spawn(move || {
                 let cursor = std::io::Cursor::new(bytes);
                 let source = match rodio::Decoder::new(cursor) {
@@ -98,7 +108,7 @@ impl AudioPlayer {
                         return;
                     }
                 };
-                
+
                 let sink = match Sink::try_new(&handle) {
                     Ok(sk) => sk,
                     Err(e) => {
@@ -111,7 +121,7 @@ impl AudioPlayer {
                         return;
                     }
                 };
-                
+
                 sink.set_volume(volume);
                 sink.append(source);
                 sink.sleep_until_end();
@@ -124,7 +134,9 @@ impl AudioPlayer {
     }
 
     pub fn play_task_complete(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/focus-task-complete.ogg"));
+        self.play_effect_bytes(include_bytes!(
+            "../../assets/sounds/focus-task-complete.ogg"
+        ));
     }
 
     pub fn play_delete(&self) {
@@ -153,14 +165,19 @@ impl AudioPlayer {
 
     // dispara el audio cinemático en su propio sink para que suene encima del soundscape
     pub fn play_cinematic(&self) {
-        let Some(ref handle) = self.handle else { return };
+        let Some(ref handle) = self.handle else {
+            return;
+        };
         let sink_arc = self.cinematic_sink.clone();
-        let volume = self.get_state().volume * 0.20;
+        let state = self.get_state();
+        if !state.sound_effects_enabled {
+            return;
+        }
+        let volume = state.volume * 0.20 * state.sound_effects_volume;
         let handle = handle.clone();
         std::thread::spawn(move || {
-            let cursor = std::io::Cursor::new(
-                include_bytes!("../../assets/sounds/Cinematic Epic.mp3"),
-            );
+            let cursor =
+                std::io::Cursor::new(include_bytes!("../../assets/sounds/Cinematic Epic.mp3"));
             let source = match rodio::Decoder::new(cursor) {
                 Ok(s) => s,
                 Err(_) => return,
@@ -186,7 +203,13 @@ impl AudioPlayer {
     }
 
     pub fn play(&self, soundscape_name: &str) {
-        trigger_playback(soundscape_name, &self.state, &self.sink, &self.handle, &self.spectrum);
+        trigger_playback(
+            soundscape_name,
+            &self.state,
+            &self.sink,
+            &self.handle,
+            &self.spectrum,
+        );
     }
 
     pub fn get_spectrum(&self) -> [f32; crate::audio::spectrum::NUM_BARS] {
@@ -253,6 +276,27 @@ impl AudioPlayer {
     pub fn volume_down(&self) {
         let current = self.get_state().volume;
         self.set_volume(current - 0.05);
+    }
+
+    pub fn set_sound_effects_enabled(&self, enabled: bool) {
+        let mut state = self.state.lock().unwrap();
+        state.sound_effects_enabled = enabled;
+    }
+
+    // Ajusta el volumen de efectos; el volumen maestro se mantiene separado para música y soundscapes.
+    pub fn set_sound_effects_volume(&self, vol: f32) {
+        let mut state = self.state.lock().unwrap();
+        state.sound_effects_volume = vol.clamp(0.0, 1.0);
+    }
+
+    pub fn sound_effects_volume_up(&self) {
+        let current = self.get_state().sound_effects_volume;
+        self.set_sound_effects_volume(current + 0.05);
+    }
+
+    pub fn sound_effects_volume_down(&self) {
+        let current = self.get_state().sound_effects_volume;
+        self.set_sound_effects_volume(current - 0.05);
     }
 
     pub fn get_state(&self) -> AudioState {
@@ -354,17 +398,41 @@ impl AudioPlayer {
                         MediaControlEvent::Next => {
                             let current = state_clone.lock().unwrap().current_soundscape.clone();
                             if current == "Local Folder" || current.starts_with("Local:") {
-                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
-                            } else if current == "Music For Programming" || current.starts_with("MFP:") {
-                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
+                                trigger_local_folder(
+                                    state_clone.clone(),
+                                    sink_clone.clone(),
+                                    handle_clone.clone(),
+                                    spectrum_clone.clone(),
+                                );
+                            } else if current == "Music For Programming"
+                                || current.starts_with("MFP:")
+                            {
+                                trigger_music_for_programming(
+                                    state_clone.clone(),
+                                    sink_clone.clone(),
+                                    handle_clone.clone(),
+                                    spectrum_clone.clone(),
+                                );
                             }
                         }
                         MediaControlEvent::Previous => {
                             let current = state_clone.lock().unwrap().current_soundscape.clone();
                             if current == "Local Folder" || current.starts_with("Local:") {
-                                trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
-                            } else if current == "Music For Programming" || current.starts_with("MFP:") {
-                                trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum_clone.clone());
+                                trigger_local_folder(
+                                    state_clone.clone(),
+                                    sink_clone.clone(),
+                                    handle_clone.clone(),
+                                    spectrum_clone.clone(),
+                                );
+                            } else if current == "Music For Programming"
+                                || current.starts_with("MFP:")
+                            {
+                                trigger_music_for_programming(
+                                    state_clone.clone(),
+                                    sink_clone.clone(),
+                                    handle_clone.clone(),
+                                    spectrum_clone.clone(),
+                                );
                             }
                         }
                         _ => {}
@@ -437,21 +505,34 @@ fn trigger_playback(
         // drop explícito antes de spawn para no tener deadlock en el otro thread
         drop(sink_guard);
         drop(state);
-        trigger_music_for_programming(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum.clone());
+        trigger_music_for_programming(
+            state_clone.clone(),
+            sink_clone.clone(),
+            handle_clone.clone(),
+            spectrum.clone(),
+        );
         return;
     }
 
     if soundscape_name == "Local Folder" {
         drop(sink_guard);
         drop(state);
-        trigger_local_folder(state_clone.clone(), sink_clone.clone(), handle_clone.clone(), spectrum.clone());
+        trigger_local_folder(
+            state_clone.clone(),
+            sink_clone.clone(),
+            handle_clone.clone(),
+            spectrum.clone(),
+        );
         return;
     }
 
     if let Some(src) = build_source(soundscape_name) {
         if let Some(ref sk) = *sink_guard {
             // envuelve la fuente en SpectrumTap para capturar muestras en tiempo real
-            sk.append(crate::audio::spectrum::SpectrumSource::new(src, spectrum.clone()));
+            sk.append(crate::audio::spectrum::SpectrumSource::new(
+                src,
+                spectrum.clone(),
+            ));
             sk.play();
         }
     }
@@ -467,7 +548,10 @@ fn trigger_music_for_programming(
     std::thread::spawn(move || {
         // todo esto corre en background — el UI no espera, la descarga puede tardar
         let rss_url = "https://musicforprogramming.net/rss.xml";
-        let body = match ureq::get(rss_url).timeout(std::time::Duration::from_secs(10)).call() {
+        let body = match ureq::get(rss_url)
+            .timeout(std::time::Duration::from_secs(10))
+            .call()
+        {
             Ok(resp) => match resp.into_string() {
                 Ok(s) => s,
                 Err(_) => return,
@@ -491,10 +575,11 @@ fn trigger_music_for_programming(
         }
 
         // usa el timestamp como semilla para elegir episodio — aleatorio sin importar rand
-        let index = match std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            Ok(d) => (d.as_millis() as usize) % urls.len(),
-            Err(_) => 0,
-        };
+        let index =
+            match std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH) {
+                Ok(d) => (d.as_millis() as usize) % urls.len(),
+                Err(_) => 0,
+            };
         let mp3_url = urls[index].clone();
 
         let display_name = if let Some(filename) = mp3_url.split('/').last() {
@@ -522,7 +607,10 @@ fn trigger_music_for_programming(
         };
         let temp_file_path = storage_dir.join("music_for_programming.mp3");
 
-        let resp = match ureq::get(&mp3_url).timeout(std::time::Duration::from_secs(30)).call() {
+        let resp = match ureq::get(&mp3_url)
+            .timeout(std::time::Duration::from_secs(30))
+            .call()
+        {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -540,7 +628,9 @@ fn trigger_music_for_programming(
         {
             // check: si el usuario cambió de soundscape mientras descargaba, cancelar y limpiar
             let state = state_clone.lock().unwrap();
-            if !state.current_soundscape.starts_with("MFP:") && state.current_soundscape != "Music For Programming" {
+            if !state.current_soundscape.starts_with("MFP:")
+                && state.current_soundscape != "Music For Programming"
+            {
                 let _ = std::fs::remove_file(&temp_file_path);
                 return;
             }
@@ -643,7 +733,11 @@ fn trigger_local_folder(
             if path.is_file() {
                 if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                     let ext_lower = ext.to_lowercase();
-                    if ext_lower == "mp3" || ext_lower == "ogg" || ext_lower == "wav" || ext_lower == "flac" {
+                    if ext_lower == "mp3"
+                        || ext_lower == "ogg"
+                        || ext_lower == "wav"
+                        || ext_lower == "flac"
+                    {
                         audio_files.push(path);
                     }
                 }
@@ -685,7 +779,8 @@ fn trigger_local_folder(
                 };
 
                 if play_count == 0 {
-                    first_file_name = path.file_name()
+                    first_file_name = path
+                        .file_name()
                         .and_then(|n| n.to_str())
                         .unwrap_or("Local Track")
                         .to_string();
@@ -718,7 +813,6 @@ fn trigger_local_folder(
     });
 }
 
-
 #[cfg(test)]
 mod tests {
     #[test]
@@ -726,14 +820,19 @@ mod tests {
         let cursor1 = std::io::Cursor::new(include_bytes!("../../assets/sounds/TaskCreattion.wav"));
         let _decoder1 = rodio::Decoder::new(cursor1).expect("Failed to decode TaskCreattion.wav");
 
-        let cursor2 = std::io::Cursor::new(include_bytes!("../../assets/sounds/focus-task-complete.ogg"));
-        let _decoder2 = rodio::Decoder::new(cursor2).expect("Failed to decode focus-task-complete.ogg");
+        let cursor2 = std::io::Cursor::new(include_bytes!(
+            "../../assets/sounds/focus-task-complete.ogg"
+        ));
+        let _decoder2 =
+            rodio::Decoder::new(cursor2).expect("Failed to decode focus-task-complete.ogg");
 
         let cursor3 = std::io::Cursor::new(include_bytes!("../../assets/sounds/Delete.wav"));
         let _decoder3 = rodio::Decoder::new(cursor3).expect("Failed to decode Delete.wav");
 
-        let cursor4 = std::io::Cursor::new(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
-        let _decoder4 = rodio::Decoder::new(cursor4).expect("Failed to decode NotificationSwarm.mp3");
+        let cursor4 =
+            std::io::Cursor::new(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
+        let _decoder4 =
+            rodio::Decoder::new(cursor4).expect("Failed to decode NotificationSwarm.mp3");
 
         let cursor5 = std::io::Cursor::new(include_bytes!("../../assets/sounds/OpenTasks.wav"));
         let _decoder5 = rodio::Decoder::new(cursor5).expect("Failed to decode OpenTasks.wav");

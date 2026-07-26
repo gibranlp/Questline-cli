@@ -3,11 +3,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::{app::App, theme::Theme};
@@ -47,10 +47,18 @@ pub struct StoryLine {
 
 impl StoryLine {
     const fn t(text: &'static str, kind: LineKind) -> Self {
-        Self { text, kind, instant: false }
+        Self {
+            text,
+            kind,
+            instant: false,
+        }
     }
     const fn i(text: &'static str, kind: LineKind) -> Self {
-        Self { text, kind, instant: true }
+        Self {
+            text,
+            kind,
+            instant: true,
+        }
     }
 }
 
@@ -60,22 +68,43 @@ pub static PROLOGUE: &[StoryLine] = &[
     StoryLine::i("", LineKind::Empty),
     StoryLine::i("T H E   S T O R Y   S O   F A R", LineKind::Title),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::i("──────────────────────────────────────────────────────────────", LineKind::Separator),
+    StoryLine::i(
+        "──────────────────────────────────────────────────────────────",
+        LineKind::Separator,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("In the beginning, there was the Void.", LineKind::Normal),
-    StoryLine::t("The Void was full of things no one had finished yet.", LineKind::Muted),
+    StoryLine::t(
+        "The Void was full of things no one had finished yet.",
+        LineKind::Muted,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Then came the Age of Open Tabs,", LineKind::Normal),
-    StoryLine::t("when people tried to organize their lives", LineKind::Normal),
-    StoryLine::t("and instead buried themselves under scattered notebooks", LineKind::Normal),
-    StoryLine::t("and browser windows numbering in the hundreds.", LineKind::Normal),
+    StoryLine::t(
+        "when people tried to organize their lives",
+        LineKind::Normal,
+    ),
+    StoryLine::t(
+        "and instead buried themselves under scattered notebooks",
+        LineKind::Normal,
+    ),
+    StoryLine::t(
+        "and browser windows numbering in the hundreds.",
+        LineKind::Normal,
+    ),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("From the rubble rose the Great Backlog.", LineKind::Highlight),
+    StoryLine::t(
+        "From the rubble rose the Great Backlog.",
+        LineKind::Highlight,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("A force of accumulated neglect so vast,", LineKind::Normal),
     StoryLine::t("so patient,", LineKind::Normal),
     StoryLine::t("so deeply uninterested in your excuses,", LineKind::Normal),
-    StoryLine::t("that entire organizations vanished beneath it.", LineKind::Dramatic),
+    StoryLine::t(
+        "that entire organizations vanished beneath it.",
+        LineKind::Dramatic,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Then the First Cursor appeared.", LineKind::Highlight),
     StoryLine::i("", LineKind::Empty),
@@ -84,10 +113,10 @@ pub static PROLOGUE: &[StoryLine] = &[
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Six Great Orders emerged from the chaos.", LineKind::Normal),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("The Arch Accountants.",   LineKind::Order(5)),
-    StoryLine::t("The Code Warlocks.",      LineKind::Order(0)),
-    StoryLine::t("The Mind Sages.",         LineKind::Order(2)),
-    StoryLine::t("The Task Paladins.",      LineKind::Order(1)),
+    StoryLine::t("The Arch Accountants.", LineKind::Order(5)),
+    StoryLine::t("The Code Warlocks.", LineKind::Order(0)),
+    StoryLine::t("The Mind Sages.", LineKind::Order(2)),
+    StoryLine::t("The Task Paladins.", LineKind::Order(1)),
     StoryLine::t("The Systems Architects.", LineKind::Order(3)),
     StoryLine::t("The Time Chronomancers.", LineKind::Order(4)),
     StoryLine::i("", LineKind::Empty),
@@ -96,7 +125,10 @@ pub static PROLOGUE: &[StoryLine] = &[
     StoryLine::t("Projects were completed.", LineKind::Muted),
     StoryLine::t("Goals were achieved.", LineKind::Muted),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("The Great Backlog retreated to the horizon,", LineKind::Normal),
+    StoryLine::t(
+        "The Great Backlog retreated to the horizon,",
+        LineKind::Normal,
+    ),
     StoryLine::t("where it sat quietly, thinking.", LineKind::Muted),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("It was still thinking.", LineKind::Highlight),
@@ -113,7 +145,10 @@ pub static CHAPTER_ONE: &[StoryLine] = &[
     StoryLine::i("C H A P T E R   O N E", LineKind::ChapterNum),
     StoryLine::i("The Notification Swarm", LineKind::Title),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("Long before the Orders tracked every task and timed every session,", LineKind::Normal),
+    StoryLine::t(
+        "Long before the Orders tracked every task and timed every session,",
+        LineKind::Normal,
+    ),
     StoryLine::t("a quieter world existed.", LineKind::Muted),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Notifications were rare.", LineKind::Muted),
@@ -122,26 +157,50 @@ pub static CHAPTER_ONE: &[StoryLine] = &[
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Then something changed.", LineKind::Highlight),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("No one remembers exactly when the Swarm began.", LineKind::Normal),
+    StoryLine::t(
+        "No one remembers exactly when the Swarm began.",
+        LineKind::Normal,
+    ),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("A single red circle appearing where there had been none.", LineKind::Normal),
-    StoryLine::t("A banner arriving for a task that did not require one.", LineKind::Normal),
+    StoryLine::t(
+        "A single red circle appearing where there had been none.",
+        LineKind::Normal,
+    ),
+    StoryLine::t(
+        "A banner arriving for a task that did not require one.",
+        LineKind::Normal,
+    ),
     StoryLine::t("A reminder about a reminder.", LineKind::Normal),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Then the numbers grew.", LineKind::Highlight),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Pings multiplied.", LineKind::Normal),
     StoryLine::t("Badges propagated.", LineKind::Normal),
-    StoryLine::t("Alerts arrived to inform heroes that other alerts had arrived.", LineKind::Dramatic),
+    StoryLine::t(
+        "Alerts arrived to inform heroes that other alerts had arrived.",
+        LineKind::Dramatic,
+    ),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("The Notification Sprites had been messengers once.", LineKind::Normal),
-    StoryLine::t("Harmless creatures carrying messages across the Realm.", LineKind::Muted),
+    StoryLine::t(
+        "The Notification Sprites had been messengers once.",
+        LineKind::Normal,
+    ),
+    StoryLine::t(
+        "Harmless creatures carrying messages across the Realm.",
+        LineKind::Muted,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("But something fed them.", LineKind::Highlight),
-    StoryLine::t("Something nurtured their numbers beyond any natural limit.", LineKind::Normal),
+    StoryLine::t(
+        "Something nurtured their numbers beyond any natural limit.",
+        LineKind::Normal,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Without intervention,", LineKind::Normal),
-    StoryLine::t("the Swarm would consume all remaining attention in the Realm.", LineKind::Dramatic),
+    StoryLine::t(
+        "the Swarm would consume all remaining attention in the Realm.",
+        LineKind::Dramatic,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("The Orders have convened.", LineKind::Normal),
     StoryLine::t("The diagnosis is clear.", LineKind::Normal),
@@ -150,9 +209,15 @@ pub static CHAPTER_ONE: &[StoryLine] = &[
     StoryLine::t("Heroes must begin working again.", LineKind::Dramatic),
     StoryLine::i("", LineKind::Empty),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::i("T H E   C A L L   H A S   B E E N   I S S U E D", LineKind::ChapterNum),
+    StoryLine::i(
+        "T H E   C A L L   H A S   B E E N   I S S U E D",
+        LineKind::ChapterNum,
+    ),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("The Great Chronicle tracks the war against the Swarm.", LineKind::Normal),
+    StoryLine::t(
+        "The Great Chronicle tracks the war against the Swarm.",
+        LineKind::Normal,
+    ),
     StoryLine::t("Every hero across the Realm contributes.", LineKind::Normal),
     StoryLine::i("", LineKind::Empty),
     StoryLine::t("Every quest completed.", LineKind::Muted),
@@ -164,7 +229,10 @@ pub static CHAPTER_ONE: &[StoryLine] = &[
     StoryLine::i("", LineKind::Empty),
     StoryLine::i("", LineKind::Checkbox),
     StoryLine::i("", LineKind::Empty),
-    StoryLine::t("Press  [ 8 ]  or  [ g ]  to see the state of the Realm.", LineKind::Call),
+    StoryLine::t(
+        "Press  [ 8 ]  or  [ g ]  to see the state of the Realm.",
+        LineKind::Call,
+    ),
     StoryLine::i("", LineKind::Empty),
     StoryLine::i("", LineKind::Empty),
 ];
@@ -175,22 +243,32 @@ pub fn page_lines(page: u8) -> &'static [StoryLine] {
 
 // detecta cuántas líneas al inicio son "header" — las que preceden al primer texto de cuerpo
 fn header_line_count(lines: &[StoryLine]) -> usize {
-    lines.iter().take_while(|sl| {
-        !matches!(sl.kind, LineKind::Normal | LineKind::Muted | LineKind::Dramatic
-            | LineKind::Highlight | LineKind::Order(_) | LineKind::Call)
-    }).count()
+    lines
+        .iter()
+        .take_while(|sl| {
+            !matches!(
+                sl.kind,
+                LineKind::Normal
+                    | LineKind::Muted
+                    | LineKind::Dramatic
+                    | LineKind::Highlight
+                    | LineKind::Order(_)
+                    | LineKind::Call
+            )
+        })
+        .count()
 }
 
 // todo el estilo visual de línea — centrado en todos los tipos, sin excepciones
 fn style_line(text: String, kind: LineKind, class_color: Color) -> Line<'static> {
     match kind {
-        LineKind::Empty | LineKind::ColumnBreak | LineKind::Checkbox => {
-            Line::from("")
-        }
+        LineKind::Empty | LineKind::ColumnBreak | LineKind::Checkbox => Line::from(""),
 
         LineKind::Title => Line::from(Span::styled(
             text,
-            Style::default().fg(class_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(class_color)
+                .add_modifier(Modifier::BOLD),
         ))
         .alignment(Alignment::Center),
 
@@ -280,7 +358,9 @@ fn build_header_lines(lines: &[StoryLine], class_color: Color, n: usize) -> Vec<
                         Span::styled("  ✦  ", Style::default().fg(class_color)),
                         Span::styled(
                             sl.text.to_string(),
-                            Style::default().fg(class_color).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(class_color)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled("  ✦", Style::default().fg(class_color)),
                     ])
@@ -307,7 +387,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let size = f.size();
     let class_color = theme.primary;
 
-    f.render_widget(Block::default().style(Style::default().bg(Color::Black)), size);
+    f.render_widget(
+        Block::default().style(Style::default().bg(Color::Black)),
+        size,
+    );
 
     let outer = Block::default()
         .borders(Borders::ALL)
@@ -316,17 +399,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let inner_area = outer.inner(size);
     f.render_widget(outer, size);
 
-    let lines_def   = page_lines(app.prologue_page);
-    let header_n    = header_line_count(lines_def);
-    let body_def    = &lines_def[header_n..];
-    let line_idx    = app.prologue_line_idx;
-    let char_pos    = app.prologue_char_in_line;
-    let page_done   = line_idx >= lines_def.len();
+    let lines_def = page_lines(app.prologue_page);
+    let header_n = header_line_count(lines_def);
+    let body_def = &lines_def[header_n..];
+    let line_idx = app.prologue_line_idx;
+    let char_pos = app.prologue_char_in_line;
+    let page_done = line_idx >= lines_def.len();
     let show_cursor = (app.intro_ticks / 10) % 2 == 0;
     let body_line_idx = line_idx.saturating_sub(header_n);
 
     let header_lines = build_header_lines(lines_def, class_color, header_n);
-    let header_h     = header_lines.len() as u16;
+    let header_h = header_lines.len() as u16;
     let footer_h: u16 = 2;
 
     let inner_chunks = Layout::default()
@@ -367,8 +450,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                     ("[ ]  Don't show this again", Color::Rgb(60, 60, 60))
                 };
                 rendered.push(
-                    Line::from(Span::styled(cb_text.to_string(), Style::default().fg(color)))
-                        .alignment(Alignment::Center),
+                    Line::from(Span::styled(
+                        cb_text.to_string(),
+                        Style::default().fg(color),
+                    ))
+                    .alignment(Alignment::Center),
                 );
             } else {
                 rendered.push(Line::from(""));
@@ -381,11 +467,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             continue;
         }
 
-        let is_current      = !page_done && i == body_line_idx;
+        let is_current = !page_done && i == body_line_idx;
         let full_char_count = sl.text.chars().count();
 
         let display: String = if is_current {
-            sl.text.chars().take(char_pos.min(full_char_count)).collect()
+            sl.text
+                .chars()
+                .take(char_pos.min(full_char_count))
+                .collect()
         } else {
             sl.text.to_string()
         };
@@ -402,7 +491,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     // auto-scroll para mantener el cursor siempre visible
     let viewport = inner_chunks[1].height as usize;
-    let scroll_y  = rendered.len().saturating_sub(viewport) as u16;
+    let scroll_y = rendered.len().saturating_sub(viewport) as u16;
 
     f.render_widget(
         Paragraph::new(rendered)

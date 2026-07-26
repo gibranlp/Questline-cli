@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // storage/mod.rs — resuelve la ruta del directorio de datos del usuario
 // ─────────────────────────────────────────────────────────────────────────────
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use directories::BaseDirs;
 use std::path::PathBuf;
 

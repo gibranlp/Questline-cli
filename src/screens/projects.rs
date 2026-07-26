@@ -7,11 +7,11 @@ use crate::models::{Project, Task};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
 use ratatui::{
+    Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph},
-    Frame,
 };
 
 // pinta la pantalla de proyectos con lista + detalles + modales encima — recibe el area del layout padre
@@ -29,7 +29,10 @@ pub fn draw(
     let accent_color = theme.primary;
 
     // filtra archivados aquí mismo — los proyectos archivados tienen su propia pantalla
-    let active_projects: Vec<&Project> = projects.iter().filter(|p| !p.archived && !p.completed).collect();
+    let active_projects: Vec<&Project> = projects
+        .iter()
+        .filter(|p| !p.archived && !p.completed)
+        .collect();
 
     // Screen Layout splits: Main List/Details, Bottom keyboard shortcut guide
     let chunks = Layout::default()
@@ -49,66 +52,125 @@ pub fn draw(
         .split(chunks[0]);
 
     // "All" pinned entry + real projects
-    let active_ids: std::collections::HashSet<uuid::Uuid> = active_projects.iter().map(|p| p.id).collect();
-    let total_open_tasks = all_tasks.iter()
-        .filter(|t| t.project_id.map(|id| active_ids.contains(&id)).unwrap_or(false) && !t.completed && t.parent_task_id.is_none())
+    let active_ids: std::collections::HashSet<uuid::Uuid> =
+        active_projects.iter().map(|p| p.id).collect();
+    let total_open_tasks = all_tasks
+        .iter()
+        .filter(|t| {
+            t.project_id
+                .map(|id| active_ids.contains(&id))
+                .unwrap_or(false)
+                && !t.completed
+                && t.parent_task_id.is_none()
+        })
         .count();
-    let total_open_steps = all_tasks.iter()
-        .filter(|t| t.project_id.map(|id| active_ids.contains(&id)).unwrap_or(false) && !t.completed && t.parent_task_id.is_some())
+    let total_open_steps = all_tasks
+        .iter()
+        .filter(|t| {
+            t.project_id
+                .map(|id| active_ids.contains(&id))
+                .unwrap_or(false)
+                && !t.completed
+                && t.parent_task_id.is_some()
+        })
         .count();
 
     let mut list_items: Vec<ListItem> = Vec::new();
     let all_selected_style = if all_selected {
-        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD)
     };
     let all_task_count_style = if all_selected {
-        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(accent_color)
+            .add_modifier(Modifier::BOLD)
     };
     let all_step_count_style = if all_selected {
-        Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(theme.secondary)
+            .add_modifier(Modifier::BOLD)
     };
-    let mut all_spans = vec![
-        Span::styled(format!("  {} All Campaigns ", if all_selected { "▶" } else { "◈" }), all_selected_style),
-    ];
+    let mut all_spans = vec![Span::styled(
+        format!("  {} All Campaigns ", if all_selected { "▶" } else { "◈" }),
+        all_selected_style,
+    )];
     if total_open_tasks > 0 {
-        all_spans.push(Span::styled(format!("({}) ", total_open_tasks), all_task_count_style));
+        all_spans.push(Span::styled(
+            format!("({}) ", total_open_tasks),
+            all_task_count_style,
+        ));
     }
     if total_open_steps > 0 {
-        all_spans.push(Span::styled(format!("({}) ", total_open_steps), all_step_count_style));
+        all_spans.push(Span::styled(
+            format!("({}) ", total_open_steps),
+            all_step_count_style,
+        ));
     }
     list_items.push(ListItem::new(Line::from(all_spans)));
 
     if active_projects.is_empty() {
-        list_items.push(ListItem::new("  No campaigns. Press [n] to create one.").style(Style::default().fg(theme.muted)));
+        list_items.push(
+            ListItem::new("  No campaigns. Press [n] to create one.")
+                .style(Style::default().fg(theme.muted)),
+        );
     } else {
         for (i, p) in active_projects.iter().enumerate() {
-            let open_tasks = all_tasks.iter()
-                .filter(|t| t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_none())
+            let open_tasks = all_tasks
+                .iter()
+                .filter(|t| {
+                    t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_none()
+                })
                 .count();
-            let open_steps = all_tasks.iter()
-                .filter(|t| t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_some())
+            let open_steps = all_tasks
+                .iter()
+                .filter(|t| {
+                    t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_some()
+                })
                 .count();
             let selected = !all_selected && i == selected_idx;
             let name_style = if selected {
-                Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(Color::White)
             };
             let task_count_style = if selected {
-                Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD)
             };
             let step_count_style = if selected {
-                Style::default().fg(Color::Black).bg(theme.selection).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(theme.secondary)
+                    .add_modifier(Modifier::BOLD)
             };
             let mut spans = vec![Span::styled(format!("  {} ", p.name), name_style)];
             if open_tasks > 0 {
@@ -146,7 +208,9 @@ pub fn draw(
                     .border_style(Style::default().fg(theme.primary))
                     .title(Span::styled(
                         " All Active Quests ",
-                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
                     )),
             )
             .wrap(ratatui::widgets::Wrap { trim: false });
@@ -164,7 +228,11 @@ pub fn draw(
         } else {
             let p = active_projects[selected_idx];
             let desc = p.description.as_deref().unwrap_or("No description.");
-            let date_str = p.created_at.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string();
+            let date_str = p
+                .created_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
 
             let mut text = vec![
                 Line::from(""),
@@ -183,7 +251,10 @@ pub fn draw(
                     Span::styled(date_str, Style::default().fg(theme.text)),
                 ]),
                 Line::from(""),
-                Line::from(Span::styled("  Description:", Style::default().fg(theme.muted))),
+                Line::from(Span::styled(
+                    "  Description:",
+                    Style::default().fg(theme.muted),
+                )),
             ];
 
             for line in desc.lines() {
@@ -196,7 +267,9 @@ pub fn draw(
             // open tasks for this project
             let open_tasks: Vec<&Task> = all_tasks
                 .iter()
-                .filter(|t| t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_none())
+                .filter(|t| {
+                    t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_none()
+                })
                 .collect();
 
             if !open_tasks.is_empty() {
@@ -205,7 +278,9 @@ pub fn draw(
                     Span::styled("  Open Quests  ", Style::default().fg(theme.muted)),
                     Span::styled(
                         format!("({})", open_tasks.len()),
-                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 for (i, task) in open_tasks.iter().enumerate() {
@@ -267,7 +342,9 @@ pub fn draw(
         Span::styled(" Edit | ", Style::default().fg(theme.muted)),
         Span::styled(
             "d",
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" Archive | | ", Style::default().fg(theme.muted)),
         Span::styled(
@@ -311,7 +388,16 @@ pub fn draw(
             desc_cursor,
             focus_idx,
         } => {
-            draw_project_modal(f, " New Campaign ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
+            draw_project_modal(
+                f,
+                " New Campaign ",
+                name,
+                *name_cursor,
+                desc,
+                *desc_cursor,
+                *focus_idx,
+                theme,
+            );
         }
         ModalType::EditProject {
             name,
@@ -321,7 +407,16 @@ pub fn draw(
             focus_idx,
             ..
         } => {
-            draw_project_modal(f, " Edit Campaign ", name, *name_cursor, desc, *desc_cursor, *focus_idx, theme);
+            draw_project_modal(
+                f,
+                " Edit Campaign ",
+                name,
+                *name_cursor,
+                desc,
+                *desc_cursor,
+                *focus_idx,
+                theme,
+            );
         }
         _ => {}
     }
@@ -341,9 +436,7 @@ fn build_all_tasks_tree<'a>(
         let top_tasks: Vec<&Task> = all_tasks
             .iter()
             .filter(|t| {
-                !t.completed
-                    && t.parent_task_id.is_none()
-                    && t.project_id == Some(project.id)
+                !t.completed && t.parent_task_id.is_none() && t.project_id == Some(project.id)
             })
             .collect();
 
@@ -353,16 +446,27 @@ fn build_all_tasks_tree<'a>(
         any = true;
 
         lines.push(Line::from(vec![
-            Span::styled("  ◆ ", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  ◆ ",
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::styled(
                 project.name.clone(),
-                Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]));
 
         for (ti, task) in top_tasks.iter().enumerate() {
             let is_last_task = ti == top_tasks.len() - 1;
-            let task_prefix = if is_last_task { "  └─ " } else { "  ├─ " };
+            let task_prefix = if is_last_task {
+                "  └─ "
+            } else {
+                "  ├─ "
+            };
 
             lines.push(Line::from(vec![
                 Span::styled(task_prefix, Style::default().fg(theme.muted)),
@@ -378,7 +482,11 @@ fn build_all_tasks_tree<'a>(
             for (si, sub) in sub_tasks.iter().enumerate() {
                 let is_last_sub = si == sub_tasks.len() - 1;
                 let sub_prefix = if is_last_task {
-                    if is_last_sub { "       └─ " } else { "       ├─ " }
+                    if is_last_sub {
+                        "       └─ "
+                    } else {
+                        "       ├─ "
+                    }
                 } else if is_last_sub {
                     "  │    └─ "
                 } else {
@@ -418,7 +526,10 @@ fn draw_project_modal(
 ) {
     let area = centered_rect(60, 40, f.size());
     f.render_widget(Clear, area);
-    f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        area,
+    );
 
     let accent_color = theme.primary;
 
@@ -468,7 +579,10 @@ fn draw_project_modal(
             ));
             name_spans.push(Span::styled(&after[char_len..], Style::default()));
         } else {
-            name_spans.push(Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)));
+            name_spans.push(Span::styled(
+                " ",
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
         }
     } else {
         name_spans.push(Span::styled(name, Style::default()));
@@ -519,7 +633,10 @@ fn draw_project_modal(
 // el cursor (carácter reversed) en la línea que le corresponde
 fn desc_lines_with_cursor(desc: &str, cursor: usize, focused: bool) -> Vec<Line<'static>> {
     if !focused {
-        return desc.split('\n').map(|l| Line::from(l.to_string())).collect();
+        return desc
+            .split('\n')
+            .map(|l| Line::from(l.to_string()))
+            .collect();
     }
 
     let c_pos = cursor.min(desc.len());
@@ -533,11 +650,15 @@ fn desc_lines_with_cursor(desc: &str, cursor: usize, focused: bool) -> Vec<Line<
         lines.push(Line::from(part.to_string()));
     }
 
-    let mut cur_line_spans: Vec<Span> = vec![Span::styled(last_before.to_string(), Style::default())];
+    let mut cur_line_spans: Vec<Span> =
+        vec![Span::styled(last_before.to_string(), Style::default())];
 
     if let Some(first_char) = after.chars().next() {
         if first_char == '\n' {
-            cur_line_spans.push(Span::styled(" ".to_string(), Style::default().add_modifier(Modifier::REVERSED)));
+            cur_line_spans.push(Span::styled(
+                " ".to_string(),
+                Style::default().add_modifier(Modifier::REVERSED),
+            ));
             lines.push(Line::from(cur_line_spans));
             let rest = &after[1..];
             for part in rest.split('\n') {
@@ -560,7 +681,10 @@ fn desc_lines_with_cursor(desc: &str, cursor: usize, focused: bool) -> Vec<Line<
             }
         }
     } else {
-        cur_line_spans.push(Span::styled(" ".to_string(), Style::default().add_modifier(Modifier::REVERSED)));
+        cur_line_spans.push(Span::styled(
+            " ".to_string(),
+            Style::default().add_modifier(Modifier::REVERSED),
+        ));
         lines.push(Line::from(cur_line_spans));
     }
 

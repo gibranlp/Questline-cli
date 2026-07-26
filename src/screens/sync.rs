@@ -47,15 +47,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Style::default().fg(Color::White),
             ),
         ]),
-        Line::from(vec![
-            Span::styled("   Public Key (Share Key):", Style::default().fg(theme.muted)),
-        ]),
-        Line::from(vec![
-            Span::styled(
-                format!("   {}", app.identity.public_key),
-                Style::default().fg(Color::LightCyan),
-            ),
-        ]),
+        Line::from(vec![Span::styled(
+            "   Public Key (Share Key):",
+            Style::default().fg(theme.muted),
+        )]),
+        Line::from(vec![Span::styled(
+            format!("   {}", app.identity.public_key),
+            Style::default().fg(Color::LightCyan),
+        )]),
         Line::from(vec![
             Span::styled("   Created At: ", Style::default().fg(theme.muted)),
             Span::styled(&app.identity.created_at, Style::default().fg(theme.text)),
@@ -92,32 +91,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::styled("  [a] toggle", Style::default().fg(theme.muted)),
         ]),
         Line::from(vec![
-            Span::styled("   OS Alerts:  ", Style::default().fg(theme.muted)),
-            Span::styled(
-                if app.external_notifications { "Enabled" } else { "Disabled" },
-                Style::default()
-                    .fg(if app.external_notifications {
-                        theme.success
-                    } else {
-                        theme.danger
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  [n] toggle", Style::default().fg(theme.muted)),
-        ]),
-        Line::from(vec![
-            Span::styled("   Task Alerts:", Style::default().fg(theme.muted)),
-            Span::styled(
-                if app.task_notifications_enabled { "Enabled" } else { "Disabled" },
-                Style::default()
-                    .fg(if app.task_notifications_enabled {
-                        theme.success
-                    } else {
-                        theme.danger
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  [t] toggle", Style::default().fg(theme.muted)),
+            Span::styled("   Alerts:     ", Style::default().fg(theme.muted)),
+            Span::styled("Managed in Settings [9]", Style::default().fg(theme.text)),
         ]),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -150,15 +125,24 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]),
         {
             // el CodeWarlock gana XP extra por sincronizar — bonus de clase, chido
-            let is_warlock = app.user.as_ref().map(|u| u.class == crate::models::ClassType::CodeWarlock).unwrap_or(false);
+            let is_warlock = app
+                .user
+                .as_ref()
+                .map(|u| u.class == crate::models::ClassType::CodeWarlock)
+                .unwrap_or(false);
             let mut status_spans = vec![
                 Span::styled("   Status:     ", Style::default().fg(theme.muted)),
-                Span::styled(app.sync_status_msg.clone(), Style::default().fg(Color::White)),
+                Span::styled(
+                    app.sync_status_msg.clone(),
+                    Style::default().fg(Color::White),
+                ),
             ];
             if is_warlock && app.last_sync_warlock_xp > 0 {
                 status_spans.push(Span::styled(
                     format!("  +{} XP", app.last_sync_warlock_xp),
-                    Style::default().fg(accent_color).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(accent_color)
+                        .add_modifier(Modifier::BOLD),
                 ));
             }
             Line::from(status_spans)
@@ -177,7 +161,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity (new device: use this first) | [p] Prune | [n] OS Alerts",
+            "   [i] Restore Identity (new device: use this first) | [p] Prune | [9] Settings",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -189,7 +173,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         left_text.push(Line::from(""));
         left_text.push(Line::from(vec![Span::styled(
             "   === Resolved Conflicts ===",
-            Style::default().fg(theme.danger).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme.danger)
+                .add_modifier(Modifier::BOLD),
         )]));
         for conflict in app.sync_conflicts.iter().take(4) {
             left_text.push(Line::from(vec![Span::styled(
@@ -426,7 +412,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
             // formateamos el timestamp a hora local — si falla el parse usamos el string crudo
             let time_formatted = if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
-                dt.with_timezone(&chrono::Local).format("%H:%M:%S").to_string()
+                dt.with_timezone(&chrono::Local)
+                    .format("%H:%M:%S")
+                    .to_string()
             } else {
                 ts.clone()
             };
@@ -609,7 +597,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
             Span::styled(
                 format!("  |  {} online now", stats.active_devices),
-                Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::LightGreen)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 if stats.conflict_count > 0 {
@@ -617,7 +607,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 } else {
                     "  |  no conflicts".to_string()
                 },
-                Style::default().fg(if stats.conflict_count > 0 { theme.warning } else { theme.muted }),
+                Style::default().fg(if stats.conflict_count > 0 {
+                    theme.warning
+                } else {
+                    theme.muted
+                }),
             ),
         ]),
         Line::from(""),
@@ -653,7 +647,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::EditServerUrl { input } = &app.modal_state {
         let area = centered_rect(50, 20, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -691,10 +688,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     }
 
     // modal de exportar perfil — muestra el transfer code partido a la mitad para que quepa
-    if let ModalType::ExportProfile { transfer_code, backup_in_progress, backup_message } = &app.modal_state {
+    if let ModalType::ExportProfile {
+        transfer_code,
+        backup_in_progress,
+        backup_message,
+    } = &app.modal_state
+    {
         let area = centered_rect(70, 46, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -732,8 +737,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         let half = transfer_code.len() / 2;
         let (line1, line2) = transfer_code.split_at(half);
         let code_p = Paragraph::new(vec![
-            Line::from(Span::styled(format!("  {}", line1), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD))),
-            Line::from(Span::styled(format!("  {}", line2), Style::default().fg(Color::LightCyan).add_modifier(Modifier::BOLD))),
+            Line::from(Span::styled(
+                format!("  {}", line1),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("  {}", line2),
+                Style::default()
+                    .fg(Color::LightCyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
         ])
         .block(
             Block::default()
@@ -742,38 +757,63 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         );
         f.render_widget(code_p, inner_layout[3]);
 
-        let warn = Paragraph::new("  Keep this code secret — it contains your private signing key.")
-            .style(Style::default().fg(theme.danger));
+        let warn =
+            Paragraph::new("  Keep this code secret — it contains your private signing key.")
+                .style(Style::default().fg(theme.danger));
         f.render_widget(warn, inner_layout[4]);
 
         // barra de progreso animada mientras el cloud backup está en curso
         if *backup_in_progress {
-            let spinner_frames = ["▰▱▱▱▱▱▱▱", "▰▰▱▱▱▱▱▱", "▰▰▰▱▱▱▱▱", "▰▰▰▰▱▱▱▱", "▰▰▰▰▰▱▱▱", "▰▰▰▰▰▰▱▱", "▰▰▰▰▰▰▰▱", "▰▰▰▰▰▰▰▰"];
+            let spinner_frames = [
+                "▰▱▱▱▱▱▱▱",
+                "▰▰▱▱▱▱▱▱",
+                "▰▰▰▱▱▱▱▱",
+                "▰▰▰▰▱▱▱▱",
+                "▰▰▰▰▰▱▱▱",
+                "▰▰▰▰▰▰▱▱",
+                "▰▰▰▰▰▰▰▱",
+                "▰▰▰▰▰▰▰▰",
+            ];
             let frame = (app.intro_ticks / 6) as usize % spinner_frames.len();
             let bar = Paragraph::new(vec![
                 Line::from(Span::styled(
-                    format!("  {} Sealing chronicle into the Æther...", spinner_frames[frame]),
-                    Style::default().fg(theme.warning).add_modifier(Modifier::BOLD),
+                    format!(
+                        "  {} Sealing chronicle into the Æther...",
+                        spinner_frames[frame]
+                    ),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     "  Do NOT import on your new device until this completes.",
                     Style::default().fg(theme.muted),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(theme.warning)));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(theme.warning)),
+            );
             f.render_widget(bar, inner_layout[5]);
         } else {
             let done = Paragraph::new(vec![
                 Line::from(Span::styled(
                     "  ▰▰▰▰▰▰▰▰  Chronicle sealed. Safe to import on your new device.",
-                    Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::LightGreen)
+                        .add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     &backup_message[..backup_message.len().min(80)],
                     Style::default().fg(theme.muted),
                 )),
             ])
-            .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::LightGreen)));
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(Color::LightGreen)),
+            );
             f.render_widget(done, inner_layout[5]);
         }
 
@@ -786,7 +826,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     if let ModalType::RestoreIdentity { input } = &app.modal_state {
         let area = centered_rect(60, 35, size);
         f.render_widget(Clear, area);
-        f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
+        f.render_widget(
+            Block::default().style(Style::default().bg(theme.background)),
+            area,
+        );
 
         let block = Block::default()
             .borders(Borders::ALL)
@@ -818,13 +861,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .style(Style::default().fg(theme.muted));
         f.render_widget(desc, inner_layout[1]);
 
-        let input_p = Paragraph::new(format!("  {}", input))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(accent_color))
-                    .title(" Transfer Code "),
-            );
+        let input_p = Paragraph::new(format!("  {}", input)).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(accent_color))
+                .title(" Transfer Code "),
+        );
         f.render_widget(input_p, inner_layout[3]);
 
         let warn = Paragraph::new("  WARNING: This will replace your current identity key.")
@@ -924,7 +966,9 @@ fn draw_cloud_progress_modal(
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ));
 
     let inner = block.inner(area);
@@ -945,18 +989,41 @@ fn draw_cloud_progress_modal(
 
     let step_style = |active: bool, done: bool| {
         if done {
-            Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD)
         } else if active {
-            Style::default().fg(accent_color).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme.muted)
         }
     };
     let check = |done: bool| if done { "✓" } else { "○" };
     let steps_text = vec![Line::from(vec![
-        Span::styled(format!("  {} {}   ", check(step > 0), step_labels[0]), step_style(step == 0, step > 0)),
-        Span::styled(format!("{}  {} {}   ", if step > 0 { "→" } else { " " }, check(step > 1), step_labels[1]), step_style(step == 1, step > 1)),
-        Span::styled(format!("{}  {} {}", if step > 1 { "→" } else { " " }, check(step == 2), step_labels[2]), step_style(step == 2, false)),
+        Span::styled(
+            format!("  {} {}   ", check(step > 0), step_labels[0]),
+            step_style(step == 0, step > 0),
+        ),
+        Span::styled(
+            format!(
+                "{}  {} {}   ",
+                if step > 0 { "→" } else { " " },
+                check(step > 1),
+                step_labels[1]
+            ),
+            step_style(step == 1, step > 1),
+        ),
+        Span::styled(
+            format!(
+                "{}  {} {}",
+                if step > 1 { "→" } else { " " },
+                check(step == 2),
+                step_labels[2]
+            ),
+            step_style(step == 2, false),
+        ),
     ])];
     f.render_widget(Paragraph::new(steps_text), layout[0]);
 
@@ -978,16 +1045,26 @@ fn draw_cloud_progress_modal(
     };
     let bar_lines = vec![
         Line::from(Span::styled(bar_str, Style::default().fg(bar_color))),
-        Line::from(Span::styled(format!("  {:>3}%", pct), Style::default().fg(theme.muted))),
+        Line::from(Span::styled(
+            format!("  {:>3}%", pct),
+            Style::default().fg(theme.muted),
+        )),
     ];
     f.render_widget(Paragraph::new(bar_lines), layout[2]);
 
-    let msg_color = match step { 3 => theme.danger, 2 => Color::LightGreen, _ => theme.text };
-    let msg_p = Paragraph::new(format!("  {}", message))
-        .style(Style::default().fg(msg_color));
+    let msg_color = match step {
+        3 => theme.danger,
+        2 => Color::LightGreen,
+        _ => theme.text,
+    };
+    let msg_p = Paragraph::new(format!("  {}", message)).style(Style::default().fg(msg_color));
     f.render_widget(msg_p, layout[4]);
 
-    let footer_text = if step >= 2 { "  [Esc] Close" } else { "  Please wait..." };
+    let footer_text = if step >= 2 {
+        "  [Esc] Close"
+    } else {
+        "  Please wait..."
+    };
     let footer = Paragraph::new(footer_text).style(Style::default().fg(theme.muted));
     f.render_widget(footer, layout[5]);
 }
