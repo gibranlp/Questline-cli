@@ -5,7 +5,7 @@
 pub mod schema;
 
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc, Weekday};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::path::Path;
 use uuid::Uuid;
@@ -18,6 +18,107 @@ use crate::models::{
 
 pub struct Database {
     pub conn: Connection,
+}
+
+const DEFAULT_STREAK_WORKDAY_MASK: u8 = 0b111_1111;
+const STREAK_WORKDAY_MASK_KEY: &str = "streak_workday_mask";
+const STREAK_ACTIVE_FROM_KEY: &str = "streak_active_from";
+const STREAK_ACTIVE_TO_KEY: &str = "streak_active_to";
+pub const SYNCED_STREAK_SETTING_KEYS: [&str; 3] = [
+    STREAK_WORKDAY_MASK_KEY,
+    STREAK_ACTIVE_FROM_KEY,
+    STREAK_ACTIVE_TO_KEY,
+];
+
+#[derive(Debug, Clone, Copy)]
+pub struct StreakSchedule {
+    pub workday_mask: u8,
+    pub active_from: u32,
+    pub active_to: u32,
+}
+
+impl Default for StreakSchedule {
+    fn default() -> Self {
+        Self {
+            workday_mask: DEFAULT_STREAK_WORKDAY_MASK,
+            active_from: 0,
+            active_to: 24,
+        }
+    }
+}
+
+impl StreakSchedule {
+    pub fn normalized_mask(mask: u8) -> u8 {
+        let mask = mask & DEFAULT_STREAK_WORKDAY_MASK;
+        if mask == 0 {
+            DEFAULT_STREAK_WORKDAY_MASK
+        } else {
+            mask
+        }
+    }
+
+    pub fn weekday_bit(day: Weekday) -> u8 {
+        1 << day.num_days_from_monday()
+    }
+
+    pub fn counts_date(&self, date: NaiveDate) -> bool {
+        self.workday_mask & Self::weekday_bit(date.weekday()) != 0
+    }
+
+    pub fn counts_at(&self, now_local: DateTime<Local>) -> bool {
+        if !self.counts_date(now_local.date_naive()) {
+            return false;
+        }
+        let hour = now_local.hour();
+        if self.active_from == self.active_to {
+            return true;
+        }
+        if self.active_from < self.active_to {
+            hour >= self.active_from && hour < self.active_to
+        } else {
+            hour >= self.active_from || hour < self.active_to
+        }
+    }
+
+    pub fn previous_counted_day(&self, from: NaiveDate) -> Option<NaiveDate> {
+        let mut d = from.pred_opt()?;
+        for _ in 0..7 {
+            if self.counts_date(d) {
+                return Some(d);
+            }
+            d = d.pred_opt()?;
+        }
+        None
+    }
+
+    pub fn anchor_day(&self, today: NaiveDate) -> Option<NaiveDate> {
+        if self.counts_date(today) {
+            Some(today)
+        } else {
+            self.previous_counted_day(today)
+        }
+    }
+
+    pub fn counted_days_between(&self, after: NaiveDate, before: NaiveDate) -> i64 {
+        let mut count = 0;
+        let Some(mut d) = after.succ_opt() else {
+            return 0;
+        };
+        while d < before {
+            if self.counts_date(d) {
+                count += 1;
+            }
+            let Some(next) = d.succ_opt() else {
+                break;
+            };
+            d = next;
+        }
+        count
+    }
+
+    pub fn is_continuous_since(&self, last_day: NaiveDate, current_day: NaiveDate) -> bool {
+        last_day < current_day && self.counted_days_between(last_day, current_day) == 0
+    }
 }
 
 impl Database {
@@ -33,6 +134,42 @@ impl Database {
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
 
         // Migraciones por columna — ALTER TABLE si el campo no existe todavía (upgrades de versiones viejas)
+        let has_lore_unlock_type: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('lore_library') WHERE name='unlock_type'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_lore_unlock_type {
+            conn.execute(
+                "ALTER TABLE lore_library ADD COLUMN unlock_type TEXT NOT NULL DEFAULT '';",
+                [],
+            )?;
+        }
+
+        let has_lore_unlock_chapter_id: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('lore_library') WHERE name='unlock_chapter_id'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_lore_unlock_chapter_id {
+            conn.execute(
+                "ALTER TABLE lore_library ADD COLUMN unlock_chapter_id TEXT;",
+                [],
+            )?;
+        }
+
+        let has_lore_unlock_display: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('lore_library') WHERE name='unlock_display'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_lore_unlock_display {
+            conn.execute(
+                "ALTER TABLE lore_library ADD COLUMN unlock_display TEXT;",
+                [],
+            )?;
+        }
+
         let has_task_updated_at: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='updated_at'",
             [],
@@ -372,6 +509,18 @@ impl Database {
             conn.execute("ALTER TABLE ritual_history ADD COLUMN completion_count INTEGER NOT NULL DEFAULT 1;", [])?;
         }
 
+        let has_ritual_completed_at: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('ritual_history') WHERE name='completed_at'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_ritual_completed_at {
+            conn.execute(
+                "ALTER TABLE ritual_history ADD COLUMN completed_at TEXT;",
+                [],
+            )?;
+        }
+
         // Hydration log table — created via schema, but add migration guard for older DBs
         conn.execute_batch(
             "
@@ -604,15 +753,32 @@ impl Database {
 
             // Inserta si no existe — preserva unlocked/unlocked_at del usuario
             self.conn.execute(
-                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-                rusqlite::params![e.id, e.category, e.title, e.content, starts_unlocked],
+                "INSERT OR IGNORE INTO lore_library (id, category, title, content, unlock_type, unlock_chapter_id, unlock_display, unlocked, unlocked_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                rusqlite::params![
+                    e.id,
+                    e.category,
+                    e.title,
+                    e.content,
+                    e.unlock.unlock_type,
+                    e.unlock.chapter_id,
+                    e.unlock.display,
+                    starts_unlocked
+                ],
             )?;
 
-            // Actualiza título y contenido en filas existentes — el admin puede editar el texto
+            // Actualiza contenido y reglas remotas en filas existentes — el admin puede editar el texto
             // sin tocar unlocked ni unlocked_at, que son progreso del usuario
             self.conn.execute(
-                "UPDATE lore_library SET category = ?2, title = ?3, content = ?4 WHERE id = ?1",
-                rusqlite::params![e.id, e.category, e.title, e.content],
+                "UPDATE lore_library SET category = ?2, title = ?3, content = ?4, unlock_type = ?5, unlock_chapter_id = ?6, unlock_display = ?7 WHERE id = ?1",
+                rusqlite::params![
+                    e.id,
+                    e.category,
+                    e.title,
+                    e.content,
+                    e.unlock.unlock_type,
+                    e.unlock.chapter_id,
+                    e.unlock.display
+                ],
             )?;
         }
 
@@ -1900,7 +2066,12 @@ impl Database {
 
     // Increments today's completion count up to the ritual's daily_target.
     // Returns Some((new_count, target)) when incremented, None when already at target.
-    pub fn complete_ritual(&self, ritual_id: &str, date: NaiveDate) -> Result<Option<(i32, i32)>> {
+    pub fn complete_ritual(
+        &self,
+        ritual_id: &str,
+        date: NaiveDate,
+        completed_at: DateTime<Local>,
+    ) -> Result<Option<(i32, i32)>> {
         let target: i32 = self
             .conn
             .query_row(
@@ -1911,13 +2082,13 @@ impl Database {
             .unwrap_or(1);
 
         self.conn.execute(
-            "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date, completion_count) VALUES (?1, ?2, 0)",
-            params![ritual_id, date.to_string()],
+            "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date, completion_count, completed_at) VALUES (?1, ?2, 0, ?3)",
+            params![ritual_id, date.to_string(), completed_at.to_rfc3339()],
         )?;
 
         let changed = self.conn.execute(
-            "UPDATE ritual_history SET completion_count = completion_count + 1 WHERE ritual_id = ?1 AND completed_date = ?2 AND completion_count < ?3",
-            params![ritual_id, date.to_string(), target],
+            "UPDATE ritual_history SET completion_count = completion_count + 1, completed_at = ?4 WHERE ritual_id = ?1 AND completed_date = ?2 AND completion_count < ?3",
+            params![ritual_id, date.to_string(), target, completed_at.to_rfc3339()],
         )?;
 
         if changed == 0 {
@@ -1989,27 +2160,42 @@ impl Database {
             .unwrap_or(1);
 
         let mut stmt = self.conn.prepare(
-            "SELECT completed_date FROM ritual_history WHERE ritual_id = ?1 AND completion_count >= ?2 ORDER BY completed_date DESC",
+            "SELECT completed_date, completed_at FROM ritual_history WHERE ritual_id = ?1 AND completion_count >= ?2 ORDER BY completed_date DESC",
         )?;
-        let rows = stmt.query_map(params![ritual_id, target], |row| row.get::<_, String>(0))?;
-        let dates: Vec<NaiveDate> = rows
+        let rows = stmt.query_map(params![ritual_id, target], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })?;
+        let schedule = self.get_streak_schedule();
+        let dates: std::collections::HashSet<NaiveDate> = rows
             .filter_map(|r| r.ok())
-            .filter_map(|s| NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok())
+            .filter_map(|(s, completed_at)| {
+                let date = NaiveDate::parse_from_str(&s, "%Y-%m-%d").ok()?;
+                if let Some(ts) = completed_at {
+                    let completed_local = DateTime::parse_from_rfc3339(&ts)
+                        .ok()?
+                        .with_timezone(&Local);
+                    schedule.counts_at(completed_local).then_some(date)
+                } else {
+                    schedule.counts_date(date).then_some(date)
+                }
+            })
             .collect();
 
         if dates.is_empty() {
             return Ok(0);
         }
         let today = chrono::Local::now().date_naive();
-        if dates[0] != today {
+        let Some(mut expected) = schedule.anchor_day(today) else {
             return Ok(0);
-        }
+        };
         let mut streak = 0i32;
-        let mut expected = today;
-        for date in &dates {
-            if *date == expected {
+        loop {
+            if dates.contains(&expected) {
                 streak += 1;
-                expected = expected.pred_opt().unwrap_or(expected);
+                let Some(prev) = schedule.previous_counted_day(expected) else {
+                    break;
+                };
+                expected = prev;
             } else {
                 break;
             }
@@ -2020,37 +2206,55 @@ impl Database {
     // Streak for every ritual in one pass — only fully-completed days count.
     pub fn get_all_ritual_streaks(&self) -> Result<std::collections::HashMap<String, i32>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rh.ritual_id, rh.completed_date
+            "SELECT rh.ritual_id, rh.completed_date, rh.completed_at
              FROM ritual_history rh
              JOIN rituals r ON r.id = rh.ritual_id
              WHERE rh.completion_count >= r.daily_target
              ORDER BY rh.ritual_id, rh.completed_date DESC",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
         })?;
 
         let today = chrono::Local::now().date_naive();
-        let mut per_ritual: std::collections::HashMap<String, Vec<NaiveDate>> =
-            std::collections::HashMap::new();
+        let schedule = self.get_streak_schedule();
+        let mut per_ritual: std::collections::HashMap<
+            String,
+            std::collections::HashSet<NaiveDate>,
+        > = std::collections::HashMap::new();
         for r in rows.filter_map(|r| r.ok()) {
             if let Ok(d) = NaiveDate::parse_from_str(&r.1, "%Y-%m-%d") {
-                per_ritual.entry(r.0).or_default().push(d);
+                let counts = if let Some(ts) = r.2 {
+                    DateTime::parse_from_rfc3339(&ts)
+                        .map(|dt| schedule.counts_at(dt.with_timezone(&Local)))
+                        .unwrap_or(false)
+                } else {
+                    schedule.counts_date(d)
+                };
+                if counts {
+                    per_ritual.entry(r.0).or_default().insert(d);
+                }
             }
         }
 
         let mut out = std::collections::HashMap::new();
         for (id, dates) in per_ritual {
-            if dates.is_empty() || dates[0] != today {
+            let Some(mut expected) = schedule.anchor_day(today) else {
                 out.insert(id, 0);
                 continue;
-            }
+            };
             let mut streak = 0i32;
-            let mut expected = today;
-            for date in &dates {
-                if *date == expected {
+            loop {
+                if dates.contains(&expected) {
                     streak += 1;
-                    expected = expected.pred_opt().unwrap_or(expected);
+                    let Some(prev) = schedule.previous_counted_day(expected) else {
+                        break;
+                    };
+                    expected = prev;
                 } else {
                     break;
                 }
@@ -2852,6 +3056,13 @@ impl Database {
             queued += 1;
         }
 
+        for key in SYNCED_STREAK_SETTING_KEYS {
+            if self.get_setting(key)?.is_some() {
+                self.log_change("setting", key, "upsert")?;
+                queued += 1;
+            }
+        }
+
         let mut assignment_stmt = self
             .conn
             .prepare("SELECT task_id, user_identity FROM task_assignments")?;
@@ -2959,6 +3170,64 @@ impl Database {
             "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, ?2)",
             params![key, value],
         )?;
+        Ok(())
+    }
+
+    pub fn get_streak_schedule(&self) -> StreakSchedule {
+        let defaults = StreakSchedule::default();
+        let workday_mask = self
+            .get_setting(STREAK_WORKDAY_MASK_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u8>().ok())
+            .map(StreakSchedule::normalized_mask)
+            .unwrap_or(defaults.workday_mask);
+        let active_from = self
+            .get_setting(STREAK_ACTIVE_FROM_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(defaults.active_from)
+            .min(23);
+        let active_to = self
+            .get_setting(STREAK_ACTIVE_TO_KEY)
+            .ok()
+            .flatten()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(defaults.active_to)
+            .min(24);
+
+        StreakSchedule {
+            workday_mask,
+            active_from,
+            active_to,
+        }
+    }
+
+    pub fn set_streak_schedule(&self, schedule: StreakSchedule) -> Result<()> {
+        self.set_setting(
+            STREAK_WORKDAY_MASK_KEY,
+            &StreakSchedule::normalized_mask(schedule.workday_mask).to_string(),
+        )?;
+        self.set_setting(
+            STREAK_ACTIVE_FROM_KEY,
+            &schedule.active_from.min(23).to_string(),
+        )?;
+        self.set_setting(
+            STREAK_ACTIVE_TO_KEY,
+            &schedule.active_to.min(24).to_string(),
+        )?;
+        Ok(())
+    }
+
+    pub fn queue_streak_schedule_sync(&self) -> Result<()> {
+        for key in SYNCED_STREAK_SETTING_KEYS {
+            self.conn.execute(
+                "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
+                params![key],
+            )?;
+            self.log_change("setting", key, "upsert")?;
+        }
         Ok(())
     }
 
@@ -4046,6 +4315,25 @@ impl Database {
         } else {
             Ok(false)
         }
+    }
+
+    pub fn unlock_lore_for_chapter(&self, chapter_id: &str) -> Result<usize> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id FROM lore_library WHERE unlocked = 0 AND unlock_type = 'chapter_reward' AND unlock_chapter_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![chapter_id], |row| row.get::<_, String>(0))?;
+        let mut ids = Vec::new();
+        for row in rows {
+            ids.push(row?);
+        }
+
+        let mut unlocked = 0usize;
+        for id in ids {
+            if self.unlock_lore_entry(&id)? {
+                unlocked += 1;
+            }
+        }
+        Ok(unlocked)
     }
 
     pub fn unlock_lore_by_title(&self, title: &str) -> Result<bool> {

@@ -193,6 +193,24 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v1.1.2",
+            "Jul 26, 2026",
+            "The Command Center Holds",
+            &[
+                "Today's Workload replaced with Today's Command Center for clearer priorities",
+                "New [9] Settings tab for themes, alerts, audio, and Oath Calendar settings",
+                "Timezone handling separates local hero time from UTC server time",
+                "Global sync shortcut changed to Ctrl+Y; Ctrl+S saves tasks and steps",
+                "Vim-like editing and Ctrl+Backspace added for task and step descriptions",
+                "New themes added, including Terminal Default and Pywal-compatible palettes",
+                "Steps can be unmarked from the task editing window",
+                "OS notification icons added for common Linux notification tools",
+                "Oath Calendar lets planned rest days avoid breaking streaks",
+                "Focus pauses unlock at levels 1/10/20/30/40, up to 5 total pauses",
+                "Quest completion ambient effect can be selected in Settings, including Off",
+            ],
+        ),
+        (
             "v1.1.1",
             "Jul 23, 2026",
             "The World Before the Swarm",
@@ -455,7 +473,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
-            "  Every project is an adventure.",
+            "  Every project is a campaign.",
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
         )),
         Line::from(Span::styled(
@@ -481,6 +499,7 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
         "The Evergrowth Growth System",
         "Focus Sessions and Ambient Soundscapes",
         "Local-First Architecture with Cloud Synchronization",
+        "Hydration Habit System",
         "A Ridiculous Amount of Lore",
     ] {
         lines.push(Line::from(vec![

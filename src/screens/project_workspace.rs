@@ -5,9 +5,10 @@ use crate::app::{App, DueDateType, JOURNAL_ENTRY_CHAR_LIMIT, ModalType};
 use crate::milestone_templates::{self, ProjectStats, Tier};
 use crate::models::RecurrenceType;
 use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
+use crate::screens::editor::{EditorMode, EditorState, render_body_line};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, Local, Utc};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -29,18 +30,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     let tasks = &app.all_tasks;
     let notes = &app.all_notes;
     let journals = &app.all_journals;
-    let milestones = app
-        .db
-        .get_milestones_for_project(project.id)
-        .unwrap_or_default();
+    let milestones = &app.stats_cache.active_project_milestones;
 
     // Armamos las stats del proyecto — se usan para calcular el progreso de milestones
-    let streak = app.db.get_streak().unwrap_or(crate::models::Streak {
-        id: String::new(),
-        current_streak: 0,
-        best_streak: 0,
-        last_active_day: None,
-    });
+    let streak = &app.stats_cache.streak;
     let project_stats = ProjectStats {
         project_age_days: (Utc::now() - project.created_at).num_days(),
         completed_tasks_in_project: tasks
@@ -49,14 +42,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             .count() as i64,
         notes_in_project: notes.iter().filter(|n| n.project_id == Some(p_id)).count() as i64,
         journal_entries_in_project: journals.iter().filter(|j| j.project_id == p_id).count() as i64,
-        active_days_in_project: app.db.get_active_days_for_project(p_id).unwrap_or(0),
+        active_days_in_project: app.stats_cache.active_project_days,
         total_completed_tasks: tasks
             .iter()
             .filter(|t| t.completed && t.parent_task_id.is_none())
             .count() as i64,
         current_streak: streak.current_streak as i64,
-        focus_sessions_total: app.db.get_focus_sessions().unwrap_or_default().len() as i64,
-        daily_adventures_completed: app.db.get_daily_adventures_completed_count().unwrap_or(0),
+        focus_sessions_total: app.stats_cache.focus_sessions_total,
+        daily_adventures_completed: app.stats_cache.daily_adventures_completed,
     };
 
     let selected_item_idx = match active_tab {
@@ -150,25 +143,29 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                     .then_with(|| b.created_at.cmp(&a.created_at))
             }),
         }
-        // Intercalamos los steps incompletos justo debajo de su padre — así queda la lista plana
+        // Intercalamos los steps debajo de su padre — abiertos primero, terminados después
         let mut flat: Vec<&Task> = Vec::new();
         for parent in parents {
             flat.push(parent);
             if !parent.completed {
                 let mut steps: Vec<&Task> = tasks
                     .iter()
-                    .filter(|t| t.parent_task_id == Some(parent.id) && !t.completed)
+                    .filter(|t| t.parent_task_id == Some(parent.id))
                     .collect();
-                steps.sort_by(|a, b| match task_sort.as_str() {
-                    "DueDate" => match (a.due_date, b.due_date) {
-                        (Some(d1), Some(d2)) => d1.cmp(&d2),
-                        (Some(_), None) => std::cmp::Ordering::Less,
-                        (None, Some(_)) => std::cmp::Ordering::Greater,
-                        (None, None) => a.created_at.cmp(&b.created_at),
-                    },
-                    "Priority" => b.priority.cmp(&a.priority),
-                    "Alphabetical" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
-                    _ => b.created_at.cmp(&a.created_at),
+                steps.sort_by(|a, b| {
+                    a.completed
+                        .cmp(&b.completed)
+                        .then_with(|| match task_sort.as_str() {
+                            "DueDate" => match (a.due_date, b.due_date) {
+                                (Some(d1), Some(d2)) => d1.cmp(&d2),
+                                (Some(_), None) => std::cmp::Ordering::Less,
+                                (None, Some(_)) => std::cmp::Ordering::Greater,
+                                (None, None) => a.created_at.cmp(&b.created_at),
+                            },
+                            "Priority" => b.priority.cmp(&a.priority),
+                            "Alphabetical" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+                            _ => b.created_at.cmp(&a.created_at),
+                        })
                 });
                 flat.extend(steps);
             }
@@ -541,6 +538,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 set_date_val,
                 *focus_idx,
                 theme,
+                app.task_desc_editor.as_ref(),
                 None,
                 0,
                 false,
@@ -583,6 +581,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 set_date_val,
                 *focus_idx,
                 theme,
+                app.task_desc_editor.as_ref(),
                 steps_opt,
                 *step_selected_idx,
                 false,
@@ -671,6 +670,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             set_date_val,
             *focus_idx,
             theme,
+            app.task_desc_editor.as_ref(),
             None,
             0,
             false,
@@ -1117,7 +1117,7 @@ fn draw_tasks_tab(
                 let is_inline_step = t.parent_task_id.is_some() && viewing_step_for_task.is_none();
 
                 if is_inline_step {
-                    let (prefix_style, title_style) = if is_sel {
+                    let (prefix_style, mut title_style) = if is_sel {
                         (
                             Style::default()
                                 .fg(accent_color)
@@ -1133,6 +1133,9 @@ fn draw_tasks_tab(
                             Style::default().fg(theme.muted),
                         )
                     };
+                    if t.completed {
+                        title_style = title_style.add_modifier(Modifier::CROSSED_OUT);
+                    }
                     let prefix = if is_sel { "   > o " } else { "     o " };
                     ListItem::new(Line::from(vec![
                         Span::styled(prefix, prefix_style),
@@ -1188,10 +1191,10 @@ fn draw_tasks_tab(
                         String::new()
                     };
 
-                    let today = Utc::now().date_naive();
+                    let today = Local::now().date_naive();
                     let date_badge = t.due_date.or(t.set_date);
                     let date_badge_style = |date: DateTime<Utc>| {
-                        let date_day = date.date_naive();
+                        let date_day = date.with_timezone(&Local).date_naive();
                         let fg = if date_day <= today {
                             theme.danger
                         } else if date_day <= today + Duration::days(7) {
@@ -1238,7 +1241,7 @@ fn draw_tasks_tab(
                         }
                         if let Some(date) = date_badge {
                             spans.push(Span::styled(
-                                format!(" [{}]", date.format("%Y-%m-%d")),
+                                format!(" [{}]", date.with_timezone(&Local).format("%Y-%m-%d")),
                                 Style::default().fg(fg).bg(bg),
                             ));
                         }
@@ -1257,7 +1260,7 @@ fn draw_tasks_tab(
                         }
                         if let Some(date) = date_badge {
                             spans.push(Span::styled(
-                                format!(" [{}]", date.format("%Y-%m-%d")),
+                                format!(" [{}]", date.with_timezone(&Local).format("%Y-%m-%d")),
                                 date_badge_style(date),
                             ));
                         }
@@ -1327,7 +1330,7 @@ fn draw_tasks_tab(
             .unwrap_or("No description provided.");
         let due_str = t
             .due_date
-            .map(|d| d.format("%Y-%m-%d").to_string())
+            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
             .unwrap_or_else(|| "None".to_string());
 
         let mut text = vec![
@@ -1400,7 +1403,7 @@ fn draw_tasks_tab(
                 let check = if s.completed { "[x]" } else { "[ ]" };
                 let due_str = s
                     .due_date
-                    .map(|d| format!(" - {}", d.format("%Y-%m-%d")))
+                    .map(|d| format!(" - {}", d.with_timezone(&Local).format("%Y-%m-%d")))
                     .unwrap_or_default();
                 let (fg, modifier) = if s.completed {
                     (theme.muted, Modifier::CROSSED_OUT)
@@ -2480,6 +2483,7 @@ fn draw_task_modal(
     set_date_val: &str,
     focus_idx: usize,
     theme: &Theme,
+    desc_editor: Option<&EditorState>,
     // None = NewTask (no steps section); Some(slice) = EditTask (always show steps section)
     steps_opt: Option<&[&Task]>,
     step_selected_idx: usize,
@@ -2503,11 +2507,15 @@ fn draw_task_modal(
     let recur_chunk = prio_chunk + 1;
     let steps_chunk = recur_chunk + if show_recurrence { 1 } else { 0 };
 
+    const DESC_BOX_HEIGHT: u16 = 12;
+    const DESC_VISIBLE_LINES: usize = DESC_BOX_HEIGHT as usize - 2;
+    const STEPS_BOX_HEIGHT: u16 = 8;
+
     let base_height: u16 = match (hide_desc, show_steps) {
-        (false, true) => 85,
-        (false, false) => 62,
-        (true, true) => 72,
-        (true, false) => 45,
+        (false, true) => 78,
+        (false, false) => 58,
+        (true, true) => 64,
+        (true, false) => 42,
     };
     let modal_height = base_height + if show_recurrence { 4 } else { 0 };
     let area = centered_rect(65, modal_height, f.size());
@@ -2521,14 +2529,14 @@ fn draw_task_modal(
 
     let mut constraints = vec![Constraint::Length(3)]; // Title
     if !hide_desc {
-        constraints.push(Constraint::Length(10)); // Description
+        constraints.push(Constraint::Length(DESC_BOX_HEIGHT)); // Description
     }
     constraints.push(Constraint::Length(3)); // Priority & Due
     if show_recurrence {
         constraints.push(Constraint::Length(3)); // Recurrence
     }
     if show_steps {
-        constraints.push(Constraint::Min(1)); // Steps (fills remaining space)
+        constraints.push(Constraint::Length(STEPS_BOX_HEIGHT)); // Steps
     }
     constraints.push(Constraint::Length(2)); // Help
 
@@ -2586,41 +2594,60 @@ fn draw_task_modal(
             Style::default().fg(theme.border)
         };
 
-        // Cuántas líneas caben en el box de descripción — fijo en 8 por el tamaño del modal
-        let visible_lines: usize = 8;
+        let visible_lines: usize = DESC_VISIBLE_LINES;
+        let vim_desc = focus_idx == 1
+            && desc_editor
+                .as_ref()
+                .map(|editor| editor.get_content() == task_desc)
+                .unwrap_or(false);
 
-        // Split desc into lines and locate cursor line/col
-        let lines: Vec<&str> = task_desc.split('\n').collect();
-        let cursor = desc_cursor.min(task_desc.len());
-        let (cursor_line, cursor_col) = {
-            let mut pos = 0usize;
-            let mut cl = 0usize;
-            let mut cc = 0usize;
-            for (i, line) in lines.iter().enumerate() {
-                let end = pos + line.len();
-                if cursor <= end || i + 1 == lines.len() {
-                    cl = i;
-                    cc = cursor - pos;
-                    break;
-                }
-                pos = end + 1; // +1 for '\n'
-            }
-            (cl, cc)
-        };
-
-        // Scroll para mantener el cursor visible — se ajusta automáticamente al escribir
-        let scroll_top = if cursor_line >= visible_lines {
-            cursor_line + 1 - visible_lines
-        } else {
-            0
-        };
-
-        let desc_lines: Vec<Line> = if task_desc.is_empty() && focus_idx == 1 {
+        let desc_lines: Vec<Line> = if vim_desc {
+            let editor = desc_editor.unwrap();
+            let scroll_top = if editor.cursor_y >= visible_lines {
+                editor.cursor_y + 1 - visible_lines
+            } else {
+                0
+            };
+            editor
+                .lines
+                .iter()
+                .enumerate()
+                .skip(scroll_top)
+                .take(visible_lines)
+                .map(|(i, line)| render_body_line(line, i, editor, theme))
+                .collect()
+        } else if task_desc.is_empty() && focus_idx == 1 {
             vec![Line::from(Span::styled(
                 "_",
                 Style::default().fg(accent_color),
             ))]
         } else {
+            // Split desc into lines and locate cursor line/col
+            let lines: Vec<&str> = task_desc.split('\n').collect();
+            let cursor = desc_cursor.min(task_desc.len());
+            let (cursor_line, cursor_col) = {
+                let mut pos = 0usize;
+                let mut cl = 0usize;
+                let mut cc = 0usize;
+                for (i, line) in lines.iter().enumerate() {
+                    let end = pos + line.len();
+                    if cursor <= end || i + 1 == lines.len() {
+                        cl = i;
+                        cc = cursor - pos;
+                        break;
+                    }
+                    pos = end + 1; // +1 for '\n'
+                }
+                (cl, cc)
+            };
+
+            // Scroll para mantener el cursor visible — se ajusta automáticamente al escribir
+            let scroll_top = if cursor_line >= visible_lines {
+                cursor_line + 1 - visible_lines
+            } else {
+                0
+            };
+
             lines
                 .iter()
                 .enumerate()
@@ -2656,12 +2683,51 @@ fn draw_task_modal(
                 .collect()
         };
 
+        let desc_title = if vim_desc {
+            let editor = desc_editor.unwrap();
+            let mode_style = match &editor.mode {
+                EditorMode::Normal => Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+                EditorMode::Insert => Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+                EditorMode::Visual { .. } => Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            };
+            let mut spans = vec![
+                Span::raw(" Quest Description  "),
+                Span::styled(format!(" {} ", editor.mode.label()), mode_style),
+                Span::raw("  "),
+                Span::styled(
+                    " Ctrl+S Save ",
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ];
+            if !editor.pending_cmd.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}_ ", editor.pending_cmd),
+                    Style::default().fg(theme.warning),
+                ));
+            }
+            Line::from(spans)
+        } else {
+            Line::from(" Quest Description ")
+        };
+
         let desc_p = Paragraph::new(desc_lines).block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(desc_border_style)
-                .title(" Quest Description "),
+                .title(desc_title),
         );
         f.render_widget(desc_p, chunks[1]);
     }
@@ -2935,7 +3001,7 @@ fn draw_task_modal(
                     let check = if s.completed { "[x]" } else { "[ ]" };
                     let due_str = s
                         .due_date
-                        .map(|d| format!(" - {}", d.format("%Y-%m-%d")))
+                        .map(|d| format!(" - {}", d.with_timezone(&Local).format("%Y-%m-%d")))
                         .unwrap_or_default();
                     let is_sel = focus_idx == steps_focus_idx && i == step_selected_idx;
                     let style = if is_sel {
@@ -2982,7 +3048,7 @@ fn draw_task_modal(
     let helper_text = if focus_idx == steps_focus_idx && show_steps {
         "↑/↓: select step | Space: toggle | Del: remove | n/+: new step | Tab: back"
     } else if focus_idx == 1 && !hide_desc {
-        "Tab: cycle field | Enter: newline | ESC: cancel"
+        "Vim description | Ctrl+S: save | Tab: cycle field | Esc: mode/cancel"
     } else if show_recurrence && focus_idx == recurrence_focus_idx {
         "L/R/Space: cycle recurrence | Tab: next field | Enter: save | ESC: cancel"
     } else {

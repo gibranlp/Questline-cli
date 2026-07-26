@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS ritual_history (
     ritual_id TEXT NOT NULL,
     completed_date TEXT NOT NULL,
     completion_count INTEGER NOT NULL DEFAULT 1,
+    completed_at TEXT,
     PRIMARY KEY(ritual_id, completed_date),
     FOREIGN KEY(ritual_id) REFERENCES rituals(id) ON DELETE CASCADE
 );
@@ -341,6 +342,9 @@ CREATE TABLE IF NOT EXISTS lore_library (
     category TEXT NOT NULL,
     title TEXT NOT NULL,
     content TEXT NOT NULL,
+    unlock_type TEXT NOT NULL DEFAULT '',
+    unlock_chapter_id TEXT,
+    unlock_display TEXT,
     unlocked INTEGER NOT NULL DEFAULT 0,
     unlocked_at TEXT
 );

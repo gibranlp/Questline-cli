@@ -6,9 +6,9 @@ use crate::app::{App, ModalType};
 use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
-use crate::services::planner::{self, DashboardPlan, ScoredTask, format_duration};
+use crate::services::planner::{self, DashboardPlan, format_duration};
 use crate::theme::Theme;
-use chrono::Timelike;
+use chrono::{Local, Timelike};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout},
@@ -35,13 +35,6 @@ fn priority_label(priority: TaskPriority) -> (&'static str, Color) {
     }
 }
 
-fn task_xp(priority: TaskPriority) -> i32 {
-    match priority {
-        TaskPriority::High => 50,
-        _ => 25,
-    }
-}
-
 fn render_progress_bar(filled: usize, total: usize, width: usize) -> String {
     if total == 0 {
         return "░".repeat(width);
@@ -64,6 +57,52 @@ fn workload_label(minutes: u32) -> (&'static str, Color) {
     }
 }
 
+fn sidequest_rank(streak: i32) -> Option<(&'static str, Color)> {
+    match streak {
+        s if s >= 90 => Some(("Ascendant Oath", Color::Yellow)),
+        s if s >= 60 => Some(("Warlord Oath", Color::Rgb(245, 158, 11))),
+        s if s >= 30 => Some(("Champion Oath", Color::Rgb(250, 204, 21))),
+        s if s >= 15 => Some(("Devoted Oath", Color::Cyan)),
+        s if s >= 7 => Some(("Seeker Oath", Color::Rgb(34, 197, 94))),
+        s if s >= 3 => Some(("Initiate Oath", Color::Rgb(96, 165, 250))),
+        _ => None,
+    }
+}
+
+fn task_energy_tag(task: &Task) -> (&'static str, Color) {
+    let title = task.title.to_lowercase();
+    let desc = task.description.as_deref().unwrap_or("").to_lowercase();
+    let text = format!("{} {}", title, desc);
+    if text.contains("write")
+        || text.contains("design")
+        || text.contains("draft")
+        || text.contains("create")
+    {
+        ("Creative", Color::Rgb(168, 85, 247))
+    } else if text.contains("email")
+        || text.contains("call")
+        || text.contains("invoice")
+        || text.contains("admin")
+        || text.contains("reply")
+    {
+        ("Admin", Color::Rgb(96, 165, 250))
+    } else if task.priority == TaskPriority::High {
+        ("Deep Work", Color::Rgb(239, 68, 68))
+    } else {
+        ("Quick Win", Color::Rgb(34, 197, 94))
+    }
+}
+
+fn short_text(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let short: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{}...", short)
+    } else {
+        short
+    }
+}
+
 // ─── Columna izquierda: la campaña de hoy ────────────────────────────────────
 
 fn draw_campaign_header(
@@ -75,6 +114,15 @@ fn draw_campaign_header(
 ) {
     let user = app.user.as_ref().unwrap();
     let greeting_str = greeting(&user.username);
+    let guidance = format!("   \"{}\"", plan.guidance);
+    let local_time = format!(" {}", Local::now().format("%H:%M:%S"));
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let used_width = greeting_str.chars().count() + guidance.chars().count() + local_time.len();
+    let gap = if inner_width > used_width {
+        " ".repeat(inner_width - used_width)
+    } else {
+        " ".to_string()
+    };
 
     let lines = vec![Line::from(vec![
         Span::styled(
@@ -83,9 +131,13 @@ fn draw_campaign_header(
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled(guidance, Style::default().fg(theme.muted)),
+        Span::raw(gap),
         Span::styled(
-            format!("   \"{}\"", plan.guidance),
-            Style::default().fg(theme.muted),
+            local_time,
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
         ),
     ])];
 
@@ -99,379 +151,206 @@ fn draw_campaign_header(
     f.render_widget(p, area);
 }
 
-fn draw_main_quest(
-    f: &mut Frame,
-    theme: &Theme,
-    area: ratatui::layout::Rect,
-    main: Option<&ScoredTask>,
-) {
-    let border_color = theme.primary;
-
-    if let Some(sq) = main {
-        let (prio_label, prio_color) = priority_label(sq.task.priority);
-        let xp = task_xp(sq.task.priority);
-        let progress_bar = render_progress_bar(sq.completed_steps, sq.total_steps, 10);
-        let step_text = if sq.total_steps > 0 {
-            format!(
-                "[{}] {}/{} steps",
-                progress_bar, sq.completed_steps, sq.total_steps
-            )
-        } else {
-            "[No steps]".to_string()
-        };
-
-        let lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("[{}]", prio_label),
-                    Style::default().fg(prio_color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  ", Style::default()),
-                Span::styled(sq.project_name.as_str(), Style::default().fg(theme.muted)),
-                Span::styled(
-                    format!("  |  +{} XP  |  {}", xp, format_duration(sq.est_minutes)),
-                    Style::default().fg(theme.muted),
-                ),
-            ]),
-            Line::from(vec![Span::styled(
-                sq.task.title.as_str(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![Span::styled(
-                step_text,
-                Style::default().fg(theme.success),
-            )]),
-            Line::from(vec![
-                Span::styled(sq.reason, Style::default().fg(theme.muted)),
-                Span::styled(
-                    "   [o] Open in Workspace",
-                    Style::default().fg(theme.disabled),
-                ),
-            ]),
-        ];
-
-        let p = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .title(Span::styled(
-                    " Main Quest ",
-                    Style::default()
-                        .fg(border_color)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        );
-        f.render_widget(p, area);
-    } else {
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  No quest selected for today.",
-                Style::default().fg(theme.muted),
-            )),
-            Line::from(Span::styled(
-                "  Add quests to your campaigns to begin the adventure.",
-                Style::default().fg(theme.disabled),
-            )),
-        ];
-        let p = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .title(" Main Quest "),
-        );
-        f.render_widget(p, area);
-    }
-}
-
-fn draw_next_quest(
-    f: &mut Frame,
-    theme: &Theme,
-    area: ratatui::layout::Rect,
-    next: Option<&ScoredTask>,
-) {
-    if let Some(sq) = next {
-        let (prio_label, prio_color) = priority_label(sq.task.priority);
-        let xp = task_xp(sq.task.priority);
-
-        let lines = vec![
-            Line::from(vec![Span::styled(
-                sq.task.title.as_str(),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )]),
-            Line::from(vec![
-                Span::styled(format!("[{}]", prio_label), Style::default().fg(prio_color)),
-                Span::styled(
-                    format!("  {}  |  +{} XP", sq.project_name, xp),
-                    Style::default().fg(theme.muted),
-                ),
-            ]),
-            Line::from(vec![Span::styled(
-                sq.reason,
-                Style::default().fg(theme.secondary),
-            )]),
-            Line::from(vec![Span::styled(
-                format_duration(sq.est_minutes),
-                Style::default().fg(theme.muted),
-            )]),
-        ];
-
-        let p = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.secondary))
-                .title(" Next Quest "),
-        );
-        f.render_widget(p, area);
-    } else {
-        let lines = vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                "  No further quests.",
-                Style::default().fg(theme.muted),
-            )),
-        ];
-        let p = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .title(" Next Quest "),
-        );
-        f.render_widget(p, area);
-    }
-}
-
-fn draw_daily_quests(
+fn draw_today_command_center(
     f: &mut Frame,
     app: &App,
     theme: &Theme,
     area: ratatui::layout::Rect,
-    focused: bool,
+    all_tasks: &[Task],
+    today: chrono::NaiveDate,
+    plan: &DashboardPlan,
 ) {
-    let daily_adventures = app.db.get_daily_adventures().unwrap_or_default();
-    let comp_count = daily_adventures.iter().filter(|a| a.completed).count();
-    let total = daily_adventures.len();
+    let (_, label_color) = workload_label(plan.estimated_minutes);
+    let overdue = all_tasks
+        .iter()
+        .filter(|t| {
+            !t.completed
+                && t.parent_task_id.is_none()
+                && t.due_date
+                    .map(|d| d.with_timezone(&Local).date_naive() < today)
+                    .unwrap_or(false)
+        })
+        .count();
+    let due_today = all_tasks
+        .iter()
+        .filter(|t| {
+            !t.completed
+                && t.parent_task_id.is_none()
+                && t.due_date
+                    .map(|d| d.with_timezone(&Local).date_naive() == today)
+                    .unwrap_or(false)
+        })
+        .count();
+    let high = all_tasks
+        .iter()
+        .filter(|t| !t.completed && t.parent_task_id.is_none() && t.priority == TaskPriority::High)
+        .count();
+    let mut rows: Vec<ListItem> = Vec::new();
+    let mut selected_visual_idx = None;
+    let mut action_idx = 0usize;
+    let push_separator = |rows: &mut Vec<ListItem>, label: &'static str, color: Color| {
+        if !rows.is_empty() {
+            rows.push(ListItem::new(Line::from("")));
+            rows.push(ListItem::new(Line::from(Span::styled(
+                format!("  -- {} --", label),
+                Style::default().fg(color),
+            ))));
+        }
+    };
 
-    let rituals = app.db.get_rituals().unwrap_or_default();
-    let today = chrono::Local::now().date_naive();
-    let ritual_day_counts = app.db.get_ritual_day_counts(today).unwrap_or_default();
-    let ritual_streaks = app.db.get_all_ritual_streaks().unwrap_or_default();
-
-    let mut items: Vec<ListItem> = Vec::new();
-
-    for a in &daily_adventures {
-        let check = if a.completed { "[x]" } else { "[ ]" };
-        let style = if a.completed {
-            Style::default().fg(theme.success)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("  {} ", check), style),
+    if let Some(main) = plan.main_quest.as_ref() {
+        let (prio_label, prio_color) = priority_label(main.task.priority);
+        if action_idx == app.selected_dashboard_task_idx {
+            selected_visual_idx = Some(rows.len());
+        }
+        action_idx += 1;
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled("MAIN  ", Style::default().fg(theme.warning)),
             Span::styled(
-                format!("{} ({}/{})", a.title, a.current_count, a.target_count),
-                style,
+                format!("{} ", short_text(&main.project_name, 14)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!("[{}] ", prio_label),
+                Style::default().fg(prio_color),
+            ),
+            Span::styled(
+                main.task.title.as_str(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", format_duration(main.est_minutes)),
+                Style::default().fg(theme.muted),
             ),
         ])));
     }
 
-    if !rituals.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            "  ── Sidequests ──────────────────",
-            Style::default().fg(theme.border),
-        ))));
-
-        for (idx, r) in rituals.iter().enumerate() {
-            let (count, target) = ritual_day_counts
-                .get(&r.id)
-                .copied()
-                .unwrap_or((0, r.daily_target));
-            let is_done = count >= target;
-            let is_sel = idx == app.selected_ritual_idx && !app.dashboard_task_focus;
-            let cursor = if is_sel { "> " } else { "  " };
-
-            let (cursor_style, text_style) = if is_sel {
-                (
-                    Style::default()
-                        .fg(theme.primary)
-                        .add_modifier(Modifier::BOLD),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                )
-            } else {
-                (
-                    Style::default().fg(theme.muted),
-                    Style::default().fg(theme.text),
-                )
-            };
-
-            // Check indicator: [x] when done, [N/M] when partial multi-target, [ ] when untouched
-            let (check_str, check_style) = if is_done {
-                ("[x]".to_string(), Style::default().fg(theme.success))
-            } else if target > 1 && count > 0 {
-                (
-                    format!("[{}/{}]", count, target),
-                    Style::default().fg(theme.warning),
-                )
-            } else {
-                ("[ ]".to_string(), Style::default())
-            };
-
-            let streak = *ritual_streaks.get(&r.id).unwrap_or(&0);
-            let streak_badge = if streak > 0 {
-                let milestone_marker = match streak {
-                    s if s >= 90 => " *90d*",
-                    s if s >= 85 => " *85d*",
-                    s if s >= 60 => " *60d*",
-                    s if s >= 45 => " *45d*",
-                    s if s >= 30 => " *30d*",
-                    s if s >= 15 => " *15d*",
-                    s if s >= 7 => " *7d*",
-                    s if s >= 3 => " *3d*",
-                    _ => "",
-                };
-                format!(" ~{}d{}", streak, milestone_marker)
-            } else {
-                String::new()
-            };
-
-            let streak_color = match streak {
-                s if s >= 30 => Color::Yellow,
-                s if s >= 7 => theme.warning,
-                s if s > 0 => Color::Cyan,
-                _ => theme.muted,
-            };
-
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(cursor, cursor_style),
-                Span::styled(format!("{} ", check_str), check_style),
-                Span::styled(r.name.as_str(), text_style),
-                Span::styled(
-                    format!(" (+{} XP)", r.reward_xp),
-                    Style::default().fg(theme.muted),
-                ),
-                Span::styled(streak_badge, Style::default().fg(streak_color)),
-            ])));
+    push_separator(&mut rows, "Quick Wins", theme.primary);
+    for task in &plan.quick_wins {
+        let (prio_label, prio_color) = priority_label(task.priority);
+        let project_name = app
+            .projects
+            .iter()
+            .find(|p| Some(p.id) == task.project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("General");
+        let (energy_label, energy_color) = task_energy_tag(task);
+        if action_idx == app.selected_dashboard_task_idx {
+            selected_visual_idx = Some(rows.len());
         }
+        action_idx += 1;
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled("[ ] ", Style::default().fg(theme.text)),
+            Span::styled(
+                format!("{} ", short_text(project_name, 14)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!("[{}] ", prio_label),
+                Style::default().fg(prio_color),
+            ),
+            Span::styled(task.title.as_str(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!(" [{}]", energy_label),
+                Style::default().fg(energy_color),
+            ),
+        ])));
     }
 
-    if items.is_empty() {
-        items.push(ListItem::new(Span::styled(
-            "  No daily quests today.",
+    push_separator(&mut rows, "Sidequests", theme.secondary);
+    for ritual in &app.stats_cache.rituals {
+        let (count, target) = app
+            .stats_cache
+            .ritual_day_counts
+            .get(&ritual.id)
+            .copied()
+            .unwrap_or((0, ritual.daily_target));
+        let done = count >= target;
+        let streak = *app.stats_cache.ritual_streaks.get(&ritual.id).unwrap_or(&0);
+        let (rank, rank_color) = sidequest_rank(streak).unwrap_or(("Sidequest", theme.muted));
+        if action_idx == app.selected_dashboard_task_idx {
+            selected_visual_idx = Some(rows.len());
+        }
+        action_idx += 1;
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                if done {
+                    "[x] "
+                } else if count > 0 {
+                    "[~] "
+                } else {
+                    "[ ] "
+                },
+                Style::default().fg(if done { theme.success } else { theme.text }),
+            ),
+            Span::styled(ritual.name.as_str(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!(" ({}/{}) +{} XP ", count, target, ritual.reward_xp),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!("{}d {}", streak, rank),
+                Style::default().fg(rank_color),
+            ),
+        ])));
+    }
+
+    push_separator(&mut rows, "Daily", theme.warning);
+    for adventure in &app.stats_cache.todays_daily_adventures {
+        if action_idx == app.selected_dashboard_task_idx {
+            selected_visual_idx = Some(rows.len());
+        }
+        action_idx += 1;
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled("DAILY ", Style::default().fg(theme.warning)),
+            Span::styled(
+                if adventure.completed { "[x] " } else { "[ ] " },
+                Style::default().fg(if adventure.completed {
+                    theme.success
+                } else {
+                    theme.text
+                }),
+            ),
+            Span::styled(adventure.title.as_str(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!(" ({}/{})", adventure.current_count, adventure.target_count),
+                Style::default().fg(theme.muted),
+            ),
+        ])));
+    }
+
+    if rows.is_empty() {
+        rows.push(ListItem::new(Span::styled(
+            "  The command board is clear.",
             Style::default().fg(theme.muted),
         )));
     }
 
-    let border_color = if focused { theme.warning } else { theme.border };
-    let hint = if focused {
-        "[Tab] Quick Wins  [n] New  [Del] Remove"
-    } else {
-        "[Tab] to focus"
-    };
-    let title = format!(" Daily Quests ({}/{})  {} ", comp_count, total, hint);
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(border_color))
-            .title(title.as_str()),
-    );
-    f.render_widget(list, area);
-}
-
-fn draw_quick_wins(
-    f: &mut Frame,
-    app: &App,
-    theme: &Theme,
-    area: ratatui::layout::Rect,
-    quick_wins: &[Task],
-) {
-    let focused = app.dashboard_task_focus;
-    let border_color = if focused { theme.primary } else { theme.border };
-
-    let items: Vec<ListItem> = if quick_wins.is_empty() {
-        vec![ListItem::new(Span::styled(
-            "  No quick wins available.",
-            Style::default().fg(theme.muted),
-        ))]
-    } else {
-        quick_wins
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let is_sel = focused && i == app.selected_dashboard_task_idx;
-                let cursor = if is_sel { "> " } else { "  " };
-                let (cursor_style, text_style) = if is_sel {
-                    (
-                        Style::default()
-                            .fg(theme.primary)
-                            .add_modifier(Modifier::BOLD),
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(theme.selection)
-                            .add_modifier(Modifier::BOLD),
-                    )
-                } else {
-                    (
-                        Style::default().fg(theme.muted),
-                        Style::default().fg(theme.text),
-                    )
-                };
-                let (prio_label, prio_color) = priority_label(t.priority);
-                let project_name = app
-                    .projects
-                    .iter()
-                    .find(|p| Some(p.id) == t.project_id)
-                    .map(|p| p.name.as_str())
-                    .unwrap_or("Unknown Project");
-                let project_style = if is_sel {
-                    text_style
-                } else {
-                    Style::default().fg(theme.muted)
-                };
-                ListItem::new(Line::from(vec![
-                    Span::styled(cursor, cursor_style),
-                    Span::styled(
-                        format!("[{}] ", prio_label),
-                        Style::default().fg(prio_color),
-                    ),
-                    Span::styled(t.title.as_str(), text_style),
-                    Span::styled(format!(" ({})", project_name), project_style),
-                ]))
-            })
-            .collect()
-    };
-
-    let hint = if focused {
-        "[Space] Done  [Enter] Open  [Tab] Sidequests"
-    } else {
-        "[Tab] to focus"
-    };
-
     let mut state = ListState::default();
-    if focused && !quick_wins.is_empty() {
+    if !rows.is_empty() {
         state.select(Some(
-            app.selected_dashboard_task_idx
-                .min(quick_wins.len().saturating_sub(1)),
+            selected_visual_idx
+                .unwrap_or(0)
+                .min(rows.len().saturating_sub(1)),
         ));
     }
 
-    let list = List::new(items)
+    let title = format!(
+        " Today's Command Center  Due {} Overdue {} High {} Load: {}  Space Done | Enter Open | z Tomorrow | Z Week ",
+        due_today,
+        overdue,
+        high,
+        format_duration(plan.estimated_minutes)
+    );
+    let list = List::new(rows)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(border_color))
-                .title(format!(" Quick Wins ({})  {} ", quick_wins.len(), hint)),
+                .border_style(Style::default().fg(label_color))
+                .title(title.as_str()),
         )
         .highlight_style(
             Style::default()
@@ -482,55 +361,173 @@ fn draw_quick_wins(
     f.render_stateful_widget(list, area, &mut state);
 }
 
-fn draw_workload(
+fn draw_campaign_intel(
     f: &mut Frame,
+    app: &App,
     theme: &Theme,
     area: ratatui::layout::Rect,
-    total_quests: usize,
-    estimated_minutes: u32,
+    all_tasks: &[Task],
+    today: chrono::NaiveDate,
 ) {
-    let (label, label_color) = workload_label(estimated_minutes);
-    let cap_minutes = 480u32;
-    let ratio = (estimated_minutes.min(cap_minutes) as f64 / cap_minutes as f64).clamp(0.0, 1.0);
-    let bar_width = area.width.saturating_sub(4) as usize;
-    let filled = (ratio * bar_width as f64).round() as usize;
-    let bar = format!(
-        "[{}{}]",
-        "\u{2588}".repeat(filled),
-        "\u{2591}".repeat(bar_width.saturating_sub(filled))
-    );
+    let mut lines = Vec::new();
 
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                format!("  {} quests  |  ", total_quests),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                label,
-                Style::default()
-                    .fg(label_color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(Span::styled(
-            format!("  {}", bar),
-            Style::default().fg(label_color),
-        )),
-        Line::from(Span::styled(
-            format!("  Est. remaining: {}", format_duration(estimated_minutes)),
+    lines.push(Line::from(Span::styled(
+        "Upcoming Threats",
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let mut threats: Vec<&Task> = all_tasks
+        .iter()
+        .filter(|t| !t.completed && t.parent_task_id.is_none() && t.due_date.is_some())
+        .collect();
+    threats.sort_by(|a, b| a.due_date.cmp(&b.due_date));
+    if threats.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No dated threats.",
             Style::default().fg(theme.muted),
-        )),
-    ];
+        )));
+    } else {
+        for task in threats.into_iter().take(3) {
+            let due = task
+                .due_date
+                .map(|d| d.with_timezone(&Local).date_naive())
+                .unwrap_or(today);
+            let label = if due < today {
+                format!("{}d late", (today - due).num_days())
+            } else if due == today {
+                "today".to_string()
+            } else if due == today + chrono::Duration::days(1) {
+                "tomorrow".to_string()
+            } else {
+                format!("{}d", (due - today).num_days())
+            };
+            let days_until = (due - today).num_days();
+            let color = if due <= today + chrono::Duration::days(1) {
+                theme.danger
+            } else if days_until <= 3 {
+                theme.warning
+            } else {
+                theme.success
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {:>8} ", label), Style::default().fg(color)),
+                Span::styled(short_text(&task.title, 24), Style::default().fg(theme.text)),
+            ]));
+        }
+    }
 
-    let p = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" Today's Workload "),
-    );
-    f.render_widget(p, area);
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Active Milestones",
+        Style::default()
+            .fg(theme.secondary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let milestones = &app.stats_cache.active_milestones;
+    if milestones.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No active milestones.",
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for intel in milestones.iter().take(2) {
+            let milestone = &intel.milestone;
+            let tier = match milestone.tier {
+                3 => "LEG",
+                2 => "VET",
+                1 => "INI",
+                _ => "ARC",
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  [{}] ", tier),
+                    Style::default().fg(theme.secondary),
+                ),
+                Span::styled(
+                    short_text(&milestone.name, 24),
+                    Style::default().fg(theme.text),
+                ),
+                Span::styled(
+                    format!(
+                        " +{} {}",
+                        milestone.xp_reward,
+                        short_text(&intel.project_name, 12)
+                    ),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+            for requirement in &intel.progress {
+                let marker = if requirement.met { "[x]" } else { "[ ]" };
+                let color = if requirement.met {
+                    theme.success
+                } else {
+                    theme.warning
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {} ", marker), Style::default().fg(color)),
+                    Span::styled(
+                        short_text(&requirement.label, 30),
+                        Style::default().fg(theme.muted),
+                    ),
+                    Span::styled(
+                        format!(" {}/{}", requirement.current, requirement.target),
+                        Style::default().fg(color),
+                    ),
+                ]));
+            }
+        }
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Recent Scrolls",
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD),
+    )));
+    let mut notes = app.all_notes.clone();
+    notes.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    if notes.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No scrolls yet.",
+            Style::default().fg(theme.muted),
+        )));
+    } else {
+        for note in notes.iter().take(3) {
+            let project_name = app
+                .projects
+                .iter()
+                .find(|p| Some(p.id) == note.project_id)
+                .map(|p| p.name.as_str())
+                .unwrap_or("General");
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(
+                        "  {} ",
+                        note.updated_at.with_timezone(&Local).format("%m-%d")
+                    ),
+                    Style::default().fg(theme.muted),
+                ),
+                Span::styled(short_text(&note.title, 20), Style::default().fg(theme.text)),
+                Span::styled(
+                    format!(" ({})", short_text(project_name, 12)),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
+    }
+
+    let panel = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border))
+                .title(" Campaign Intel "),
+        )
+        .wrap(ratatui::widgets::Wrap { trim: true });
+    f.render_widget(panel, area);
 }
 
 // ─── Columna derecha: héroe y reino ──────────────────────────────────────────
@@ -629,7 +626,7 @@ fn draw_hero_panel(f: &mut Frame, theme: &Theme, area: ratatui::layout::Rect, us
 }
 
 fn draw_evergrowth_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
-    let zen_tree = app.db.get_zen_tree().unwrap();
+    let zen_tree = &app.stats_cache.zen_tree;
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -791,28 +788,19 @@ fn achievement_progress(
 }
 
 fn draw_streaks_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
-    let streak = app.db.get_streak().unwrap();
-    let achievements = app.db.get_achievements().unwrap_or_default();
+    let streak = &app.stats_cache.streak;
+    let achievements = &app.stats_cache.achievements;
     let unlocked = achievements
         .iter()
         .filter(|a| a.unlocked_at.is_some())
         .count();
 
-    let stats = app.db.get_statistics().unwrap();
-    let zen_stage = app.db.get_zen_tree().map(|t| t.stage).unwrap_or(0);
-    let silent_count = app
-        .db
-        .count_focus_sessions_with_soundscape(&["Silent"])
-        .unwrap_or(0);
-    let forest_count = app
-        .db
-        .count_focus_sessions_with_soundscape(&["Forest Sounds"])
-        .unwrap_or(0);
-    let rain_count = app
-        .db
-        .count_focus_sessions_with_soundscape(&["Rain Sounds"])
-        .unwrap_or(0);
-    let unique_sc = app.db.count_unique_soundscapes_used().unwrap_or(0);
+    let stats = &app.stats_cache.statistics;
+    let zen_stage = app.stats_cache.zen_tree.stage;
+    let silent_count = app.stats_cache.silent_sessions;
+    let forest_count = app.stats_cache.forest_sessions;
+    let rain_count = app.stats_cache.rain_sessions;
+    let unique_sc = app.stats_cache.unique_soundscapes;
     let codex_count = app.db.count_codices().unwrap_or(0);
 
     let block = Block::default()
@@ -960,11 +948,8 @@ fn draw_streaks_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::la
 }
 
 fn draw_focus_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
-    let stats = app.db.get_statistics().unwrap();
-    let fav = app
-        .db
-        .get_favorite_soundscape()
-        .unwrap_or_else(|_| "None".to_string());
+    let stats = &app.stats_cache.statistics;
+    let fav = &app.stats_cache.favorite_soundscape;
 
     let lines = vec![
         Line::from(vec![
@@ -1258,19 +1243,20 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
     let all_tasks = &app.all_tasks;
 
     // Datos para el motor de planificación
-    let daily_adventures = app.db.get_daily_adventures().unwrap_or_default();
-    let streak = app.db.get_streak().unwrap();
-    let zen_tree = app.db.get_zen_tree().unwrap();
+    let streak = &app.stats_cache.streak;
+    let zen_tree = &app.stats_cache.zen_tree;
     let overdue_count = all_tasks
         .iter()
         .filter(|t| {
             !t.completed
                 && t.parent_task_id.is_none()
-                && t.due_date.map(|d| d.date_naive() < today).unwrap_or(false)
+                && t.due_date
+                    .map(|d| d.with_timezone(&Local).date_naive() < today)
+                    .unwrap_or(false)
         })
         .count();
-    let daily_completed = daily_adventures.iter().filter(|a| a.completed).count();
-    let daily_total = daily_adventures.len();
+    let daily_completed = app.stats_cache.todays_daily_adventures_completed;
+    let daily_total = app.stats_cache.todays_daily_adventures_total;
 
     let plan = planner::generate_plan(
         all_tasks,
@@ -1314,44 +1300,25 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3), // encabezado de campaña
-            Constraint::Length(7), // quest principal
-            Constraint::Min(8),    // siguiente quest + quests diarias
-            Constraint::Length(9), // victorias rápidas + carga de trabajo
+            Constraint::Min(18),   // centro de mando + hidratación
             Constraint::Length(4), // trabajo profundo + reflexión + compañerismo
         ])
         .split(main_cols[1]);
 
     draw_campaign_header(f, app, theme, right_rows[0], &plan);
 
-    // Always split the main-quest row — show hydration widget whether enabled or not
-    let quest_row = Layout::default()
+    let command_row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(right_rows[1]);
-    draw_main_quest(f, theme, quest_row[0], plan.main_quest.as_ref());
-    draw_hydration_widget(f, app, theme, quest_row[1]);
+    draw_today_command_center(f, app, theme, command_row[0], all_tasks, today, &plan);
 
-    // Fila de siguiente quest y quests diarias
-    let mid_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(right_rows[2]);
-    draw_next_quest(f, theme, mid_row[0], plan.next_quest.as_ref());
-    draw_daily_quests(f, app, theme, mid_row[1], !app.dashboard_task_focus);
-
-    // Fila de victorias rápidas y carga de trabajo
-    let bottom_row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(right_rows[3]);
-    draw_quick_wins(f, app, theme, bottom_row[0], &plan.quick_wins);
-    draw_workload(
-        f,
-        theme,
-        bottom_row[1],
-        plan.total_quest_count,
-        plan.estimated_minutes,
-    );
+    let intel_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(10)])
+        .split(command_row[1]);
+    draw_hydration_widget(f, app, theme, intel_rows[0]);
+    draw_campaign_intel(f, app, theme, intel_rows[1], all_tasks, today);
 
     // Fila de trabajo profundo, reflexión y compañerismo
     let stats_row = Layout::default()
@@ -1361,7 +1328,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             Constraint::Percentage(32), // reflexión
             Constraint::Percentage(30), // compañerismo
         ])
-        .split(right_rows[4]);
+        .split(right_rows[2]);
     draw_focus_panel(f, app, theme, stats_row[0]);
     draw_reflection_panel(f, theme, stats_row[1], reflected_today);
     draw_fellowship_panel(f, app, theme, stats_row[2]);
@@ -1533,19 +1500,25 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         }
         ModalType::HydrationReminder => {
             let modal_area = centered_rect(40, 35, area);
+            let hydration_bg = Color::Rgb(7, 25, 48);
+            let hydration_border = Color::Rgb(56, 189, 248);
+            let hydration_title = Color::Rgb(224, 242, 254);
+            let hydration_text = Color::Rgb(186, 230, 253);
+            let hydration_muted = Color::Rgb(125, 211, 252);
             f.render_widget(Clear, modal_area);
             f.render_widget(
-                Block::default().style(Style::default().bg(theme.background)),
+                Block::default().style(Style::default().bg(hydration_bg)),
                 modal_area,
             );
             let block = Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Double)
-                .border_style(Style::default().fg(theme.secondary))
+                .border_style(Style::default().fg(hydration_border).bg(hydration_bg))
                 .title(Span::styled(
                     " Hydration Reminder ",
                     Style::default()
-                        .fg(Color::White)
+                        .fg(hydration_title)
+                        .bg(hydration_bg)
                         .add_modifier(Modifier::BOLD),
                 ));
             let inner = block.inner(modal_area);
@@ -1566,7 +1539,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                 Paragraph::new(Span::styled(
                     "  Time to drink some water!",
                     Style::default()
-                        .fg(Color::White)
+                        .fg(hydration_title)
+                        .bg(hydration_bg)
                         .add_modifier(Modifier::BOLD),
                 )),
                 content[1],
@@ -1577,7 +1551,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                         "  Today: {}/{} glasses",
                         app.hydration_glasses, app.hydration_target
                     ),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(hydration_text).bg(hydration_bg),
                 )),
                 content[2],
             );
@@ -1591,7 +1565,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             f.render_widget(
                 Paragraph::new(Span::styled(
                     format!("  [{}]", render_progress_bar(filled, bar_w, bar_w)),
-                    Style::default().fg(theme.secondary),
+                    Style::default().fg(hydration_border).bg(hydration_bg),
                 )),
                 content[3],
             );
@@ -1599,7 +1573,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
             f.render_widget(
                 Paragraph::new(Span::styled(
                     " [d] Drink  [s] Snooze 15m  [x] Dismiss ",
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(hydration_muted).bg(hydration_bg),
                 ))
                 .alignment(Alignment::Center),
                 content[5],

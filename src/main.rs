@@ -515,7 +515,9 @@ async fn main() -> Result<()> {
             break;
         }
 
-        app.terminal_height = terminal.size().map(|s| s.height).unwrap_or(40);
+        let terminal_size = terminal.size().ok();
+        app.terminal_width = terminal_size.map(|s| s.width).unwrap_or(120);
+        app.terminal_height = terminal_size.map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_auto_sync()?;
         let sync_busy = app.sync_in_progress;
@@ -647,34 +649,32 @@ async fn main() -> Result<()> {
                         }
 
                         ActiveScreen::Character => {
-                            // Jala un chorro de datos de la DB para la pantalla de personaje — no se cachean
-                            let achievements = app.db.get_achievements().unwrap_or_default();
-                            let achievements_count = achievements.iter().filter(|a| a.unlocked_at.is_some()).count() as i32;
-                            let tree = app.db.get_zen_tree().unwrap();
-                            let streak_obj = app.db.get_streak().unwrap();
-                            let xp_history = app.db.get_xp_history().unwrap_or_default();
-                            let most_productive = app.db.get_most_productive_project().unwrap_or_else(|_| "None yet".to_string());
-                            let reflections = app.db.get_reflections().unwrap_or_default();
-                            let devices = app.db.get_devices().unwrap_or_default();
-                            let chronicle_entries = app.db.get_chronicle_entries().unwrap_or_default();
+                            let achievements_count = app
+                                .stats_cache
+                                .achievements
+                                .iter()
+                                .filter(|a| a.unlocked_at.is_some())
+                                .count() as i32;
+                            let tree = &app.stats_cache.zen_tree;
+                            let streak_obj = &app.stats_cache.streak;
 
                             screens::character::draw(
                                 f,
-	                                app.user.as_ref().unwrap(),
-	                                achievements_count,
-	                                achievements.len(),
-	                                tree.stage_name(),
+                                app.user.as_ref().unwrap(),
+                                achievements_count,
+                                app.stats_cache.achievements.len(),
+                                tree.stage_name(),
                                 tree.growth,
                                 tree.health,
                                 streak_obj.current_streak,
                                 streak_obj.best_streak,
-                                &xp_history,
-                                &most_productive,
-                                &reflections,
+                                &app.stats_cache.xp_history,
+                                &app.stats_cache.most_productive_project,
+                                &app.stats_cache.reflections,
                                 app.selected_reflection_idx,
                                 &app.modal_state,
-                                &devices,
-                                &chronicle_entries,
+                                &app.stats_cache.devices,
+                                &app.stats_cache.chronicle_entries,
                                 app.selected_chronicle_idx,
                                 app.character_focus,
                                 app.reflection_detail_scroll,
@@ -723,11 +723,10 @@ async fn main() -> Result<()> {
                             );
                         }
                         ActiveScreen::Legends => {
-                            let stats = app.db.get_statistics().unwrap();
                             let relics = app.db.get_relics().unwrap_or_default();
                             screens::legends::draw(
                                 f,
-                                &stats,
+                                &app.stats_cache.statistics,
                                 app.selected_relic_idx,
                                 &relics,
                                 &theme,
@@ -843,7 +842,7 @@ async fn main() -> Result<()> {
 
                     let left_p = Paragraph::new(footer_text);
                     let sync_p = Paragraph::new(sync_line).alignment(ratatui::layout::Alignment::Right);
-                    
+
                     f.render_widget(left_p, footer_cols[0]);
                     f.render_widget(sync_p, footer_cols[1]);
                 }
@@ -1110,7 +1109,7 @@ async fn main() -> Result<()> {
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Choose Legendary Theme ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-                    
+
                 let mut list_items = Vec::new();
                 for (idx, choice) in choices.iter().enumerate() {
                     let prefix = if idx == selected_idx { "> " } else { "  " };
@@ -1124,7 +1123,7 @@ async fn main() -> Result<()> {
                         Span::styled(choice, style),
                     ]));
                 }
-                
+
                 let p = Paragraph::new(list_items)
                     .block(block)
                     .alignment(ratatui::layout::Alignment::Center);
@@ -1142,7 +1141,7 @@ async fn main() -> Result<()> {
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Mention User ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-                    
+
                 let mut list_items = Vec::new();
                 for (idx, username) in usernames.iter().enumerate() {
                     let prefix = if idx == selected_idx { "> " } else { "  " };
@@ -1156,7 +1155,7 @@ async fn main() -> Result<()> {
                         Span::styled(format!("@{}", username), style),
                     ]));
                 }
-                
+
                 let p = Paragraph::new(list_items)
                     .block(block)
                     .alignment(ratatui::layout::Alignment::Left);
@@ -1174,24 +1173,24 @@ async fn main() -> Result<()> {
                     .border_type(BorderType::Double)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" CELEBRATION MOMENT ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
-                
+
                 let mut content = vec![
                     Line::from(""),
                     Line::from(Span::styled(title.to_uppercase(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))),
                     Line::from(""),
                 ];
-                
+
                 if !ascii_art.is_empty() {
                     content.extend(celebration_art_lines(ascii_art, app.quit_confirm_ticks));
                     content.push(Line::from(""));
                 }
-                
+
                 for line in details.lines() {
                     content.push(Line::from(Span::styled(line, Style::default().fg(Color::White))));
                 }
                 content.push(Line::from(""));
                 content.push(Line::from(Span::styled("Press [Enter] or [Space] or [Esc] to continue your journey...", Style::default().fg(Color::Rgb(140, 140, 140)))));
-                
+
                 let p = Paragraph::new(content)
                     .block(block)
                     .alignment(ratatui::layout::Alignment::Center)
@@ -1667,7 +1666,7 @@ async fn main() -> Result<()> {
                     .block(block)
                     .alignment(ratatui::layout::Alignment::Center)
                     .wrap(ratatui::widgets::Wrap { trim: false });
-                
+
                 f.render_widget(p, overlay_area);
             }
 
@@ -2230,7 +2229,7 @@ async fn main() -> Result<()> {
                     .alignment(ratatui::layout::Alignment::Left)
                     .wrap(ratatui::widgets::Wrap { trim: false })
                     .style(Style::default().fg(Color::White));
-                
+
                 f.render_widget(p, overlay_area);
             }
 

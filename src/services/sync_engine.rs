@@ -320,16 +320,40 @@ impl<'a> SyncEngine<'a> {
                     // Formato compuesto: "{ritual_id}__{completed_date}" — hay que partirlo
                     let parts: Vec<&str> = entity_id.splitn(2, "__").collect();
                     if parts.len() == 2 {
+                        let row = self
+                            .db
+                            .conn
+                            .query_row(
+                                "SELECT completion_count, completed_at FROM ritual_history WHERE ritual_id = ?1 AND completed_date = ?2",
+                                params![parts[0], parts[1]],
+                                |row| Ok((row.get::<_, i32>(0)?, row.get::<_, Option<String>>(1)?)),
+                            )
+                            .ok();
+                        let (completion_count, completed_at) = row.unwrap_or((1, None));
                         Some(
                             serde_json::json!({
                                 "ritual_id": parts[0],
                                 "completed_date": parts[1],
+                                "completion_count": completion_count,
+                                "completed_at": completed_at,
                             })
                             .to_string(),
                         )
                     } else {
                         None
                     }
+                }
+                "setting"
+                    if crate::database::SYNCED_STREAK_SETTING_KEYS
+                        .contains(&entity_id.as_str()) =>
+                {
+                    self.db.get_setting(&entity_id).ok().flatten().map(|value| {
+                        serde_json::json!({
+                            "key": entity_id,
+                            "value": value,
+                        })
+                        .to_string()
+                    })
                 }
                 "codex" => self
                     .db
@@ -658,19 +682,9 @@ impl<'a> SyncEngine<'a> {
                     !unlocked
                 }
                 "ritual" => true,
-                "ritual_history" => {
-                    // Misma convención de formato compuesto que arriba — hay que partir el id
-                    let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
-                    if parts.len() == 2 {
-                        let exists = self.db.conn.query_row(
-                            "SELECT count(*) FROM ritual_history WHERE ritual_id = ?1 AND completed_date = ?2",
-                            params![parts[0], parts[1]],
-                            |row| row.get::<_, i32>(0),
-                        ).unwrap_or(0) > 0;
-                        !exists
-                    } else {
-                        false
-                    }
+                "ritual_history" => true,
+                "setting" => {
+                    crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&log.entity_id.as_str())
                 }
                 // Codex: siempre aplicamos — INSERT OR REPLACE propaga renombres y cambios de parent
                 "codex" => true,
@@ -1016,11 +1030,30 @@ impl<'a> SyncEngine<'a> {
                                 let ritual_id = rh["ritual_id"].as_str().unwrap_or_default();
                                 let completed_date =
                                     rh["completed_date"].as_str().unwrap_or_default();
+                                let completion_count =
+                                    rh["completion_count"].as_i64().unwrap_or(1) as i32;
+                                let completed_at = rh["completed_at"].as_str();
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date) VALUES (?1, ?2)",
-                                    params![ritual_id, completed_date],
+                                    "INSERT INTO ritual_history (ritual_id, completed_date, completion_count, completed_at) VALUES (?1, ?2, ?3, ?4)
+                                     ON CONFLICT(ritual_id, completed_date) DO UPDATE SET
+                                        completion_count = MAX(completion_count, excluded.completion_count),
+                                        completed_at = COALESCE(excluded.completed_at, completed_at)",
+                                    params![ritual_id, completed_date, completion_count, completed_at],
                                 );
                                 pulled_count += 1;
+                            }
+                        }
+                        "setting" => {
+                            if let Ok(setting) = serde_json::from_str::<serde_json::Value>(content)
+                            {
+                                let key = setting["key"].as_str().unwrap_or_default();
+                                let value = setting["value"].as_str().unwrap_or_default();
+                                if key == log.entity_id
+                                    && crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&key)
+                                {
+                                    let _ = self.db.set_setting(key, value);
+                                    pulled_count += 1;
+                                }
                             }
                         }
                         "codex" => {

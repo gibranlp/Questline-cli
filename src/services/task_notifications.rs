@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, Local, NaiveDate, Utc};
 use uuid::Uuid;
 
 use crate::database::Database;
@@ -70,7 +70,7 @@ pub fn collect_task_notifications(
     }
 
     let mut events = Vec::new();
-    let today = now.date_naive();
+    let today = now.with_timezone(&Local).date_naive();
 
     if settings.summary {
         if let Some(event) = daily_summary_event(db, tasks, today)? {
@@ -179,7 +179,7 @@ fn overdue_event(
     let first_key = task_key("overdue_first", task.id, "once");
     if let Some(sent_at) = db.get_setting(&first_key)? {
         if DateTime::parse_from_rfc3339(&sent_at)
-            .map(|d| d.with_timezone(&Utc).date_naive() == today)
+            .map(|d| d.with_timezone(&Local).date_naive() == today)
             .unwrap_or(false)
         {
             return Ok(None);
@@ -303,7 +303,9 @@ fn due_today_count(tasks: &[Task], today: NaiveDate) -> usize {
         .filter(|t| {
             !t.completed
                 && t.parent_task_id.is_none()
-                && t.due_date.map(|d| d.date_naive() == today).unwrap_or(false)
+                && t.due_date
+                    .map(|d| d.with_timezone(&Local).date_naive() == today)
+                    .unwrap_or(false)
         })
         .count()
 }
