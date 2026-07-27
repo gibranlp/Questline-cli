@@ -257,8 +257,6 @@ impl EditorState {
             let line = &self.lines[self.cursor_y];
             self.cursor_x = floor_char_boundary(line, self.cursor_x.min(line.len()));
             self.clamp_to_normal();
-        } else {
-            self.editing_title = true;
         }
     }
 
@@ -883,8 +881,6 @@ impl EditorState {
             self.cursor_y -= 1;
             let line = &self.lines[self.cursor_y];
             self.cursor_x = floor_char_boundary(line, self.cursor_x.min(line.len()));
-        } else {
-            self.editing_title = true;
         }
     }
 
@@ -1177,9 +1173,9 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         state.title.clone()
     };
     let title_block_label = if state.editing_title {
-        " Scroll Title  Enter/↓: Body "
+        " Scroll Title  Tab/Enter: Body "
     } else {
-        " Scroll Title  k/↑: edit "
+        " Scroll Title  Shift+Tab: edit "
     };
     f.render_widget(
         Paragraph::new(title_text).block(
@@ -1495,5 +1491,53 @@ mod tests {
 
         editor.redo();
         assert_eq!(editor.lines[0], "goodbye world");
+    }
+
+    #[test]
+    fn test_up_on_first_body_line_stays_in_body() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            Some(Uuid::new_v4()),
+            "Title".to_string(),
+            "alpha\nbeta".to_string(),
+        );
+        editor.editing_title = false;
+        editor.cursor_y = 0;
+
+        editor.normal_k();
+        assert!(!editor.editing_title);
+        assert_eq!(editor.cursor_y, 0);
+
+        editor.mode = EditorMode::Insert;
+        editor.move_up();
+        assert!(!editor.editing_title);
+        assert_eq!(editor.cursor_y, 0);
+    }
+
+    #[test]
+    fn test_visual_mode_line_navigation_stays_in_body() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            Some(Uuid::new_v4()),
+            "Title".to_string(),
+            "alpha\nbeta\ngamma".to_string(),
+        );
+        editor.editing_title = false;
+        editor.enter_visual_char();
+
+        editor.normal_j();
+        assert!(!editor.editing_title);
+        assert_eq!(editor.cursor_y, 1);
+
+        editor.normal_k();
+        assert!(!editor.editing_title);
+        assert_eq!(editor.cursor_y, 0);
+
+        editor.normal_k();
+        assert!(!editor.editing_title);
+        assert_eq!(editor.cursor_y, 0);
+        assert!(matches!(editor.mode, EditorMode::Visual { .. }));
     }
 }
