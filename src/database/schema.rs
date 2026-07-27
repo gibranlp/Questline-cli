@@ -366,7 +366,8 @@ CREATE TABLE IF NOT EXISTS processed_remote_events (
 CREATE TABLE IF NOT EXISTS hydration_log (
     log_date TEXT PRIMARY KEY,
     count INTEGER NOT NULL DEFAULT 0,
-    reward_given INTEGER NOT NULL DEFAULT 0
+    reward_given INTEGER NOT NULL DEFAULT 0,
+    last_drink_at TEXT
 );
 
 -- índices base — presentes desde el inicio
