@@ -527,10 +527,22 @@ impl Database {
             CREATE TABLE IF NOT EXISTS hydration_log (
                 log_date TEXT PRIMARY KEY,
                 count INTEGER NOT NULL DEFAULT 0,
-                reward_given INTEGER NOT NULL DEFAULT 0
+                reward_given INTEGER NOT NULL DEFAULT 0,
+                last_drink_at TEXT
             );
         ",
         )?;
+        let has_hydration_last_drink_at: bool = conn.query_row(
+            "SELECT count(*) FROM pragma_table_info('hydration_log') WHERE name='last_drink_at'",
+            [],
+            |row| row.get::<_, i32>(0).map(|c| c > 0),
+        )?;
+        if !has_hydration_last_drink_at {
+            conn.execute(
+                "ALTER TABLE hydration_log ADD COLUMN last_drink_at TEXT;",
+                [],
+            )?;
+        }
 
         for (id, name, desc) in Achievement::static_list() {
             conn.execute(
@@ -2282,13 +2294,32 @@ impl Database {
             .map_err(Into::into)
     }
 
-    // Increments glass count; returns the new count.
-    pub fn hydration_drink(&self) -> Result<i32> {
+    pub fn hydration_last_drink_at(&self) -> Result<Option<DateTime<Utc>>> {
         let today = chrono::Local::now().date_naive().to_string();
+        let last_drink_at: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT last_drink_at FROM hydration_log WHERE log_date = ?1",
+                params![today],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+
+        Ok(last_drink_at.and_then(|s| {
+            DateTime::parse_from_rfc3339(&s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .ok()
+        }))
+    }
+
+    pub fn hydration_drink_at(&self, now: DateTime<Utc>) -> Result<i32> {
+        let today = now.with_timezone(&Local).date_naive().to_string();
+        let now_str = now.to_rfc3339();
         self.conn.execute(
-            "INSERT INTO hydration_log (log_date, count, reward_given) VALUES (?1, 1, 0)
-             ON CONFLICT(log_date) DO UPDATE SET count = count + 1",
-            params![today],
+            "INSERT INTO hydration_log (log_date, count, reward_given, last_drink_at) VALUES (?1, 1, 0, ?2)
+             ON CONFLICT(log_date) DO UPDATE SET count = count + 1, last_drink_at = excluded.last_drink_at",
+            params![today, now_str],
         )?;
         self.conn
             .query_row(
@@ -2297,6 +2328,11 @@ impl Database {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    // Increments glass count; returns the new count.
+    pub fn hydration_drink(&self) -> Result<i32> {
+        self.hydration_drink_at(Utc::now())
     }
 
     // Marks the daily reward as claimed so it doesn't fire again today.
@@ -4768,5 +4804,49 @@ impl Database {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    #[test]
+    fn hydration_counts_12_glasses_in_one_day() {
+        let db_file = Path::new("test_questline_db_hydration_12.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+
+        let today = Local::now().date_naive();
+        let local_noon = Local
+            .with_ymd_and_hms(today.year(), today.month(), today.day(), 12, 0, 0)
+            .unwrap();
+        for i in 0..12 {
+            db.hydration_drink_at(
+                (local_noon + chrono::Duration::minutes(i * 31)).with_timezone(&Utc),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(db.hydration_max_glasses_day().unwrap(), 12);
+        assert_eq!(db.hydration_total_glasses().unwrap(), 12);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn hydration_drink_records_last_drink_time() {
+        let db_file = Path::new("test_questline_db_hydration_last_drink.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now();
+
+        db.hydration_drink_at(now).unwrap();
+
+        let last_drink_at = db.hydration_last_drink_at().unwrap().unwrap();
+        assert_eq!(last_drink_at.timestamp(), now.timestamp());
+
+        let _ = std::fs::remove_file(db_file);
     }
 }

@@ -3081,41 +3081,7 @@ impl App {
                     // d = drink and dismiss
                     KeyCode::Char('d') | KeyCode::Char('D') => {
                         self.modal_state = ModalType::None;
-                        if let Ok(new_count) = self.db.hydration_drink() {
-                            self.audio_player.play_task_complete();
-                            self.hydration_glasses = new_count;
-                            if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
-                                if let Ok((_, reward_given)) = self.db.hydration_get_today() {
-                                    if !reward_given {
-                                        let _ = self.db.hydration_mark_reward_given();
-                                        let _ = self.grant_xp(
-                                            "hydration_daily_target",
-                                            self.hydration_reward_xp,
-                                        );
-                                        let _ = self
-                                            .update_daily_adventure_progress("hydrate_fully", 1);
-                                        self.notifications.push(Notification::info(format!(
-                                            "Daily hydration goal reached! +{} XP",
-                                            self.hydration_reward_xp
-                                        )));
-                                    }
-                                }
-                            } else {
-                                self.notifications.push(Notification::info(format!(
-                                    "Drank a glass! {}/{} today",
-                                    new_count, self.hydration_target
-                                )));
-                            }
-                            let _ = self.check_action_achievements();
-                            let _ = self.increment_quest_progress(40, 1);
-                        }
-                        // Rearm reminder
-                        self.hydration_next_reminder_at = Some(
-                            std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    self.hydration_interval_mins as u64 * 60,
-                                ),
-                        );
+                        let _ = self.record_hydration_drink(false);
                     }
                     // s = snooze 15 min
                     KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -7057,40 +7023,7 @@ impl App {
                     && matches!(self.modal_state, ModalType::None)
                     && self.hydration_enabled
                 {
-                    if let Ok(new_count) = self.db.hydration_drink() {
-                        self.audio_player.play_task_complete();
-                        self.hydration_glasses = new_count;
-                        if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
-                            if let Ok((_, reward_given)) = self.db.hydration_get_today() {
-                                if !reward_given {
-                                    let _ = self.db.hydration_mark_reward_given();
-                                    let _ = self.grant_xp(
-                                        "hydration_daily_target",
-                                        self.hydration_reward_xp,
-                                    );
-                                    let _ =
-                                        self.update_daily_adventure_progress("hydrate_fully", 1);
-                                    self.notifications.push(Notification::info(format!(
-                                        "Daily hydration goal reached! +{} XP",
-                                        self.hydration_reward_xp
-                                    )));
-                                }
-                            }
-                        } else {
-                            self.notifications.push(Notification::info(format!(
-                                "Drank a glass! {}/{} today",
-                                new_count, self.hydration_target
-                            )));
-                        }
-                        let _ = self.check_action_achievements();
-                        let _ = self.increment_quest_progress(40, 1);
-                        self.hydration_next_reminder_at = Some(
-                            std::time::Instant::now()
-                                + std::time::Duration::from_secs(
-                                    self.hydration_interval_mins as u64 * 60,
-                                ),
-                        );
-                    }
+                    self.record_hydration_drink(true)?;
                 }
             }
             KeyCode::Char('p') | KeyCode::Char('P') => {
@@ -13735,17 +13668,20 @@ impl App {
         let achievements = self.db.get_achievements()?;
         if let Some(ach) = achievements.iter().find(|a| a.id == id) {
             if ach.unlocked_at.is_none() {
+                let ach_name = ach.name.clone();
+                let ach_description = ach.description.clone();
                 self.db.unlock_achievement(id)?;
+                self.stats_cache.achievements = self.db.get_achievements()?;
                 let user_ref = self.user.as_ref().unwrap();
                 let day_number = (Utc::now() - user_ref.created_at).num_days() as i32 + 1;
                 self.db.add_chronicle_entry(
                     day_number,
-                    &format!("Unlocked Achievement: {} - {}", ach.name, ach.description),
+                    &format!("Unlocked Achievement: {} - {}", ach_name, ach_description),
                 )?;
 
                 self.notifications.push(Notification::info(format!(
                     "ACHIEVEMENT UNLOCKED: {} ({})",
-                    ach.name, ach.description
+                    ach_name, ach_description
                 )));
                 self.trigger_ambient_particles();
                 self.push_great_chronicle_async("Achievement", "unlocked an achievement.", true);
@@ -16402,6 +16338,60 @@ impl App {
             }
         }
 
+        Ok(())
+    }
+
+    fn record_hydration_drink(&mut self, enforce_wait: bool) -> Result<()> {
+        if enforce_wait {
+            if let Some(last_drink_at) = self.db.hydration_last_drink_at()? {
+                let wait = chrono::Duration::minutes(self.hydration_interval_mins.max(1) as i64);
+                let next_allowed_at = last_drink_at + wait;
+                let now = Utc::now();
+                if now < next_allowed_at {
+                    let remaining = next_allowed_at - now;
+                    let remaining_secs = remaining.num_seconds().max(1) as u64;
+                    let remaining_mins = ((remaining_secs + 59) / 60).max(1);
+                    self.hydration_next_reminder_at = Some(
+                        std::time::Instant::now() + std::time::Duration::from_secs(remaining_secs),
+                    );
+                    self.notifications.push(Notification::info(format!(
+                        "Hydration is resting. Next glass in {} min.",
+                        remaining_mins
+                    )));
+                    return Ok(());
+                }
+            }
+        }
+
+        let new_count = self.db.hydration_drink()?;
+        self.audio_player.play_task_complete();
+        self.hydration_glasses = new_count;
+
+        if new_count >= self.hydration_target && self.hydration_reward_xp > 0 {
+            let (_, reward_given) = self.db.hydration_get_today()?;
+            if !reward_given {
+                self.db.hydration_mark_reward_given()?;
+                self.grant_xp("hydration_daily_target", self.hydration_reward_xp)?;
+                self.update_daily_adventure_progress("hydrate_fully", 1)?;
+                self.notifications.push(Notification::info(format!(
+                    "Daily hydration goal reached! +{} XP",
+                    self.hydration_reward_xp
+                )));
+            }
+        } else {
+            self.notifications.push(Notification::info(format!(
+                "Drank a glass! {}/{} today",
+                new_count, self.hydration_target
+            )));
+        }
+
+        self.check_action_achievements()?;
+        self.stats_cache.achievements = self.db.get_achievements()?;
+        self.increment_quest_progress(40, 1)?;
+        self.hydration_next_reminder_at = Some(
+            std::time::Instant::now()
+                + std::time::Duration::from_secs(self.hydration_interval_mins as u64 * 60),
+        );
         Ok(())
     }
 }
