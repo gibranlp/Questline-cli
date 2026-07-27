@@ -949,6 +949,19 @@ async fn main() -> Result<()> {
                 }
             }
 
+            if matches!(
+                app.modal_state,
+                questline::app::ModalType::HydrationReminder
+            ) {
+                questline::ui::draw_hydration_reminder_modal(
+                    f,
+                    size,
+                    app.hydration_glasses,
+                    app.hydration_target,
+                    &theme,
+                );
+            }
+
             // Modal para configurar la carpeta de música local — incluye autocompletado de paths
             if let questline::app::ModalType::LocalMusicFolder { ref input, ref suggestions, selected } = app.modal_state {
                 let has_suggestions = !suggestions.is_empty();
