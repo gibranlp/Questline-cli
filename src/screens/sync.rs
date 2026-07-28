@@ -31,6 +31,21 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .get_setting("last_sync")
         .unwrap_or(None)
         .unwrap_or_else(|| "Never".to_string());
+    let local_sync_seq = app
+        .db
+        .get_setting("last_pull_seq")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "0".to_string());
+    let cloud_sync_seq = app
+        .db
+        .get_setting("last_remote_head_seq")
+        .unwrap_or(None)
+        .unwrap_or_else(|| local_sync_seq.clone());
+    let sync_lag = app
+        .db
+        .get_setting("last_sync_lag")
+        .unwrap_or(None)
+        .unwrap_or_else(|| "0".to_string());
 
     let mut left_text = vec![
         Line::from(""),
@@ -118,6 +133,31 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
+        Line::from(vec![
+            Span::styled("   Local Sync: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                local_sync_seq,
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Cloud: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                cloud_sync_seq,
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("   Behind:     ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} events", sync_lag),
+                Style::default()
+                    .fg(if sync_lag == "0" {
+                        theme.success
+                    } else {
+                        theme.warning
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         {
             // el CodeWarlock gana XP extra por sincronizar — bonus de clase, chido
             let is_warlock = app
@@ -196,7 +236,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(24), Constraint::Min(8)])
+        .constraints([Constraint::Length(26), Constraint::Min(8)])
         .split(chunks[0]);
 
     f.render_widget(left_panel, left_chunks[0]);

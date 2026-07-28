@@ -2,7 +2,7 @@
 // theme/mod.rs — definiciones de colores y temas del TUI
 // ─────────────────────────────────────────────────────────────────────────────
 use crate::models::ClassType;
-use ratatui::style::Color;
+use ratatui::style::{Color, Modifier, Style};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ThemeChoice {
@@ -55,6 +55,24 @@ const FOCUS_TIMER: Color = Color::Rgb(20, 184, 166);
 const DISABLED: Color = Color::Rgb(107, 114, 128);
 
 impl Theme {
+    pub fn selected_fg(&self) -> Color {
+        Color::Black
+    }
+
+    pub fn selected_style(&self) -> Style {
+        Style::default()
+            .fg(self.selected_fg())
+            .bg(self.selection)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn primary_selected_style(&self) -> Style {
+        Style::default()
+            .fg(self.selected_fg())
+            .bg(self.primary)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn all_choices() -> &'static [ThemeChoice] {
         &[
             ThemeChoice::ClassDefault,

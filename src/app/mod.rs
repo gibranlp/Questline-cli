@@ -14431,22 +14431,7 @@ impl App {
                 if include_contributions {
                     let _ = db.queue_full_state_sync();
                 }
-                let (pushed, first_pulled, mut conflicts) = sync_engine.sync()?;
-                // Drain: a pull returns up to 500 events per call. If exactly 500 came back
-                // there are likely more waiting — keep pulling until the batch is smaller.
-                // This matters after a restore when last_pull_seq resets to 0 and the device
-                // must catch up on thousands of events instead of waiting 30s per batch.
-                let mut total_pulled = first_pulled;
-                let mut last_batch = first_pulled;
-                let mut drain_iters = 0;
-                while last_batch >= 500 && drain_iters < 100 {
-                    let (_, more, more_conflicts) = sync_engine.sync()?;
-                    conflicts.extend(more_conflicts);
-                    total_pulled += more;
-                    last_batch = more;
-                    drain_iters += 1;
-                }
-                let pulled = total_pulled;
+                let (pushed, pulled, conflicts) = sync_engine.sync()?;
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);

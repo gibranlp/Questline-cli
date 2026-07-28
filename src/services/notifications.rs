@@ -89,18 +89,7 @@ pub fn send_system_notification_with_icon(
             };
             let mut used_terminal_notifier = false;
             if let Some(path) = icon_path.as_ref() {
-                if std::process::Command::new("terminal-notifier")
-                    .arg("-title")
-                    .arg(&title)
-                    .arg("-subtitle")
-                    .arg(subtitle)
-                    .arg("-message")
-                    .arg(&message)
-                    .arg("-appIcon")
-                    .arg(path)
-                    .status()
-                    .is_ok()
-                {
+                if send_with_terminal_notifier(&title, &message, subtitle, path) {
                     used_terminal_notifier = true;
                 }
             }
@@ -165,6 +154,41 @@ pub fn send_system_notification_with_icon(
                 .status();
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn send_with_terminal_notifier(
+    title: &str,
+    message: &str,
+    subtitle: &str,
+    icon_path: &PathBuf,
+) -> bool {
+    for command in terminal_notifier_candidates() {
+        let status = std::process::Command::new(&command)
+            .arg("-title")
+            .arg(title)
+            .arg("-subtitle")
+            .arg(subtitle)
+            .arg("-message")
+            .arg(message)
+            .arg("-appIcon")
+            .arg(icon_path)
+            .arg("-contentImage")
+            .arg(icon_path)
+            .status();
+        if status.map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_notifier_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("terminal-notifier")];
+    candidates.push(PathBuf::from("/opt/homebrew/bin/terminal-notifier"));
+    candidates.push(PathBuf::from("/usr/local/bin/terminal-notifier"));
+    candidates
 }
 
 #[cfg(target_os = "linux")]
