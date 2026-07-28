@@ -1001,6 +1001,11 @@ impl Database {
     }
 
     pub fn delete_project_permanently(&self, id: Uuid) -> Result<()> {
+        if let Some(project) = self.get_projects()?.into_iter().find(|p| p.id == id) {
+            if let Ok(content_json) = serde_json::to_string(&project) {
+                let _ = self.create_revision("project", &id.to_string(), &content_json);
+            }
+        }
         // Tombstone antes de borrar — los otros dispositivos necesitan saber que este proyecto ya no existe
         let _ = self.log_change("project", &id.to_string(), "delete");
         self.conn.execute(
@@ -1239,6 +1244,11 @@ impl Database {
     }
 
     pub fn delete_task(&self, id: Uuid) -> Result<()> {
+        if let Ok(task) = self.get_task_by_id(id) {
+            if let Ok(content_json) = serde_json::to_string(&task) {
+                let _ = self.create_revision("task", &id.to_string(), &content_json);
+            }
+        }
         // Tombstone — sin esto la tarea resucita en el próximo pull desde otro dispositivo
         let _ = self.log_change("task", &id.to_string(), "delete");
         self.conn
@@ -1393,6 +1403,11 @@ impl Database {
     }
 
     pub fn delete_note(&self, id: Uuid) -> Result<()> {
+        if let Ok(note) = self.get_note_by_id(id) {
+            if let Ok(content_json) = serde_json::to_string(&note) {
+                let _ = self.create_revision("note", &id.to_string(), &content_json);
+            }
+        }
         let _ = self.log_change("note", &id.to_string(), "delete");
         self.conn
             .execute("DELETE FROM notes WHERE id = ?1", params![id.to_string()])?;
@@ -2438,6 +2453,25 @@ impl Database {
     }
 
     pub fn delete_milestone(&self, id: Uuid) -> Result<()> {
+        let _ = self.conn.query_row(
+            "SELECT json_object(
+                'id', id,
+                'project_id', project_id,
+                'name', name,
+                'description', description,
+                'completed', completed != 0,
+                'xp_reward', xp_reward,
+                'created_at', created_at,
+                'tier', tier,
+                'template_id', template_id
+            ) FROM milestones WHERE id = ?1",
+            params![id.to_string()],
+            |row| {
+                let content: String = row.get(0)?;
+                let _ = self.create_revision("milestone", &id.to_string(), &content);
+                Ok(())
+            },
+        );
         let _ = self.log_change("milestone", &id.to_string(), "delete");
         self.conn.execute(
             "DELETE FROM milestones WHERE id = ?1",
@@ -2826,6 +2860,12 @@ impl Database {
     }
 
     pub fn delete_codex(&self, id: Uuid) -> Result<()> {
+        if let Ok(codex) = self.get_codex_by_id(&id.to_string()) {
+            if let Ok(content_json) = serde_json::to_string(&codex) {
+                let _ = self.create_revision("codex", &id.to_string(), &content_json);
+            }
+        }
+        let _ = self.log_change("codex", &id.to_string(), "delete");
         // los sub-codices huérfanos suben a raíz en vez de borrarse — el usuario no pierde jerarquía de golpe
         self.conn.execute(
             "UPDATE codices SET parent_codex_id = NULL WHERE parent_codex_id = ?1",
@@ -2834,7 +2874,6 @@ impl Database {
         // el ON DELETE SET NULL del schema ya desagrupa las notas — no hace falta UPDATE manual aquí
         self.conn
             .execute("DELETE FROM codices WHERE id = ?1", params![id.to_string()])?;
-        let _ = self.log_change("codex", &id.to_string(), "delete");
         Ok(())
     }
 

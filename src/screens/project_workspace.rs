@@ -175,7 +175,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     let filtered_notes: Vec<&Note> = notes
         .iter()
-        .filter(|n| n.project_id == Some(project.id))
+        .filter(|n| {
+            n.project_id == Some(project.id)
+                || (n.project_id.is_none()
+                    && n.codex_id
+                        .map(|codex_id| {
+                            app.codices
+                                .iter()
+                                .any(|c| c.id == codex_id && c.project_id == project.id)
+                        })
+                        .unwrap_or(true))
+        })
         .filter(|n| {
             if searching && !search_query.is_empty() {
                 n.title
@@ -323,6 +333,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             &app.identity.public_key,
         ),
         1 => {
+            let project_codices: Vec<crate::models::Codex> = app
+                .codices
+                .iter()
+                .filter(|c| c.project_id == project.id)
+                .cloned()
+                .collect();
             draw_notes_tab(
                 f,
                 body_chunks[1],
@@ -330,7 +346,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 selected_item_idx,
                 theme,
                 sidebar_focused,
-                &app.codices,
+                &project_codices,
                 app.note_preview_focused,
                 app.note_preview_scroll,
             );
@@ -453,9 +469,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             sep(),
             key("Del"),
             txt(" Remove"),
-            sep(),
-            key("→"),
-            txt(" Preview"),
         ],
         2 => vec![
             txt(" Journal  "),
@@ -480,8 +493,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     footer_spans.extend(vec![
         sep(),
+        key("Tab"),
+        txt(" Panes"),
+        sep(),
         key("1-4"),
-        txt(" Tabs"),
+        txt(" Sections"),
         sep(),
         key("/"),
         txt(" Search"),
@@ -727,7 +743,7 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
     let col_w = (area.width.saturating_sub(6)) / 2;
 
     let left: Vec<Line> = vec![
-        Line::from(vec![h("  QUESTS (Tab 1)")]),
+        Line::from(vec![h("  QUESTS (Section 1)")]),
         Line::from(vec![k("  n"), d("          New quest")]),
         Line::from(vec![k("  Enter / e"), d("    Edit quest")]),
         Line::from(vec![k("  Space"), d("       Complete / Reopen")]),
@@ -750,27 +766,28 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         Line::from(vec![k("  ← / ESC"), d("     Back to quests")]),
         Line::from(vec![]),
         Line::from(vec![h("  NAVIGATION")]),
-        Line::from(vec![k("  1 2 3 4"), d("     Switch tabs")]),
-        Line::from(vec![k("  ← / →"), d("      Sidebar / content")]),
+        Line::from(vec![k("  1 2 3 4"), d("     Switch sections")]),
+        Line::from(vec![k("  Tab"), d("         Cycle panes")]),
+        Line::from(vec![k("  Shift+Tab"), d("   Cycle panes back")]),
         Line::from(vec![k("  ↑ / ↓"), d("      Navigate items")]),
         Line::from(vec![k("  /"), d("           Search")]),
         Line::from(vec![k("  ESC"), d("         Exit workspace")]),
     ];
 
     let right: Vec<Line> = vec![
-        Line::from(vec![h("  SCROLLS (Tab 2)")]),
+        Line::from(vec![h("  SCROLLS (Section 2)")]),
         Line::from(vec![k("  n"), d("          New scroll")]),
         Line::from(vec![k("  Enter / e"), d("    Edit scroll")]),
         Line::from(vec![k("  d"), d("           New codex")]),
         Line::from(vec![k("  r"), d("           Move to codex")]),
         Line::from(vec![k("  Delete"), d("      Delete scroll")]),
         Line::from(vec![]),
-        Line::from(vec![h("  JOURNAL (Tab 3)")]),
+        Line::from(vec![h("  JOURNAL (Section 3)")]),
         Line::from(vec![k("  j"), d("           New journal log")]),
         Line::from(vec![k("  v"), d("           Toggle visibility")]),
         Line::from(vec![k("  Delete"), d("      Delete entry")]),
         Line::from(vec![]),
-        Line::from(vec![h("  OVERVIEW (Tab 4)")]),
+        Line::from(vec![h("  OVERVIEW (Section 4)")]),
         Line::from(vec![k("  m"), d("           New milestone")]),
         Line::from(vec![k("  Space"), d("       Toggle milestone")]),
         Line::from(vec![k("  Delete"), d("      Remove milestone")]),
@@ -1804,7 +1821,7 @@ fn draw_notes_tab(
     let mut flat_list: Vec<(String, Option<usize>, bool)> = Vec::new();
     append_display_subtree(&mut flat_list, notes, codices, None, 0);
 
-    // Ungrouped notes (no codex or codex from a different project)
+    // Unassigned / ungrouped notes: no campaign, no codex, or codex not present in this campaign.
     let mut ungrouped: Vec<usize> = notes
         .iter()
         .enumerate()
@@ -1817,8 +1834,8 @@ fn draw_notes_tab(
             .to_lowercase()
             .cmp(&notes[b].title.to_lowercase())
     });
-    if !codices.is_empty() && !ungrouped.is_empty() {
-        flat_list.push(("  ── Ungrouped ──".to_string(), None, false));
+    if !ungrouped.is_empty() {
+        flat_list.push(("  ── Unassigned / Ungrouped ──".to_string(), None, false));
     }
     for idx in &ungrouped {
         let lock = if notes[*idx].sharing_permission == "read_only" {

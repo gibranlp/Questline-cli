@@ -8559,19 +8559,30 @@ impl App {
         project_id: Uuid,
     ) -> Vec<(Option<Uuid>, Option<usize>)> {
         let mut flat: Vec<(Option<Uuid>, Option<usize>)> = Vec::new();
+        let project_codices: Vec<crate::models::Codex> = codices
+            .iter()
+            .filter(|c| c.project_id == project_id)
+            .cloned()
+            .collect();
         let proj_notes: Vec<(usize, &Note)> = notes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.project_id == Some(project_id))
+            .filter(|(_, n)| {
+                n.project_id == Some(project_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| project_codices.iter().any(|c| c.id == codex_id))
+                            .unwrap_or(true))
+            })
             .collect();
 
-        Self::append_codex_subtree(&mut flat, &proj_notes, codices, None);
+        Self::append_codex_subtree(&mut flat, &proj_notes, &project_codices, None);
 
         // grouped includes ALL notes in a codex, even inside collapsed ones (so they don't appear as ungrouped)
         let grouped: std::collections::HashSet<usize> = proj_notes
             .iter()
             .filter(|(_, n)| {
-                n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id)
+                n.codex_id.is_some() && project_codices.iter().any(|c| Some(c.id) == n.codex_id)
             })
             .map(|(i, _)| *i)
             .collect();
@@ -8581,7 +8592,7 @@ impl App {
             .map(|(i, n)| (*i, *n))
             .collect();
         ungrouped.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        if !codices.is_empty() && !ungrouped.is_empty() {
+        if !ungrouped.is_empty() {
             flat.push((None, None)); // divider
         }
         for (idx, _) in ungrouped {
@@ -8642,6 +8653,46 @@ impl App {
             .filter(|c| c.id != codex_id && !descendants.contains(&c.id))
             .map(|c| c.id)
             .collect()
+    }
+
+    fn reset_workspace_pane_focus(&mut self) {
+        self.workspace_sidebar_focused = false;
+        self.note_preview_focused = false;
+    }
+
+    fn cycle_workspace_pane_focus(&mut self, reverse: bool) {
+        match self.workspace_tab_idx {
+            // Quests and Overview have two focusable panes: workspace menu and content.
+            0 | 3 => {
+                self.note_preview_focused = false;
+                self.workspace_sidebar_focused = !self.workspace_sidebar_focused;
+            }
+            // Scrolls has three focusable panes: workspace menu, scroll list, and preview.
+            1 => {
+                let current = if self.workspace_sidebar_focused {
+                    0
+                } else if self.note_preview_focused {
+                    2
+                } else {
+                    1
+                };
+                let next = if reverse {
+                    if current == 0 { 2 } else { current - 1 }
+                } else {
+                    (current + 1) % 3
+                };
+                self.workspace_sidebar_focused = next == 0;
+                self.note_preview_focused = next == 2;
+                if self.note_preview_focused {
+                    self.note_preview_scroll = 0;
+                }
+            }
+            // Chronicles currently has only one content pane, so Tab stays local/no-op there.
+            _ => {
+                self.workspace_sidebar_focused = false;
+                self.note_preview_focused = false;
+            }
+        }
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -8709,7 +8760,17 @@ impl App {
         let proj_notes: Vec<Note> = self
             .all_notes
             .iter()
-            .filter(|n| n.project_id == Some(p_id))
+            .filter(|n| {
+                n.project_id == Some(p_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| {
+                                self.codices
+                                    .iter()
+                                    .any(|c| c.id == codex_id && c.project_id == p_id)
+                            })
+                            .unwrap_or(true))
+            })
             .filter(|n| {
                 if !self.search_query.is_empty() {
                     n.title
@@ -8759,54 +8820,33 @@ impl App {
             }
             KeyCode::Char('1') => {
                 self.workspace_tab_idx = 0;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('2') => {
                 self.workspace_tab_idx = 1;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('3') => {
                 self.workspace_tab_idx = 2;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('4') => {
                 self.workspace_tab_idx = 3;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Tab => {
-                self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
-                self.workspace_sidebar_focused = false;
+                self.cycle_workspace_pane_focus(false);
             }
             KeyCode::BackTab => {
-                self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
-                    self.workspace_tab_idx - 1
-                } else {
-                    3
-                };
-                self.workspace_sidebar_focused = false;
-            }
-            KeyCode::Left if self.note_preview_focused => {
-                self.note_preview_focused = false;
+                self.cycle_workspace_pane_focus(true);
             }
             KeyCode::Left
-                if !self.workspace_sidebar_focused
-                    && self.viewing_step_for_task.is_some()
-                    && self.workspace_tab_idx == 0 =>
+                if self.viewing_step_for_task.is_some()
+                    && self.workspace_tab_idx == 0
+                    && !self.workspace_sidebar_focused =>
             {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
-            }
-            KeyCode::Left if !self.workspace_sidebar_focused => {
-                self.workspace_sidebar_focused = true;
-            }
-            // → en tab de notas mueve el foco al panel de preview
-            KeyCode::Right
-                if !self.workspace_sidebar_focused
-                    && self.workspace_tab_idx == 1
-                    && !self.note_preview_focused =>
-            {
-                self.note_preview_focused = true;
-                self.note_preview_scroll = 0;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right
@@ -8823,18 +8863,17 @@ impl App {
                     }
                 }
             }
-            KeyCode::Right if self.workspace_sidebar_focused => {
-                self.workspace_sidebar_focused = false;
-            }
             KeyCode::Up if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
                     self.workspace_tab_idx - 1
                 } else {
                     3
                 };
+                self.note_preview_focused = false;
             }
             KeyCode::Down if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
+                self.note_preview_focused = false;
             }
             KeyCode::Up if self.note_preview_focused => {
                 self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
@@ -12435,7 +12474,7 @@ impl App {
                     self.note_preview_focused = true;
                     if let Ok(note_uuid) = uuid::Uuid::parse_str(&result.item_id) {
                         self.reload_data()?;
-                        let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
+                        let notes = self.db.get_notes().unwrap_or_default();
                         let Some(note_idx) = notes.iter().position(|n| n.id == note_uuid) else {
                             return Ok(());
                         };
@@ -12455,7 +12494,7 @@ impl App {
                         }
 
                         self.reload_data()?;
-                        let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
+                        let notes = self.db.get_notes().unwrap_or_default();
                         let codices = self.db.get_codices_for_project(p_id).unwrap_or_default();
                         let Some(note_idx) = notes.iter().position(|n| n.id == note_uuid) else {
                             return Ok(());

@@ -209,6 +209,69 @@ impl<'a> SyncEngine<'a> {
         })
     }
 
+    fn save_local_revision_before_delete(&self, entity_type: &str, entity_id: &str) {
+        match entity_type {
+            "task" => {
+                if let Ok(id) = Uuid::parse_str(entity_id) {
+                    if let Ok(task) = self.db.get_task_by_id(id) {
+                        if let Ok(content) = serde_json::to_string(&task) {
+                            let _ = self.db.create_revision("task", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "note" => {
+                if let Ok(id) = Uuid::parse_str(entity_id) {
+                    if let Ok(note) = self.db.get_note_by_id(id) {
+                        if let Ok(content) = serde_json::to_string(&note) {
+                            let _ = self.db.create_revision("note", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "project" => {
+                if let Ok(projects) = self.db.get_projects() {
+                    if let Some(project) =
+                        projects.into_iter().find(|p| p.id.to_string() == entity_id)
+                    {
+                        if let Ok(content) = serde_json::to_string(&project) {
+                            let _ = self.db.create_revision("project", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "milestone" => {
+                let _ = self.db.conn.query_row(
+                    "SELECT json_object(
+                        'id', id,
+                        'project_id', project_id,
+                        'name', name,
+                        'description', description,
+                        'completed', completed != 0,
+                        'xp_reward', xp_reward,
+                        'created_at', created_at,
+                        'tier', tier,
+                        'template_id', template_id
+                    ) FROM milestones WHERE id = ?1",
+                    params![entity_id],
+                    |row| {
+                        let content: String = row.get(0)?;
+                        let _ = self.db.create_revision("milestone", entity_id, &content);
+                        Ok(())
+                    },
+                );
+            }
+            "codex" => {
+                if let Ok(codex) = self.db.get_codex_by_id(entity_id) {
+                    if let Ok(content) = serde_json::to_string(&codex) {
+                        let _ = self.db.create_revision("codex", entity_id, &content);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
         let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
             self.sync_once(true)?;
@@ -666,9 +729,16 @@ impl<'a> SyncEngine<'a> {
                 // Solo aceptamos usuario remoto si no existe localmente — restauración en dispositivo nuevo
                 "user" => self.db.get_user().map(|u| u.is_none()).unwrap_or(true),
                 "task" => {
-                    // Los deletes (tombstones) siempre se aplican — no tienen conflicto posible
                     if log.operation == "delete" {
-                        true
+                        match self.db.get_task_by_id(ent_uuid) {
+                            Ok(local_task) => {
+                                let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+                                incoming_time > local_task.updated_at
+                            }
+                            _ => true,
+                        }
                     } else {
                         match self.db.get_task_by_id(ent_uuid) {
                             Ok(local_task) => {
@@ -714,7 +784,15 @@ impl<'a> SyncEngine<'a> {
                 // Notas: mismo juego que tasks — timestamp gana, pero guardamos la versión local si hay conflicto
                 "note" => {
                     if log.operation == "delete" {
-                        true
+                        match self.db.get_note_by_id(ent_uuid) {
+                            Ok(local_note) => {
+                                let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
+                                    .map(|d| d.with_timezone(&Utc))
+                                    .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
+                                incoming_time > local_note.updated_at
+                            }
+                            _ => true,
+                        }
                     } else {
                         match self.db.get_note_by_id(ent_uuid) {
                             Ok(local_note) => {
@@ -845,6 +923,74 @@ impl<'a> SyncEngine<'a> {
             };
 
             if is_newer {
+                if log.operation == "delete" {
+                    match log.entity_type.as_str() {
+                        "task" => {
+                            self.save_local_revision_before_delete("task", &log.entity_id);
+                            let _ = self
+                                .db
+                                .conn
+                                .execute("DELETE FROM tasks WHERE id = ?1", params![log.entity_id]);
+                            pulled_count += 1;
+                        }
+                        "note" => {
+                            self.save_local_revision_before_delete("note", &log.entity_id);
+                            let _ = self
+                                .db
+                                .conn
+                                .execute("DELETE FROM notes WHERE id = ?1", params![log.entity_id]);
+                            pulled_count += 1;
+                        }
+                        "project" => {
+                            self.save_local_revision_before_delete("project", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM projects WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "milestone" => {
+                            self.save_local_revision_before_delete("milestone", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM milestones WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "codex" => {
+                            self.save_local_revision_before_delete("codex", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM codices WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "task_assignment" => {
+                            let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                            if parts.len() == 2 {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                                    params![parts[0], parts[1]],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        "project_member" => {
+                            let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                            if parts.len() == 2 {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                                    params![parts[0], parts[1]],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    newly_processed_ids.push(log.id);
+                    continue;
+                }
+
                 if let Some(ref content) = log.content {
                     match log.entity_type.as_str() {
                         "user" => {
@@ -868,6 +1014,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "task" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("task", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM tasks WHERE id = ?1",
                                     params![log.entity_id],
@@ -964,6 +1111,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "note" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("note", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM notes WHERE id = ?1",
                                     params![log.entity_id],
@@ -971,7 +1119,7 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             } else if let Ok(n) = serde_json::from_str::<Note>(content) {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                                     params![
                                         n.id.to_string(),
                                         n.project_id.map(|id| id.to_string()),
@@ -981,6 +1129,7 @@ impl<'a> SyncEngine<'a> {
                                         n.updated_at.to_rfc3339(),
                                         n.sharing_permission,
                                         n.codex_id.map(|id| id.to_string()),
+                                        n.owner_identity,
                                     ],
                                 );
                                 pulled_count += 1;
@@ -988,6 +1137,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "project" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("project", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM projects WHERE id = ?1",
                                     params![log.entity_id],
@@ -1049,6 +1199,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "milestone" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("milestone", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM milestones WHERE id = ?1",
                                     params![log.entity_id],
@@ -1149,6 +1300,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "codex" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("codex", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM codices WHERE id = ?1",
                                     params![log.entity_id],
@@ -1383,6 +1535,45 @@ mod tests {
     use super::*;
     use crate::database::Database;
     use crate::models::{Note, Task, TaskPriority};
+    use chrono::Duration;
+
+    struct StaticCloudProvider {
+        pull_payload: String,
+    }
+
+    impl CloudProvider for StaticCloudProvider {
+        fn name(&self) -> &str {
+            "Static Test Provider"
+        }
+
+        fn push(&self, _public_key: &str, _signature: &str, _payload: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn pull(&self, _public_key: &str, _signature: &str, _since_seq: i64) -> Result<String> {
+            Ok(self.pull_payload.clone())
+        }
+    }
+
+    fn test_identity() -> Identity {
+        let mut rng = rand::thread_rng();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        Identity {
+            user_uuid: Uuid::new_v4(),
+            public_key: verifying_key
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+            secret_key: signing_key
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
 
     // Verifica que la criptografía ed25519 funcione bien — firma válida pasa, mensaje alterado falla
     #[test]
@@ -1594,5 +1785,142 @@ mod tests {
         assert_eq!(page.head_seq, 100);
         assert!(page.has_more);
         assert!(page.metadata_supported);
+    }
+
+    #[test]
+    fn test_remote_task_delete_older_than_local_edit_is_skipped() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_stale_task_delete.db");
+        if temp_db_path.exists() {
+            let _ = std::fs::remove_file(&temp_db_path);
+        }
+
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let task_id = Uuid::new_v4();
+        let updated_at = Utc::now();
+        let task = Task {
+            id: task_id,
+            project_id: None,
+            title: "Keep newer local task".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: updated_at,
+            updated_at,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        db.insert_task(&task).expect("Failed to insert task");
+
+        let remote_delete = serde_json::json!({
+            "events": [{
+                "id": "remote-delete-task",
+                "entity_type": "task",
+                "entity_id": task_id.to_string(),
+                "operation": "delete",
+                "timestamp": (updated_at - Duration::minutes(5)).to_rfc3339(),
+                "content": null,
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        let sync_engine = SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: remote_delete,
+            }),
+        };
+
+        sync_engine.sync().expect("sync should complete");
+        assert!(
+            db.get_task_by_id(task_id).is_ok(),
+            "stale remote delete removed a newer local task"
+        );
+
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn test_contentless_remote_note_delete_applies_with_revision() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_contentless_note_delete.db");
+        if temp_db_path.exists() {
+            let _ = std::fs::remove_file(&temp_db_path);
+        }
+
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let note_id = Uuid::new_v4();
+        let created_at = Utc::now() - Duration::minutes(10);
+        let note = Note {
+            id: note_id,
+            project_id: None,
+            title: "Delete via tombstone".to_string(),
+            markdown_content: "Recoverable content".to_string(),
+            created_at,
+            updated_at: created_at,
+            sharing_permission: "collaborative".to_string(),
+            codex_id: None,
+            owner_identity: None,
+        };
+        db.insert_note(&note).expect("Failed to insert note");
+
+        let remote_delete = serde_json::json!({
+            "events": [{
+                "id": "remote-delete-note",
+                "entity_type": "note",
+                "entity_id": note_id.to_string(),
+                "operation": "delete",
+                "timestamp": Utc::now().to_rfc3339(),
+                "content": null,
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        let sync_engine = SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: remote_delete,
+            }),
+        };
+
+        sync_engine.sync().expect("sync should complete");
+        assert!(
+            db.get_note_by_id(note_id).is_err(),
+            "contentless remote delete did not remove the note"
+        );
+        let revisions = db
+            .get_revisions("note", &note_id.to_string())
+            .expect("Failed to read note revisions");
+        assert!(
+            revisions
+                .iter()
+                .any(|(_, content, _)| content.contains("Recoverable content")),
+            "remote delete did not leave a recoverable note revision"
+        );
+
+        let _ = std::fs::remove_file(&temp_db_path);
     }
 }
