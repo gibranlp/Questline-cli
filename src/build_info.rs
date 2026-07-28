@@ -1,8 +1,5 @@
+pub const BUILD_NUMBER: u32 = 1;
+
 pub fn build_label() -> String {
-    format!(
-        "v{}+{}{}",
-        env!("CARGO_PKG_VERSION"),
-        env!("QUESTLINE_BUILD_HASH"),
-        env!("QUESTLINE_BUILD_DIRTY")
-    )
+    format!("v{}.{:04}", env!("CARGO_PKG_VERSION"), BUILD_NUMBER)
 }
