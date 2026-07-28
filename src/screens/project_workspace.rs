@@ -1204,10 +1204,7 @@ fn draw_tasks_tab(
                         };
 
                         if is_sel {
-                            Style::default()
-                                .fg(fg)
-                                .bg(theme.selection)
-                                .add_modifier(Modifier::BOLD)
+                            theme.selected_style()
                         } else {
                             Style::default().fg(fg)
                         }

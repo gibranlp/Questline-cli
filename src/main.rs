@@ -785,10 +785,7 @@ async fn main() -> Result<()> {
                         if app.active_screen == *screen {
                             tab_spans.push(Span::styled(
                                 format!("[{}]{}", num, name),
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(theme.primary)
-                                    .add_modifier(Modifier::BOLD),
+                                theme.primary_selected_style(),
                             ));
                         } else {
                             tab_spans.push(Span::styled(
@@ -802,10 +799,7 @@ async fn main() -> Result<()> {
                     if app.active_screen == ActiveScreen::About {
                         tab_spans.push(Span::styled(
                             "[?]About",
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(theme.primary)
-                                .add_modifier(Modifier::BOLD),
+                            theme.primary_selected_style(),
                         ));
                     } else {
                         tab_spans.push(Span::styled("?", Style::default().fg(muted)));
@@ -1425,25 +1419,35 @@ async fn main() -> Result<()> {
                         let is_selected = idx == selected_idx;
                         let prefix = if is_selected { "> " } else { "  " };
                         let style = if is_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Rgb(200, 200, 200))
                         };
                         let type_style = if is_selected {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(theme.secondary)
                         };
+                        let detail_style = if is_selected {
+                            Style::default().fg(theme.selected_fg())
+                        } else {
+                            Style::default().fg(Color::Rgb(140, 140, 140))
+                        };
+                        let prefix_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                        };
 
                         let item_line = Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(format!("[{}] ", r.result_type.label()), type_style),
                             Span::styled(&r.title, style),
-                            Span::styled(format!(" - {}", r.details), Style::default().fg(Color::Rgb(140, 140, 140))),
+                            Span::styled(format!(" - {}", r.details), detail_style),
                         ]);
 
                         let list_item = if is_selected {
-                            ListItem::new(item_line).style(Style::default().bg(Color::Rgb(30, 30, 40)))
+                            ListItem::new(item_line).style(theme.selected_style())
                         } else {
                             ListItem::new(item_line)
                         };
@@ -1499,21 +1503,35 @@ async fn main() -> Result<()> {
                         let is_selected = idx == selected_idx;
                         let prefix = if is_selected { "> " } else { "  " };
                         let name_style = if is_selected {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
                         };
-                        let shortcut_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                        let shortcut_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        };
+                        let description_style = if is_selected {
+                            Style::default().fg(theme.selected_fg())
+                        } else {
+                            Style::default().fg(Color::Rgb(200, 200, 200))
+                        };
+                        let prefix_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                        };
 
                         let item_line = Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(act.name, name_style),
-                            Span::styled(format!(" - {}", act.description), Style::default().fg(Color::Rgb(200, 200, 200))),
+                            Span::styled(format!(" - {}", act.description), description_style),
                             Span::styled(if act.shortcut.is_empty() { "".to_string() } else { format!("  [{}]", act.shortcut) }, shortcut_style),
                         ]);
 
                         let list_item = if is_selected {
-                            ListItem::new(item_line).style(Style::default().bg(Color::Rgb(30, 30, 40)))
+                            ListItem::new(item_line).style(theme.selected_style())
                         } else {
                             ListItem::new(item_line)
                         };
@@ -1563,13 +1581,18 @@ async fn main() -> Result<()> {
                     projects.iter().enumerate().map(|(i, p)| {
                         let is_sel = i == selected_idx;
                         let style = if is_sel {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD).bg(Color::Rgb(30, 30, 40))
+                            theme.selected_style()
                         } else {
                             Style::default().fg(Color::White)
                         };
                         let prefix = if is_sel { "> " } else { "  " };
+                        let prefix_style = if is_sel {
+                            theme.selected_style()
+                        } else {
+                            Style::default().fg(theme.primary)
+                        };
                         ListItem::new(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(p.name.clone(), style),
                         ]))
                     }).collect()
@@ -2298,7 +2321,7 @@ async fn main() -> Result<()> {
                 let type_spans: Vec<Span> = types.iter().flat_map(|t| {
                     let selected = *t == modal.report_type;
                     let style = if selected {
-                        Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)
+                        theme.primary_selected_style()
                     } else {
                         Style::default().fg(Color::Rgb(140, 140, 140))
                     };

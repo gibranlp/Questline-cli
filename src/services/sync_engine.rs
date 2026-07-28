@@ -12,6 +12,9 @@ use crate::database::Database;
 use crate::models::{Note, Task};
 use crate::services::Identity;
 
+const PULL_PAGE_SIZE: usize = 1000;
+const MAX_DRAIN_PAGES: usize = 100;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncLogEntry {
     pub id: String,
@@ -25,6 +28,56 @@ pub struct SyncLogEntry {
     // seq — cursor incremental del servidor para no descargar toda la historia en cada sync
     #[serde(default)]
     pub seq: i64,
+}
+
+#[derive(Debug)]
+struct PullPage {
+    events: Vec<SyncLogEntry>,
+    head_seq: i64,
+    next_seq: i64,
+    has_more: bool,
+    metadata_supported: bool,
+}
+
+#[derive(Deserialize)]
+struct PullPageEnvelope {
+    events: Vec<SyncLogEntry>,
+    #[serde(default)]
+    head_seq: i64,
+    #[serde(default)]
+    next_seq: i64,
+    #[serde(default)]
+    has_more: bool,
+}
+
+fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
+    if let Ok(envelope) = serde_json::from_str::<PullPageEnvelope>(data) {
+        let max_event_seq = envelope
+            .events
+            .iter()
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(since_seq);
+        let next_seq = envelope.next_seq.max(max_event_seq).max(since_seq);
+        let head_seq = envelope.head_seq.max(next_seq);
+        return Ok(PullPage {
+            events: envelope.events,
+            head_seq,
+            next_seq,
+            has_more: envelope.has_more,
+            metadata_supported: true,
+        });
+    }
+
+    let events: Vec<SyncLogEntry> = serde_json::from_str(data)?;
+    let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(since_seq);
+    Ok(PullPage {
+        has_more: events.len() >= PULL_PAGE_SIZE,
+        head_seq: next_seq,
+        next_seq,
+        events,
+        metadata_supported: false,
+    })
 }
 
 pub trait CloudProvider {
@@ -117,8 +170,14 @@ impl CloudProvider for HttpCloudProvider {
     }
 
     fn pull(&self, _public_key: &str, _signature: &str, since_seq: i64) -> Result<String> {
-        self.client
-            .send_request("POST", &format!("sync/pull?since_seq={}", since_seq), "")
+        self.client.send_request(
+            "POST",
+            &format!(
+                "sync/pull?since_seq={}&limit={}&include_meta=1",
+                since_seq, PULL_PAGE_SIZE
+            ),
+            "",
+        )
     }
 }
 
@@ -150,13 +209,39 @@ impl<'a> SyncEngine<'a> {
         })
     }
 
-    // CRÍTICO: el orden push-antes-pull no es negociable — así los cambios locales no se pisan con lo remoto
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
+        let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
+            self.sync_once(true)?;
+        let mut drain_pages = 0usize;
+
+        while has_more && drain_pages < MAX_DRAIN_PAGES {
+            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+                self.sync_once(false)?;
+            pushed += more_pushed;
+            pulled += more_pulled;
+            downloaded += more_downloaded;
+            conflicts.extend(more_conflicts);
+            has_more = more_has_more && more_downloaded > 0;
+            drain_pages += 1;
+        }
+
+        let _ = self
+            .db
+            .set_setting("last_sync_downloaded", &downloaded.to_string());
+        Ok((pushed, pulled, conflicts))
+    }
+
+    // CRÍTICO: el orden push-antes-pull no es negociable — así los cambios locales no se pisan con lo remoto
+    fn sync_once(&self, push_local: bool) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
         let mut pulled_count = 0;
 
-        let pending = self.db.get_pending_sync_logs()?;
+        let pending = if push_local {
+            self.db.get_pending_sync_logs()?
+        } else {
+            Vec::new()
+        };
         let mut local_payload = Vec::new();
 
         for (log_id, entity_type, entity_id, operation, timestamp) in pending {
@@ -485,7 +570,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Heartbeat del dispositivo — lleva identidad del usuario para actualizar presencia en otros nodos
-        {
+        if push_local {
             let now_str = Utc::now().to_rfc3339();
             let username = self
                 .db
@@ -544,7 +629,13 @@ impl<'a> SyncEngine<'a> {
         let pulled_data = self
             .provider
             .pull(&self.identity.public_key, "", since_seq)?;
-        let remote_logs: Vec<SyncLogEntry> = serde_json::from_str(&pulled_data)?;
+        let pull_page = parse_pull_page(&pulled_data, since_seq)?;
+        let remote_downloaded = pull_page.events.len();
+        let remote_head_seq = pull_page.head_seq;
+        let remote_next_seq = pull_page.next_seq;
+        let metadata_supported = pull_page.metadata_supported;
+        let mut remote_has_more = pull_page.has_more;
+        let remote_logs = pull_page.events;
 
         // Dedup por ID — si el servidor no retorna seq reales (todos llegan con seq=0), este set
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
@@ -1231,8 +1322,18 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
+        max_seq = max_seq.max(remote_next_seq);
         if max_seq > since_seq {
             let _ = self.db.set_setting("last_pull_seq", &max_seq.to_string());
+        }
+        let last_remote_head_seq = remote_head_seq.max(max_seq);
+        let _ = self
+            .db
+            .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
+        let lag = last_remote_head_seq.saturating_sub(max_seq);
+        let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+        if !metadata_supported {
+            remote_has_more = remote_downloaded >= PULL_PAGE_SIZE && max_seq > since_seq;
         }
 
         // Persistir IDs de eventos aplicados — end del loop infinito de replay
@@ -1248,7 +1349,13 @@ impl<'a> SyncEngine<'a> {
         // Limpiar entradas antiguas de dedup (>90 días) — housekeeping silencioso
         let _ = self.db.cleanup_processed_remote_events(90);
 
-        Ok((pushed_count, pulled_count, conflicts))
+        Ok((
+            pushed_count,
+            pulled_count,
+            conflicts,
+            remote_downloaded,
+            remote_has_more,
+        ))
     }
 
     /// Registra una notificación de Fellowship una sola vez por evento remoto aplicado.
@@ -1436,5 +1543,56 @@ mod tests {
             entries[0].device_id, "",
             "Expected device_id to default to an empty string"
         );
+    }
+
+    #[test]
+    fn test_pull_page_parses_legacy_array_response() {
+        let json_data = r#"[
+            {
+                "id": "event-1",
+                "entity_type": "task",
+                "entity_id": "task-uuid-1",
+                "operation": "update",
+                "timestamp": "2026-06-21T12:00:00Z",
+                "content": "{}",
+                "device_id": "device-a",
+                "seq": 42
+            }
+        ]"#;
+
+        let page = parse_pull_page(json_data, 10).expect("legacy pull page should parse");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_seq, 42);
+        assert_eq!(page.head_seq, 42);
+        assert!(!page.has_more);
+        assert!(!page.metadata_supported);
+    }
+
+    #[test]
+    fn test_pull_page_parses_metadata_response() {
+        let json_data = r#"{
+            "events": [
+                {
+                    "id": "event-1",
+                    "entity_type": "task",
+                    "entity_id": "task-uuid-1",
+                    "operation": "update",
+                    "timestamp": "2026-06-21T12:00:00Z",
+                    "content": "{}",
+                    "device_id": "device-a",
+                    "seq": 42
+                }
+            ],
+            "head_seq": 100,
+            "next_seq": 42,
+            "has_more": true
+        }"#;
+
+        let page = parse_pull_page(json_data, 10).expect("metadata pull page should parse");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_seq, 42);
+        assert_eq!(page.head_seq, 100);
+        assert!(page.has_more);
+        assert!(page.metadata_supported);
     }
 }

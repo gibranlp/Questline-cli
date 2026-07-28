@@ -962,11 +962,34 @@ try {
             }
             // Filtramos propios eventos y aplicamos cursor incremental para no descargar todo en cada sync
             $pullDeviceId = $deviceId ?? '';
-            $sinceSeq = isset($_GET['since_seq']) ? (int)$_GET['since_seq'] : 0;
-            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp, device_id, seq FROM sync_events WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT 500");
+            $sinceSeq = isset($_GET['since_seq']) ? max(0, (int)$_GET['since_seq']) : 0;
+            $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 500;
+            $limit = max(1, min($limit, 1000));
+            $includeMeta = isset($_GET['include_meta']) && $_GET['include_meta'] === '1';
+            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp, device_id, seq FROM sync_events WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT {$limit}");
             $stmt->execute([$userId, $pullDeviceId, $sinceSeq]);
             $events = $stmt->fetchAll();
-            echo json_encode($events);
+
+            if ($includeMeta) {
+                $headStmt = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_events WHERE user_id = ? AND device_id != ?");
+                $headStmt->execute([$userId, $pullDeviceId]);
+                $headSeq = (int)$headStmt->fetchColumn();
+                $nextSeq = $sinceSeq;
+                foreach ($events as $event) {
+                    $eventSeq = isset($event['seq']) ? (int)$event['seq'] : 0;
+                    if ($eventSeq > $nextSeq) {
+                        $nextSeq = $eventSeq;
+                    }
+                }
+                echo json_encode([
+                    "events" => $events,
+                    "head_seq" => $headSeq,
+                    "next_seq" => $nextSeq,
+                    "has_more" => $nextSeq < $headSeq
+                ]);
+            } else {
+                echo json_encode($events);
+            }
             break;
 
         case 'sync/head':
