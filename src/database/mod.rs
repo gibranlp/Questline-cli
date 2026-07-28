@@ -3085,6 +3085,26 @@ impl Database {
     /// second PC can pull forever and never receive those existing tasks/steps.
     /// A forced/manual sync uses this to reseed the server from the current DB.
     pub fn queue_full_state_sync(&self) -> Result<usize> {
+        let total_notes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap_or(0);
+        let projectless_notes: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE project_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if total_notes > 0 && projectless_notes * 2 >= total_notes {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} of {} scrolls are missing project links",
+                projectless_notes,
+                total_notes
+            ));
+        }
+
         let mut queued = 0usize;
 
         if let Ok(Some(user)) = self.get_user() {
