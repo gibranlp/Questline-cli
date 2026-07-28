@@ -20,7 +20,7 @@ use crate::models::{
 use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
 use crate::screens::onboarding::OnboardingFocus;
-use crate::services::{ThemeService, XPService};
+use crate::services::{Identity, ThemeService, XPService};
 use crate::theme::ThemeChoice;
 
 pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
@@ -2027,6 +2027,12 @@ impl App {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
                     if db.import_from_json(&decoded).is_ok() {
+                        let _ = App::anchor_restore_to_sync_head(
+                            &db,
+                            &identity,
+                            &device_id,
+                            &server_url,
+                        );
                         user = db.get_user()?;
                     }
                 }
@@ -3679,6 +3685,12 @@ impl App {
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
+                                                let _ = App::anchor_restore_to_sync_head(
+                                                    &self.db,
+                                                    &self.identity,
+                                                    &self.device_id,
+                                                    &self.server_url,
+                                                );
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string(),
                                                 ));
@@ -5308,6 +5320,12 @@ impl App {
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
+                                        let _ = App::anchor_restore_to_sync_head(
+                                            &self.db,
+                                            &self.identity,
+                                            &self.device_id,
+                                            &self.server_url,
+                                        );
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
@@ -14190,6 +14208,13 @@ impl App {
                 };
                 match self.db.import_from_json(&decoded_json) {
                     Ok(_) => {
+                        let _ = App::anchor_restore_to_sync_head(
+                            &self.db,
+                            &self.identity,
+                            &self.device_id,
+                            &self.server_url,
+                        );
+                        let _ = self.db.set_setting("conflict_count", "0");
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
                             "Chronicle restored from cloud!".to_string(),
@@ -14197,7 +14222,7 @@ impl App {
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
                             message:
-                                "Restore complete! Sync will now catch up remaining cloud events."
+                                "Restore complete! Sync will now pull only changes after this backup."
                                     .to_string(),
                         };
                         self.start_background_sync();
@@ -14432,6 +14457,37 @@ impl App {
             let _ = tx.send(result);
         });
 
+        Ok(())
+    }
+
+    fn anchor_restore_to_sync_head(
+        db: &crate::database::Database,
+        identity: &Identity,
+        device_id: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        let client =
+            crate::services::api_client::ApiClient::new(server_url, identity.clone(), device_id);
+        let response =
+            client.send_request("POST", "sync/pull?since_seq=0&limit=1&include_meta=1", "")?;
+        let value: serde_json::Value = serde_json::from_str(&response)?;
+        let head_seq = value
+            .get("head_seq")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                value.as_array().and_then(|events| {
+                    events
+                        .iter()
+                        .filter_map(|event| event.get("seq").and_then(|seq| seq.as_i64()))
+                        .max()
+                })
+            })
+            .unwrap_or(0);
+
+        db.set_setting("last_pull_seq", &head_seq.to_string())?;
+        db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
+        db.set_setting("last_sync_lag", "0")?;
+        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
         Ok(())
     }
 
