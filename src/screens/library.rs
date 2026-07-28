@@ -2,6 +2,7 @@
 // screens/library.rs — la biblioteca de lore: fragmentos, memorias y piezas coleccionables
 // ─────────────────────────────────────────────────────────────────────────────
 
+use crate::models::{Achievement, Statistics};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -21,6 +22,7 @@ pub enum LibraryCategory {
     ClassStories,
     WorldHistory,
     Achievements,
+    AchievementLore,
     MemoryFragments,
 }
 
@@ -30,7 +32,8 @@ impl LibraryCategory {
             LibraryCategory::ClassQuests => "Class Quests",
             LibraryCategory::ClassStories => "Class Stories",
             LibraryCategory::WorldHistory => "World History",
-            LibraryCategory::Achievements => "Achievement Lore",
+            LibraryCategory::Achievements => "Achievements",
+            LibraryCategory::AchievementLore => "Achievement Lore",
             LibraryCategory::MemoryFragments => "Memory Fragments",
         }
     }
@@ -42,6 +45,109 @@ fn masked_world_history_title(title: &str, unlocked: bool) -> String {
     }
 
     "?".repeat(title.chars().count().max(8))
+}
+
+fn word_wrap(text: &str, max_width: usize) -> Vec<String> {
+    if max_width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if current.is_empty() {
+            current.push_str(word);
+        } else if current.len() + 1 + word.len() <= max_width {
+            current.push(' ');
+            current.push_str(word);
+        } else {
+            lines.push(current);
+            current = word.to_string();
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn library_achievement_progress(
+    id: &str,
+    stats: &Statistics,
+    streak_days: i32,
+    zen_stage: i32,
+    silent: i32,
+    forest: i32,
+    rain: i32,
+    unique_sc: i32,
+    codices: i32,
+) -> Option<(i32, i32, &'static str)> {
+    match id {
+        "first_quest" => Some((stats.tasks_completed.min(1), 1, "task completed")),
+        "task_apprentice" => Some((stats.tasks_completed, 10, "quests completed")),
+        "task_squire" => Some((stats.tasks_completed, 25, "quests completed")),
+        "task_knight" => Some((stats.tasks_completed, 50, "quests completed")),
+        "task_champion" => Some((stats.tasks_completed, 250, "quests completed")),
+        "task_legend" => Some((stats.tasks_completed, 500, "quests completed")),
+        "thousand_quest_myth" => Some((stats.tasks_completed, 1000, "quests completed")),
+        "scholar" => Some((stats.notes_created, 25, "notes created")),
+        "note_taker" => Some((stats.notes_created.min(1), 1, "note created")),
+        "note_architect" => Some((stats.notes_created, 50, "notes created")),
+        "note_vault" => Some((stats.notes_created, 100, "notes created")),
+        "note_grand_vault" => Some((stats.notes_created, 250, "notes created")),
+        "chronicler" => Some((stats.journal_entries, 50, "journal entries")),
+        "journal_spark" => Some((stats.journal_entries.min(1), 1, "journal entry")),
+        "journal_keeper" => Some((stats.journal_entries, 10, "journal entries")),
+        "journal_oracle" => Some((stats.journal_entries, 100, "journal entries")),
+        "project_starter" => Some((stats.projects_created.min(1), 1, "project created")),
+        "project_builder" => Some((stats.projects_created, 5, "projects created")),
+        "project_architect" => Some((stats.projects_created, 25, "projects created")),
+        "project_city_planner" => Some((stats.projects_created, 50, "projects created")),
+        "project_finisher" => Some((stats.projects_completed.min(1), 1, "project completed")),
+        "project_master" => Some((stats.projects_completed, 10, "projects completed")),
+        "ancient_gardener" => Some((zen_stage, 5, "tree stages grown")),
+        "streak_three" => Some((streak_days, 3, "day streak")),
+        "streak_week" => Some((streak_days, 7, "day streak")),
+        "streak_month" => Some((streak_days, 30, "day streak")),
+        "hundred_day_journey" => Some((streak_days, 100, "day streak")),
+        "first_focus" => Some((stats.sessions_completed.min(1), 1, "focus session")),
+        "focus_initiate" => Some((stats.sessions_completed, 5, "focus sessions")),
+        "focus_regular" => Some((stats.sessions_completed, 25, "focus sessions")),
+        "focus_veteran" => Some((stats.sessions_completed, 50, "focus sessions")),
+        "deep_worker" => Some((stats.sessions_completed, 100, "focus sessions")),
+        "focus_marathoner" => Some((stats.sessions_completed, 250, "focus sessions")),
+        "master_concentration" => Some((stats.sessions_completed, 500, "focus sessions")),
+        "focus_grandmaster" => Some((stats.sessions_completed, 1000, "focus sessions")),
+        "silent_monk" => Some((silent, 25, "silent sessions")),
+        "silent_adept" => Some((silent, 50, "silent sessions")),
+        "forest_wanderer" => Some((forest, 50, "forest sessions")),
+        "forest_warden" => Some((forest, 100, "forest sessions")),
+        "rain_listener" => Some((rain, 50, "rain sessions")),
+        "storm_listener" => Some((rain, 100, "rain sessions")),
+        "atmosphere_explorer" => Some((unique_sc, 3, "soundscapes used")),
+        "atmosphere_collector" => Some((unique_sc, 5, "soundscapes used")),
+        "master_atmosphere" => Some((unique_sc, 8, "soundscapes used")),
+        "archivist" => Some((codices, 3, "codices")),
+        "grand_archivist" => Some((codices, 10, "codices")),
+        _ => None,
+    }
+}
+
+fn achievement_missing_detail(id: &str, used_soundscapes: &[String]) -> Option<String> {
+    match id {
+        "master_atmosphere" | "atmosphere_collector" | "atmosphere_explorer" => {
+            let missing: Vec<&str> = crate::audio::soundscapes::ATMOSPHERE_ACHIEVEMENT_SOUNDSCAPES
+                .iter()
+                .copied()
+                .filter(|name| !used_soundscapes.iter().any(|used| used == name))
+                .collect();
+            if missing.is_empty() {
+                None
+            } else {
+                Some(format!(" MISSING: {}", missing.join(", ")))
+            }
+        }
+        _ => None,
+    }
 }
 
 // Renderiza arte compacto de fragmentos para el panel de detalles de la biblioteca.
@@ -111,11 +217,22 @@ pub fn draw(
     active_col: usize,
     selected_cat: usize,
     selected_item: usize,
+    item_scroll_offset: usize,
     scroll_offset: u16,
     // Quests details: (class_name, unlock_level, name, desc, status, progress, target, reward)
     quests: &[(String, i32, String, String, String, i32, i32, String)],
     // Lore entries: (id, category, title, content, unlocked, unlocked_at)
     lore_entries: &[(String, String, String, String, bool, Option<String>)],
+    achievements: &[Achievement],
+    stats: &Statistics,
+    streak_days: i32,
+    zen_stage: i32,
+    silent_sessions: i32,
+    forest_sessions: i32,
+    rain_sessions: i32,
+    unique_soundscapes: i32,
+    codices: i32,
+    used_soundscapes: &[String],
     user_class: &str,
     theme: &Theme,
     animation_ticks: usize,
@@ -169,6 +286,7 @@ pub fn draw(
         LibraryCategory::ClassStories,
         LibraryCategory::WorldHistory,
         LibraryCategory::Achievements,
+        LibraryCategory::AchievementLore,
         LibraryCategory::MemoryFragments,
     ];
 
@@ -217,6 +335,7 @@ pub fn draw(
         LibraryCategory::ClassStories => "Class",
         LibraryCategory::WorldHistory => "World",
         LibraryCategory::Achievements => "Achievement",
+        LibraryCategory::AchievementLore => "Achievement",
         LibraryCategory::MemoryFragments => "Memory",
     };
 
@@ -278,6 +397,23 @@ pub fn draw(
                 items_unlocked.push(q.4 != "Locked");
             }
         }
+        LibraryCategory::Achievements => {
+            for achievement in achievements {
+                let status = if achievement.unlocked_at.is_some() {
+                    "[+] "
+                } else {
+                    "[ ] "
+                };
+                items_lines.push(format!("{}{}", status, achievement.name));
+                items_unlocked.push(achievement.unlocked_at.is_some());
+            }
+        }
+        LibraryCategory::AchievementLore => {
+            for entry in &filtered_lore_entries {
+                items_lines.push(entry.2.clone());
+                items_unlocked.push(entry.4);
+            }
+        }
         LibraryCategory::ClassStories => {
             for entry in &filtered_lore_entries {
                 items_lines.push(entry.2.clone());
@@ -316,12 +452,16 @@ pub fn draw(
         vec![None; items_lines.len()]
     };
 
+    let visible_item_rows = col_chunks[1].height.saturating_sub(2).max(1) as usize;
+    let start_idx = item_scroll_offset.min(items_lines.len().saturating_sub(1));
     let item_items: Vec<ListItem> = if items_lines.is_empty() {
         vec![ListItem::new("  (No entries found)")]
     } else {
         items_lines
             .iter()
             .enumerate()
+            .skip(start_idx)
+            .take(visible_item_rows)
             .map(|(idx, title)| {
                 let is_selected = idx == selected_item;
                 let is_active = is_selected && active_col == 1;
@@ -382,6 +522,21 @@ pub fn draw(
     };
     let items_title = if cur_cat == LibraryCategory::MemoryFragments {
         format!(" Memory Fragments | Found: {}/15 ", found_count)
+    } else if cur_cat == LibraryCategory::Achievements {
+        let unlocked = achievements
+            .iter()
+            .filter(|a| a.unlocked_at.is_some())
+            .count();
+        format!(
+            " Achievements | Unlocked: {}/{} ",
+            unlocked,
+            achievements.len()
+        )
+    } else if cur_cat == LibraryCategory::AchievementLore {
+        format!(
+            " Achievement Lore | Entries: {} ",
+            filtered_lore_entries.len()
+        )
     } else if cur_cat == LibraryCategory::ClassStories {
         format!(" Class Stories | Unlocked: {} ", unlocked_class_count)
     } else {
@@ -399,6 +554,26 @@ pub fn draw(
         .title(items_title);
     let item_list = List::new(item_items).block(item_block);
     f.render_widget(item_list, col_chunks[1]);
+    if items_lines.len() > visible_item_rows {
+        let mut scrollbar_state =
+            ScrollbarState::new(items_lines.len().saturating_sub(visible_item_rows))
+                .position(start_idx);
+        f.render_stateful_widget(
+            Scrollbar::default()
+                .orientation(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"))
+                .track_symbol(Some("│"))
+                .thumb_symbol("█")
+                .style(Style::default().fg(if active_col == 1 {
+                    accent_color
+                } else {
+                    theme.muted
+                })),
+            col_chunks[1],
+            &mut scrollbar_state,
+        );
+    }
 
     // Render Column 2: panel de detalles — bifurca entre quests y lore general
     let details_block = Block::default()
@@ -564,6 +739,134 @@ pub fn draw(
         }
         let action_p = Paragraph::new(actions).alignment(Alignment::Center);
         f.render_widget(action_p, detail_layout[2]);
+    } else if cur_cat == LibraryCategory::Achievements {
+        if achievements.is_empty() {
+            let p = Paragraph::new("\n\n  No achievement selected.")
+                .block(details_block)
+                .alignment(Alignment::Center);
+            f.render_widget(p, col_chunks[2]);
+        } else {
+            let a_idx = selected_item.min(achievements.len() - 1);
+            let achievement = &achievements[a_idx];
+            let unlocked = achievement.unlocked_at.is_some();
+            let progress = library_achievement_progress(
+                &achievement.id,
+                stats,
+                streak_days,
+                zen_stage,
+                silent_sessions,
+                forest_sessions,
+                rain_sessions,
+                unique_soundscapes,
+                codices,
+            )
+            .map(|(cur, tgt, unit)| {
+                if unlocked {
+                    (tgt, tgt, unit)
+                } else {
+                    (cur.min(tgt), tgt, unit)
+                }
+            });
+            let progress_ratio = progress
+                .map(|(cur, tgt, _)| {
+                    if tgt > 0 {
+                        (cur as f64 / tgt as f64).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(if unlocked { 1.0 } else { 0.0 });
+            let status_color = if unlocked {
+                theme.success
+            } else {
+                theme.warning
+            };
+            let detail_inner = details_block.inner(col_chunks[2]);
+            f.render_widget(details_block, col_chunks[2]);
+
+            let mut text = vec![
+                Line::from(vec![
+                    Span::styled(" ACHIEVEMENT: ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        &achievement.name,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(vec![
+                    Span::styled(" STATUS:      ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        if unlocked { "Unlocked" } else { "Locked" },
+                        Style::default()
+                            .fg(status_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+            ];
+            if let Some(unlocked_at) = achievement.unlocked_at {
+                text.push(Line::from(vec![
+                    Span::styled(" UNLOCKED:    ", Style::default().fg(theme.muted)),
+                    Span::styled(
+                        unlocked_at.format("%Y-%m-%d %H:%M").to_string(),
+                        Style::default().fg(theme.text),
+                    ),
+                ]));
+            }
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                " REQUIREMENT:",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )));
+            for line in word_wrap(
+                &achievement.description,
+                detail_inner.width.saturating_sub(4) as usize,
+            ) {
+                text.push(Line::from(Span::styled(
+                    format!("  {}", line),
+                    Style::default().fg(theme.text),
+                )));
+            }
+            if let Some((cur, tgt, unit)) = progress {
+                text.push(Line::from(""));
+                text.push(Line::from(Span::styled(
+                    format!(" PROGRESS: {}/{} {}", cur, tgt, unit),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                )));
+            }
+            if let Some(detail) = achievement_missing_detail(&achievement.id, used_soundscapes) {
+                text.push(Line::from(""));
+                text.push(Line::from(Span::styled(
+                    detail,
+                    Style::default().fg(theme.warning),
+                )));
+            }
+
+            let detail_layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(3)])
+                .split(detail_inner);
+            let p = Paragraph::new(text)
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .scroll((scroll_offset, 0));
+            f.render_widget(p, detail_layout[0]);
+            let gauge = Gauge::default()
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.border))
+                        .title(" Achievement Progress "),
+                )
+                .gauge_style(Style::default().fg(status_color).bg(Color::Rgb(30, 30, 30)))
+                .ratio(progress_ratio)
+                .label(format!("{:.0}%", progress_ratio * 100.0));
+            f.render_widget(gauge, detail_layout[1]);
+        }
     } else {
         // Lore general — muestra bloqueado o el contenido completo con scroll
         if filtered_lore_entries.is_empty() {

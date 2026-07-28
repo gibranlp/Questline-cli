@@ -1939,12 +1939,28 @@ impl Database {
     }
 
     pub fn count_unique_soundscapes_used(&self) -> Result<i32> {
-        let count: i32 = self.conn.query_row(
-            "SELECT count(distinct soundscape) FROM focus_sessions WHERE soundscape IN ('LoFi Radio', 'Ambient Radio', 'Forest Sounds', 'Rain Sounds', 'Ocean Waves', 'White Noise', 'Brown Noise', 'Silent')",
-            [],
-            |row| row.get(0)
-        )?;
-        Ok(count)
+        Ok(self.get_unique_soundscapes_used()?.len() as i32)
+    }
+
+    pub fn get_unique_soundscapes_used(&self) -> Result<Vec<String>> {
+        let soundscapes = crate::audio::soundscapes::ATMOSPHERE_ACHIEVEMENT_SOUNDSCAPES;
+        let placeholders = soundscapes
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let query = format!(
+            "SELECT DISTINCT soundscape FROM focus_sessions WHERE soundscape IN ({})",
+            placeholders
+        );
+        let mut stmt = self.conn.prepare(&query)?;
+        let params = rusqlite::params_from_iter(soundscapes.iter().copied());
+        let rows = stmt.query_map(params, |row| row.get::<_, String>(0))?;
+        let mut used = Vec::new();
+        for row in rows {
+            used.push(row?);
+        }
+        Ok(used)
     }
 
     pub fn get_max_focus_session_duration(&self) -> Result<i32> {

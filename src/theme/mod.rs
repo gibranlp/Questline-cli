@@ -279,7 +279,9 @@ impl Theme {
                 disabled: DISABLED,
             },
             ThemeChoice::TerminalNative => Self::terminal_native(),
-            ThemeChoice::Pywal => Self::pywal().unwrap_or_else(|| Self::for_class(class)),
+            ThemeChoice::Pywal => Self::from_pywal()
+                .or_else(Self::xresources)
+                .unwrap_or_else(|| Self::for_class(class)),
         }
     }
 
@@ -441,7 +443,7 @@ impl Theme {
         }
     }
 
-    fn pywal() -> Option<Self> {
+    pub fn from_pywal() -> Option<Self> {
         let home = std::env::var("HOME").ok()?;
         let path = std::path::Path::new(&home).join(".cache/wal/colors.json");
         let data = std::fs::read_to_string(path).ok()?;

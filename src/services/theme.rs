@@ -30,15 +30,13 @@ impl ThemeService {
     // Dynamic switcher updates current theme layout rules.
     pub fn set_class(&mut self, class: ClassType) {
         self.class = Some(class);
-        self.current_theme = Theme::for_choice(self.choice, class);
+        self.apply_choice();
     }
 
     // Update active theme choice
     pub fn set_theme_choice(&mut self, choice: ThemeChoice) {
         self.choice = choice;
-        if let Some(c) = self.class {
-            self.current_theme = Theme::for_choice(choice, c);
-        }
+        self.apply_choice();
     }
 
     pub fn choice(&self) -> ThemeChoice {
@@ -48,5 +46,18 @@ impl ThemeService {
     // Accessor returning active UI layout settings.
     pub fn theme(&self) -> Theme {
         self.current_theme
+    }
+
+    fn apply_choice(&mut self) {
+        if self.choice == ThemeChoice::Pywal {
+            if let Some(theme) = Theme::from_pywal() {
+                self.current_theme = theme;
+            }
+            return;
+        }
+
+        if let Some(c) = self.class {
+            self.current_theme = Theme::for_choice(self.choice, c);
+        }
     }
 }

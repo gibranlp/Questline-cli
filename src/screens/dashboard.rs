@@ -787,6 +787,29 @@ fn achievement_progress(
     }
 }
 
+fn achievement_detail(id: &str, app: &App, max_width: usize) -> Option<String> {
+    match id {
+        "master_atmosphere" | "atmosphere_collector" | "atmosphere_explorer" => {
+            let used = app.db.get_unique_soundscapes_used().unwrap_or_default();
+            let missing: Vec<&str> = crate::audio::soundscapes::ATMOSPHERE_ACHIEVEMENT_SOUNDSCAPES
+                .iter()
+                .copied()
+                .filter(|name| !used.iter().any(|u| u == name))
+                .collect();
+            if missing.is_empty() {
+                None
+            } else {
+                let list = missing.join(", ");
+                Some(format!(
+                    "Missing: {}",
+                    short_text(&list, max_width.saturating_sub(9))
+                ))
+            }
+        }
+        _ => None,
+    }
+}
+
 fn draw_streaks_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
     let streak = &app.stats_cache.streak;
     let achievements = &app.stats_cache.achievements;
@@ -939,6 +962,9 @@ fn draw_streaks_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::la
                         ),
                     ]))];
                     items.extend(make_desc_items(&desc, theme.disabled));
+                    if let Some(detail) = achievement_detail(&a.id, app, desc_width) {
+                        items.extend(make_desc_items(&detail, theme.warning));
+                    }
                     items
                 }
             })
