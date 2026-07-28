@@ -849,6 +849,8 @@ pub struct App {
 
     pub audio_player: crate::audio::AudioPlayer,
     pub selected_soundscape_idx: usize,
+    pub selected_local_track_idx: usize,
+    pub local_music_tracks_cache: Vec<std::path::PathBuf>,
     pub selected_focus_soundscape_idx: usize, // 0 = None (Silent), 1..=SOUNDSCAPES.len() = specific soundscape
 
     pub mpris_now_playing: Option<crate::audio::mpris_player::NowPlaying>,
@@ -905,6 +907,7 @@ pub struct App {
     pub selected_library_cat_idx: usize,
     pub selected_library_item_idx: usize,
     pub library_active_col: usize,
+    pub library_item_scroll_offset: usize,
     pub library_scroll_offset: u16,
     pub selected_relic_idx: usize,
     pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End
@@ -2063,6 +2066,10 @@ impl App {
         if let Some(ref u) = user {
             theme_service.set_class(u.class);
         }
+        if let Ok(Some(theme_choice_str)) = db.get_setting("equipped_theme") {
+            let choice = crate::theme::Theme::choice_from_key(&theme_choice_str);
+            theme_service.set_theme_choice(choice);
+        }
 
         let (quote, quote_author, class_quote_opt) = Self::choose_dynamic_quote(&user, &db);
         let class_quote = class_quote_opt.as_ref().map(|q| q.0.clone());
@@ -2136,6 +2143,8 @@ impl App {
 
             audio_player: crate::audio::AudioPlayer::new(),
             selected_soundscape_idx: 0,
+            selected_local_track_idx: 0,
+            local_music_tracks_cache: Vec::new(),
             selected_focus_soundscape_idx: 0,
 
             identity,
@@ -2176,6 +2185,7 @@ impl App {
             selected_library_cat_idx: 0,
             selected_library_item_idx: 0,
             library_active_col: 0,
+            library_item_scroll_offset: 0,
             library_scroll_offset: 0,
             selected_relic_idx: 0,
             selected_settings_focus_idx: 0,
@@ -2341,6 +2351,7 @@ impl App {
         if let Ok(Some(folder)) = app.db.get_setting("local_music_folder") {
             if !folder.trim().is_empty() {
                 app.audio_player.set_local_music_folder(&folder);
+                app.refresh_local_music_tracks_cache();
             }
         }
 
@@ -2851,6 +2862,13 @@ impl App {
                         crate::audio::mpris_player::next_track();
                         return Ok(());
                     }
+                    if self.active_screen == ActiveScreen::Soundscapes
+                        && self.local_folder_selected()
+                    {
+                        self.select_next_local_track();
+                        self.play_selected_local_choice();
+                        return Ok(());
+                    }
                     // 'n' en Dashboard/Projects/Workspace/Fellowship/SyncSettings ya está tomado para otras acciones
                     if self.active_screen != ActiveScreen::Dashboard
                         && self.active_screen != ActiveScreen::Projects
@@ -2928,7 +2946,21 @@ impl App {
                         if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
                             crate::audio::mpris_player::prev_track();
                             return Ok(());
+                        } else if self.local_folder_selected() {
+                            self.select_previous_local_track();
+                            self.play_selected_local_choice();
+                            return Ok(());
                         }
+                    }
+                }
+                KeyCode::Char('r') => {
+                    if self.active_screen == ActiveScreen::Soundscapes
+                        && self.modal_state == ModalType::None
+                        && self.local_folder_selected()
+                    {
+                        self.selected_local_track_idx = 0;
+                        self.play_selected_local_choice();
+                        return Ok(());
                     }
                 }
                 _ => {}
@@ -3759,6 +3791,7 @@ impl App {
                     KeyCode::Enter => {
                         let _ = self.db.set_setting("local_music_folder", &val);
                         self.audio_player.set_local_music_folder(&val);
+                        self.refresh_local_music_tracks_cache();
                         self.modal_state = ModalType::None;
                         let current_sc = self.audio_player.get_state().current_soundscape;
                         if current_sc == "Local Folder"
@@ -7161,6 +7194,8 @@ impl App {
                     if self.character_focus > 0 {
                         self.character_focus -= 1;
                     }
+                } else if self.active_screen == ActiveScreen::Soundscapes {
+                    self.select_previous_soundscape();
                 }
             }
             KeyCode::Right => {
@@ -7187,6 +7222,8 @@ impl App {
                     if has_reflections && self.character_focus < 2 {
                         self.character_focus += 1;
                     }
+                } else if self.active_screen == ActiveScreen::Soundscapes {
+                    self.select_next_soundscape();
                 }
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
@@ -7447,12 +7484,7 @@ impl App {
                         self.great_chronicle_scroll = self.great_chronicle_scroll.saturating_sub(3);
                     }
                 } else if self.active_screen == ActiveScreen::Soundscapes {
-                    use crate::audio::SOUNDSCAPES;
-                    if self.selected_soundscape_idx > 0 {
-                        self.selected_soundscape_idx -= 1;
-                    } else {
-                        self.selected_soundscape_idx = SOUNDSCAPES.len() - 1;
-                    }
+                    self.select_previous_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
                     if self.selected_fellowship_tab == 1 {
                         let invites = self.db.get_invitations().unwrap_or_default();
@@ -7495,48 +7527,18 @@ impl App {
                         self.selected_library_cat_idx = if self.selected_library_cat_idx > 0 {
                             self.selected_library_cat_idx - 1
                         } else {
-                            4
+                            5
                         };
-                        self.selected_library_item_idx = 0;
-                        self.library_scroll_offset = 0;
+                        self.reset_library_item_view();
                     } else if self.library_active_col == 1 {
-                        let count = match self.selected_library_cat_idx {
-                            0 => {
-                                let class_name =
-                                    self.user.as_ref().map(|u| u.class.name()).unwrap_or("");
-                                self.db
-                                    .get_class_quests(class_name)
-                                    .map(|q| q.len())
-                                    .unwrap_or(0)
-                            }
-                            1 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Class").count())
-                                .unwrap_or(0),
-                            2 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "World").count())
-                                .unwrap_or(0),
-                            3 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Achievement").count())
-                                .unwrap_or(0),
-                            4 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Memory").count())
-                                .unwrap_or(0),
-                            _ => 0,
-                        };
+                        let count = self.library_category_count(self.selected_library_cat_idx);
                         if count > 0 {
                             self.selected_library_item_idx = if self.selected_library_item_idx > 0 {
                                 self.selected_library_item_idx - 1
                             } else {
                                 count - 1
                             };
+                            self.update_library_item_scroll();
                         }
                         self.library_scroll_offset = 0;
                     } else if self.library_active_col == 2 && self.library_scroll_offset > 0 {
@@ -7617,9 +7619,7 @@ impl App {
                         self.great_chronicle_scroll = self.great_chronicle_scroll.saturating_add(3);
                     }
                 } else if self.active_screen == ActiveScreen::Soundscapes {
-                    use crate::audio::SOUNDSCAPES;
-                    self.selected_soundscape_idx =
-                        (self.selected_soundscape_idx + 1) % SOUNDSCAPES.len();
+                    self.select_next_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
                     if self.selected_fellowship_tab == 1 {
                         let invites = self.db.get_invitations().unwrap_or_default();
@@ -7649,44 +7649,14 @@ impl App {
                     }
                 } else if self.active_screen == ActiveScreen::Library {
                     if self.library_active_col == 0 {
-                        self.selected_library_cat_idx = (self.selected_library_cat_idx + 1) % 5;
-                        self.selected_library_item_idx = 0;
-                        self.library_scroll_offset = 0;
+                        self.selected_library_cat_idx = (self.selected_library_cat_idx + 1) % 6;
+                        self.reset_library_item_view();
                     } else if self.library_active_col == 1 {
-                        let count = match self.selected_library_cat_idx {
-                            0 => {
-                                let class_name =
-                                    self.user.as_ref().map(|u| u.class.name()).unwrap_or("");
-                                self.db
-                                    .get_class_quests(class_name)
-                                    .map(|q| q.len())
-                                    .unwrap_or(0)
-                            }
-                            1 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Class").count())
-                                .unwrap_or(0),
-                            2 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "World").count())
-                                .unwrap_or(0),
-                            3 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Achievement").count())
-                                .unwrap_or(0),
-                            4 => self
-                                .db
-                                .get_lore_entries()
-                                .map(|e| e.iter().filter(|x| x.1 == "Memory").count())
-                                .unwrap_or(0),
-                            _ => 0,
-                        };
+                        let count = self.library_category_count(self.selected_library_cat_idx);
                         if count > 0 {
                             self.selected_library_item_idx =
                                 (self.selected_library_item_idx + 1) % count;
+                            self.update_library_item_scroll();
                         }
                         self.library_scroll_offset = 0;
                     } else if self.library_active_col == 2 {
@@ -7743,6 +7713,8 @@ impl App {
                             };
                             return Ok(());
                         }
+                        self.play_selected_local_choice();
+                        return Ok(());
                     }
                     let _ = self.db.set_setting("last_music_source", s_name);
                     self.audio_player.play(s_name);
@@ -8094,8 +8066,15 @@ impl App {
                     };
                 }
             }
+            KeyCode::Char('k') => {
+                if self.active_screen == ActiveScreen::Soundscapes && self.local_folder_selected() {
+                    self.select_previous_local_track();
+                }
+            }
             KeyCode::Char('j') => {
-                if self.active_screen == ActiveScreen::Fellowship {
+                if self.active_screen == ActiveScreen::Soundscapes && self.local_folder_selected() {
+                    self.select_next_local_track();
+                } else if self.active_screen == ActiveScreen::Fellowship {
                     let shared_projects: Vec<_> =
                         self.projects.iter().filter(|p| p.is_shared).collect();
                     if !shared_projects.is_empty()
@@ -13890,6 +13869,212 @@ impl App {
         Ok(())
     }
 
+    fn local_folder_selected(&self) -> bool {
+        use crate::audio::SOUNDSCAPES;
+        self.active_screen == ActiveScreen::Soundscapes
+            && self.selected_soundscape_idx < SOUNDSCAPES.len()
+            && SOUNDSCAPES[self.selected_soundscape_idx].name == "Local Folder"
+    }
+
+    fn select_previous_soundscape(&mut self) {
+        use crate::audio::SOUNDSCAPES;
+        if self.selected_soundscape_idx > 0 {
+            self.selected_soundscape_idx -= 1;
+        } else {
+            self.selected_soundscape_idx = SOUNDSCAPES.len() - 1;
+        }
+    }
+
+    fn select_next_soundscape(&mut self) {
+        use crate::audio::SOUNDSCAPES;
+        self.selected_soundscape_idx = (self.selected_soundscape_idx + 1) % SOUNDSCAPES.len();
+    }
+
+    fn select_previous_local_track(&mut self) {
+        self.refresh_local_music_tracks_cache();
+        let tracks = self.local_audio_files();
+        let choices = tracks.len() + 1;
+        if self.selected_local_track_idx > 0 {
+            self.selected_local_track_idx -= 1;
+        } else {
+            self.selected_local_track_idx = choices - 1;
+        }
+    }
+
+    fn select_next_local_track(&mut self) {
+        self.refresh_local_music_tracks_cache();
+        let tracks = self.local_audio_files();
+        let choices = tracks.len() + 1;
+        self.selected_local_track_idx = (self.selected_local_track_idx + 1) % choices;
+    }
+
+    fn selected_local_audio_file(&mut self) -> Option<std::path::PathBuf> {
+        self.refresh_local_music_tracks_cache();
+        let tracks = self.local_audio_files();
+        if tracks.is_empty() || self.selected_local_track_idx == 0 {
+            None
+        } else {
+            if self.selected_local_track_idx > tracks.len() {
+                self.selected_local_track_idx = tracks.len();
+            }
+            tracks.get(self.selected_local_track_idx - 1).cloned()
+        }
+    }
+
+    fn library_category_count(&self, category_idx: usize) -> usize {
+        match category_idx {
+            0 => {
+                let class_name = self.user.as_ref().map(|u| u.class.name()).unwrap_or("");
+                self.db
+                    .get_class_quests(class_name)
+                    .map(|q| q.len())
+                    .unwrap_or(0)
+            }
+            1 => self
+                .db
+                .get_lore_entries()
+                .map(|e| e.iter().filter(|x| x.1 == "Class").count())
+                .unwrap_or(0),
+            2 => self
+                .db
+                .get_lore_entries()
+                .map(|e| e.iter().filter(|x| x.1 == "World").count())
+                .unwrap_or(0),
+            3 => self.db.get_achievements().map(|a| a.len()).unwrap_or(0),
+            4 => self
+                .db
+                .get_lore_entries()
+                .map(|e| e.iter().filter(|x| x.1 == "Achievement").count())
+                .unwrap_or(0),
+            5 => self
+                .db
+                .get_lore_entries()
+                .map(|e| e.iter().filter(|x| x.1 == "Memory").count())
+                .unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    fn reset_library_item_view(&mut self) {
+        self.selected_library_item_idx = 0;
+        self.library_item_scroll_offset = 0;
+        self.library_scroll_offset = 0;
+    }
+
+    fn update_library_item_scroll(&mut self) {
+        let count = self.library_category_count(self.selected_library_cat_idx);
+        if count == 0 {
+            self.library_item_scroll_offset = 0;
+            return;
+        }
+        let visible = self.terminal_height.saturating_sub(8).max(1) as usize;
+        let half = visible / 2;
+        let max_offset = count.saturating_sub(visible);
+        if self.selected_library_item_idx <= half {
+            self.library_item_scroll_offset = 0;
+        } else {
+            self.library_item_scroll_offset = self
+                .selected_library_item_idx
+                .saturating_sub(half)
+                .min(max_offset);
+        }
+    }
+
+    pub fn refresh_local_music_tracks_cache(&mut self) {
+        let tracks = self.scan_local_audio_files();
+        if !tracks.is_empty() {
+            self.local_music_tracks_cache = tracks;
+        }
+    }
+
+    fn play_selected_local_choice(&mut self) {
+        let _ = self.db.set_setting("last_music_source", "Local Folder");
+        if self.selected_local_track_idx == 0 {
+            self.play_random_local_track();
+        } else if let Some(path) = self.selected_local_audio_file() {
+            if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
+                self.audio_player.set_local_music_folder(parent);
+            }
+            self.audio_player.play_local_file(&path);
+        }
+    }
+
+    fn play_random_local_track(&mut self) {
+        self.refresh_local_music_tracks_cache();
+        let tracks = self.local_audio_files();
+        if tracks.is_empty() {
+            return;
+        }
+
+        use rand::seq::SliceRandom;
+        let mut rng = rand::thread_rng();
+        let Some(path) = tracks.choose(&mut rng).cloned() else {
+            return;
+        };
+        if let Some(parent) = path.parent().and_then(|p| p.to_str()) {
+            self.audio_player.set_local_music_folder(parent);
+        }
+        self.audio_player.play_local_file(&path);
+    }
+
+    fn local_audio_files(&self) -> Vec<std::path::PathBuf> {
+        let tracks = self.scan_local_audio_files();
+        if tracks.is_empty() {
+            self.local_music_tracks_cache.clone()
+        } else {
+            tracks
+        }
+    }
+
+    fn scan_local_audio_files(&self) -> Vec<std::path::PathBuf> {
+        let folder = self
+            .db
+            .get_setting("local_music_folder")
+            .unwrap_or_default()
+            .unwrap_or_default();
+        let folder = Self::expand_home(folder.trim());
+        if folder.is_empty() {
+            return Vec::new();
+        }
+
+        let Ok(entries) = std::fs::read_dir(&folder) else {
+            return Vec::new();
+        };
+        let mut tracks: Vec<std::path::PathBuf> = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_file() && Self::is_supported_audio(path))
+            .collect();
+        tracks.sort_by(|a, b| {
+            let a_name = a.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            let b_name = b.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            a_name.to_lowercase().cmp(&b_name.to_lowercase())
+        });
+        tracks
+    }
+
+    fn is_supported_audio(path: &std::path::Path) -> bool {
+        matches!(
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.to_lowercase())
+                .as_deref(),
+            Some("mp3" | "ogg" | "wav" | "flac")
+        )
+    }
+
+    fn expand_home(path: &str) -> String {
+        if path == "~" {
+            return std::env::var("HOME").unwrap_or_else(|_| path.to_string());
+        }
+        if let Some(rest) = path.strip_prefix("~/") {
+            if let Ok(home) = std::env::var("HOME") {
+                return format!("{}/{}", home, rest);
+            }
+        }
+        path.to_string()
+    }
+
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
@@ -14541,7 +14726,13 @@ impl App {
         self.db
             .set_setting("equipped_theme", crate::theme::Theme::theme_key(choice))?;
         self.theme_service.set_theme_choice(choice);
-        self.last_pywal_modified = Self::pywal_colors_modified();
+        if choice == ThemeChoice::Pywal {
+            if let Some(modified) = Self::pywal_colors_modified() {
+                self.last_pywal_modified = Some(modified);
+            }
+        } else {
+            self.last_pywal_modified = None;
+        }
         self.last_pywal_check = Some(std::time::Instant::now());
         self.selected_settings_theme_idx = crate::theme::Theme::all_choices()
             .iter()
@@ -14742,9 +14933,11 @@ impl App {
         }
         self.last_pywal_check = Some(std::time::Instant::now());
 
-        let modified = Self::pywal_colors_modified();
-        if modified != self.last_pywal_modified {
-            self.last_pywal_modified = modified;
+        let Some(modified) = Self::pywal_colors_modified() else {
+            return;
+        };
+        if Some(modified) != self.last_pywal_modified {
+            self.last_pywal_modified = Some(modified);
             self.theme_service.set_theme_choice(ThemeChoice::Pywal);
         }
     }
@@ -15424,6 +15617,10 @@ impl App {
             let elapsed_seconds = (Utc::now() - active.start_time).num_seconds();
             let remaining = total_seconds - elapsed_seconds;
             if remaining <= 0 {
+                if active.soundscape == "Media Player" {
+                    crate::audio::mpris_player::pause();
+                }
+                self.audio_player.stop();
                 self.audio_player.play_focus_end();
                 if self.external_notifications {
                     let duration = active.duration_mins;
@@ -17088,7 +17285,12 @@ mod app_tests {
 
         // 5. Test Atmosphere Master Achievement (Use all 8 soundscapes)
         // We have used Forest Sounds, Rain Sounds, Ocean Waves, White Noise. Let's seed the rest.
-        let soundscapes_list = ["LoFi Radio", "Ambient Radio", "Brown Noise", "Silent"];
+        let soundscapes_list = [
+            "Music For Programming",
+            "LoFi Radio",
+            "Local Folder",
+            "Silent",
+        ];
         for sc in soundscapes_list {
             app.active_focus_session = Some(ActiveFocusSession {
                 start_time: Utc::now() - chrono::Duration::seconds(15 * 60 + 2),

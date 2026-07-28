@@ -56,6 +56,19 @@ pub fn play_pause() {
 pub fn play_pause() {}
 
 #[cfg(target_os = "linux")]
+pub fn pause() {
+    use mpris::PlayerFinder;
+    if let Ok(finder) = PlayerFinder::new() {
+        if let Ok(player) = finder.find_active() {
+            let _ = player.pause();
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn pause() {}
+
+#[cfg(target_os = "linux")]
 pub fn next_track() {
     use mpris::PlayerFinder;
     if let Ok(finder) = PlayerFinder::new() {

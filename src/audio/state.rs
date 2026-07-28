@@ -11,6 +11,7 @@ pub enum PlaybackStatus {
 #[derive(Debug, Clone)]
 pub struct AudioState {
     pub current_soundscape: String,
+    pub active_source: String,
     pub status: PlaybackStatus,
     pub volume: f32, // 0.0 to 1.0
     pub sound_effects_enabled: bool,
@@ -28,6 +29,7 @@ impl AudioState {
     pub fn new() -> Self {
         Self {
             current_soundscape: "Silent".to_string(),
+            active_source: "Silent".to_string(),
             status: PlaybackStatus::Stopped,
             volume: 0.5,
             sound_effects_enabled: true,

@@ -709,14 +709,26 @@ async fn main() -> Result<()> {
                             let class_name = app.user.as_ref().map(|u| u.class.name()).unwrap_or("");
                             let quests = app.db.get_class_quests(class_name).unwrap_or_default();
                             let lore = app.db.get_lore_entries().unwrap_or_default();
+                            let used_soundscapes = app.db.get_unique_soundscapes_used().unwrap_or_default();
                             screens::library::draw(
                                 f,
                                 app.library_active_col,
                                 app.selected_library_cat_idx,
                                 app.selected_library_item_idx,
+                                app.library_item_scroll_offset,
                                 app.library_scroll_offset,
                                 &quests,
                                 &lore,
+                                &app.stats_cache.achievements,
+                                &app.stats_cache.statistics,
+                                app.stats_cache.streak.current_streak,
+                                app.stats_cache.zen_tree.stage,
+                                app.stats_cache.silent_sessions,
+                                app.stats_cache.forest_sessions,
+                                app.stats_cache.rain_sessions,
+                                app.stats_cache.unique_soundscapes,
+                                app.db.count_codices().unwrap_or(0),
+                                &used_soundscapes,
                                 class_name,
                                 &theme,
                                 app.quit_confirm_ticks,
@@ -2218,7 +2230,13 @@ async fn main() -> Result<()> {
                     ActiveScreen::Soundscapes => {
                         lines.push(Line::from("  p            Pause current ambient soundscape"));
                         lines.push(Line::from("  s            Stop playing soundscape"));
-                        lines.push(Line::from("  n            Cycle through available Soundscapes"));
+                        lines.push(Line::from(
+                            "  Left/Right   Cycle through available Soundscapes",
+                        ));
+                        lines.push(Line::from("  Up/Down      Cycle through available Soundscapes"));
+                        lines.push(Line::from("  j / k        Select local tracks"));
+                        lines.push(Line::from("  r            Random local folder playback"));
+                        lines.push(Line::from("  b / n        Previous / next media or local track"));
                         lines.push(Line::from("  + / *        Increase audio volume"));
                         lines.push(Line::from("  -            Decrease audio volume"));
                     }

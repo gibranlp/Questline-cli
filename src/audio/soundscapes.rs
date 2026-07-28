@@ -64,3 +64,14 @@ pub const SOUNDSCAPES: [SoundscapeInfo; 9] = [
         bonus: "Silent Monk Achievement progression",
     },
 ];
+
+pub const ATMOSPHERE_ACHIEVEMENT_SOUNDSCAPES: [&str; 8] = [
+    "Music For Programming",
+    "LoFi Radio",
+    "Local Folder",
+    "Forest Sounds",
+    "Rain Sounds",
+    "Ocean Waves",
+    "White Noise",
+    "Silent",
+];
