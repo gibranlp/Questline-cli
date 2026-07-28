@@ -3556,9 +3556,21 @@ impl App {
                     }
                     KeyCode::Char('c') => {
                         if let ModalType::ExportProfile {
-                            ref transfer_code, ..
+                            ref transfer_code,
+                            backup_in_progress,
+                            ..
                         } = self.modal_state.clone()
                         {
+                            if backup_in_progress {
+                                self.sync_status_msg =
+                                    "Transfer Code locked until cloud backup completes."
+                                        .to_string();
+                                self.notifications.push(Notification::warning(
+                                    "Wait for the chronicle backup to finish before importing."
+                                        .to_string(),
+                                ));
+                                return Ok(true);
+                            }
                             match crate::services::identity::copy_to_clipboard(transfer_code) {
                                 Ok(_) => {
                                     self.sync_status_msg =
