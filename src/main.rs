@@ -645,7 +645,17 @@ async fn main() -> Result<()> {
                             screens::focus::draw(f, &app, &theme);
                         },
                         ActiveScreen::Projects => {
-                            screens::projects::draw(f, &app.projects, &app.all_tasks, app.selected_project_idx, app.projects_all_selected, &app.modal_state, &theme, chunks[0]);
+                            screens::projects::draw(
+                                f,
+                                &app.projects,
+                                &app.all_tasks,
+                                &app.all_notes,
+                                app.selected_project_idx,
+                                app.projects_all_selected,
+                                &app.modal_state,
+                                &theme,
+                                chunks[0],
+                            );
                         }
 
                         ActiveScreen::Character => {

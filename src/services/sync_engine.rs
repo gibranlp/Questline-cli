@@ -742,20 +742,12 @@ impl<'a> SyncEngine<'a> {
                     } else {
                         match self.db.get_task_by_id(ent_uuid) {
                             Ok(local_task) => {
-                                // El más reciente gana — sin democracia
-                                let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
-                                    .map(|d| d.with_timezone(&Utc))
-                                    .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-
-                                if incoming_time > local_task.updated_at {
-                                    if let Some(ref content) = log.content {
-                                        if let Ok(remote_task) =
-                                            serde_json::from_str::<Task>(content)
-                                        {
+                                if let Some(ref content) = log.content {
+                                    if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
+                                        if remote_task.updated_at > local_task.updated_at {
                                             if remote_task.title != local_task.title
                                                 || remote_task.completed != local_task.completed
                                             {
-                                                // Conflicto real — guardamos la versión local antes de pisarla
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_task)
                                                 {
@@ -770,9 +762,13 @@ impl<'a> SyncEngine<'a> {
                                             local_task.title
                                         ));
                                             }
+                                            true
+                                        } else {
+                                            false
                                         }
+                                    } else {
+                                        false
                                     }
-                                    true
                                 } else {
                                     false
                                 }
@@ -796,19 +792,15 @@ impl<'a> SyncEngine<'a> {
                     } else {
                         match self.db.get_note_by_id(ent_uuid) {
                             Ok(local_note) => {
-                                let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
-                                    .map(|d| d.with_timezone(&Utc))
-                                    .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-                                if incoming_time > local_note.updated_at {
-                                    if let Some(ref content) = log.content {
-                                        if let Ok(remote_note) =
-                                            serde_json::from_str::<Note>(content)
-                                        {
+                                if let Some(ref content) = log.content {
+                                    if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
+                                        if remote_note.updated_at > local_note.updated_at {
                                             if remote_note.title != local_note.title
                                                 || remote_note.markdown_content
                                                     != local_note.markdown_content
+                                                || remote_note.codex_id != local_note.codex_id
+                                                || remote_note.project_id != local_note.project_id
                                             {
-                                                // Conflicto en nota — archivamos lo local antes de sobreescribir
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_note)
                                                 {
@@ -823,9 +815,13 @@ impl<'a> SyncEngine<'a> {
                                             local_note.title
                                         ));
                                             }
+                                            true
+                                        } else {
+                                            false
                                         }
+                                    } else {
+                                        false
                                     }
-                                    true
                                 } else {
                                     false
                                 }
