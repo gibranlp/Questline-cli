@@ -3104,7 +3104,6 @@ impl Database {
                 total_notes
             ));
         }
-
         let mut queued = 0usize;
 
         if let Ok(Some(user)) = self.get_user() {
@@ -3583,6 +3582,7 @@ impl Database {
             let _ = self
                 .conn
                 .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", []);
+            let _ = self.conn.execute("UPDATE sync_log SET synced = 1", []);
             // Clear dedup IDs from the backup source — they belong to a different device's
             // view of the event stream and would cause this machine to skip events it has
             // never actually applied.
