@@ -3094,6 +3094,7 @@ impl Database {
 
         let simple_tables = [
             ("project", "projects", "id"),
+            ("codex", "codices", "id"),
             ("task", "tasks", "id"),
             ("note", "notes", "id"),
             ("journal_entry", "journal_entries", "id"),
@@ -3101,7 +3102,6 @@ impl Database {
             ("achievement", "achievements", "id"),
             ("ritual", "rituals", "id"),
             ("focus_session", "focus_sessions", "id"),
-            ("codex", "codices", "id"),
             ("chronicle_message", "chronicle_messages", "id"),
         ];
 
