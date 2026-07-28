@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-v" | "version" => {
-                println!("questline {}", env!("CARGO_PKG_VERSION"));
+                println!("questline {}", questline::build_info::build_label());
                 return Ok(());
             }
             _ => {

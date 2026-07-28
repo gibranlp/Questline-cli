@@ -13,6 +13,7 @@
 
 pub mod app;
 pub mod audio;
+pub mod build_info;
 pub mod database;
 pub mod milestone_templates;
 pub mod models;
