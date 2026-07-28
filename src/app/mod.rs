@@ -8964,6 +8964,7 @@ impl App {
                             self.db.update_task(&t)?;
                             self.mark_dirty();
                             self.audio_player.play_task_complete();
+                            self.notify_task_completed(&t, true);
                             if !task.xp_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let xp = if is_high { 50 } else { 25 };
@@ -9034,6 +9035,7 @@ impl App {
                                 self.db.update_task(&t)?;
                                 self.mark_dirty();
                                 self.audio_player.play_task_complete();
+                                self.notify_task_completed(&t, false);
                                 if !task.xp_awarded {
                                     let is_high = t.priority == TaskPriority::High;
                                     let val = if is_high { 50 } else { 25 };
@@ -9596,6 +9598,7 @@ impl App {
                                     self.db.update_task(&s)?;
                                     self.mark_dirty();
                                     self.audio_player.play_task_complete();
+                                    self.notify_task_completed(&s, true);
                                     if !step.xp_awarded {
                                         let is_high = s.priority == TaskPriority::High;
                                         let xp = if is_high { 50 } else { 25 };
@@ -11111,6 +11114,7 @@ impl App {
         self.db.update_task(&t)?;
         self.mark_dirty();
         self.audio_player.play_task_complete();
+        self.notify_task_completed(&t, false);
         if !already_awarded {
             let is_high = t.priority == TaskPriority::High;
             let val = if is_high { 50 } else { 25 };
@@ -15023,6 +15027,23 @@ impl App {
             return false;
         }
         true
+    }
+
+    fn notify_task_completed(&self, task: &Task, is_step: bool) {
+        if !self.external_notifications {
+            return;
+        }
+        let title = if is_step {
+            "Step completed"
+        } else {
+            "Quest completed"
+        };
+        crate::services::notifications::send_system_notification_with_icon(
+            title,
+            &task.title,
+            false,
+            crate::services::notifications::NotificationIcon::TaskCompleted,
+        );
     }
 
     /// Called after a task is marked complete — occasionally spawns a Swarm response.
