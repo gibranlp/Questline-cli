@@ -338,7 +338,7 @@ fn draw_today_command_center(
     }
 
     let title = format!(
-        " Today's Command Center  Due {} Overdue {} High {} Load: {}  Space Done | Enter Open | z Tomorrow | Z Week ",
+        "Command Center  Due {} Overdue {} High {} L: {}  Space Done | Enter Open | z Tomorrow | Z Week ",
         due_today,
         overdue,
         high,

@@ -2033,6 +2033,7 @@ impl App {
                             &device_id,
                             &server_url,
                         );
+                        let _ = db.set_setting("sync_restore_hold", "1");
                         user = db.get_user()?;
                     }
                 }
@@ -3691,6 +3692,8 @@ impl App {
                                                     &self.device_id,
                                                     &self.server_url,
                                                 );
+                                                let _ =
+                                                    self.db.set_setting("sync_restore_hold", "1");
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string(),
                                                 ));
@@ -5326,6 +5329,7 @@ impl App {
                                             &self.device_id,
                                             &self.server_url,
                                         );
+                                        let _ = self.db.set_setting("sync_restore_hold", "1");
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
@@ -13793,8 +13797,9 @@ impl App {
                         self.sync_failure_count = 0;
                         self.sync_conflicts = bg.conflicts;
                         if !self.sync_conflicts.is_empty() {
+                            let _ = self.db.set_setting("sync_restore_hold", "1");
                             self.notifications.push(Notification::warning(format!(
-                                "{} sync conflict(s) detected — check revision history",
+                                "{} sync conflict(s) detected — automatic sync paused",
                                 self.sync_conflicts.len()
                             )));
                         }
@@ -14215,6 +14220,7 @@ impl App {
                             &self.server_url,
                         );
                         let _ = self.db.set_setting("conflict_count", "0");
+                        let _ = self.db.set_setting("sync_restore_hold", "1");
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
                             "Chronicle restored from cloud!".to_string(),
@@ -14222,10 +14228,9 @@ impl App {
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
                             message:
-                                "Restore complete! Sync will now pull only changes after this backup."
+                                "Restore complete. Automatic sync is paused until you manually sync."
                                     .to_string(),
                         };
-                        self.start_background_sync();
                     }
                     Err(e) => {
                         self.modal_state = ModalType::CloudRestoreProgress {
@@ -14487,12 +14492,26 @@ impl App {
         db.set_setting("last_pull_seq", &head_seq.to_string())?;
         db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
         db.set_setting("last_sync_lag", "0")?;
+        db.set_setting("sync_restore_hold", "1")?;
         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
         let _ = db.conn.execute("UPDATE sync_log SET synced = 1", []);
         Ok(())
     }
 
     fn start_background_sync(&mut self) {
+        if self
+            .db
+            .get_setting("sync_restore_hold")
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some("1")
+        {
+            self.sync_status_msg =
+                "Sync paused after restore. Run manual sync when ready.".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
         self.do_background_sync(false);
     }
 
@@ -14507,6 +14526,7 @@ impl App {
             step: 0,
             message: "Preparing full synchronization...".to_string(),
         };
+        let _ = self.db.set_setting("sync_restore_hold", "0");
         self.do_background_sync(true);
     }
 
@@ -14537,7 +14557,13 @@ impl App {
                     &device_id,
                     Some(server_url.as_str()),
                 )?;
+                if !include_contributions
+                    && db.get_setting("sync_restore_hold")?.as_deref() == Some("1")
+                {
+                    return Ok((0, 0, Vec::new()));
+                }
                 if include_contributions {
+                    let _ = db.set_setting("sync_restore_hold", "0");
                     let _ = db.queue_full_state_sync();
                 }
                 let (pushed, pulled, conflicts) = sync_engine.sync()?;
@@ -14780,7 +14806,7 @@ impl App {
                             .unwrap_or(true)
                     }
                 };
-                if should_backup {
+                if should_backup && conflicts.is_empty() {
                     if let Ok(json) = db.export_to_json() {
                         if client.send_request("POST", "recovery", &json).is_ok() {
                             let _ = db

@@ -273,9 +273,30 @@ impl<'a> SyncEngine<'a> {
     }
 
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
+        // Pull and drain remote history first, then push local changes. This keeps restore and
+        // normal sync incremental: a device learns the server head before it publishes anything.
         let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
-            self.sync_once(true)?;
+            self.sync_once(false)?;
         let mut drain_pages = 0usize;
+
+        while has_more && drain_pages < MAX_DRAIN_PAGES {
+            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+                self.sync_once(false)?;
+            pushed += more_pushed;
+            pulled += more_pulled;
+            downloaded += more_downloaded;
+            conflicts.extend(more_conflicts);
+            has_more = more_has_more && more_downloaded > 0;
+            drain_pages += 1;
+        }
+
+        let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+            self.sync_once(true)?;
+        pushed += more_pushed;
+        pulled += more_pulled;
+        downloaded += more_downloaded;
+        conflicts.extend(more_conflicts);
+        has_more = more_has_more && more_downloaded > 0;
 
         while has_more && drain_pages < MAX_DRAIN_PAGES {
             let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
@@ -294,7 +315,8 @@ impl<'a> SyncEngine<'a> {
         Ok((pushed, pulled, conflicts))
     }
 
-    // CRÍTICO: el orden push-antes-pull no es negociable — así los cambios locales no se pisan con lo remoto
+    // One page of sync. `sync()` calls this in pull-before-push order; when `push_local` is true
+    // this still performs a small post-push pull so the cursor catches any concurrent events.
     fn sync_once(&self, push_local: bool) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
@@ -744,9 +766,16 @@ impl<'a> SyncEngine<'a> {
                             Ok(local_task) => {
                                 if let Some(ref content) = log.content {
                                     if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
-                                        if remote_task.updated_at > local_task.updated_at {
+                                        if local_task.project_id.is_some()
+                                            && remote_task.project_id.is_none()
+                                        {
+                                            false
+                                        } else if remote_task.updated_at > local_task.updated_at {
                                             if remote_task.title != local_task.title
                                                 || remote_task.completed != local_task.completed
+                                                || remote_task.project_id != local_task.project_id
+                                                || remote_task.parent_task_id
+                                                    != local_task.parent_task_id
                                             {
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_task)
@@ -794,7 +823,11 @@ impl<'a> SyncEngine<'a> {
                             Ok(local_note) => {
                                 if let Some(ref content) = log.content {
                                     if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
-                                        if remote_note.updated_at > local_note.updated_at {
+                                        if local_note.project_id.is_some()
+                                            && remote_note.project_id.is_none()
+                                        {
+                                            false
+                                        } else if remote_note.updated_at > local_note.updated_at {
                                             if remote_note.title != local_note.title
                                                 || remote_note.markdown_content
                                                     != local_note.markdown_content
@@ -1166,6 +1199,17 @@ impl<'a> SyncEngine<'a> {
                                 let owner_id = p["owner_identity"].as_str();
                                 let owner_name = p["owner_username"].as_str();
                                 let is_shared = p["is_shared"].as_bool().unwrap_or(false);
+                                let local_is_shared = self
+                                    .db
+                                    .conn
+                                    .query_row(
+                                        "SELECT is_shared FROM projects WHERE id = ?1",
+                                        params![id],
+                                        |row| row.get::<_, i32>(0),
+                                    )
+                                    .unwrap_or(0)
+                                    != 0;
+                                let merged_is_shared = is_shared || local_is_shared;
                                 let _ = self.db.conn.execute(
                                     "INSERT OR REPLACE INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                                     params![
@@ -1173,11 +1217,11 @@ impl<'a> SyncEngine<'a> {
                                         if archived { 1 } else { 0 },
                                         if completed { 1 } else { 0 },
                                         owner_id, owner_name,
-                                        if is_shared { 1 } else { 0 }
+                                        if merged_is_shared { 1 } else { 0 }
                                     ],
                                 );
                                 // When a project is shared, ensure owner appears in project_members
-                                if is_shared {
+                                if merged_is_shared {
                                     let owner_id_str =
                                         p["owner_identity"].as_str().unwrap_or_default();
                                     let owner_name_str =
