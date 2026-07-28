@@ -2142,7 +2142,7 @@ impl App {
             selected_milestone_idx: 0,
 
             audio_player: crate::audio::AudioPlayer::new(),
-            selected_soundscape_idx: 0,
+            selected_soundscape_idx: 3,
             selected_local_track_idx: 0,
             local_music_tracks_cache: Vec::new(),
             selected_focus_soundscape_idx: 0,
