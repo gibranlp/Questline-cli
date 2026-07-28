@@ -764,24 +764,40 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ])
             .split(inner);
 
-        let label = Paragraph::new("  Your Transfer Code (paste this on the new device):")
-            .style(Style::default().fg(theme.muted));
+        let label_text = if *backup_in_progress {
+            "  Preparing Transfer Code. Wait until the chronicle is sealed:"
+        } else {
+            "  Your Transfer Code (paste this on the new device):"
+        };
+        let label = Paragraph::new(label_text).style(Style::default().fg(theme.muted));
         f.render_widget(label, inner_layout[1]);
 
-        // el transfer code es largo, lo partimos en dos líneas para que se vea bien
-        let half = transfer_code.len() / 2;
-        let (line1, line2) = transfer_code.split_at(half);
+        let display_code = if *backup_in_progress {
+            "Backup still running. Transfer code locked until complete.".to_string()
+        } else {
+            transfer_code.clone()
+        };
+        let half = display_code.len() / 2;
+        let (line1, line2) = display_code.split_at(half);
         let code_p = Paragraph::new(vec![
             Line::from(Span::styled(
                 format!("  {}", line1),
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(if *backup_in_progress {
+                        theme.muted
+                    } else {
+                        Color::LightCyan
+                    })
                     .add_modifier(Modifier::BOLD),
             )),
             Line::from(Span::styled(
                 format!("  {}", line2),
                 Style::default()
-                    .fg(Color::LightCyan)
+                    .fg(if *backup_in_progress {
+                        theme.muted
+                    } else {
+                        Color::LightCyan
+                    })
                     .add_modifier(Modifier::BOLD),
             )),
         ])
@@ -852,8 +868,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             f.render_widget(done, inner_layout[5]);
         }
 
-        let help = Paragraph::new("  [c] Copy to Clipboard  |  [Esc] Close")
-            .style(Style::default().fg(theme.muted));
+        let help_text = if *backup_in_progress {
+            "  Copy is locked until sealing completes  |  [Esc] Close"
+        } else {
+            "  [c] Copy to Clipboard  |  [Esc] Close"
+        };
+        let help = Paragraph::new(help_text).style(Style::default().fg(theme.muted));
         f.render_widget(help, inner_layout[7]);
     }
 
