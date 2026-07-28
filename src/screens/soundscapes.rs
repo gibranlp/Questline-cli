@@ -279,7 +279,7 @@ fn draw_source_detail_panel(f: &mut Frame, theme: &Theme, area: Rect, selected: 
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Looping WAV ambience",
+                    "  Looping MP3 ambience",
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
@@ -297,7 +297,7 @@ fn draw_source_detail_panel(f: &mut Frame, theme: &Theme, area: Rect, selected: 
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Looping WAV ambience",
+                    "  Looping MP3 ambience",
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
@@ -315,7 +315,7 @@ fn draw_source_detail_panel(f: &mut Frame, theme: &Theme, area: Rect, selected: 
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Looping WAV ambience",
+                    "  Looping MP3 ambience",
                     Style::default().fg(theme.muted),
                 )),
                 Line::from(Span::styled(
