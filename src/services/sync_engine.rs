@@ -903,12 +903,28 @@ impl<'a> SyncEngine<'a> {
                 }
                 // Árbol zen: latest-watered timestamp wins — es una sola fila global por usuario
                 "zen_tree" => {
-                    let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
-                        .map(|d| d.with_timezone(&Utc))
-                        .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-                    match self.db.get_zen_tree() {
-                        Ok(lt) => lt.last_watered.map(|lw| incoming_time > lw).unwrap_or(true),
-                        Err(_) => true,
+                    if let Some(ref content) = log.content {
+                        if let Ok(remote_tree) =
+                            serde_json::from_str::<crate::models::ZenTree>(content)
+                        {
+                            match self.db.get_zen_tree() {
+                                Ok(local_tree) => {
+                                    remote_tree.growth > local_tree.growth
+                                        || remote_tree.stage > local_tree.stage
+                                        || remote_tree.total_waterings > local_tree.total_waterings
+                                        || remote_tree
+                                            .last_watered
+                                            .zip(local_tree.last_watered)
+                                            .map(|(remote, local)| remote > local)
+                                            .unwrap_or(remote_tree.last_watered.is_some())
+                                }
+                                Err(_) => true,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
                 }
                 // Milestones: siempre aplicamos — INSERT OR REPLACE maneja create y update
@@ -1417,17 +1433,28 @@ impl<'a> SyncEngine<'a> {
                         // disparar log_change() de nuevo y crear un loop de sync
                         "zen_tree" => {
                             if let Ok(t) = serde_json::from_str::<crate::models::ZenTree>(content) {
+                                let local_tree = self.db.get_zen_tree().ok();
+                                let local_growth =
+                                    local_tree.as_ref().map(|lt| lt.growth).unwrap_or(0);
+                                let local_health =
+                                    local_tree.as_ref().map(|lt| lt.health).unwrap_or(0);
+                                let local_stage =
+                                    local_tree.as_ref().map(|lt| lt.stage).unwrap_or(1);
                                 let local_water_today =
-                                    self.db.get_zen_tree().map(|lt| lt.water_today).unwrap_or(0);
+                                    local_tree.as_ref().map(|lt| lt.water_today).unwrap_or(0);
+                                let local_total_waterings = local_tree
+                                    .as_ref()
+                                    .map(|lt| lt.total_waterings)
+                                    .unwrap_or(0);
                                 let _ = self.db.conn.execute(
                                     "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
                                     params![
-                                        t.growth,
-                                        t.health,
-                                        t.stage,
+                                        t.growth.max(local_growth),
+                                        t.health.max(local_health),
+                                        t.stage.max(local_stage),
                                         t.last_watered.map(|dt| dt.to_rfc3339()),
                                         t.water_today.max(local_water_today),
-                                        t.total_waterings,
+                                        t.total_waterings.max(local_total_waterings),
                                         t.id.to_string(),
                                     ],
                                 );

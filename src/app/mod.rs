@@ -14488,6 +14488,7 @@ impl App {
         db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
         db.set_setting("last_sync_lag", "0")?;
         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+        let _ = db.conn.execute("UPDATE sync_log SET synced = 1", []);
         Ok(())
     }
 
