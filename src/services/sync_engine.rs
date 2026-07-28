@@ -1534,7 +1534,7 @@ impl<'a> SyncEngine<'a> {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::models::{Note, Task, TaskPriority};
+    use crate::models::{Codex, Note, Project, Task, TaskPriority, ZenTree};
     use chrono::Duration;
 
     struct StaticCloudProvider {
@@ -1922,5 +1922,90 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn test_export_import_preserves_note_codex_and_zen_tree() {
+        let source_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_export_source.db");
+        let restore_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_export_restore.db");
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&restore_path);
+
+        let source = Database::new(&source_path).expect("Failed to create source DB");
+        let project_id = Uuid::new_v4();
+        let codex_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        source
+            .insert_project(&Project {
+                id: project_id,
+                name: "Gibranlp".to_string(),
+                description: None,
+                created_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .expect("Failed to insert project");
+        source
+            .insert_codex(&Codex {
+                id: codex_id,
+                project_id,
+                name: "Software".to_string(),
+                created_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            })
+            .expect("Failed to insert codex");
+        source
+            .insert_note(&Note {
+                id: note_id,
+                project_id: Some(project_id),
+                title: "Grouped Scroll".to_string(),
+                markdown_content: "Must stay inside Software".to_string(),
+                created_at: now,
+                updated_at: now,
+                sharing_permission: "collaborative".to_string(),
+                codex_id: Some(codex_id),
+                owner_identity: None,
+            })
+            .expect("Failed to insert note");
+        source
+            .update_zen_tree(&ZenTree {
+                id: source.get_zen_tree().unwrap().id,
+                growth: 272,
+                health: 88,
+                stage: 4,
+                last_watered: Some(now),
+                water_today: 1,
+                total_waterings: 12,
+            })
+            .expect("Failed to update tree");
+
+        let json = source.export_to_json().expect("Failed to export source");
+        let restored = Database::new(&restore_path).expect("Failed to create restore DB");
+        restored.import_from_json(&json).expect("Failed to import");
+
+        let restored_note = restored
+            .get_note_by_id(note_id)
+            .expect("Missing restored note");
+        assert_eq!(restored_note.project_id, Some(project_id));
+        assert_eq!(restored_note.codex_id, Some(codex_id));
+        let restored_tree = restored.get_zen_tree().expect("Missing restored tree");
+        assert_eq!(restored_tree.growth, 272);
+        assert_eq!(restored_tree.stage, 4);
+        assert_eq!(restored_tree.total_waterings, 12);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&restore_path);
     }
 }

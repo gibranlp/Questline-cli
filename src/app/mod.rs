@@ -2027,7 +2027,6 @@ impl App {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
                     if db.import_from_json(&decoded).is_ok() {
-                        let _ = App::set_pull_cursor_to_remote_head(&db, &client);
                         user = db.get_user()?;
                     }
                 }
@@ -3668,9 +3667,6 @@ impl App {
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
-                                                let _ = App::set_pull_cursor_to_remote_head(
-                                                    &self.db, &client,
-                                                );
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string(),
                                                 ));
@@ -5300,8 +5296,6 @@ impl App {
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
-                                        let _ =
-                                            App::set_pull_cursor_to_remote_head(&self.db, &client);
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
@@ -6775,6 +6769,19 @@ impl App {
                                 let db_path = storage_dir.join("questline.db");
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
+                                let _ = db
+                                    .queue_full_state_sync()
+                                    .map_err(|e| format!("Full-state queue failed: {}", e))?;
+                                let sync_engine = crate::services::sync_engine::SyncEngine::new(
+                                    &db,
+                                    &identity,
+                                    &device_id,
+                                    Some(&server_url),
+                                )
+                                .map_err(|e| format!("Sync init failed: {}", e))?;
+                                sync_engine
+                                    .sync()
+                                    .map_err(|e| format!("Full-state sync failed: {}", e))?;
                                 let json = db
                                     .export_to_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
@@ -6869,43 +6876,53 @@ impl App {
                             let (backup_in_progress, backup_message) = if self.config.sync_enabled {
                                 // El upload a nube corre en hilo aparte — el modal se abre sin esperar
                                 let result_slot = std::sync::Arc::clone(&self.export_backup_result);
-                                if let Ok(json) = self.db.export_to_json() {
-                                    let server_url = self.server_url.clone();
-                                    let identity = self.identity.clone();
-                                    let device_id = self.device_id.clone();
-                                    let backup_display = backup_path.display().to_string();
-                                    std::thread::spawn(move || {
+                                let server_url = self.server_url.clone();
+                                let identity = self.identity.clone();
+                                let device_id = self.device_id.clone();
+                                let backup_display = backup_path.display().to_string();
+                                std::thread::spawn(move || {
+                                    let outcome: Result<String, String> = (|| {
+                                        let storage_dir = crate::storage::get_storage_dir()
+                                            .map_err(|e| format!("Storage error: {}", e))?;
+                                        let db_path = storage_dir.join("questline.db");
+                                        let db = crate::database::Database::new(&db_path)
+                                            .map_err(|e| format!("Database error: {}", e))?;
+                                        let _ = db.queue_full_state_sync().map_err(|e| {
+                                            format!("Full-state queue failed: {}", e)
+                                        })?;
+                                        let sync_engine =
+                                            crate::services::sync_engine::SyncEngine::new(
+                                                &db,
+                                                &identity,
+                                                &device_id,
+                                                Some(&server_url),
+                                            )
+                                            .map_err(|e| format!("Sync init failed: {}", e))?;
+                                        sync_engine.sync().map_err(|e| {
+                                            format!("Full-state sync failed: {}", e)
+                                        })?;
+                                        let fresh_json = db
+                                            .export_to_json()
+                                            .map_err(|e| format!("Export failed: {}", e))?;
                                         let client = crate::services::api_client::ApiClient::new(
                                             &server_url,
                                             identity,
                                             &device_id,
                                         );
-                                        let outcome = match client
-                                            .send_request("POST", "recovery", &json)
-                                        {
-                                            Ok(_) => Ok(format!(
-                                                "Profile exported & cloud backup saved! Local: {}",
-                                                backup_display
-                                            )),
-                                            Err(e) => Err(format!(
-                                                "Profile exported to {} (cloud backup failed: {})",
-                                                backup_display, e
-                                            )),
-                                        };
-                                        if let Ok(mut slot) = result_slot.lock() {
-                                            *slot = Some(outcome);
-                                        }
-                                    });
-                                    (true, "Sealing your chronicle into the Æther... do not import on the new device until the backup completes.".to_string())
-                                } else {
-                                    (
-                                        false,
-                                        format!(
-                                            "Profile exported! Backup saved to {}",
-                                            backup_path.display()
-                                        ),
-                                    )
-                                }
+                                        client
+                                            .send_request("POST", "recovery", &fresh_json)
+                                            .map_err(|e| format!("Upload failed: {}", e))?;
+                                        Ok(format!(
+                                            "Profile exported & cloud backup saved! Local: {}",
+                                            backup_display
+                                        ))
+                                    })(
+                                    );
+                                    if let Ok(mut slot) = result_slot.lock() {
+                                        *slot = Some(outcome);
+                                    }
+                                });
+                                (true, "Sealing your chronicle into the Æther... do not import on the new device until this completes.".to_string())
                             } else {
                                 (
                                     false,
@@ -13900,18 +13917,6 @@ impl App {
         }
     }
 
-    fn set_pull_cursor_to_remote_head(
-        db: &crate::database::Database,
-        client: &crate::services::api_client::ApiClient,
-    ) -> Result<()> {
-        let resp = client.send_request("GET", "sync/head", "")?;
-        let val: serde_json::Value = serde_json::from_str(&resp)?;
-        let seq = val["seq"].as_i64().unwrap_or(0);
-        db.set_setting("last_pull_seq", &seq.to_string())?;
-        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
-        Ok(())
-    }
-
     fn local_folder_selected(&self) -> bool {
         use crate::audio::SOUNDSCAPES;
         self.active_screen == ActiveScreen::Soundscapes
@@ -14173,12 +14178,6 @@ impl App {
                 };
                 match self.db.import_from_json(&decoded_json) {
                     Ok(_) => {
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
-                            &self.device_id,
-                        );
-                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
                             "Chronicle restored from cloud!".to_string(),
@@ -14186,11 +14185,9 @@ impl App {
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
                             message:
-                                "Restore complete! Future sync starts from the current cloud state."
+                                "Restore complete! Sync will now catch up remaining cloud events."
                                     .to_string(),
                         };
-                        // Backup restore is a full snapshot. Set the cursor to server HEAD first
-                        // so old event-log history cannot replay over the restored database.
                         self.start_background_sync();
                     }
                     Err(e) => {
