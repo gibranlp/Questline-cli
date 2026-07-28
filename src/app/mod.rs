@@ -1923,13 +1923,25 @@ impl App {
         // If a full Questline DB folder is copied to another PC, it carries the old device_id too.
         // The server filters pulls with `device_id != current_device`, so cloned IDs make both PCs
         // hide each other's events. Bind the id to the first hostname that used it and repair copies.
+        let preserve_restore_cursor = |db: &crate::database::Database| {
+            if let Ok(Some(head_seq)) = db.get_setting("last_remote_head_seq") {
+                if head_seq.parse::<i64>().unwrap_or(0) > 0 {
+                    let _ = db.set_setting("last_pull_seq", &head_seq);
+                    let _ = db.set_setting("last_sync_lag", "0");
+                    let _ = db.set_setting("sync_restore_hold", "1");
+                    return;
+                }
+            }
+            let _ = db.set_setting("last_pull_seq", "0");
+        };
+
         let device_id = match db.get_setting("device_id")? {
             Some(id) => match db.get_setting("device_bound_name")? {
                 Some(bound_name) if bound_name != device_name => {
                     let new_id = Uuid::new_v4().to_string();
                     db.set_setting("device_id", &new_id)?;
                     db.set_setting("device_bound_name", &device_name)?;
-                    let _ = db.set_setting("last_pull_seq", "0");
+                    preserve_restore_cursor(&db);
                     let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                     new_id
                 }
@@ -1951,7 +1963,7 @@ impl App {
                         let new_id = Uuid::new_v4().to_string();
                         db.set_setting("device_id", &new_id)?;
                         db.set_setting("device_bound_name", &device_name)?;
-                        let _ = db.set_setting("last_pull_seq", "0");
+                        preserve_restore_cursor(&db);
                         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                         new_id
                     } else {
@@ -14515,10 +14527,30 @@ impl App {
         self.do_background_sync(false);
     }
 
+    fn scroll_links_are_safe_for_full_sync(&self) -> bool {
+        let counts = self.db.conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(project_id IS NULL), 0) FROM notes",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        );
+        match counts {
+            Ok((total, projectless)) => total == 0 || projectless * 2 < total,
+            Err(_) => false,
+        }
+    }
+
     fn start_forced_sync(&mut self) {
         if self.sync_in_progress {
             self.sync_status_msg = "S󰓦".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
+        if !self.scroll_links_are_safe_for_full_sync() {
+            let _ = self.db.set_setting("sync_restore_hold", "1");
+            self.sync_status_msg =
+                "Sync blocked: scroll project links need recovery first.".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            self.modal_state = ModalType::None;
             return;
         }
         self.sync_status_msg = "S󰓦".to_string();

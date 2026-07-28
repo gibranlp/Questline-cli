@@ -823,8 +823,10 @@ impl<'a> SyncEngine<'a> {
                             Ok(local_note) => {
                                 if let Some(ref content) = log.content {
                                     if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
-                                        if local_note.project_id.is_some()
-                                            && remote_note.project_id.is_none()
+                                        if (local_note.project_id.is_some()
+                                            && remote_note.project_id.is_none())
+                                            || (local_note.codex_id.is_some()
+                                                && remote_note.codex_id.is_none())
                                         {
                                             false
                                         } else if remote_note.updated_at > local_note.updated_at {
@@ -1162,7 +1164,15 @@ impl<'a> SyncEngine<'a> {
                                     params![log.entity_id],
                                 );
                                 pulled_count += 1;
-                            } else if let Ok(n) = serde_json::from_str::<Note>(content) {
+                            } else if let Ok(mut n) = serde_json::from_str::<Note>(content) {
+                                if let Ok(local_note) = self.db.get_note_by_id(n.id) {
+                                    if local_note.project_id.is_some() && n.project_id.is_none() {
+                                        n.project_id = local_note.project_id;
+                                    }
+                                    if local_note.codex_id.is_some() && n.codex_id.is_none() {
+                                        n.codex_id = local_note.codex_id;
+                                    }
+                                }
                                 let _ = self.db.conn.execute(
                                     "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                                     params![
