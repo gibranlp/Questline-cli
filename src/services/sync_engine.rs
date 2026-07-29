@@ -276,12 +276,12 @@ impl<'a> SyncEngine<'a> {
         // Pull and drain remote history first, then push local changes. This keeps restore and
         // normal sync incremental: a device learns the server head before it publishes anything.
         let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
-            self.sync_once(false)?;
+            self.sync_once(false, true)?;
         let mut drain_pages = 0usize;
 
         while has_more && drain_pages < MAX_DRAIN_PAGES {
             let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false)?;
+                self.sync_once(false, true)?;
             pushed += more_pushed;
             pulled += more_pulled;
             downloaded += more_downloaded;
@@ -291,7 +291,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-            self.sync_once(true)?;
+            self.sync_once(true, true)?;
         pushed += more_pushed;
         pulled += more_pulled;
         downloaded += more_downloaded;
@@ -300,7 +300,7 @@ impl<'a> SyncEngine<'a> {
 
         while has_more && drain_pages < MAX_DRAIN_PAGES {
             let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false)?;
+                self.sync_once(false, true)?;
             pushed += more_pushed;
             pulled += more_pulled;
             downloaded += more_downloaded;
@@ -315,9 +315,22 @@ impl<'a> SyncEngine<'a> {
         Ok((pushed, pulled, conflicts))
     }
 
+    /// Pushes pending local/full-state logs without pulling remote events.
+    ///
+    /// Cloud backup/export uses this so a known-good local snapshot can be uploaded even when the
+    /// remote event stream still contains older destructive updates that must not be applied.
+    pub fn push_pending_only(&self) -> Result<usize> {
+        let (pushed, _, _, _, _) = self.sync_once(true, false)?;
+        Ok(pushed)
+    }
+
     // One page of sync. `sync()` calls this in pull-before-push order; when `push_local` is true
-    // this still performs a small post-push pull so the cursor catches any concurrent events.
-    fn sync_once(&self, push_local: bool) -> Result<(usize, usize, Vec<String>, usize, bool)> {
+    // this normally performs a small post-push pull so the cursor catches any concurrent events.
+    fn sync_once(
+        &self,
+        push_local: bool,
+        pull_remote: bool,
+    ) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
         let mut pulled_count = 0;
@@ -702,6 +715,14 @@ impl<'a> SyncEngine<'a> {
         } else {
             Vec::new()
         };
+
+        if !pull_remote {
+            if !pushed_ids.is_empty() {
+                self.db.mark_sync_logs_synced(&pushed_ids)?;
+            }
+            self.db.update_device_sync_time(self.device_id)?;
+            return Ok((pushed_count, 0, Vec::new(), 0, false));
+        }
 
         // El cursor `since_seq` evita descargar toda la historia en cada sync
         let since_seq: i64 = self

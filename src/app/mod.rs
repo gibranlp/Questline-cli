@@ -6826,8 +6826,8 @@ impl App {
                                 )
                                 .map_err(|e| format!("Sync init failed: {}", e))?;
                                 sync_engine
-                                    .sync()
-                                    .map_err(|e| format!("Full-state sync failed: {}", e))?;
+                                    .push_pending_only()
+                                    .map_err(|e| format!("Full-state upload failed: {}", e))?;
                                 let json = db
                                     .export_to_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
@@ -6944,8 +6944,8 @@ impl App {
                                                 Some(&server_url),
                                             )
                                             .map_err(|e| format!("Sync init failed: {}", e))?;
-                                        sync_engine.sync().map_err(|e| {
-                                            format!("Full-state sync failed: {}", e)
+                                        sync_engine.push_pending_only().map_err(|e| {
+                                            format!("Full-state upload failed: {}", e)
                                         })?;
                                         let fresh_json = db
                                             .export_to_json()
