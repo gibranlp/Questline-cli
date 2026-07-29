@@ -359,6 +359,7 @@ impl<'a> SyncEngine<'a> {
         let mut pulled_count = 0;
 
         let pending = if push_local {
+            self.db.compact_pending_sync_logs()?;
             self.db.get_pending_sync_logs()?
         } else {
             Vec::new()

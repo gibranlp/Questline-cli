@@ -3004,7 +3004,7 @@ impl Database {
     }
 
     pub fn get_pending_sync_logs(&self) -> Result<Vec<(String, String, String, String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0")?;
+        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0 ORDER BY rowid ASC")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let et: String = row.get(1)?;
@@ -3018,6 +3018,23 @@ impl Database {
             logs.push(r?);
         }
         Ok(logs)
+    }
+
+    /// Keep only the newest unsynced event per entity. Sync payloads contain the entity's
+    /// complete current state, so older pending edits are redundant and can resurrect stale data.
+    pub fn compact_pending_sync_logs(&self) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM sync_log
+             WHERE synced = 0
+               AND rowid NOT IN (
+                   SELECT MAX(rowid)
+                   FROM sync_log
+                   WHERE synced = 0
+                   GROUP BY entity_type, entity_id
+               )",
+            [],
+        )?;
+        Ok(deleted)
     }
 
     // el IN dinámico con placeholders numerados es necesario porque rusqlite no acepta slices directamente en execute
@@ -3536,8 +3553,13 @@ impl Database {
             )
             .ok();
 
-        // FK off para importar sin importar el orden de tablas — se reactiva al final pase lo que pase
+        // Import all tables atomically. Foreign keys are disabled only while the transaction
+        // is active because exports are not required to list parent tables first.
         self.conn.execute("PRAGMA foreign_keys = OFF;", [])?;
+        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            let _ = self.conn.execute("PRAGMA foreign_keys = ON;", []);
+            return Err(error.into());
+        }
 
         let res = (|| -> Result<()> {
             for (table_name, rows_val) in map {
@@ -3635,35 +3657,61 @@ impl Database {
             // making sync silently diverge after the first restart post-restore.
             match pre_import_device_id {
                 Some(ref id) => {
-                    let _ = self.conn.execute(
+                    self.conn.execute(
                         "INSERT OR REPLACE INTO settings (key, value) VALUES ('device_id', ?1)",
                         params![id],
-                    );
+                    )?;
                 }
                 None => {
                     // This machine had no device_id before the import either; let App::new()
                     // generate a fresh one on next launch.
-                    let _ = self
-                        .conn
-                        .execute("DELETE FROM settings WHERE key = 'device_id'", []);
+                    self.conn
+                        .execute("DELETE FROM settings WHERE key = 'device_id'", [])?;
                 }
             }
             // Reset the pull cursor — the restored machine must pull the full event history
             // so it reaches the same state as the backup source.
-            let _ = self
-                .conn
-                .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", []);
-            let _ = self.conn.execute("UPDATE sync_log SET synced = 1", []);
+            self.conn
+                .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", [])?;
+            self.conn.execute("UPDATE sync_log SET synced = 1", [])?;
             // Clear dedup IDs from the backup source — they belong to a different device's
             // view of the event stream and would cause this machine to skip events it has
             // never actually applied.
-            let _ = self.conn.execute("DELETE FROM processed_remote_events", []);
+            self.conn
+                .execute("DELETE FROM processed_remote_events", [])?;
+
+            let foreign_key_errors: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if foreign_key_errors > 0 {
+                return Err(anyhow::anyhow!(
+                    "Imported backup contains {} foreign key violation(s)",
+                    foreign_key_errors
+                ));
+            }
 
             Ok(())
         })();
 
-        self.conn.execute("PRAGMA foreign_keys = ON;", [])?;
-        res
+        let transaction_result = match res {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        };
+        let foreign_key_result = self.conn.execute("PRAGMA foreign_keys = ON;", []);
+        transaction_result?;
+        foreign_key_result?;
+        Ok(())
     }
 
     pub fn get_recent_revisions(&self) -> Result<Vec<(String, String, String, i32, String)>> {
@@ -4993,6 +5041,59 @@ mod tests {
         let last_drink_at = db.hydration_last_drink_at().unwrap().unwrap();
         assert_eq!(last_drink_at.timestamp(), now.timestamp());
 
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn failed_json_import_rolls_back_all_changes() {
+        let db_file = Path::new("test_questline_db_import_rollback.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        db.set_setting("import_rollback_test", "preserved").unwrap();
+
+        let result = db.import_from_json(r#"{"settings":[42]}"#);
+
+        assert!(result.is_err());
+        assert_eq!(
+            db.get_setting("import_rollback_test").unwrap().as_deref(),
+            Some("preserved")
+        );
+        let foreign_keys_enabled: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys_enabled, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn pending_sync_compaction_keeps_only_latest_entity_state() {
+        let db_file = Path::new("test_questline_db_sync_compaction.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+
+        db.log_change("task", "task-a", "create").unwrap();
+        db.log_change("task", "task-a", "update").unwrap();
+        db.log_change("task", "task-a", "delete").unwrap();
+        db.log_change("task", "task-b", "create").unwrap();
+
+        assert_eq!(db.compact_pending_sync_logs().unwrap(), 2);
+        let pending = db.get_pending_sync_logs().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.2 == "task-a" && row.3 == "delete")
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.2 == "task-b" && row.3 == "create")
+        );
+
+        drop(db);
         let _ = std::fs::remove_file(db_file);
     }
 }
