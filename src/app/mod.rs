@@ -5255,7 +5255,9 @@ impl App {
 
     /// Maneja las teclas de la pantalla de selección inicial — navega entre las dos opciones y confirma.
     fn handle_gateway_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
+        let nav_code = Self::navigation_key_code(key);
+
+        match nav_code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.gateway_selected_idx > 0 {
                     self.gateway_selected_idx -= 1;
@@ -6737,6 +6739,8 @@ impl App {
     }
 
     fn handle_top_screen_key(&mut self, key: KeyEvent) -> Result<()> {
+        let nav_code = Self::navigation_key_code(key);
+
         if self.active_screen == ActiveScreen::GreatChronicle
             && key.code == KeyCode::Esc
             && self.chapter_panel_focused
@@ -6746,7 +6750,7 @@ impl App {
         }
 
         if self.active_screen == ActiveScreen::GreatChronicle
-            && key.code == KeyCode::Left
+            && nav_code == KeyCode::Left
             && self.chapter_panel_focused
         {
             self.chapter_panel_focused = false;
@@ -6754,7 +6758,7 @@ impl App {
         }
 
         if self.active_screen == ActiveScreen::GreatChronicle
-            && key.code == KeyCode::Right
+            && nav_code == KeyCode::Right
             && !self.chapter_panel_focused
         {
             self.chapter_panel_focused = true;
@@ -6763,7 +6767,7 @@ impl App {
 
         if self.active_screen == ActiveScreen::SyncSettings {
             match key.code {
-                KeyCode::Char('s') | KeyCode::Enter => {
+                KeyCode::Enter => {
                     if self.config.sync_enabled {
                         self.start_forced_sync();
                     } else {
@@ -6808,6 +6812,21 @@ impl App {
                             "Disabled"
                         }
                     );
+                    return Ok(());
+                }
+                KeyCode::Char('T') => {
+                    if self.external_notifications {
+                        crate::services::notifications::send_system_notification_with_icon(
+                            "Questline OS Alert Test",
+                            "If you can see this, macOS notifications are working.",
+                            false,
+                            crate::services::notifications::NotificationIcon::Info,
+                        );
+                        self.sync_status_msg = "OS alert test sent.".to_string();
+                    } else {
+                        self.sync_status_msg =
+                            "OS Alerts are disabled. Press [n] to enable them.".to_string();
+                    }
                     return Ok(());
                 }
                 KeyCode::Char('c') => {
@@ -7093,7 +7112,7 @@ impl App {
             return Ok(());
         }
 
-        match key.code {
+        match nav_code {
             // Los atajos 1-9 solo aplican fuera del Workspace — ahí el 1-4 son sub-tabs.
             KeyCode::Char('1') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Dashboard;
@@ -8283,6 +8302,20 @@ impl App {
         Ok(())
     }
 
+    fn navigation_key_code(key: KeyEvent) -> KeyCode {
+        if !key.modifiers.is_empty() {
+            return key.code;
+        }
+
+        match key.code {
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('l') => KeyCode::Right,
+            _ => key.code,
+        }
+    }
+
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) =
             match self.modal_state {
@@ -8937,7 +8970,9 @@ impl App {
             .cloned()
             .collect();
 
-        match key.code {
+        let nav_code = Self::navigation_key_code(key);
+
+        match nav_code {
             KeyCode::Esc => {
                 if self.note_preview_focused {
                     self.note_preview_focused = false;
@@ -9715,7 +9750,8 @@ impl App {
                         .into_iter()
                         .filter(|t| t.parent_task_id == Some(id))
                         .collect();
-                    match key.code {
+                    let nav_code = Self::navigation_key_code(key);
+                    match nav_code {
                         KeyCode::Up => {
                             let new_idx = if step_selected_idx > 0 {
                                 step_selected_idx - 1
