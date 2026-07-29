@@ -14744,6 +14744,38 @@ impl App {
         Ok(())
     }
 
+    fn local_db_health_error(db: &crate::database::Database) -> Option<String> {
+        let quick_check: String = db
+            .conn
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap_or_else(|e| format!("quick_check failed: {}", e));
+        if quick_check != "ok" {
+            return Some(format!("local database is malformed ({})", quick_check));
+        }
+
+        let counts = db.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id))",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        );
+        match counts {
+            Ok((projectless_notes, orphan_codices, mismatched_steps)) => {
+                if projectless_notes > 0 || orphan_codices > 0 || mismatched_steps > 0 {
+                    Some(format!(
+                        "{} projectless scrolls, {} orphan codices, {} step mismatches",
+                        projectless_notes, orphan_codices, mismatched_steps
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(format!("health check failed: {}", e)),
+        }
+    }
+
     fn start_cloud_sync_reset(&mut self) {
         if self.sync_in_progress {
             self.sync_status_msg = "S󰓦".to_string();
@@ -14910,6 +14942,14 @@ impl App {
                         .map_err(|e| anyhow::anyhow!("Full-state queue failed: {}", e))?;
                 }
                 let (pushed, pulled, conflicts) = sync_engine.sync()?;
+                if let Some(health_error) = Self::local_db_health_error(&db) {
+                    let _ = db.set_setting("auto_sync", "false");
+                    let _ = db.set_setting("sync_restore_hold", "1");
+                    return Err(anyhow::anyhow!(
+                        "Sync left local DB unhealthy: {}",
+                        health_error
+                    ));
+                }
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);

@@ -899,7 +899,12 @@ impl<'a> SyncEngine<'a> {
                                     false
                                 }
                             }
-                            _ => true,
+                            _ => log
+                                .content
+                                .as_ref()
+                                .and_then(|content| serde_json::from_str::<Task>(content).ok())
+                                .map(|remote_task| remote_task.project_id.is_some())
+                                .unwrap_or(false),
                         }
                     }
                 }
@@ -958,7 +963,15 @@ impl<'a> SyncEngine<'a> {
                                     false
                                 }
                             }
-                            _ => true,
+                            _ => log
+                                .content
+                                .as_ref()
+                                .and_then(|content| serde_json::from_str::<Note>(content).ok())
+                                .map(|remote_note| {
+                                    remote_note.project_id.is_some()
+                                        && remote_note.codex_id.is_some()
+                                })
+                                .unwrap_or(false),
                         }
                     }
                 }
@@ -1172,6 +1185,16 @@ impl<'a> SyncEngine<'a> {
                                         t.project_id = local.project_id;
                                     }
                                 }
+                                if t.project_id.is_none() {
+                                    conflicts.push(format!(
+                                        "Task '{}' rejected: missing project link",
+                                        t.title
+                                    ));
+                                    let _ = self.db.set_setting("auto_sync", "false");
+                                    let _ = self.db.set_setting("sync_restore_hold", "1");
+                                    newly_processed_ids.push(log.id);
+                                    continue;
+                                }
                                 let local_completed =
                                     local_task.as_ref().map(|lt| lt.completed).unwrap_or(false);
                                 let was_incomplete_locally = !local_completed;
@@ -1274,6 +1297,16 @@ impl<'a> SyncEngine<'a> {
                                     if local_note.codex_id.is_some() && n.codex_id.is_none() {
                                         n.codex_id = local_note.codex_id;
                                     }
+                                }
+                                if n.project_id.is_none() || n.codex_id.is_none() {
+                                    conflicts.push(format!(
+                                        "Scroll '{}' rejected: missing project/codex link",
+                                        n.title
+                                    ));
+                                    let _ = self.db.set_setting("auto_sync", "false");
+                                    let _ = self.db.set_setting("sync_restore_hold", "1");
+                                    newly_processed_ids.push(log.id);
+                                    continue;
                                 }
                                 let _ = self.db.conn.execute(
                                     "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
