@@ -14596,7 +14596,8 @@ impl App {
                 }
                 if include_contributions {
                     let _ = db.set_setting("sync_restore_hold", "0");
-                    let _ = db.queue_full_state_sync();
+                    db.queue_full_state_sync()
+                        .map_err(|e| anyhow::anyhow!("Full-state queue failed: {}", e))?;
                 }
                 let (pushed, pulled, conflicts) = sync_engine.sync()?;
 

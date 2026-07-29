@@ -727,6 +727,54 @@ impl<'a> SyncEngine<'a> {
         let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
         let mut newly_processed_ids: Vec<String> = Vec::new();
 
+        let mut destructive_note_unlinks = 0usize;
+        let mut destructive_task_unlinks = 0usize;
+        for log in &remote_logs {
+            if already_processed.contains(&log.id) || log.device_id == self.device_id {
+                continue;
+            }
+            let Some(content) = log.content.as_ref() else {
+                continue;
+            };
+            match log.entity_type.as_str() {
+                "note" if log.operation != "delete" => {
+                    if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
+                        if remote_note.project_id.is_none() || remote_note.codex_id.is_none() {
+                            if let Ok(local_note) = self.db.get_note_by_id(remote_note.id) {
+                                if (local_note.project_id.is_some()
+                                    && remote_note.project_id.is_none())
+                                    || (local_note.codex_id.is_some()
+                                        && remote_note.codex_id.is_none())
+                                {
+                                    destructive_note_unlinks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                "task" if log.operation != "delete" => {
+                    if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
+                        if remote_task.project_id.is_none() {
+                            if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
+                                if local_task.project_id.is_some() {
+                                    destructive_task_unlinks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if destructive_note_unlinks >= 5 || destructive_task_unlinks >= 5 {
+            let _ = self.db.set_setting("sync_restore_hold", "1");
+            return Err(anyhow::anyhow!(
+                "Refusing remote sync page: would unlink {} scrolls and {} tasks",
+                destructive_note_unlinks,
+                destructive_task_unlinks
+            ));
+        }
+
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
         for log in remote_logs {
@@ -1067,9 +1115,14 @@ impl<'a> SyncEngine<'a> {
                                     params![log.entity_id],
                                 );
                                 pulled_count += 1;
-                            } else if let Ok(t) = serde_json::from_str::<Task>(content) {
+                            } else if let Ok(mut t) = serde_json::from_str::<Task>(content) {
                                 // Triquete de completado: si ya está completa localmente, no la regresamos a incompleta
                                 let local_task = self.db.get_task_by_id(ent_uuid).ok();
+                                if let Some(local) = local_task.as_ref() {
+                                    if local.project_id.is_some() && t.project_id.is_none() {
+                                        t.project_id = local.project_id;
+                                    }
+                                }
                                 let local_completed =
                                     local_task.as_ref().map(|lt| lt.completed).unwrap_or(false);
                                 let was_incomplete_locally = !local_completed;

@@ -71,6 +71,7 @@ pub fn draw(
             t.project_id
                 .map(|id| active_ids.contains(&id))
                 .unwrap_or(false)
+                && !t.completed
                 && t.parent_task_id.is_some()
         })
         .count();
@@ -163,7 +164,9 @@ pub fn draw(
                 .count();
             let total_steps = all_tasks
                 .iter()
-                .filter(|t| t.project_id == Some(p.id) && t.parent_task_id.is_some())
+                .filter(|t| {
+                    t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_some()
+                })
                 .count();
             let scrolls = all_notes
                 .iter()
