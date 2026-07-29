@@ -213,6 +213,31 @@ impl DueDateType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskCalendarState {
+    pub selected: NaiveDate,
+    pub planner_mode: bool,
+    pub show_all_projects: bool,
+}
+
+impl TaskCalendarState {
+    fn date_picker(selected: NaiveDate) -> Self {
+        Self {
+            selected,
+            planner_mode: false,
+            show_all_projects: false,
+        }
+    }
+
+    fn month_planner(selected: NaiveDate) -> Self {
+        Self {
+            selected,
+            planner_mode: true,
+            show_all_projects: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchResultType {
     Project,
@@ -831,6 +856,8 @@ pub struct App {
     pub overlay_modal: ModalType,
     pub editor_state: Option<EditorState>,
     pub task_desc_editor: Option<EditorState>,
+    pub task_calendar: Option<TaskCalendarState>,
+    pub pending_calendar_due_date: Option<NaiveDate>,
 
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
@@ -1054,7 +1081,7 @@ enum DashboardCommandTarget {
 }
 
 fn edit_task_modal_from_task(task: &Task) -> ModalType {
-    let (due_date_type, due_date_val) = match task.due_date {
+    let (due_date_type, due_date_val) = match task.due_date.or(task.set_date) {
         None => (DueDateType::None, String::new()),
         Some(d) => {
             let today = Local::now().date_naive();
@@ -1081,10 +1108,7 @@ fn edit_task_modal_from_task(task: &Task) -> ModalType {
         priority: task.priority,
         due_date_type,
         due_date_val,
-        set_date_val: task
-            .set_date
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_default(),
+        set_date_val: String::new(),
         focus_idx: 0,
         step_selected_idx: 0,
         is_step: task.parent_task_id.is_some(),
@@ -2150,6 +2174,8 @@ impl App {
             overlay_modal: ModalType::None,
             editor_state: None,
             task_desc_editor: None,
+            task_calendar: None,
+            pending_calendar_due_date: None,
             dashboard_task_focus: true,
             selected_dashboard_task_idx: 0,
             searching: false,
@@ -2628,6 +2654,11 @@ impl App {
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         let key = normalize_ctrl_backspace(key);
 
+        if self.task_calendar.is_some() {
+            self.handle_task_calendar_key(key);
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.notifications.push(Notification::info(
                 "Use [q] to quit — seals the Chronicle and syncs before exit.",
@@ -2705,6 +2736,7 @@ impl App {
         if !in_text_entry && key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('t') => {
+                    self.pending_calendar_due_date = None;
                     if self.active_project_id.is_some() {
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
@@ -2713,8 +2745,8 @@ impl App {
                             desc: String::new(),
                             desc_cursor: 0,
                             priority: crate::models::task::TaskPriority::Medium,
-                            due_date_type: DueDateType::InDays,
-                            due_date_val: "1".to_string(),
+                            due_date_type: DueDateType::None,
+                            due_date_val: String::new(),
                             set_date_val: String::new(),
                             focus_idx: 0,
                             parent_task_id: None,
@@ -4185,6 +4217,7 @@ impl App {
                                         reward_xp: xp_val,
                                         daily_target,
                                         created_at: Utc::now(),
+                                        updated_at: Utc::now(),
                                     };
                                     self.db.insert_ritual(&rit)?;
                                     self.mark_dirty();
@@ -4288,6 +4321,7 @@ impl App {
                                 completed: false,
                                 xp_reward: tmpl.xp_reward,
                                 created_at: Utc::now(),
+                                updated_at: Utc::now(),
                                 tier: tmpl.tier as u8,
                                 template_id: tmpl.id.to_string(),
                             };
@@ -4934,10 +4968,8 @@ impl App {
                     KeyCode::Enter => {
                         let vis_options = ["Private", "Campaign Visible", "Fellowship Visible"];
                         let selected_vis = vis_options[idx].to_string();
-                        self.db.conn.execute(
-                            "UPDATE journal_entries SET visibility = ?1 WHERE id = ?2",
-                            params![selected_vis, entry_id.to_string()],
-                        )?;
+                        self.db.update_journal_visibility(entry_id, &selected_vis)?;
+                        self.mark_dirty();
                         self.modal_state = ModalType::None;
                         self.reload_data()?;
                     }
@@ -5182,6 +5214,9 @@ impl App {
                 let mut sel = selected_idx;
                 match key.code {
                     KeyCode::Esc => {
+                        if action_id == "create_task" {
+                            self.pending_calendar_due_date = None;
+                        }
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -5211,18 +5246,23 @@ impl App {
                         self.reload_data()?;
                         if action_id == "create_task" {
                             self.workspace_tab_idx = 0;
-                            self.modal_state = ModalType::NewTask {
-                                title: String::new(),
-                                desc: String::new(),
-                                desc_cursor: 0,
-                                priority: crate::models::task::TaskPriority::Medium,
-                                due_date_type: crate::app::DueDateType::InDays,
-                                due_date_val: "1".to_string(),
-                                set_date_val: String::new(),
-                                focus_idx: 0,
-                                parent_task_id: None,
-                                recurrence: None,
-                            };
+                            self.modal_state =
+                                if let Some(date) = self.pending_calendar_due_date.take() {
+                                    Self::new_task_modal_for_calendar_date(date)
+                                } else {
+                                    ModalType::NewTask {
+                                        title: String::new(),
+                                        desc: String::new(),
+                                        desc_cursor: 0,
+                                        priority: crate::models::task::TaskPriority::Medium,
+                                        due_date_type: crate::app::DueDateType::None,
+                                        due_date_val: String::new(),
+                                        set_date_val: String::new(),
+                                        focus_idx: 0,
+                                        parent_task_id: None,
+                                        recurrence: None,
+                                    }
+                                };
                         } else {
                             self.workspace_tab_idx = 1;
                             let mut state =
@@ -7516,6 +7556,25 @@ impl App {
                 self.active_screen = ActiveScreen::Archive;
                 self.active_tab_idx = 10;
             }
+            KeyCode::Char('C') if self.active_screen == ActiveScreen::Projects => {
+                let active: Vec<&Project> = self
+                    .projects
+                    .iter()
+                    .filter(|project| !project.archived && !project.completed)
+                    .collect();
+                if self.projects_all_selected {
+                    self.active_project_id = None;
+                    self.task_calendar =
+                        Some(TaskCalendarState::month_planner(Local::now().date_naive()));
+                } else if let Some(project) = active.get(self.selected_project_idx) {
+                    self.active_project_id = Some(project.id);
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 0;
+                    self.reload_data()?;
+                    self.task_calendar =
+                        Some(TaskCalendarState::month_planner(Local::now().date_naive()));
+                }
+            }
             KeyCode::Char('g') | KeyCode::Char('G')
                 if self.active_screen == ActiveScreen::Library =>
             {
@@ -8182,6 +8241,7 @@ impl App {
                                         name: invite.2.clone(),
                                         description: Some("Fellowship shared project".to_string()),
                                         created_at: Utc::now(),
+                                        updated_at: Utc::now(),
                                         archived: false,
                                         completed: false,
                                         owner_identity: Some(invite.3.clone()),
@@ -8966,6 +9026,7 @@ impl App {
                 name: name.trim().to_string(),
                 description: project_desc,
                 created_at: Utc::now(),
+                updated_at: Utc::now(),
                 archived: false,
                 completed: false,
                 owner_identity: Some(self.identity.public_key.clone()),
@@ -9263,6 +9324,10 @@ impl App {
             KeyCode::Char('/') => {
                 self.searching = true;
                 self.search_query.clear();
+            }
+            KeyCode::Char('C') => {
+                self.task_calendar =
+                    Some(TaskCalendarState::month_planner(Local::now().date_naive()));
             }
             KeyCode::Char('1') => {
                 self.workspace_tab_idx = 0;
@@ -9575,35 +9640,9 @@ impl App {
                                     true,
                                 );
                                 self.maybe_spawn_task_completion_sprite();
-                                // Tarea recurrente — genera la siguiente ocurrencia automáticamente
-                                if let Some(recurrence) = t.recurrence {
-                                    let next_due = Self::advance_recurrence_date(
-                                        t.set_date.or(t.due_date),
-                                        recurrence,
-                                    );
-                                    let next_task = Task {
-                                        id: Uuid::new_v4(),
-                                        project_id: t.project_id,
-                                        title: t.title.clone(),
-                                        description: t.description.clone(),
-                                        due_date: Some(next_due),
-                                        set_date: Some(next_due),
-                                        completed: false,
-                                        priority: t.priority,
-                                        created_at: Utc::now(),
-                                        updated_at: Utc::now(),
-                                        owner_identity: t.owner_identity.clone(),
-                                        owner_username: t.owner_username.clone(),
-                                        parent_task_id: None,
-                                        xp_awarded: false,
-                                        recurrence: Some(recurrence),
-                                    };
-                                    let _ = self.db.insert_task(&next_task);
-                                    let recur_label = recurrence.name();
-                                    self.notifications.push(Notification::info(format!(
-                                        "Quest recurring! Next {} occurrence queued for {}.",
-                                        recur_label,
-                                        next_due.with_timezone(&Local).format("%Y-%m-%d")
+                                if let Err(error) = self.queue_next_recurring_quest(&t) {
+                                    self.notifications.push(Notification::warning(format!(
+                                        "The quest was completed, but its next recurrence could not be created: {error}"
                                     )));
                                 }
                                 self.reload_data()?;
@@ -10003,11 +10042,10 @@ impl App {
                 is_step,
                 recurrence,
             } => {
-                // índice del bloque de steps — depende de si hay campo de valor de fecha
+                // índice del bloque de steps — depende de si hay valor de fecha y recurrencia
                 let has_due_value =
                     matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-                let set_date_focus = if has_due_value { 5usize } else { 4usize };
-                let recurrence_focus = set_date_focus + 1;
+                let recurrence_focus = if has_due_value { 5usize } else { 4usize };
                 let steps_focus = recurrence_focus + 1;
 
                 // Handle step-section keys when focus is on the steps list
@@ -10167,7 +10205,7 @@ impl App {
                         KeyCode::Char('e') => {
                             if let Some(step) = steps.get(step_selected_idx) {
                                 let today = Local::now().date_naive();
-                                let (due_type, due_val) = match step.due_date {
+                                let (due_type, due_val) = match step.due_date.or(step.set_date) {
                                     None => (DueDateType::None, String::new()),
                                     Some(d) => {
                                         let d_naive = d.with_timezone(&Local).date_naive();
@@ -10195,12 +10233,7 @@ impl App {
                                     priority: step.priority,
                                     due_date_type: due_type,
                                     due_date_val: due_val,
-                                    set_date_val: step
-                                        .set_date
-                                        .map(|d| {
-                                            d.with_timezone(&Local).format("%Y-%m-%d").to_string()
-                                        })
-                                        .unwrap_or_default(),
+                                    set_date_val: String::new(),
                                     focus_idx: 0,
                                     step_selected_idx: 0,
                                     is_step: true,
@@ -10250,6 +10283,7 @@ impl App {
                             project_id,
                             name: name.trim().to_string(),
                             created_at: Utc::now(),
+                            updated_at: Utc::now(),
                             parent_codex_id: pcid,
                             collapsed: false,
                         };
@@ -10339,7 +10373,7 @@ impl App {
         mut priority: TaskPriority,
         mut due_date_type: DueDateType,
         mut due_date_val: String,
-        mut set_date_val: String,
+        set_date_val: String,
         mut focus_idx: usize,
         parent_task_id: Option<Uuid>,
         step_selected_idx: usize,
@@ -10349,10 +10383,12 @@ impl App {
         // Recurrencia disponible solo para tareas padre (no pasos ni subtareas)
         let show_recurrence = !is_step && parent_task_id.is_none();
         let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-        let set_date_focus: usize = if has_due_value { 5 } else { 4 };
-        // índice dinámico del campo de recurrencia — viene después de Set Date
-        let recurrence_focus: usize = set_date_focus + 1;
-        let steps_focus: usize = recurrence_focus + 1;
+        let recurrence_focus: usize = if has_due_value { 5 } else { 4 };
+        let steps_focus: usize = if show_recurrence {
+            recurrence_focus + 1
+        } else {
+            recurrence_focus
+        };
 
         let has_steps_section = task_id.is_some() && !is_step;
         let max_fields = if has_steps_section {
@@ -10360,12 +10396,23 @@ impl App {
         } else if show_recurrence {
             recurrence_focus
         } else if has_due_value {
-            set_date_focus
+            4
         } else {
-            set_date_focus
+            3
         };
         let next_focus = |idx: usize| -> usize { (idx + 1) % (max_fields + 1) };
         let prev_focus = |idx: usize| -> usize { if idx > 0 { idx - 1 } else { max_fields } };
+
+        if key.code == KeyCode::Char('c') && matches!(focus_idx, 3 | 4) {
+            let selected = if due_date_type == DueDateType::Specific {
+                NaiveDate::parse_from_str(due_date_val.trim(), "%Y-%m-%d")
+                    .unwrap_or_else(|_| Local::now().date_naive())
+            } else {
+                Local::now().date_naive()
+            };
+            self.task_calendar = Some(TaskCalendarState::date_picker(selected));
+            return Ok(());
+        }
 
         if focus_idx == 1 {
             self.ensure_task_desc_editor(project_id, &desc, desc_cursor, true);
@@ -10393,15 +10440,7 @@ impl App {
                     DueDateType::Specific => due_date_val.trim().to_string(),
                 };
                 let due_parsed = self.parse_due_date_input(&due_str);
-                let set_parsed = if set_date_val.trim().is_empty() {
-                    None
-                } else {
-                    self.parse_due_date_input(set_date_val.trim())
-                };
                 if due_date_type != DueDateType::None && due_parsed.is_none() {
-                    return Ok(());
-                }
-                if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                     return Ok(());
                 }
                 let xp_service = XPService::new(&self.db);
@@ -10412,7 +10451,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
-                        set_date: set_parsed,
+                        set_date: None,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -10447,7 +10486,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
-                        set_date: set_parsed,
+                        set_date: None,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -10830,9 +10869,6 @@ impl App {
                     4 if has_due_value && due_date_val.len() < 20 => {
                         due_date_val.push(c);
                     }
-                    _ if focus_idx == set_date_focus && set_date_val.len() < 10 => {
-                        set_date_val.push(c);
-                    }
                     _ if show_recurrence && focus_idx == recurrence_focus && c == ' ' => {
                         recurrence = match recurrence {
                             None => Some(RecurrenceType::Daily),
@@ -10891,13 +10927,6 @@ impl App {
                             due_date_val.pop();
                         }
                     }
-                    _ if focus_idx == set_date_focus => {
-                        if is_ctrl_backspace(key) {
-                            delete_last_word(&mut set_date_val);
-                        } else {
-                            set_date_val.pop();
-                        }
-                    }
                     _ => {}
                 }
                 self.update_task_modal_state(
@@ -10952,17 +10981,8 @@ impl App {
                         DueDateType::Specific => due_date_val.trim().to_string(),
                     };
                     let due_parsed = self.parse_due_date_input(&due_str);
-                    let set_parsed = if set_date_val.trim().is_empty() {
-                        None
-                    } else {
-                        self.parse_due_date_input(set_date_val.trim())
-                    };
-
                     if due_date_type != DueDateType::None && due_parsed.is_none() {
                         // Do not save, wait for valid input
-                        return Ok(());
-                    }
-                    if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                         return Ok(());
                     }
 
@@ -10974,7 +10994,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
-                            set_date: set_parsed,
+                            set_date: None,
                             completed: false, // kept
                             priority,
                             created_at: Utc::now(),
@@ -11018,7 +11038,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
-                            set_date: set_parsed,
+                            set_date: None,
                             completed: false,
                             priority,
                             created_at: Utc::now(),
@@ -11158,6 +11178,7 @@ impl App {
                     entry_date: Utc::now().date_naive(),
                     content: content.trim().to_string(),
                     created_at: Utc::now(),
+                    updated_at: Utc::now(),
                     visibility: "Private".to_string(),
                     author_username: author,
                 };
@@ -11179,48 +11200,6 @@ impl App {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn sync_screen_tab(&mut self) {
-        self.active_screen = match self.active_tab_idx {
-            0 => ActiveScreen::Dashboard,
-            1 => ActiveScreen::Projects,
-            2 => ActiveScreen::Character,
-            3 => ActiveScreen::Character,
-            4 => ActiveScreen::Library,
-            5 => ActiveScreen::Legends,
-            6 => ActiveScreen::Focus,
-            7 => ActiveScreen::Soundscapes,
-            8 => {
-                self.pull_invitations_async();
-                ActiveScreen::Fellowship
-            }
-            9 => ActiveScreen::Settings,
-            10 => ActiveScreen::Archive,
-            11 => ActiveScreen::Dashboard,
-            12 => ActiveScreen::SyncSettings,
-            13 => {
-                self.about_scroll = 0;
-                use rand::Rng;
-                self.about_fact_seed = rand::thread_rng().r#gen();
-                ActiveScreen::About
-            }
-            14 => {
-                self.great_chronicle_scroll = 0;
-                self.chapter_panel_scroll = 0;
-                self.chapter_panel_focused = false;
-                self.great_chronicle_entries =
-                    self.db.get_global_chronicle_entries().unwrap_or_default();
-                self.pull_great_chronicle_async();
-                self.pull_chapter_progress_async();
-                ActiveScreen::GreatChronicle
-            }
-            _ => ActiveScreen::Dashboard,
-        };
-        self.active_project_id = None; // Reset workspace focus
-        self.stats_cache.active_project_milestones.clear();
-        self.stats_cache.active_project_days = 0;
-    }
-
     // Calcula la siguiente fecha de una tarea recurrente — avanza por el período correcto
     fn advance_recurrence_date(
         due_date: Option<DateTime<Utc>>,
@@ -11238,6 +11217,204 @@ impl App {
                 .checked_add_months(Months::new(12))
                 .unwrap_or(base + chrono::Duration::days(365)),
         }
+    }
+
+    fn shift_calendar_month(date: NaiveDate, delta: i32) -> NaiveDate {
+        use chrono::Datelike;
+        let month_index = date.year() * 12 + date.month0() as i32 + delta;
+        let year = month_index.div_euclid(12);
+        let month = month_index.rem_euclid(12) as u32 + 1;
+        let next_month_index = month_index + 1;
+        let next_year = next_month_index.div_euclid(12);
+        let next_month = next_month_index.rem_euclid(12) as u32 + 1;
+        let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .expect("valid calendar month")
+            .pred_opt()
+            .expect("calendar month has a previous day")
+            .day();
+        NaiveDate::from_ymd_opt(year, month, date.day().min(last_day))
+            .expect("clamped calendar date")
+    }
+
+    fn apply_calendar_date(modal: &mut ModalType, selected: NaiveDate) {
+        let value = selected.format("%Y-%m-%d").to_string();
+        match modal {
+            ModalType::NewTask {
+                due_date_type,
+                due_date_val,
+                focus_idx,
+                ..
+            }
+            | ModalType::EditTask {
+                due_date_type,
+                due_date_val,
+                focus_idx,
+                ..
+            } => {
+                *due_date_type = DueDateType::Specific;
+                *due_date_val = value;
+                *focus_idx = 4;
+            }
+            _ => {}
+        }
+    }
+
+    fn new_task_modal_for_calendar_date(selected: NaiveDate) -> ModalType {
+        ModalType::NewTask {
+            title: String::new(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::Specific,
+            due_date_val: selected.format("%Y-%m-%d").to_string(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        }
+    }
+
+    fn begin_task_from_calendar(&mut self, selected: NaiveDate) {
+        if self.active_project_id.is_some() {
+            self.modal_state = Self::new_task_modal_for_calendar_date(selected);
+        } else {
+            self.pending_calendar_due_date = Some(selected);
+            self.modal_state = ModalType::SelectProjectForAction {
+                action_id: "create_task",
+                selected_idx: 0,
+            };
+        }
+        self.task_calendar = None;
+    }
+
+    fn handle_task_calendar_key(&mut self, key: KeyEvent) {
+        let Some(mut calendar) = self.task_calendar else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.task_calendar = None;
+                return;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                calendar.selected -= chrono::Duration::days(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                calendar.selected += chrono::Duration::days(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                calendar.selected -= chrono::Duration::days(7);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                calendar.selected += chrono::Duration::days(7);
+            }
+            KeyCode::PageUp | KeyCode::Char('[') => {
+                calendar.selected = Self::shift_calendar_month(calendar.selected, -1);
+            }
+            KeyCode::PageDown | KeyCode::Char(']') => {
+                calendar.selected = Self::shift_calendar_month(calendar.selected, 1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                calendar.selected = Local::now().date_naive();
+            }
+            KeyCode::Char('a') if calendar.planner_mode && self.active_project_id.is_some() => {
+                calendar.show_all_projects = !calendar.show_all_projects;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if calendar.planner_mode {
+                    self.begin_task_from_calendar(calendar.selected);
+                } else if self.overlay_modal != ModalType::None {
+                    Self::apply_calendar_date(&mut self.overlay_modal, calendar.selected);
+                } else {
+                    Self::apply_calendar_date(&mut self.modal_state, calendar.selected);
+                }
+                self.task_calendar = None;
+                return;
+            }
+            KeyCode::Char('n') if calendar.planner_mode => {
+                self.begin_task_from_calendar(calendar.selected);
+                return;
+            }
+            _ => {}
+        }
+        self.task_calendar = Some(calendar);
+    }
+
+    fn build_next_recurring_quest(
+        source: &Task,
+        source_steps: &[Task],
+        now: DateTime<Utc>,
+    ) -> Option<(Task, Vec<Task>, DateTime<Utc>)> {
+        let recurrence = source.recurrence?;
+        let next_due =
+            Self::advance_recurrence_date(source.due_date.or(source.set_date), recurrence);
+        let next_id = Uuid::new_v4();
+        let next_task = Task {
+            id: next_id,
+            project_id: source.project_id,
+            title: source.title.clone(),
+            description: source.description.clone(),
+            due_date: Some(next_due),
+            set_date: None,
+            completed: false,
+            priority: source.priority,
+            created_at: now,
+            updated_at: now,
+            owner_identity: source.owner_identity.clone(),
+            owner_username: source.owner_username.clone(),
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: Some(recurrence),
+        };
+        let next_steps = source_steps
+            .iter()
+            .filter(|step| step.parent_task_id == Some(source.id))
+            .map(|step| Task {
+                id: Uuid::new_v4(),
+                project_id: source.project_id,
+                title: step.title.clone(),
+                description: step.description.clone(),
+                due_date: step
+                    .due_date
+                    .or(step.set_date)
+                    .map(|date| Self::advance_recurrence_date(Some(date), recurrence)),
+                set_date: None,
+                completed: false,
+                priority: step.priority,
+                created_at: now,
+                updated_at: now,
+                owner_identity: step.owner_identity.clone(),
+                owner_username: step.owner_username.clone(),
+                parent_task_id: Some(next_id),
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .collect();
+        Some((next_task, next_steps, next_due))
+    }
+
+    fn queue_next_recurring_quest(&mut self, source: &Task) -> Result<()> {
+        let source_steps: Vec<Task> = self
+            .all_tasks
+            .iter()
+            .filter(|task| task.parent_task_id == Some(source.id))
+            .cloned()
+            .collect();
+        let Some((next_task, next_steps, next_due)) =
+            Self::build_next_recurring_quest(source, &source_steps, Utc::now())
+        else {
+            return Ok(());
+        };
+        self.db.insert_task_tree(&next_task, &next_steps)?;
+        let recurrence = source.recurrence.expect("recurrence checked above");
+        self.notifications.push(Notification::info(format!(
+            "Quest recurring! Next {} occurrence queued for {} with {} reusable step{}.",
+            recurrence.name(),
+            next_due.with_timezone(&Local).format("%Y-%m-%d"),
+            next_steps.len(),
+            if next_steps.len() == 1 { "" } else { "s" }
+        )));
+        Ok(())
     }
 
     // Helper function to parse due date inputs, including today, tomorrow, and 'in X days'.
@@ -11508,7 +11685,8 @@ impl App {
         let Some(target) = local_days_from_now_at_noon(days) else {
             return Ok(());
         };
-        task.set_date = Some(target);
+        task.due_date = Some(target);
+        task.set_date = None;
         self.db.update_task(&task)?;
         self.mark_dirty();
         let label = if days == 1 {
@@ -11648,26 +11826,10 @@ impl App {
         };
         self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
         self.maybe_spawn_task_completion_sprite();
-        if let Some(recurrence) = t.recurrence {
-            let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
-            let next_task = Task {
-                id: Uuid::new_v4(),
-                project_id: t.project_id,
-                title: t.title.clone(),
-                description: t.description.clone(),
-                due_date: Some(next_due),
-                set_date: Some(next_due),
-                completed: false,
-                priority: t.priority,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                owner_identity: t.owner_identity.clone(),
-                owner_username: t.owner_username.clone(),
-                parent_task_id: None,
-                xp_awarded: false,
-                recurrence: Some(recurrence),
-            };
-            let _ = self.db.insert_task(&next_task);
+        if let Err(error) = self.queue_next_recurring_quest(&t) {
+            self.notifications.push(Notification::warning(format!(
+                "The quest was completed, but its next recurrence could not be created: {error}"
+            )));
         }
         self.reload_data()?;
         self.maybe_show_support_realm_prompt()?;
@@ -13386,6 +13548,7 @@ impl App {
                 };
             }
             "create_task" => {
+                self.pending_calendar_due_date = None;
                 if self.active_project_id.is_some() {
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
@@ -13394,8 +13557,8 @@ impl App {
                         desc: String::new(),
                         desc_cursor: 0,
                         priority: TaskPriority::Medium,
-                        due_date_type: DueDateType::InDays,
-                        due_date_val: "1".to_string(),
+                        due_date_type: DueDateType::None,
+                        due_date_val: String::new(),
                         set_date_val: String::new(),
                         focus_idx: 0,
                         parent_task_id: None,
@@ -17460,6 +17623,118 @@ mod app_tests {
     use std::path::Path;
 
     #[test]
+    fn recurring_quest_copies_steps_and_resets_completion() {
+        let now = Utc::now();
+        let source_id = Uuid::new_v4();
+        let source = Task {
+            id: source_id,
+            project_id: None,
+            title: "Weekly planning".to_string(),
+            description: Some("Prepare the week".to_string()),
+            due_date: Some(now),
+            set_date: Some(now + chrono::Duration::days(3)),
+            completed: true,
+            priority: TaskPriority::High,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: true,
+            recurrence: Some(RecurrenceType::Weekly),
+        };
+        let source_step = Task {
+            id: Uuid::new_v4(),
+            title: "Review calendar".to_string(),
+            description: Some("Look for conflicts".to_string()),
+            due_date: None,
+            set_date: Some(now + chrono::Duration::days(1)),
+            completed: true,
+            priority: TaskPriority::Medium,
+            parent_task_id: Some(source_id),
+            xp_awarded: true,
+            recurrence: None,
+            ..source.clone()
+        };
+
+        let (next, steps, next_due) =
+            App::build_next_recurring_quest(&source, &[source_step], now).unwrap();
+
+        assert_eq!(next_due, now + chrono::Duration::days(7));
+        assert!(!next.completed);
+        assert!(!next.xp_awarded);
+        assert_eq!(next.set_date, None);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].parent_task_id, Some(next.id));
+        assert_eq!(steps[0].title, "Review calendar");
+        assert!(!steps[0].completed);
+        assert!(!steps[0].xp_awarded);
+        assert_eq!(steps[0].recurrence, None);
+        assert_eq!(steps[0].due_date, Some(now + chrono::Duration::days(8)));
+        assert_eq!(steps[0].set_date, None);
+    }
+
+    #[test]
+    fn task_calendar_selects_a_specific_due_date_without_changing_recurrence() {
+        let mut modal = ModalType::NewTask {
+            title: "Fast capture".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 3,
+            parent_task_id: None,
+            recurrence: Some(RecurrenceType::Monthly),
+        };
+        let selected = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        App::apply_calendar_date(&mut modal, selected);
+
+        assert!(matches!(
+            modal,
+            ModalType::NewTask {
+                due_date_type: DueDateType::Specific,
+                ref due_date_val,
+                recurrence: Some(RecurrenceType::Monthly),
+                ..
+            } if due_date_val == "2026-08-31"
+        ));
+        assert_eq!(
+            App::shift_calendar_month(selected, 1),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()
+        );
+
+        let january_31 = Utc.with_ymd_and_hms(2026, 1, 31, 12, 0, 0).unwrap();
+        assert_eq!(
+            App::advance_recurrence_date(Some(january_31), RecurrenceType::Monthly).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+        let leap_day = Utc.with_ymd_and_hms(2024, 2, 29, 12, 0, 0).unwrap();
+        assert_eq!(
+            App::advance_recurrence_date(Some(leap_day), RecurrenceType::Yearly).date_naive(),
+            NaiveDate::from_ymd_opt(2025, 2, 28).unwrap()
+        );
+
+        let planner = TaskCalendarState::month_planner(selected);
+        assert!(planner.planner_mode);
+        assert!(planner.show_all_projects);
+        let picker = TaskCalendarState::date_picker(selected);
+        assert!(!picker.planner_mode);
+
+        assert!(matches!(
+            App::new_task_modal_for_calendar_date(selected),
+            ModalType::NewTask {
+                due_date_type: DueDateType::Specific,
+                ref due_date_val,
+                set_date_val: ref legacy_set_date,
+                ..
+            } if due_date_val == "2026-08-31" && legacy_set_date.is_empty()
+        ));
+    }
+
+    #[test]
     fn test_delete_word_before_cursor() {
         let mut input = "one two three".to_string();
         let end = input.len();
@@ -17713,6 +17988,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -18238,6 +18514,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -18254,6 +18531,7 @@ mod app_tests {
             xp_reward: 100,
             // Use a very old created_at so legacy age check passes
             created_at: Utc::now() - chrono::Duration::days(10),
+            updated_at: Utc::now(),
             tier: 0,
             template_id: String::new(), // legacy milestone — uses hardcoded checks
         };
@@ -18297,6 +18575,7 @@ mod app_tests {
             content: "Journal entry".to_string(),
             entry_date: chrono::Utc::now().date_naive(),
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             visibility: "Private".to_string(),
             author_username: String::new(),
         };
@@ -18348,6 +18627,7 @@ mod app_tests {
             reward_xp: 30,
             daily_target: 1,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         app.db.insert_ritual(&rit).unwrap();
         app.reload_data().unwrap();
@@ -18394,6 +18674,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -18480,6 +18761,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -18968,6 +19250,7 @@ mod app_tests {
             name: "Test Project".to_string(),
             description: None,
             created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
             archived: false,
             completed: false,
             owner_identity: None,

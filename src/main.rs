@@ -884,6 +884,16 @@ async fn main() -> Result<()> {
                 }
             }
 
+            if let Some(calendar) = app.task_calendar {
+                screens::project_workspace::draw_task_calendar(
+                    f,
+                    app.active_project_id,
+                    &app.all_tasks,
+                    calendar,
+                    &theme,
+                );
+            }
+
             // Limpia notificaciones viejas cada frame — solo duran 4 segundos y bye
             app.notifications.retain(|n| n.unlocked_at.elapsed().as_secs() < 4);
 

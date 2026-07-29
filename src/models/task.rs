@@ -63,10 +63,6 @@ impl TaskPriority {
     }
 }
 
-fn default_now() -> DateTime<Utc> {
-    Utc::now()
-}
-
 // Model representing a task, optionally bound to a project.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
@@ -75,13 +71,14 @@ pub struct Task {
     pub title: String,
     pub description: Option<String>,
     pub due_date: Option<DateTime<Utc>>,
+    // Retired scheduling field retained only for older sync payloads/backups.
     #[serde(default)]
     pub set_date: Option<DateTime<Utc>>,
     pub completed: bool,
     pub priority: TaskPriority,
     pub created_at: DateTime<Utc>,
     // updated_at — crítico para resolver conflictos entre dispositivos con Latest Edit Wins
-    #[serde(default = "default_now")]
+    #[serde(default = "crate::models::default_sync_timestamp")]
     pub updated_at: DateTime<Utc>,
     pub owner_identity: Option<String>,
     pub owner_username: Option<String>,
@@ -93,4 +90,15 @@ pub struct Task {
     // recurrence — si está definida, al completarse se genera una nueva copia de la tarea con fecha avanzada
     #[serde(default)]
     pub recurrence: Option<RecurrenceType>,
+}
+
+impl Task {
+    /// Converts the retired Set Date field into the canonical Due Date.
+    /// `set_date` remains serialized temporarily for compatibility with older clients.
+    pub fn normalize_schedule(&mut self) {
+        if self.due_date.is_none() {
+            self.due_date = self.set_date;
+        }
+        self.set_date = None;
+    }
 }

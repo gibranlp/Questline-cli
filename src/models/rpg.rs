@@ -587,6 +587,8 @@ pub struct Ritual {
     pub reward_xp: i32,
     pub daily_target: i32,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::models::default_sync_timestamp")]
+    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -598,6 +600,8 @@ pub struct Milestone {
     pub completed: bool,
     pub xp_reward: i32,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::models::default_sync_timestamp")]
+    pub updated_at: DateTime<Utc>,
     // 0 = legacy/custom, 1 = Initiate, 2 = Veteran, 3 = Legendary — no hay un enum porque se serializa directo a SQLite
     pub tier: u8,
     // vacío ("") cuando el milestone es legacy o fue creado a mano, no desde un template

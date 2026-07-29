@@ -26,3 +26,7 @@ pub use rpg::{
 pub use task::{RecurrenceType, Task, TaskPriority};
 pub use user::{ClassType, User};
 pub use xp_event::XPEvent;
+
+pub(crate) fn default_sync_timestamp() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from(std::time::UNIX_EPOCH)
+}

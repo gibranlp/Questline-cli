@@ -298,6 +298,39 @@ impl<'a> SyncEngine<'a> {
             .unwrap_or(false)
     }
 
+    fn timestamp_or_epoch(value: Option<&str>) -> DateTime<Utc> {
+        value
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(crate::models::default_sync_timestamp)
+    }
+
+    fn incoming_entity_is_newer(&self, table: &str, log: &SyncLogEntry) -> bool {
+        let incoming = if log.operation == "delete" {
+            Self::timestamp_or_epoch(Some(&log.timestamp))
+        } else {
+            let value = log
+                .content
+                .as_ref()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+            Self::timestamp_or_epoch(
+                value
+                    .as_ref()
+                    .and_then(|value| value["updated_at"].as_str()),
+            )
+        };
+        let sql = format!("SELECT updated_at FROM {} WHERE id = ?1", table);
+        match self
+            .db
+            .conn
+            .query_row(&sql, params![log.entity_id], |row| row.get::<_, String>(0))
+        {
+            Ok(local) => incoming > Self::timestamp_or_epoch(Some(&local)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
         // Pull and drain remote history first, then push local changes. This keeps restore and
         // normal sync incremental: a device learns the server head before it publishes anything.
@@ -389,22 +422,24 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                     .and_then(|n| serde_json::to_string(&n).ok()),
                 "project" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared FROM projects WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared FROM projects WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id_str: String = row.get(0)?;
                         let name: String = row.get(1)?;
                         let desc: Option<String> = row.get(2)?;
                         let created: String = row.get(3)?;
-                        let archived: i32 = row.get(4)?;
-                        let completed: i32 = row.get(5)?;
-                        let owner_id: Option<String> = row.get(6)?;
-                        let owner_name: Option<String> = row.get(7)?;
-                        let is_shared: i32 = row.get(8)?;
+                        let updated: String = row.get(4)?;
+                        let archived: i32 = row.get(5)?;
+                        let completed: i32 = row.get(6)?;
+                        let owner_id: Option<String> = row.get(7)?;
+                        let owner_name: Option<String> = row.get(8)?;
+                        let is_shared: i32 = row.get(9)?;
                         Ok(serde_json::json!({
                             "id": id_str,
                             "name": name,
                             "description": desc,
                             "created_at": created,
+                            "updated_at": updated,
                             "archived": archived != 0,
                             "completed": completed != 0,
                             "owner_identity": owner_id,
@@ -416,21 +451,23 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                 }
                 "journal_entry" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, entry_date, content, created_at, visibility, author_username FROM journal_entries WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, entry_date, content, created_at, updated_at, visibility, author_username FROM journal_entries WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
                         let pid: String = row.get(1)?;
                         let date: String = row.get(2)?;
                         let content: String = row.get(3)?;
                         let created: String = row.get(4)?;
-                        let visibility: String = row.get(5)?;
-                        let author: String = row.get(6)?;
+                        let updated: String = row.get(5)?;
+                        let visibility: String = row.get(6)?;
+                        let author: String = row.get(7)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "project_id": pid,
                             "entry_date": date,
                             "content": content,
                             "created_at": created,
+                            "updated_at": updated,
                             "visibility": visibility,
                             "author_username": author,
                         })
@@ -439,7 +476,7 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                 }
                 "milestone" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, tier, template_id FROM milestones WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id FROM milestones WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
                         let pid: String = row.get(1)?;
@@ -448,8 +485,9 @@ impl<'a> SyncEngine<'a> {
                         let completed: i32 = row.get(4)?;
                         let xp: i32 = row.get(5)?;
                         let created: String = row.get(6)?;
-                        let tier: i32 = row.get(7)?;
-                        let template_id: String = row.get(8)?;
+                        let updated: String = row.get(7)?;
+                        let tier: i32 = row.get(8)?;
+                        let template_id: String = row.get(9)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "project_id": pid,
@@ -458,6 +496,7 @@ impl<'a> SyncEngine<'a> {
                             "completed": completed != 0,
                             "xp_reward": xp,
                             "created_at": created,
+                            "updated_at": updated,
                             "tier": tier,
                             "template_id": template_id,
                         })
@@ -503,7 +542,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 "ritual" => {
                     let mut stmt = self.db.conn.prepare(
-                        "SELECT id, name, description, frequency, reward_xp, created_at, daily_target FROM rituals WHERE id = ?1",
+                        "SELECT id, name, description, frequency, reward_xp, created_at, updated_at, daily_target FROM rituals WHERE id = ?1",
                     )?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
@@ -512,7 +551,8 @@ impl<'a> SyncEngine<'a> {
                         let freq: String = row.get(3)?;
                         let xp: i32 = row.get(4)?;
                         let created: String = row.get(5)?;
-                        let daily_target: i32 = row.get(6)?;
+                        let updated: String = row.get(6)?;
+                        let daily_target: i32 = row.get(7)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "name": name,
@@ -520,6 +560,7 @@ impl<'a> SyncEngine<'a> {
                             "frequency": freq,
                             "reward_xp": xp,
                             "created_at": created,
+                            "updated_at": updated,
                             "daily_target": daily_target,
                         })
                         .to_string())
@@ -916,7 +957,10 @@ impl<'a> SyncEngine<'a> {
                         match self.db.get_task_by_id(ent_uuid) {
                             Ok(local_task) => {
                                 if let Some(ref content) = log.content {
-                                    if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
+                                    if let Ok(mut remote_task) =
+                                        serde_json::from_str::<Task>(content)
+                                    {
+                                        remote_task.normalize_schedule();
                                         if local_task.project_id.is_some()
                                             && remote_task.project_id.is_none()
                                         {
@@ -1031,10 +1075,8 @@ impl<'a> SyncEngine<'a> {
                         }
                     }
                 }
-                // Proyectos: siempre aplicamos — INSERT OR REPLACE propaga renombres, archivado, etc.
-                "project" => true,
-                // Entradas de journal: siempre aceptamos — INSERT OR REPLACE en el pull maneja el upsert
-                "journal_entry" => true,
+                "project" => self.incoming_entity_is_newer("projects", &log),
+                "journal_entry" => self.incoming_entity_is_newer("journal_entries", &log),
                 // Logros: solo se sincronizan si no están ya desbloqueados — no se revierten
                 "achievement" => {
                     let unlocked = self
@@ -1047,13 +1089,12 @@ impl<'a> SyncEngine<'a> {
                         .unwrap_or(false);
                     !unlocked
                 }
-                "ritual" => true,
+                "ritual" => self.incoming_entity_is_newer("rituals", &log),
                 "ritual_history" => true,
                 "setting" => {
                     crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&log.entity_id.as_str())
                 }
-                // Codex: siempre aplicamos — INSERT OR REPLACE propaga renombres y cambios de parent
-                "codex" => true,
+                "codex" => self.incoming_entity_is_newer("codices", &log),
                 // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
                     self.db
@@ -1128,8 +1169,7 @@ impl<'a> SyncEngine<'a> {
                         false
                     }
                 }
-                // Milestones: siempre aplicamos — INSERT OR REPLACE maneja create y update
-                "milestone" => true,
+                "milestone" => self.incoming_entity_is_newer("milestones", &log),
                 // Dispositivos: siempre aplicamos — upsert idempotente
                 "device" => true,
                 _ => false,
@@ -1256,6 +1296,7 @@ impl<'a> SyncEngine<'a> {
                                 );
                                 pulled_count += 1;
                             } else if let Ok(mut t) = serde_json::from_str::<Task>(content) {
+                                t.normalize_schedule();
                                 // Triquete de completado: si ya está completa localmente, no la regresamos a incompleta
                                 let local_task = self.db.get_task_by_id(ent_uuid).ok();
                                 if let Some(local) = local_task.as_ref() {
@@ -1427,6 +1468,7 @@ impl<'a> SyncEngine<'a> {
                                 let name = p["name"].as_str().unwrap_or_default();
                                 let desc = p["description"].as_str();
                                 let created = p["created_at"].as_str().unwrap_or_default();
+                                let updated = p["updated_at"].as_str().unwrap_or(created);
                                 let archived = p["archived"].as_bool().unwrap_or(false);
                                 let completed = p["completed"].as_bool().unwrap_or(false);
                                 let owner_id = p["owner_identity"].as_str();
@@ -1444,16 +1486,17 @@ impl<'a> SyncEngine<'a> {
                                     != 0;
                                 let merged_is_shared = is_shared || local_is_shared;
                                 let _ = self.db.conn.execute(
-                                    "INSERT INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                    "INSERT INTO projects (id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                                      ON CONFLICT(id) DO UPDATE SET
                                          name=excluded.name, description=excluded.description,
-                                         created_at=excluded.created_at, archived=excluded.archived,
+                                         created_at=excluded.created_at, updated_at=excluded.updated_at,
+                                         archived=excluded.archived,
                                          completed=excluded.completed, owner_identity=excluded.owner_identity,
                                          owner_username=excluded.owner_username,
                                          is_shared=excluded.is_shared",
                                     params![
-                                        id, name, desc, created,
+                                        id, name, desc, created, updated,
                                         if archived { 1 } else { 0 },
                                         if completed { 1 } else { 0 },
                                         owner_id, owner_name,
@@ -1483,12 +1526,19 @@ impl<'a> SyncEngine<'a> {
                                 let date = j["entry_date"].as_str().unwrap_or_default();
                                 let body = j["content"].as_str().unwrap_or_default();
                                 let created = j["created_at"].as_str().unwrap_or_default();
+                                let updated = j["updated_at"].as_str().unwrap_or(created);
                                 let visibility = j["visibility"].as_str().unwrap_or("Private");
                                 let author = j["author_username"].as_str().unwrap_or("");
 
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO journal_entries (id, project_id, entry_date, content, created_at, visibility, author_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                    params![id, pid, date, body, created, visibility, author],
+                                    "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, updated_at, visibility, author_username)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        project_id=excluded.project_id, entry_date=excluded.entry_date,
+                                        content=excluded.content, created_at=excluded.created_at,
+                                        updated_at=excluded.updated_at, visibility=excluded.visibility,
+                                        author_username=excluded.author_username",
+                                    params![id, pid, date, body, created, updated, visibility, author],
                                 );
                                 pulled_count += 1;
                             }
@@ -1510,12 +1560,20 @@ impl<'a> SyncEngine<'a> {
                                 let completed = m["completed"].as_bool().unwrap_or(false);
                                 let xp = m["xp_reward"].as_i64().unwrap_or(0) as i32;
                                 let created = m["created_at"].as_str().unwrap_or_default();
+                                let updated = m["updated_at"].as_str().unwrap_or(created);
                                 let tier = m["tier"].as_i64().unwrap_or(0) as i32;
                                 let template_id = m["template_id"].as_str().unwrap_or("");
 
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, tier, template_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                    params![id, pid, name, desc, if completed { 1 } else { 0 }, xp, created, tier, template_id],
+                                    "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        project_id=excluded.project_id, name=excluded.name,
+                                        description=excluded.description, completed=excluded.completed,
+                                        xp_reward=excluded.xp_reward, created_at=excluded.created_at,
+                                        updated_at=excluded.updated_at, tier=excluded.tier,
+                                        template_id=excluded.template_id",
+                                    params![id, pid, name, desc, if completed { 1 } else { 0 }, xp, created, updated, tier, template_id],
                                 );
                                 pulled_count += 1;
                             }
@@ -1555,10 +1613,17 @@ impl<'a> SyncEngine<'a> {
                                 let freq = r["frequency"].as_str().unwrap_or("Daily");
                                 let xp = r["reward_xp"].as_i64().unwrap_or(0) as i32;
                                 let created = r["created_at"].as_str().unwrap_or_default();
+                                let updated = r["updated_at"].as_str().unwrap_or(created);
                                 let daily_target = r["daily_target"].as_i64().unwrap_or(1) as i32;
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO rituals (id, name, description, frequency, reward_xp, created_at, daily_target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                    params![id, name, desc, freq, xp, created, daily_target],
+                                    "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at, updated_at, daily_target)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        name=excluded.name, description=excluded.description,
+                                        frequency=excluded.frequency, reward_xp=excluded.reward_xp,
+                                        created_at=excluded.created_at, updated_at=excluded.updated_at,
+                                        daily_target=excluded.daily_target",
+                                    params![id, name, desc, freq, xp, created, updated, daily_target],
                                 );
                                 pulled_count += 1;
                             }
@@ -1605,11 +1670,11 @@ impl<'a> SyncEngine<'a> {
                                 serde_json::from_str::<crate::models::Codex>(content)
                             {
                                 let _ = self.db.conn.execute(
-                                    "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                    "INSERT INTO codices (id, project_id, name, created_at, updated_at, parent_codex_id, collapsed)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                                      ON CONFLICT(id) DO UPDATE SET
                                          project_id=excluded.project_id, name=excluded.name,
-                                         created_at=excluded.created_at,
+                                         created_at=excluded.created_at, updated_at=excluded.updated_at,
                                          parent_codex_id=excluded.parent_codex_id,
                                          collapsed=excluded.collapsed",
                                     params![
@@ -1617,6 +1682,7 @@ impl<'a> SyncEngine<'a> {
                                         c.project_id.to_string(),
                                         c.name,
                                         c.created_at.to_rfc3339(),
+                                        c.updated_at.to_rfc3339(),
                                         c.parent_codex_id.map(|id| id.to_string()),
                                         c.collapsed as i32,
                                     ],
@@ -1847,8 +1913,8 @@ impl<'a> SyncEngine<'a> {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::models::{Codex, Note, Project, Task, TaskPriority, ZenTree};
-    use chrono::Duration;
+    use crate::models::{Codex, Note, Project, Ritual, Task, TaskPriority, ZenTree};
+    use chrono::{Duration, Local, TimeZone};
 
     struct StaticCloudProvider {
         pull_payload: String,
@@ -2189,6 +2255,231 @@ mod tests {
     }
 
     #[test]
+    fn legacy_remote_set_date_is_imported_as_due_date() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_legacy_set_date_sync.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let scheduled = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+        let legacy_task = Task {
+            id: Uuid::new_v4(),
+            project_id: None,
+            title: "Legacy yearly quest".to_string(),
+            description: None,
+            due_date: None,
+            set_date: Some(scheduled),
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: Some(crate::models::RecurrenceType::Yearly),
+        };
+        let payload = serde_json::json!({
+            "events": [{
+                "id": "legacy-set-date-task",
+                "entity_type": "task",
+                "entity_id": legacy_task.id.to_string(),
+                "operation": "create",
+                "timestamp": legacy_task.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&legacy_task).unwrap(),
+                "device_id": "older-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let saved = db.get_task_by_id(legacy_task.id).unwrap();
+        assert_eq!(saved.due_date, Some(scheduled));
+        assert_eq!(saved.set_date, None);
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn project_conflicts_use_updated_at_instead_of_pull_order() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_project_lww.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let local = Project {
+            id: project_id,
+            name: "Newer local campaign".to_string(),
+            description: None,
+            created_at: now - Duration::days(10),
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        db.insert_project(&local).unwrap();
+
+        let mut older_remote = local.clone();
+        older_remote.name = "Stale remote campaign".to_string();
+        older_remote.updated_at = now - Duration::hours(1);
+        let old_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-project-old",
+                "entity_type": "project",
+                "entity_id": project_id.to_string(),
+                "operation": "update",
+                "timestamp": older_remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&older_remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: old_payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_projects().unwrap()[0].name, "Newer local campaign");
+
+        let mut newer_remote = local;
+        newer_remote.name = "Newest remote campaign".to_string();
+        newer_remote.updated_at = now + Duration::hours(1);
+        let new_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-project-new",
+                "entity_type": "project",
+                "entity_id": project_id.to_string(),
+                "operation": "update",
+                "timestamp": newer_remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&newer_remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 2
+            }],
+            "head_seq": 2,
+            "next_seq": 2,
+            "has_more": false
+        })
+        .to_string();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: new_payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_projects().unwrap()[0].name, "Newest remote campaign");
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn remote_ritual_update_preserves_completion_history() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_ritual_history_sync.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let today = Local::now().date_naive();
+        let ritual = Ritual {
+            id: "sync-history-ritual".to_string(),
+            name: "Original ritual".to_string(),
+            description: None,
+            frequency: "Daily".to_string(),
+            reward_xp: 20,
+            daily_target: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_ritual(&ritual).unwrap();
+        db.complete_ritual(&ritual.id, today, Local::now()).unwrap();
+
+        let mut remote = ritual;
+        remote.name = "Updated on another device".to_string();
+        remote.updated_at = now + Duration::hours(1);
+        let payload = serde_json::json!({
+            "events": [{
+                "id": "remote-ritual-update",
+                "entity_type": "ritual",
+                "entity_id": remote.id.clone(),
+                "operation": "update",
+                "timestamp": remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let saved = db
+            .get_rituals()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "sync-history-ritual")
+            .unwrap();
+        assert_eq!(saved.name, "Updated on another device");
+        assert_eq!(
+            db.get_ritual_day_counts(today)
+                .unwrap()
+                .get("sync-history-ritual"),
+            Some(&(1, 1))
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
     fn test_contentless_remote_note_delete_applies_with_revision() {
         let temp_db_path = std::env::current_dir()
             .unwrap()
@@ -2283,6 +2574,7 @@ mod tests {
                 name: "Gibranlp".to_string(),
                 description: None,
                 created_at: now,
+                updated_at: now,
                 archived: false,
                 completed: false,
                 owner_identity: None,
@@ -2296,6 +2588,7 @@ mod tests {
                 project_id,
                 name: "Software".to_string(),
                 created_at: now,
+                updated_at: now,
                 parent_codex_id: None,
                 collapsed: false,
             })
@@ -2363,6 +2656,7 @@ mod tests {
             name: "Protected project".into(),
             description: None,
             created_at: now,
+            updated_at: now,
             archived: false,
             completed: false,
             owner_identity: None,
@@ -2398,6 +2692,7 @@ mod tests {
             project_id,
             name: "Codex".into(),
             created_at: now,
+            updated_at: now,
             parent_codex_id: None,
             collapsed: false,
         };

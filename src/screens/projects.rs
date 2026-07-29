@@ -389,6 +389,13 @@ pub fn draw(
         ),
         Span::styled(" Edit | ", Style::default().fg(theme.muted)),
         Span::styled(
+            "C",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Calendar | ", Style::default().fg(theme.muted)),
+        Span::styled(
             "d",
             Style::default()
                 .fg(theme.danger)

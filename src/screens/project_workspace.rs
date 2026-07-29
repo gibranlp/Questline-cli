@@ -8,7 +8,7 @@ use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
 use crate::screens::editor::{EditorMode, EditorState, render_body_line};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -493,6 +493,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     footer_spans.extend(vec![
         sep(),
+        key("C"),
+        txt(" Calendar"),
+        sep(),
         key("Tab"),
         txt(" Panes"),
         sep(),
@@ -770,6 +773,7 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         Line::from(vec![k("  Tab"), d("         Cycle panes")]),
         Line::from(vec![k("  Shift+Tab"), d("   Cycle panes back")]),
         Line::from(vec![k("  ↑ / ↓"), d("      Navigate items")]),
+        Line::from(vec![k("  C"), d("           Open quest calendar")]),
         Line::from(vec![k("  /"), d("           Search")]),
         Line::from(vec![k("  ESC"), d("         Exit workspace")]),
     ];
@@ -2491,7 +2495,7 @@ fn draw_task_modal(
     priority: TaskPriority,
     due_date_type: DueDateType,
     due_date_val: &str,
-    set_date_val: &str,
+    _set_date_val: &str,
     focus_idx: usize,
     theme: &Theme,
     desc_editor: Option<&EditorState>,
@@ -2506,10 +2510,13 @@ fn draw_task_modal(
     let steps: &[&Task] = steps_opt.unwrap_or(&[]);
 
     let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-    // índice de foco dinámico para recurrencia y steps
-    let set_date_focus_idx: usize = if has_due_value { 5 } else { 4 };
-    let recurrence_focus_idx: usize = set_date_focus_idx + 1;
-    let steps_focus_idx: usize = recurrence_focus_idx + 1;
+    // Due Date is the single scheduling field. Recurrence comes directly after it.
+    let recurrence_focus_idx: usize = if has_due_value { 5 } else { 4 };
+    let steps_focus_idx: usize = if show_recurrence {
+        recurrence_focus_idx + 1
+    } else {
+        recurrence_focus_idx
+    };
 
     // Los índices de chunk cambian según si mostramos description o no — no manches qué rollo
     // Con desc:    [0]=Title [1]=Desc [2]=Prio/Due [3]=Recurrence? [4]=Steps? [last]=Help
@@ -2743,14 +2750,10 @@ fn draw_task_modal(
         f.render_widget(desc_p, chunks[1]);
     }
 
-    // Priority, Due Date, and Set Date row
+    // Priority and Due Date row
     let row_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(38),
-            Constraint::Percentage(30),
-        ])
+        .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
         .split(chunks[prio_chunk]);
 
     // Priority selector field
@@ -2891,43 +2894,6 @@ fn draw_task_modal(
         }
     }
 
-    let set_border_style = if focus_idx == set_date_focus_idx {
-        Style::default()
-            .fg(accent_color)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.border)
-    };
-    let set_date_owned;
-    let set_date_text = if set_date_val.is_empty() {
-        if focus_idx == set_date_focus_idx {
-            "_"
-        } else {
-            "yyyy-mm-dd"
-        }
-    } else if focus_idx == set_date_focus_idx {
-        set_date_owned = format!("{}_", set_date_val);
-        &set_date_owned
-    } else {
-        set_date_val
-    };
-    let set_p = Paragraph::new(set_date_text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(set_border_style)
-                .title(" Set Date "),
-        )
-        .style(
-            if set_date_val.is_empty() && focus_idx != set_date_focus_idx {
-                Style::default().fg(theme.muted)
-            } else {
-                Style::default().fg(Color::White)
-            },
-        );
-    f.render_widget(set_p, row_chunks[2]);
-
     // Campo de recurrencia — solo para tareas padre (no pasos)
     if show_recurrence {
         let recur_border_style = if focus_idx == recurrence_focus_idx {
@@ -3052,7 +3018,7 @@ fn draw_task_modal(
         f.render_widget(steps_p, chunks[steps_chunk]);
         steps_chunk + 1
     } else {
-        prio_chunk + 1
+        prio_chunk + if show_recurrence { 2 } else { 1 }
     };
 
     // Help Text
@@ -3062,6 +3028,8 @@ fn draw_task_modal(
         "Vim description | Ctrl+S: save | Tab: cycle field | Esc: mode/cancel"
     } else if show_recurrence && focus_idx == recurrence_focus_idx {
         "L/R/Space: cycle recurrence | Tab: next field | Enter: save | ESC: cancel"
+    } else if matches!(focus_idx, 3 | 4) {
+        "c: calendar | Tab: cycle field | Space/L/R: due type | Enter: save | ESC: cancel"
     } else {
         "Tab: cycle field | Space/L/R: Priority & Due Type | Enter: save | ESC: cancel"
     };
@@ -3069,6 +3037,248 @@ fn draw_task_modal(
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center);
     f.render_widget(helper, chunks[help_chunk_idx]);
+}
+
+pub fn draw_task_calendar(
+    f: &mut Frame,
+    active_project: Option<uuid::Uuid>,
+    all_tasks: &[Task],
+    calendar: crate::app::TaskCalendarState,
+    theme: &Theme,
+) {
+    let selected = calendar.selected;
+    let area = centered_rect(98, 94, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        area,
+    );
+
+    let first = NaiveDate::from_ymd_opt(selected.year(), selected.month(), 1)
+        .expect("selected date has a valid month");
+    let leading = first.weekday().num_days_from_monday() as usize;
+    let next_month = if selected.month() == 12 {
+        NaiveDate::from_ymd_opt(selected.year() + 1, 1, 1)
+    } else {
+        NaiveDate::from_ymd_opt(selected.year(), selected.month() + 1, 1)
+    }
+    .expect("next month is valid");
+    let days_in_month = next_month.pred_opt().expect("month has a final day").day() as usize;
+    let today = Local::now().date_naive();
+    let showing_all_campaigns = calendar.show_all_projects || active_project.is_none();
+    let visible_tasks: Vec<&Task> = all_tasks
+        .iter()
+        .filter(|task| showing_all_campaigns || task.project_id == active_project)
+        .filter(|task| task.due_date.is_some())
+        .collect();
+    let selected_count = visible_tasks
+        .iter()
+        .filter(|task| {
+            task.due_date
+                .map(|date| date.with_timezone(&Local).date_naive() == selected)
+                .unwrap_or(false)
+        })
+        .count();
+    let scope = if showing_all_campaigns {
+        "All Campaigns"
+    } else {
+        "Active Campaign"
+    };
+    let mode_help = if calendar.planner_mode && active_project.is_some() {
+        "Enter/n new quest · a scope · arrows move · [ ] month · g today · Esc close"
+    } else if calendar.planner_mode {
+        "Enter/n new quest · arrows move · [ ] month · g today · Esc close"
+    } else {
+        "Enter select due date · arrows move · [ ] month · g today · Esc cancel"
+    };
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .border_style(Style::default().fg(theme.primary))
+            .title(Span::styled(
+                format!(" Quest Calendar — {} ", selected.format("%B %Y")),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        area,
+    );
+    let inner = Rect {
+        x: area.x.saturating_add(1),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(12),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!(" {} ", scope),
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "  Selected: {}  ·  {} quest{} due",
+                selected.format("%A, %B %-d, %Y"),
+                selected_count,
+                if selected_count == 1 { "" } else { "s" }
+            )),
+        ])),
+        rows[0],
+    );
+
+    let weekday_cells = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 7); 7])
+        .split(rows[1]);
+    for (index, label) in ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+        .iter()
+        .enumerate()
+    {
+        f.render_widget(
+            Paragraph::new(*label).alignment(Alignment::Center).style(
+                Style::default()
+                    .fg(theme.muted)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            weekday_cells[index],
+        );
+    }
+
+    let week_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Ratio(1, 6); 6])
+        .split(rows[2]);
+    for week in 0..6 {
+        let day_cells = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Ratio(1, 7); 7])
+            .split(week_rows[week]);
+        for weekday in 0..7 {
+            let slot = week * 7 + weekday;
+            let day_number = slot + 1;
+            if day_number <= leading || day_number > leading + days_in_month {
+                f.render_widget(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(theme.border)),
+                    day_cells[weekday],
+                );
+                continue;
+            }
+
+            let number = day_number - leading;
+            let date = NaiveDate::from_ymd_opt(selected.year(), selected.month(), number as u32)
+                .expect("calendar day is valid");
+            let cell_tasks: Vec<&Task> = visible_tasks
+                .iter()
+                .copied()
+                .filter(|task| {
+                    task.due_date
+                        .map(|due| due.with_timezone(&Local).date_naive() == date)
+                        .unwrap_or(false)
+                })
+                .collect();
+            let line_capacity = day_cells[weekday].height.saturating_sub(2) as usize;
+            let width = day_cells[weekday].width.saturating_sub(3) as usize;
+            let shown = line_capacity.min(cell_tasks.len());
+            let mut task_lines: Vec<Line> = cell_tasks
+                .iter()
+                .take(shown)
+                .map(|task| {
+                    let prefix = if task.completed {
+                        "✓ "
+                    } else if task.parent_task_id.is_some() {
+                        "↳ "
+                    } else {
+                        "• "
+                    };
+                    let available = width.saturating_sub(prefix.chars().count());
+                    let mut task_title: String = task.title.chars().take(available).collect();
+                    if task.title.chars().count() > available && !task_title.is_empty() {
+                        task_title.pop();
+                        task_title.push('…');
+                    }
+                    let style = if task.completed {
+                        Style::default()
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::CROSSED_OUT)
+                    } else {
+                        match task.priority {
+                            TaskPriority::High => Style::default().fg(theme.danger),
+                            TaskPriority::Medium => Style::default().fg(theme.warning),
+                            TaskPriority::Low => Style::default().fg(theme.text),
+                        }
+                    };
+                    Line::from(Span::styled(format!("{}{}", prefix, task_title), style))
+                })
+                .collect();
+            if cell_tasks.len() > shown && line_capacity > 0 {
+                let overflow = cell_tasks.len() - shown;
+                if task_lines.len() == line_capacity {
+                    task_lines.pop();
+                }
+                task_lines.push(Line::from(Span::styled(
+                    format!("+{} more", overflow + usize::from(shown == line_capacity)),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+
+            let is_selected = date == selected;
+            let is_today = date == today;
+            let border_color = if is_selected {
+                theme.primary
+            } else if is_today {
+                theme.warning
+            } else {
+                theme.border
+            };
+            let number_style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_today {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            f.render_widget(
+                Paragraph::new(task_lines).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(if is_selected {
+                            BorderType::Double
+                        } else {
+                            BorderType::Plain
+                        })
+                        .border_style(Style::default().fg(border_color))
+                        .title(Span::styled(format!(" {} ", number), number_style)),
+                ),
+                day_cells[weekday],
+            );
+        }
+    }
+    f.render_widget(
+        Paragraph::new(mode_help)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(theme.muted)),
+        rows[3],
+    );
 }
 
 // Modal sencillo para escribir la entrada de journal del día — sin mucho rollo
@@ -3529,4 +3739,75 @@ fn draw_journal_visibility_modal(f: &mut Frame, visibility_idx: usize, theme: &T
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center);
     f.render_widget(helper, inner_layout[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn calendar_grid_renders_due_quests_inside_day_cells() {
+        let project_id = uuid::Uuid::new_v4();
+        let due = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+        let task = |project_id, title: &str| Task {
+            id: uuid::Uuid::new_v4(),
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: Some(due),
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::High,
+            created_at: due,
+            updated_at: due,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let tasks = vec![
+            task(project_id, "Publish launch plan"),
+            task(uuid::Uuid::new_v4(), "Other campaign quest"),
+        ];
+        let mut calendar = crate::app::TaskCalendarState {
+            selected: due.date_naive(),
+            planner_mode: true,
+            show_all_projects: false,
+        };
+        let theme = Theme::default_theme();
+        let backend = TestBackend::new(110, 38);
+        let mut terminal = Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw_task_calendar(frame, Some(project_id), &tasks, calendar, &theme))
+            .unwrap();
+
+        let rendered: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(rendered.contains("Quest Calendar"));
+        assert!(rendered.contains("Publish"));
+        assert!(!rendered.contains("Other campaign"));
+        assert!(rendered.contains("Thursday, October 1, 2026"));
+
+        calendar.show_all_projects = true;
+        terminal
+            .draw(|frame| draw_task_calendar(frame, Some(project_id), &tasks, calendar, &theme))
+            .unwrap();
+        let all_campaigns: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(all_campaigns.contains("Other"));
+    }
 }
