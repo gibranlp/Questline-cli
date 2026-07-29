@@ -3307,6 +3307,10 @@ impl Database {
             [],
         )?;
         self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_sync', 'false')",
+            [],
+        )?;
+        self.conn.execute(
             "INSERT OR REPLACE INTO settings (key, value) VALUES ('conflict_count', '0')",
             [],
         )?;

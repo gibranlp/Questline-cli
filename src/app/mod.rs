@@ -1934,6 +1934,7 @@ impl App {
                     let _ = db.set_setting("last_pull_seq", &head_seq);
                     let _ = db.set_setting("last_sync_lag", "0");
                     let _ = db.set_setting("sync_restore_hold", "1");
+                    let _ = db.set_setting("auto_sync", "false");
                     return;
                 }
             }
@@ -1986,7 +1987,8 @@ impl App {
         };
         db.register_device(&device_id, &device_name)?;
 
-        // La config tiene prioridad sobre los settings de la DB — archivo > DB
+        // La URL/config base viven en config.toml, pero el toggle visible de Auto Sync
+        // debe persistir desde la DB porque el usuario lo cambia dentro del TUI con [a].
         let config = crate::services::config::Config::load().unwrap_or_default();
         let server_url = if config.sync_enabled {
             config.server_url.clone()
@@ -1994,13 +1996,10 @@ impl App {
             db.get_setting("server_url")?
                 .unwrap_or_else(|| "http://localhost:8080".to_string())
         };
-        let auto_sync = if config.sync_enabled {
-            config.auto_sync
-        } else {
-            db.get_setting("auto_sync")?
-                .map(|s| s == "true")
-                .unwrap_or(false)
-        };
+        let mut auto_sync = db
+            .get_setting("auto_sync")?
+            .map(|s| s == "true")
+            .unwrap_or(config.auto_sync);
         let external_notifications = db
             .get_setting("external_notifications")?
             .map(|s| s == "true")
@@ -2051,6 +2050,8 @@ impl App {
                             &server_url,
                         );
                         let _ = db.set_setting("sync_restore_hold", "1");
+                        let _ = db.set_setting("auto_sync", "false");
+                        auto_sync = false;
                         user = db.get_user()?;
                     }
                 }
@@ -3740,8 +3741,9 @@ impl App {
                                                     &self.device_id,
                                                     &self.server_url,
                                                 );
-                                                let _ =
-                                                    self.db.set_setting("sync_restore_hold", "1");
+                                                self.pause_auto_sync(
+                                                    "Restore complete. Auto Sync disabled; toggle [a] when ready.",
+                                                );
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string(),
                                                 ));
@@ -5379,7 +5381,9 @@ impl App {
                                             &self.device_id,
                                             &self.server_url,
                                         );
-                                        let _ = self.db.set_setting("sync_restore_hold", "1");
+                                        self.pause_auto_sync(
+                                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
+                                        );
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
@@ -13919,8 +13923,13 @@ impl App {
                     None => {
                         self.sync_failure_count = 0;
                         self.sync_conflicts = bg.conflicts;
+                        if self.db.get_setting("auto_sync").ok().flatten().as_deref()
+                            == Some("false")
+                        {
+                            self.auto_sync = false;
+                        }
                         if !self.sync_conflicts.is_empty() {
-                            let _ = self.db.set_setting("sync_restore_hold", "1");
+                            self.pause_auto_sync("Auto Sync disabled after sync conflicts.");
                             self.notifications.push(Notification::warning(format!(
                                 "{} sync conflict(s) detected — automatic sync paused",
                                 self.sync_conflicts.len()
@@ -14343,7 +14352,9 @@ impl App {
                             &self.server_url,
                         );
                         let _ = self.db.set_setting("conflict_count", "0");
-                        let _ = self.db.set_setting("sync_restore_hold", "1");
+                        self.pause_auto_sync(
+                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
+                        );
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
                             "Chronicle restored from cloud!".to_string(),
@@ -14616,26 +14627,27 @@ impl App {
         db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
         db.set_setting("last_sync_lag", "0")?;
         db.set_setting("sync_restore_hold", "1")?;
+        db.set_setting("auto_sync", "false")?;
         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
         let _ = db.conn.execute("UPDATE sync_log SET synced = 1", []);
         Ok(())
     }
 
     fn start_background_sync(&mut self) {
-        if self
-            .db
-            .get_setting("sync_restore_hold")
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some("1")
-        {
-            self.sync_status_msg =
-                "Sync paused after restore. Run manual sync when ready.".to_string();
+        if !self.auto_sync {
+            self.sync_status_msg = "Auto Sync disabled. Toggle [a] to enable it.".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             return;
         }
         self.do_background_sync(false);
+    }
+
+    fn pause_auto_sync(&mut self, reason: &str) {
+        self.auto_sync = false;
+        let _ = self.db.set_setting("auto_sync", "false");
+        let _ = self.db.set_setting("sync_restore_hold", "1");
+        self.sync_status_msg = reason.to_string();
+        self.last_sync_status_time = Some(std::time::Instant::now());
     }
 
     fn scroll_links_are_safe_for_full_sync(&self) -> bool {
@@ -14665,6 +14677,17 @@ impl App {
     }
 
     fn local_db_is_safe_for_cloud_reset(db: &crate::database::Database) -> Result<()> {
+        let quick_check: String = db
+            .conn
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap_or_else(|e| format!("quick_check failed: {}", e));
+        if quick_check != "ok" {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: local database is malformed ({})",
+                quick_check
+            ));
+        }
+
         let (
             notes_total,
             projectless_notes,
@@ -14841,10 +14864,7 @@ impl App {
             return;
         }
         if !self.scroll_links_are_safe_for_full_sync() {
-            let _ = self.db.set_setting("sync_restore_hold", "1");
-            self.sync_status_msg =
-                "Sync blocked: scroll project links need recovery first.".to_string();
-            self.last_sync_status_time = Some(std::time::Instant::now());
+            self.pause_auto_sync("Sync blocked: project links need recovery first.");
             self.modal_state = ModalType::None;
             return;
         }
@@ -14884,11 +14904,6 @@ impl App {
                     &device_id,
                     Some(server_url.as_str()),
                 )?;
-                if !include_contributions
-                    && db.get_setting("sync_restore_hold")?.as_deref() == Some("1")
-                {
-                    return Ok((0, 0, Vec::new()));
-                }
                 if include_contributions {
                     let _ = db.set_setting("sync_restore_hold", "0");
                     db.queue_full_state_sync()
