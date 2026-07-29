@@ -893,31 +893,22 @@ try {
                 echo json_encode(["error" => "Payload must be a JSON array of sync events"]);
                 exit;
             }
-            $invalidEvents = find_invalid_sync_events($entries);
-            $taskEvents = 0;
+            $invalidEvents = find_invalid_sync_events($entries, $pdo, $userId);
             $invalidTaskEvents = 0;
             $invalidScrollEvents = 0;
-            foreach ($entries as $candidate) {
-                if (!is_array($candidate)) continue;
-                if (($candidate['entity_type'] ?? '') === 'task' && ($candidate['operation'] ?? '') !== 'delete') {
-                    $taskEvents++;
-                }
-            }
             foreach ($invalidEvents as $invalid) {
                 if (($invalid['entity_type'] ?? '') === 'task') $invalidTaskEvents++;
                 if (($invalid['entity_type'] ?? '') === 'note') $invalidScrollEvents++;
             }
-            $rejectInvalidBatch = $invalidScrollEvents >= 5
-                || ($taskEvents > 0 && $invalidTaskEvents * 2 >= $taskEvents);
+            $rejectInvalidBatch = $invalidTaskEvents > 0 || $invalidScrollEvents > 0;
             if ($rejectInvalidBatch) {
                 log_api_event($pdo, $userId, $deviceId, 'SYNC_REJECTED', "Rejected invalid sync batch: " . json_encode(array_slice($invalidEvents, 0, 10)));
                 http_response_code(400);
                 echo json_encode([
-                "error" => "Invalid sync payload: refusing to store projectless scrolls or mostly projectless tasks",
+                    "error" => "Invalid sync payload: refusing unsafe task or scroll events",
                     "rejected" => count($invalidEvents),
                     "invalid_scrolls" => $invalidScrollEvents,
                     "invalid_tasks" => $invalidTaskEvents,
-                    "task_events" => $taskEvents,
                     "examples" => array_slice($invalidEvents, 0, 10)
                 ]);
                 exit;
@@ -1902,6 +1893,30 @@ function extract_project_id_from_payload($payload) {
     return $payloadObj['project_id'];
 }
 
+function sync_validation_error($event, $reason) {
+    return [
+        "id" => $event['id'] ?? '',
+        "entity_type" => $event['entity_type'] ?? '',
+        "entity_id" => $event['entity_id'] ?? '',
+        "reason" => $reason
+    ];
+}
+
+function decode_sync_event_payload($event, &$error) {
+    $payload = $event['content'] ?? $event['payload'] ?? '';
+    if (!is_string($payload) || trim($payload) === '') {
+        $error = sync_validation_error($event, "payload is empty");
+        return null;
+    }
+    $decoded = json_decode($payload, true);
+    if (!is_array($decoded)) {
+        $error = sync_validation_error($event, "payload is not valid JSON");
+        return null;
+    }
+    $error = null;
+    return $decoded;
+}
+
 function validate_sync_event_payload($event) {
     $entityType = $event['entity_type'] ?? '';
     $operation = $event['operation'] ?? '';
@@ -1912,42 +1927,92 @@ function validate_sync_event_payload($event) {
         return null;
     }
 
-    $payload = $event['content'] ?? $event['payload'] ?? '';
-    if (!is_string($payload) || trim($payload) === '') {
-        return null;
-    }
-    $decoded = json_decode($payload, true);
-    if (!is_array($decoded)) {
-        return [
-            "id" => $event['id'] ?? '',
-            "entity_type" => $entityType,
-            "entity_id" => $event['entity_id'] ?? '',
-            "reason" => "payload is not valid JSON"
-        ];
-    }
+    $error = null;
+    $decoded = decode_sync_event_payload($event, $error);
+    if ($error !== null) return $error;
 
-    if ($entityType === 'task' && empty($decoded['project_id'])) {
-        return [
-            "id" => $event['id'] ?? '',
-            "entity_type" => $entityType,
-            "entity_id" => $event['entity_id'] ?? '',
-            "reason" => "task missing project_id"
-        ];
-    }
     if ($entityType === 'note' && empty($decoded['project_id'])) {
-        return [
-            "id" => $event['id'] ?? '',
-            "entity_type" => $entityType,
-            "entity_id" => $event['entity_id'] ?? '',
-            "reason" => "scroll missing project_id"
-        ];
+        return sync_validation_error($event, "scroll missing project_id");
     }
 
     return null;
 }
 
-function find_invalid_sync_events($events) {
+function latest_server_task_payload($pdo, $userId, $taskId) {
+    $stmt = $pdo->prepare("
+        SELECT operation, payload
+        FROM sync_events
+        WHERE user_id = ? AND entity_type = 'task' AND entity_id = ?
+        ORDER BY seq DESC
+        LIMIT 1
+    ");
+    $stmt->execute([$userId, $taskId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$row || ($row['operation'] ?? '') === 'delete') {
+        return null;
+    }
+    $decoded = json_decode($row['payload'] ?? '', true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+function resolve_task_project_state($taskId, $batchTasks, $pdo, $userId, &$cache, &$resolving) {
+    if (array_key_exists($taskId, $cache)) {
+        return $cache[$taskId];
+    }
+    if (isset($resolving[$taskId])) {
+        return ["resolved" => false, "project_id" => null];
+    }
+
+    $resolving[$taskId] = true;
+    $task = array_key_exists($taskId, $batchTasks)
+        ? $batchTasks[$taskId]
+        : latest_server_task_payload($pdo, $userId, $taskId);
+    if (!is_array($task)) {
+        unset($resolving[$taskId]);
+        return $cache[$taskId] = ["resolved" => false, "project_id" => null];
+    }
+
+    $projectId = !empty($task['project_id']) ? (string)$task['project_id'] : null;
+    $parentId = !empty($task['parent_task_id']) ? (string)$task['parent_task_id'] : null;
+    if ($parentId === null) {
+        unset($resolving[$taskId]);
+        return $cache[$taskId] = ["resolved" => true, "project_id" => $projectId];
+    }
+
+    $parentState = resolve_task_project_state(
+        $parentId,
+        $batchTasks,
+        $pdo,
+        $userId,
+        $cache,
+        $resolving
+    );
+    unset($resolving[$taskId]);
+    if (!$parentState['resolved'] || $parentState['project_id'] !== $projectId) {
+        return $cache[$taskId] = ["resolved" => false, "project_id" => $projectId];
+    }
+    return $cache[$taskId] = ["resolved" => true, "project_id" => $projectId];
+}
+
+function find_invalid_sync_events($events, $pdo, $userId) {
     $invalid = [];
+    $batchTasks = [];
+
+    // Resolve parents against the final task state represented by this push, regardless
+    // of event order. A null value means the task is deleted in this batch.
+    foreach ($events as $event) {
+        if (!is_array($event) || ($event['entity_type'] ?? '') !== 'task') continue;
+        $taskId = (string)($event['entity_id'] ?? '');
+        if ($taskId === '') continue;
+        if (($event['operation'] ?? '') === 'delete') {
+            $batchTasks[$taskId] = null;
+            continue;
+        }
+        $error = null;
+        $batchTasks[$taskId] = decode_sync_event_payload($event, $error);
+    }
+
+    $taskStateCache = [];
     foreach ($events as $event) {
         if (!is_array($event)) {
             $invalid[] = [
@@ -1961,6 +2026,41 @@ function find_invalid_sync_events($events) {
         $error = validate_sync_event_payload($event);
         if ($error !== null) {
             $invalid[] = $error;
+            continue;
+        }
+
+        if (($event['entity_type'] ?? '') === 'task' && ($event['operation'] ?? '') !== 'delete') {
+            $taskId = (string)($event['entity_id'] ?? '');
+            $incomingTask = $batchTasks[$taskId] ?? null;
+            $incomingProjectId = is_array($incomingTask) && !empty($incomingTask['project_id'])
+                ? (string)$incomingTask['project_id']
+                : null;
+            if ($incomingProjectId === null) {
+                $previousTask = latest_server_task_payload($pdo, $userId, $taskId);
+                if (is_array($previousTask) && !empty($previousTask['project_id'])) {
+                    $invalid[] = sync_validation_error(
+                        $event,
+                        "task update would remove an existing project link"
+                    );
+                    continue;
+                }
+            }
+
+            $resolving = [];
+            $state = resolve_task_project_state(
+                $taskId,
+                $batchTasks,
+                $pdo,
+                $userId,
+                $taskStateCache,
+                $resolving
+            );
+            if (!$state['resolved']) {
+                $invalid[] = sync_validation_error(
+                    $event,
+                    "task project does not match its parent or parent is missing"
+                );
+            }
         }
     }
     return $invalid;
