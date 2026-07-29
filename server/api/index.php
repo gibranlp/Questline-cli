@@ -710,15 +710,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($body)) {
 }
 
 
-// ── Paso 6: Rate limiting básico — 100 req/min, Redis sería lo ideal pero MySQL jala ──
+// ── Paso 6: Rate limiting básico — sync needs room for paged recovery/reseed flows.
 try {
     $stmt = $pdo->prepare("SELECT COUNT(*) FROM nonces WHERE user_id = ? AND created_at > SUBDATE(NOW(), INTERVAL 1 MINUTE)");
     $stmt->execute([$userId]);
-    $requestCount = $stmt->fetchColumn();
-    if ($requestCount > 100) {
-        log_api_event($pdo, $userId, $deviceId, 'API_ERROR', 'Rate limit exceeded');
+    $requestCount = (int)$stmt->fetchColumn();
+    $syncRoutes = ['sync/pull', 'sync/full', 'sync/push', 'sync/head', 'sync/status', 'sync/reset', 'recovery', 'recovery/latest'];
+    $rateLimit = in_array($route, $syncRoutes, true) ? 1000 : 100;
+    if ($requestCount > $rateLimit) {
+        log_api_event($pdo, $userId, $deviceId, 'API_ERROR', "Rate limit exceeded on {$route}: {$requestCount}/{$rateLimit}");
         http_response_code(429);
-        echo json_encode(["error" => "Rate limit exceeded. Try again in a minute."]);
+        header("Retry-After: 60");
+        echo json_encode([
+            "error" => "Rate limit exceeded. Try again in a minute.",
+            "route" => $route,
+            "limit" => $rateLimit,
+            "count" => $requestCount
+        ]);
         exit;
     }
 } catch (PDOException $e) {

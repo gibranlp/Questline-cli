@@ -39,6 +39,10 @@ impl ApiClient {
                 Err(e) => {
                     let msg = e.to_string();
                     // No reintentes errores de auth (401/403) ni errores del cliente (4xx)
+                    if msg.contains("429") {
+                        last_err = e;
+                        continue;
+                    }
                     if msg.contains("401")
                         || msg.contains("403")
                         || msg.contains("400")

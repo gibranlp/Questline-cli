@@ -272,6 +272,29 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
+    fn projectless_task_payload_is_valid(
+        &self,
+        task: &Task,
+        remote_general_task_ids: &std::collections::HashSet<Uuid>,
+    ) -> bool {
+        if task.project_id.is_some() {
+            return true;
+        }
+
+        let Some(parent_id) = task.parent_task_id else {
+            return true;
+        };
+
+        if remote_general_task_ids.contains(&parent_id) {
+            return true;
+        }
+
+        self.db
+            .get_task_by_id(parent_id)
+            .map(|parent| parent.project_id.is_none())
+            .unwrap_or(false)
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
         // Pull and drain remote history first, then push local changes. This keeps restore and
         // normal sync incremental: a device learns the server head before it publishes anything.
@@ -747,6 +770,22 @@ impl<'a> SyncEngine<'a> {
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
         let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
         let mut newly_processed_ids: Vec<String> = Vec::new();
+        let remote_general_task_ids = remote_logs
+            .iter()
+            .filter(|log| {
+                !already_processed.contains(&log.id)
+                    && log.device_id != self.device_id
+                    && log.entity_type == "task"
+                    && log.operation != "delete"
+            })
+            .filter_map(|log| {
+                log.content
+                    .as_ref()
+                    .and_then(|content| serde_json::from_str::<Task>(content).ok())
+            })
+            .filter(|task| task.project_id.is_none() && task.parent_task_id.is_none())
+            .map(|task| task.id)
+            .collect::<std::collections::HashSet<_>>();
 
         let mut destructive_note_unlinks = 0usize;
         let mut destructive_task_unlinks = 0usize;
@@ -776,8 +815,10 @@ impl<'a> SyncEngine<'a> {
                 }
                 "task" if log.operation != "delete" => {
                     if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
-                        if remote_task.project_id.is_none() && remote_task.parent_task_id.is_some()
-                        {
+                        if !self.projectless_task_payload_is_valid(
+                            &remote_task,
+                            &remote_general_task_ids,
+                        ) {
                             invalid_task_payloads += 1;
                             if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
                                 if local_task.project_id.is_some() {
@@ -916,8 +957,10 @@ impl<'a> SyncEngine<'a> {
                                 .as_ref()
                                 .and_then(|content| serde_json::from_str::<Task>(content).ok())
                                 .map(|remote_task| {
-                                    remote_task.project_id.is_some()
-                                        || remote_task.parent_task_id.is_none()
+                                    self.projectless_task_payload_is_valid(
+                                        &remote_task,
+                                        &remote_general_task_ids,
+                                    )
                                 })
                                 .unwrap_or(false),
                         }
@@ -1197,7 +1240,9 @@ impl<'a> SyncEngine<'a> {
                                         t.project_id = local.project_id;
                                     }
                                 }
-                                if t.project_id.is_none() && t.parent_task_id.is_some() {
+                                if !self
+                                    .projectless_task_payload_is_valid(&t, &remote_general_task_ids)
+                                {
                                     conflicts.push(format!(
                                         "Task '{}' rejected: missing project link",
                                         t.title
