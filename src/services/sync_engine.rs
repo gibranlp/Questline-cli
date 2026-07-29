@@ -795,29 +795,20 @@ impl<'a> SyncEngine<'a> {
                     .max()
                     .unwrap_or(since_seq),
             );
-            if quarantined_to > since_seq {
-                let _ = self
-                    .db
-                    .set_setting("last_pull_seq", &quarantined_to.to_string());
-            }
             let last_remote_head_seq = remote_head_seq.max(quarantined_to);
             let _ = self
                 .db
                 .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
-            let lag = last_remote_head_seq.saturating_sub(quarantined_to);
+            let lag = last_remote_head_seq.saturating_sub(since_seq);
             let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+            let _ = self.db.set_setting("sync_restore_hold", "1");
             let _ = self.db.set_setting(
                 "last_quarantined_remote_page",
                 &format!(
-                    "Skipped remote page at seq {}..{} because it would unlink {} scrolls and {} tasks",
+                    "Quarantined remote page at seq {}..{} because it would unlink {} scrolls and {} tasks. Cursor held at {}; reset cloud from a clean device.",
                     since_seq, quarantined_to, destructive_note_unlinks, destructive_task_unlinks
+                    , since_seq
                 ),
-            );
-            let _ = self.db.mark_remote_events_processed(
-                &remote_logs
-                    .iter()
-                    .map(|log| log.id.clone())
-                    .collect::<Vec<_>>(),
             );
             return Ok((
                 pushed_count,

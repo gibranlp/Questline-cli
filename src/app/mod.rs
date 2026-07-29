@@ -14640,36 +14640,70 @@ impl App {
 
     fn scroll_links_are_safe_for_full_sync(&self) -> bool {
         let counts = self.db.conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(project_id IS NULL), 0) FROM notes",
+            "SELECT
+                (SELECT COUNT(*) FROM notes),
+                (SELECT COALESCE(SUM(project_id IS NULL), 0) FROM notes),
+                (SELECT COUNT(*) FROM tasks),
+                (SELECT COALESCE(SUM(project_id IS NULL), 0) FROM tasks)",
             [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
         );
         match counts {
-            Ok((total, projectless)) => total == 0 || projectless * 2 < total,
+            Ok((notes_total, projectless_notes, tasks_total, projectless_tasks)) => {
+                (notes_total == 0 || projectless_notes * 2 < notes_total)
+                    && (tasks_total == 0 || projectless_tasks * 2 < tasks_total)
+            }
             Err(_) => false,
         }
     }
 
     fn local_db_is_safe_for_cloud_reset(db: &crate::database::Database) -> Result<()> {
-        let (notes_total, projectless_notes, orphan_codex_refs, mismatched_steps): (
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = db.conn.query_row(
+        let (
+            notes_total,
+            projectless_notes,
+            tasks_total,
+            projectless_tasks,
+            orphan_codex_refs,
+            mismatched_steps,
+        ): (i64, i64, i64, i64, i64, i64) = db.conn.query_row(
             "SELECT
                 (SELECT COUNT(*) FROM notes),
                 (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM tasks),
+                (SELECT COUNT(*) FROM tasks WHERE project_id IS NULL),
                 (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
                 (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id))",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
         )?;
 
         if notes_total > 0 && projectless_notes > 0 {
             return Err(anyhow::anyhow!(
                 "Cloud reset refused: {} scrolls are missing project links",
                 projectless_notes
+            ));
+        }
+        if tasks_total > 0 && projectless_tasks * 2 >= tasks_total {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} of {} tasks are missing project links",
+                projectless_tasks,
+                tasks_total
             ));
         }
         if orphan_codex_refs > 0 {
