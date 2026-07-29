@@ -272,26 +272,22 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
-    fn projectless_task_payload_is_valid(
+    fn task_payload_project_is_valid(
         &self,
         task: &Task,
-        remote_general_task_ids: &std::collections::HashSet<Uuid>,
+        remote_task_projects: &std::collections::HashMap<Uuid, Option<Uuid>>,
     ) -> bool {
-        if task.project_id.is_some() {
-            return true;
-        }
-
         let Some(parent_id) = task.parent_task_id else {
             return true;
         };
 
-        if remote_general_task_ids.contains(&parent_id) {
-            return true;
+        if let Some(parent_project_id) = remote_task_projects.get(&parent_id) {
+            return task.project_id == *parent_project_id;
         }
 
         self.db
             .get_task_by_id(parent_id)
-            .map(|parent| parent.project_id.is_none())
+            .map(|parent| task.project_id == parent.project_id)
             .unwrap_or(false)
     }
 
@@ -771,7 +767,7 @@ impl<'a> SyncEngine<'a> {
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
         let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
         let mut newly_processed_ids: Vec<String> = Vec::new();
-        let remote_general_task_ids = remote_logs
+        let remote_task_projects = remote_logs
             .iter()
             .filter(|log| {
                 !already_processed.contains(&log.id)
@@ -784,9 +780,8 @@ impl<'a> SyncEngine<'a> {
                     .as_ref()
                     .and_then(|content| serde_json::from_str::<Task>(content).ok())
             })
-            .filter(|task| task.project_id.is_none() && task.parent_task_id.is_none())
-            .map(|task| task.id)
-            .collect::<std::collections::HashSet<_>>();
+            .map(|task| (task.id, task.project_id))
+            .collect::<std::collections::HashMap<_, _>>();
 
         let mut destructive_note_unlinks = 0usize;
         let mut destructive_task_unlinks = 0usize;
@@ -816,10 +811,8 @@ impl<'a> SyncEngine<'a> {
                 }
                 "task" if log.operation != "delete" => {
                     if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
-                        if !self.projectless_task_payload_is_valid(
-                            &remote_task,
-                            &remote_general_task_ids,
-                        ) {
+                        if !self.task_payload_project_is_valid(&remote_task, &remote_task_projects)
+                        {
                             invalid_task_payloads += 1;
                             if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
                                 if local_task.project_id.is_some() {
@@ -958,9 +951,9 @@ impl<'a> SyncEngine<'a> {
                                 .as_ref()
                                 .and_then(|content| serde_json::from_str::<Task>(content).ok())
                                 .map(|remote_task| {
-                                    self.projectless_task_payload_is_valid(
+                                    self.task_payload_project_is_valid(
                                         &remote_task,
-                                        &remote_general_task_ids,
+                                        &remote_task_projects,
                                     )
                                 })
                                 .unwrap_or(false),
@@ -1241,9 +1234,7 @@ impl<'a> SyncEngine<'a> {
                                         t.project_id = local.project_id;
                                     }
                                 }
-                                if !self
-                                    .projectless_task_payload_is_valid(&t, &remote_general_task_ids)
-                                {
+                                if !self.task_payload_project_is_valid(&t, &remote_task_projects) {
                                     conflicts.push(format!(
                                         "Task '{}' rejected: missing project link",
                                         t.title

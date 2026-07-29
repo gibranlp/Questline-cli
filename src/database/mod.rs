@@ -3150,6 +3150,20 @@ impl Database {
                 total_tasks
             ));
         }
+        let mismatched_steps: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM tasks step
+             JOIN tasks parent ON parent.id = step.parent_task_id
+             WHERE COALESCE(step.project_id, '') != COALESCE(parent.project_id, '')",
+            [],
+            |row| row.get(0),
+        )?;
+        if mismatched_steps > 0 {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} step(s) do not match their parent project",
+                mismatched_steps
+            ));
+        }
         let mut queued = 0usize;
 
         if let Ok(Some(user)) = self.get_user() {
