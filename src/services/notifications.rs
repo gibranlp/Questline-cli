@@ -87,13 +87,7 @@ pub fn send_system_notification_with_icon(
             } else {
                 "Questline"
             };
-            let mut used_terminal_notifier = false;
-            if let Some(path) = icon_path.as_ref() {
-                if send_with_terminal_notifier(&title, &message, subtitle, path) {
-                    used_terminal_notifier = true;
-                }
-            }
-            if !used_terminal_notifier {
+            if !send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref()) {
                 let script = format!(
                     "display notification {} with title {} subtitle {}",
                     applescript_quote(&message),
@@ -161,21 +155,22 @@ fn send_with_terminal_notifier(
     title: &str,
     message: &str,
     subtitle: &str,
-    icon_path: &PathBuf,
+    icon_path: Option<&PathBuf>,
 ) -> bool {
     for command in terminal_notifier_candidates() {
-        let status = std::process::Command::new(&command)
-            .arg("-title")
+        let mut cmd = std::process::Command::new(&command);
+        cmd.arg("-title")
             .arg(title)
             .arg("-subtitle")
             .arg(subtitle)
             .arg("-message")
             .arg(message)
-            .arg("-appIcon")
-            .arg(icon_path)
-            .arg("-contentImage")
-            .arg(icon_path)
-            .status();
+            .arg("-group")
+            .arg("questline");
+        if let Some(path) = icon_path {
+            cmd.arg("-appIcon").arg(path);
+        }
+        let status = cmd.status();
         if status.map(|s| s.success()).unwrap_or(false) {
             return true;
         }

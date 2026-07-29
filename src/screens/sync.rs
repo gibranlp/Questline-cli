@@ -46,8 +46,162 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .get_setting("last_sync_lag")
         .unwrap_or(None)
         .unwrap_or_else(|| "0".to_string());
+    let db_size_mb = app
+        .db
+        .database_size_bytes()
+        .map(|bytes| bytes as f64 / 1_048_576.0)
+        .unwrap_or(0.0);
+    let cleanup_hint = if db_size_mb >= 50.0 {
+        "Clean recommended"
+    } else {
+        "Clean when > 50 MB"
+    };
+    let cleanup_color = if db_size_mb >= 50.0 {
+        theme.warning
+    } else {
+        theme.muted
+    };
+    let health = app
+        .db
+        .conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id)),
+                (SELECT COUNT(*) FROM milestones WHERE completed = 0)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .unwrap_or((0, 0, 0, 0));
+    let health_ok = health.0 == 0 && health.1 == 0 && health.2 == 0;
+    let health_color = if health_ok {
+        theme.success
+    } else {
+        theme.danger
+    };
+    let top_health_color = health_color;
 
     let mut left_text = vec![
+        Line::from(""),
+        Line::from(vec![Span::styled(
+            "   === Sync Health ===",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled("   Health: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                if health_ok { "Ready" } else { "Needs Repair" },
+                Style::default()
+                    .fg(top_health_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |  Scrolls: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} projectless", health.0),
+                Style::default()
+                    .fg(if health.0 == 0 {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("   Codices: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} orphan", health.1),
+                Style::default()
+                    .fg(if health.1 == 0 {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |  Steps: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{} mismatches", health.2),
+                Style::default()
+                    .fg(if health.2 == 0 {
+                        theme.success
+                    } else {
+                        theme.danger
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            "   >>> Press [Enter] to Sync Now <<<",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![
+            Span::styled(
+                "   [c] Copy Share Key       ",
+                Style::default().fg(theme.text),
+            ),
+            Span::styled("[b] Backup", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "   [r] Restore Backup       ",
+                Style::default().fg(theme.text),
+            ),
+            Span::styled("[e] Export Profile", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "   [i] Restore Identity     ",
+                Style::default().fg(theme.text),
+            ),
+            Span::styled("[p] Prune Tasks", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "   [C] Clean Local History  ",
+                Style::default().fg(theme.text),
+            ),
+            Span::styled(
+                "[R] Reset Cloud Sync",
+                Style::default()
+                    .fg(if health_ok { theme.text } else { theme.danger })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "   [T] Test OS Alert        ",
+                Style::default().fg(theme.text),
+            ),
+            Span::styled("[n] OS Alerts Toggle", Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("   Database: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!("{:.1} MB", db_size_mb),
+                Style::default()
+                    .fg(if db_size_mb >= 50.0 {
+                        theme.warning
+                    } else {
+                        theme.success
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  |  ", Style::default().fg(theme.muted)),
+            Span::styled(cleanup_hint, Style::default().fg(cleanup_color)),
+        ]),
         Line::from(""),
         Line::from(vec![Span::styled(
             "   === Identity File ===",
@@ -182,25 +336,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             }
             Line::from(status_spans)
         },
-        Line::from(""),
-        Line::from(vec![Span::styled(
-            "   >>> Press [s] or [Enter] to Sync Now <<<",
-            Style::default()
-                .fg(accent_color)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            "   [c] Copy Share Key | [b] Backup | [r] Restore Backup | [e] Export Profile",
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(vec![Span::styled(
-            "   [i] Restore Identity | [p] Prune Tasks | [C] Clean Local History | [R] Reset Cloud Sync",
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        )]),
     ];
 
     // si hubo conflictos al sincronizar los mostramos aquí abajo — no manches, a veces pasa
@@ -236,7 +371,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(26), Constraint::Min(8)])
+        .constraints([Constraint::Length(34), Constraint::Min(6)])
         .split(chunks[0]);
 
     f.render_widget(left_panel, left_chunks[0]);
@@ -330,7 +465,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(accent_color))
             .title(Span::styled(
-                " Chronicles of Labor (Productivity) ",
+                " Labor Stats ",
                 Style::default()
                     .fg(theme.warning)
                     .add_modifier(Modifier::BOLD),

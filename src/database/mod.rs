@@ -122,6 +122,16 @@ impl StreakSchedule {
 }
 
 impl Database {
+    pub fn database_size_bytes(&self) -> Result<u64> {
+        let page_count: u64 = self
+            .conn
+            .query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+        Ok(page_count.saturating_mul(page_size))
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
 
