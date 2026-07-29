@@ -1000,6 +1000,19 @@ try {
             $stmt->execute([$userId]);
             echo json_encode(["seq" => (int)$stmt->fetchColumn()]);
             break;
+
+        case 'sync/reset':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                send_method_not_allowed();
+            }
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("DELETE FROM sync_events WHERE user_id = ?");
+            $stmt->execute([$userId]);
+            $deleted = $stmt->rowCount();
+            log_api_event($pdo, $userId, $deviceId, 'SYNC_RESET', "Deleted {$deleted} sync events for fresh reseed");
+            $pdo->commit();
+            echo json_encode(["status" => "success", "deleted" => $deleted]);
+            break;
             
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
         case 'invite':

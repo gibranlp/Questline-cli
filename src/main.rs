@@ -2131,6 +2131,56 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
+            if let questline::app::ModalType::ConfirmCleanupLocalHistory {
+                sync_logs,
+                processed_events,
+                revisions,
+            } = app.modal_state
+            {
+                let overlay_area = centered_rect_fixed_height(62, 12, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(
+                    Block::default().style(Style::default().bg(theme.background)),
+                    overlay_area,
+                );
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(
+                        " Clean Local History ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  This removes disposable local history only.",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(format!("  Synced sync logs:      {}", sync_logs)),
+                    Line::from(format!("  Processed remote IDs:  {}", processed_events)),
+                    Line::from(format!("  Revisions:             {}", revisions)),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Keeps current tasks, scrolls, projects, codices, XP, lore, and journals.",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Clean local history?  [Y] Yes   [N] No / Esc",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                ];
+
+                let p = Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(p, overlay_area);
+            }
+
             // Avisa que hay una versión nueva disponible — Y para instalar directo desde el app
             if let questline::app::ModalType::UpdateAvailable { ref latest_version } = app.modal_state {
                 let overlay_area = centered_rect_fixed_height(62, 12, size);

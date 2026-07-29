@@ -3265,6 +3265,25 @@ impl Database {
         Ok(count)
     }
 
+    pub fn cleanup_local_history(&self) -> Result<(usize, usize, usize)> {
+        let sync_logs = self
+            .conn
+            .execute("DELETE FROM sync_log WHERE synced = 1", [])?;
+        let processed = self
+            .conn
+            .execute("DELETE FROM processed_remote_events", [])?;
+        let revisions = self.conn.execute("DELETE FROM revisions", [])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_restore_hold', '1')",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('conflict_count', '0')",
+            [],
+        )?;
+        Ok((sync_logs, processed, revisions))
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         let mut stmt = self
             .conn
@@ -3342,6 +3361,14 @@ impl Database {
     }
 
     pub fn export_to_json(&self) -> Result<String> {
+        self.export_to_json_skipping(&[])
+    }
+
+    pub fn export_to_recovery_json(&self) -> Result<String> {
+        self.export_to_json_skipping(&["processed_remote_events", "revisions", "sync_log"])
+    }
+
+    fn export_to_json_skipping(&self, skipped_tables: &[&str]) -> Result<String> {
         let mut map = serde_json::Map::new();
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -3351,6 +3378,14 @@ impl Database {
         metadata.insert(
             "version".to_string(),
             serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+        metadata.insert(
+            "format".to_string(),
+            serde_json::Value::String(if skipped_tables.is_empty() {
+                "full".to_string()
+            } else {
+                "recovery_compact".to_string()
+            }),
         );
         metadata.insert(
             "export_date".to_string(),
@@ -3395,6 +3430,9 @@ impl Database {
             .collect();
 
         for table in tables {
+            if skipped_tables.contains(&table.as_str()) {
+                continue;
+            }
             let mut rows_list = Vec::new();
             let mut row_stmt = self.conn.prepare(&format!("SELECT * FROM {}", table))?;
             let col_names: Vec<String> = row_stmt
