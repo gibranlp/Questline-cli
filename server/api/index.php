@@ -885,6 +885,35 @@ try {
                 echo json_encode(["error" => "Payload must be a JSON array of sync events"]);
                 exit;
             }
+            $invalidEvents = find_invalid_sync_events($entries);
+            $taskEvents = 0;
+            $invalidTaskEvents = 0;
+            $invalidScrollEvents = 0;
+            foreach ($entries as $candidate) {
+                if (!is_array($candidate)) continue;
+                if (($candidate['entity_type'] ?? '') === 'task' && ($candidate['operation'] ?? '') !== 'delete') {
+                    $taskEvents++;
+                }
+            }
+            foreach ($invalidEvents as $invalid) {
+                if (($invalid['entity_type'] ?? '') === 'task') $invalidTaskEvents++;
+                if (($invalid['entity_type'] ?? '') === 'note') $invalidScrollEvents++;
+            }
+            $rejectInvalidBatch = $invalidScrollEvents >= 5
+                || ($taskEvents > 0 && $invalidTaskEvents * 2 >= $taskEvents);
+            if ($rejectInvalidBatch) {
+                log_api_event($pdo, $userId, $deviceId, 'SYNC_REJECTED', "Rejected invalid sync batch: " . json_encode(array_slice($invalidEvents, 0, 10)));
+                http_response_code(400);
+                echo json_encode([
+                "error" => "Invalid sync payload: refusing to store projectless scrolls or mostly projectless tasks",
+                    "rejected" => count($invalidEvents),
+                    "invalid_scrolls" => $invalidScrollEvents,
+                    "invalid_tasks" => $invalidTaskEvents,
+                    "task_events" => $taskEvents,
+                    "examples" => array_slice($invalidEvents, 0, 10)
+                ]);
+                exit;
+            }
             
             $inserted = 0;
             $pdo->beginTransaction();
@@ -1001,17 +1030,41 @@ try {
             echo json_encode(["seq" => (int)$stmt->fetchColumn()]);
             break;
 
+        case 'sync/status':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            echo json_encode(sync_event_status($pdo, $userId));
+            break;
+
         case 'sync/reset':
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
+            $before = sync_event_status($pdo, $userId);
             $pdo->beginTransaction();
             $stmt = $pdo->prepare("DELETE FROM sync_events WHERE user_id = ?");
             $stmt->execute([$userId]);
             $deleted = $stmt->rowCount();
             log_api_event($pdo, $userId, $deviceId, 'SYNC_RESET', "Deleted {$deleted} sync events for fresh reseed");
             $pdo->commit();
-            echo json_encode(["status" => "success", "deleted" => $deleted]);
+            $after = sync_event_status($pdo, $userId);
+            if ((int)($after['total_events'] ?? 0) !== 0) {
+                http_response_code(500);
+                echo json_encode([
+                    "error" => "Sync reset incomplete: events remain after delete",
+                    "before" => $before,
+                    "after" => $after,
+                    "deleted" => $deleted
+                ]);
+                exit;
+            }
+            echo json_encode([
+                "status" => "success",
+                "deleted" => $deleted,
+                "before" => $before,
+                "after" => $after
+            ]);
             break;
             
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
@@ -1839,6 +1892,104 @@ function extract_project_id_from_payload($payload) {
         return null;
     }
     return $payloadObj['project_id'];
+}
+
+function validate_sync_event_payload($event) {
+    $entityType = $event['entity_type'] ?? '';
+    $operation = $event['operation'] ?? '';
+    if ($operation === 'delete') {
+        return null;
+    }
+    if ($entityType !== 'task' && $entityType !== 'note') {
+        return null;
+    }
+
+    $payload = $event['content'] ?? $event['payload'] ?? '';
+    if (!is_string($payload) || trim($payload) === '') {
+        return null;
+    }
+    $decoded = json_decode($payload, true);
+    if (!is_array($decoded)) {
+        return [
+            "id" => $event['id'] ?? '',
+            "entity_type" => $entityType,
+            "entity_id" => $event['entity_id'] ?? '',
+            "reason" => "payload is not valid JSON"
+        ];
+    }
+
+    if ($entityType === 'task' && empty($decoded['project_id'])) {
+        return [
+            "id" => $event['id'] ?? '',
+            "entity_type" => $entityType,
+            "entity_id" => $event['entity_id'] ?? '',
+            "reason" => "task missing project_id"
+        ];
+    }
+    if ($entityType === 'note' && empty($decoded['project_id'])) {
+        return [
+            "id" => $event['id'] ?? '',
+            "entity_type" => $entityType,
+            "entity_id" => $event['entity_id'] ?? '',
+            "reason" => "scroll missing project_id"
+        ];
+    }
+
+    return null;
+}
+
+function find_invalid_sync_events($events) {
+    $invalid = [];
+    foreach ($events as $event) {
+        if (!is_array($event)) {
+            $invalid[] = [
+                "id" => "",
+                "entity_type" => "",
+                "entity_id" => "",
+                "reason" => "event is not an object"
+            ];
+            continue;
+        }
+        $error = validate_sync_event_payload($event);
+        if ($error !== null) {
+            $invalid[] = $error;
+        }
+    }
+    return $invalid;
+}
+
+function sync_event_status($pdo, $userId) {
+    $stmt = $pdo->prepare("
+        SELECT
+            COUNT(*) AS total_events,
+            COALESCE(MAX(seq), 0) AS head_seq,
+            SUM(CASE
+                WHEN entity_type = 'task'
+                     AND operation <> 'delete'
+                     AND payload <> ''
+                     AND (JSON_VALID(payload) = 0 OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) = '')
+                THEN 1 ELSE 0 END) AS invalid_tasks,
+            SUM(CASE
+                WHEN entity_type = 'note'
+                     AND operation <> 'delete'
+                     AND payload <> ''
+                     AND (
+                         JSON_VALID(payload) = 0
+                         OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) IS NULL
+                         OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) = ''
+                     )
+                THEN 1 ELSE 0 END) AS invalid_scrolls
+        FROM sync_events
+        WHERE user_id = ?
+    ");
+    $stmt->execute([$userId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+    return [
+        "total_events" => (int)($row['total_events'] ?? 0),
+        "head_seq" => (int)($row['head_seq'] ?? 0),
+        "invalid_tasks" => (int)($row['invalid_tasks'] ?? 0),
+        "invalid_scrolls" => (int)($row['invalid_scrolls'] ?? 0)
+    ];
 }
 
 function backfill_project_sync_events($pdo, $sourceUserId, $targetUserId, $projectId) {

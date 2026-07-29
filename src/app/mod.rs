@@ -14815,6 +14815,20 @@ impl App {
                     &device_id,
                 );
                 client.send_request("POST", "sync/reset", "{}")?;
+                if let Ok(status_resp) = client.send_request("GET", "sync/status", "") {
+                    if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status_resp) {
+                        let total = status
+                            .get("total_events")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(-1);
+                        if total != 0 {
+                            return Err(anyhow::anyhow!(
+                                "Cloud reset verification failed: {} sync events remain",
+                                total
+                            ));
+                        }
+                    }
+                }
 
                 let queued = db.queue_full_state_sync()?;
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(

@@ -750,6 +750,8 @@ impl<'a> SyncEngine<'a> {
 
         let mut destructive_note_unlinks = 0usize;
         let mut destructive_task_unlinks = 0usize;
+        let mut invalid_note_payloads = 0usize;
+        let mut invalid_task_payloads = 0usize;
         for log in &remote_logs {
             if already_processed.contains(&log.id) || log.device_id == self.device_id {
                 continue;
@@ -760,12 +762,11 @@ impl<'a> SyncEngine<'a> {
             match log.entity_type.as_str() {
                 "note" if log.operation != "delete" => {
                     if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
-                        if remote_note.project_id.is_none() || remote_note.codex_id.is_none() {
+                        if remote_note.project_id.is_none() {
+                            invalid_note_payloads += 1;
                             if let Ok(local_note) = self.db.get_note_by_id(remote_note.id) {
-                                if (local_note.project_id.is_some()
-                                    && remote_note.project_id.is_none())
-                                    || (local_note.codex_id.is_some()
-                                        && remote_note.codex_id.is_none())
+                                if local_note.project_id.is_some()
+                                    && remote_note.project_id.is_none()
                                 {
                                     destructive_note_unlinks += 1;
                                 }
@@ -776,6 +777,7 @@ impl<'a> SyncEngine<'a> {
                 "task" if log.operation != "delete" => {
                     if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
                         if remote_task.project_id.is_none() {
+                            invalid_task_payloads += 1;
                             if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
                                 if local_task.project_id.is_some() {
                                     destructive_task_unlinks += 1;
@@ -787,7 +789,11 @@ impl<'a> SyncEngine<'a> {
                 _ => {}
             }
         }
-        if destructive_note_unlinks >= 5 || destructive_task_unlinks >= 5 {
+        if destructive_note_unlinks >= 5
+            || destructive_task_unlinks >= 5
+            || invalid_note_payloads >= 5
+            || invalid_task_payloads >= 5
+        {
             let quarantined_to = remote_next_seq.max(
                 remote_logs
                     .iter()
@@ -806,14 +812,19 @@ impl<'a> SyncEngine<'a> {
             let _ = self.db.set_setting(
                 "last_quarantined_remote_page",
                 &format!(
-                    "Quarantined remote page at seq {}..{} because it would unlink {} scrolls and {} tasks. Cursor held at {}; reset cloud from a clean device.",
-                    since_seq, quarantined_to, destructive_note_unlinks, destructive_task_unlinks
-                    , since_seq
+                    "Quarantined remote page at seq {}..{} because it contained {} invalid scrolls, {} invalid tasks, and would unlink {} scrolls and {} tasks. Cursor held at {}; reset cloud from a clean device.",
+                    since_seq,
+                    quarantined_to,
+                    invalid_note_payloads,
+                    invalid_task_payloads,
+                    destructive_note_unlinks,
+                    destructive_task_unlinks,
+                    since_seq
                 ),
             );
             conflicts.push(format!(
-                "Remote sync page quarantined: would unlink {} scrolls and {} tasks",
-                destructive_note_unlinks, destructive_task_unlinks
+                "Remote sync page quarantined: {} invalid scrolls, {} invalid tasks",
+                invalid_note_payloads, invalid_task_payloads
             ));
             return Ok((
                 pushed_count,
@@ -967,10 +978,7 @@ impl<'a> SyncEngine<'a> {
                                 .content
                                 .as_ref()
                                 .and_then(|content| serde_json::from_str::<Note>(content).ok())
-                                .map(|remote_note| {
-                                    remote_note.project_id.is_some()
-                                        && remote_note.codex_id.is_some()
-                                })
+                                .map(|remote_note| remote_note.project_id.is_some())
                                 .unwrap_or(false),
                         }
                     }
@@ -1298,9 +1306,9 @@ impl<'a> SyncEngine<'a> {
                                         n.codex_id = local_note.codex_id;
                                     }
                                 }
-                                if n.project_id.is_none() || n.codex_id.is_none() {
+                                if n.project_id.is_none() {
                                     conflicts.push(format!(
-                                        "Scroll '{}' rejected: missing project/codex link",
+                                        "Scroll '{}' rejected: missing project link",
                                         n.title
                                     ));
                                     let _ = self.db.set_setting("auto_sync", "false");
