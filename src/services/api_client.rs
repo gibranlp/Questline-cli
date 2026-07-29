@@ -100,14 +100,33 @@ impl ApiClient {
             _ => return Err(anyhow::anyhow!("Unsupported HTTP method")),
         };
 
-        let response = req
+        let result = req
             .set("X-User-Id", &self.identity.user_uuid.to_string())
             .set("X-Identity", &self.identity.public_key)
             .set("X-Device-Id", &self.device_id)
             .set("X-Timestamp", &timestamp)
             .set("X-Nonce", &nonce)
             .set("X-Signature", &signature)
-            .send_string(&body_to_send)?;
+            .send_string(&body_to_send);
+
+        let response = match result {
+            Ok(response) => response,
+            Err(ureq::Error::Status(code, response)) => {
+                let mut error_body = String::new();
+                use std::io::Read;
+                let _ = response.into_reader().read_to_string(&mut error_body);
+                if error_body.trim().is_empty() {
+                    return Err(anyhow::anyhow!("{}: status code {}", url, code));
+                }
+                return Err(anyhow::anyhow!(
+                    "{}: status code {}: {}",
+                    url,
+                    code,
+                    error_body
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         let mut body = String::new();
         use std::io::Read;
