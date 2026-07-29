@@ -165,8 +165,8 @@ fn send_with_terminal_notifier(
             .arg(subtitle)
             .arg("-message")
             .arg(message)
-            .arg("-group")
-            .arg("questline");
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
         if let Some(path) = icon_path {
             cmd.arg("-appIcon").arg(path);
         }
