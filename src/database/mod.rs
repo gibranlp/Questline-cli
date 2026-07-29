@@ -3693,6 +3693,34 @@ impl Database {
             // never actually applied.
             self.conn
                 .execute("DELETE FROM processed_remote_events", [])?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_sync', 'false')",
+                [],
+            )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_restore_hold', '1')",
+                [],
+            )?;
+
+            let projectless_notes: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE project_id IS NULL OR project_id = ''",
+                [],
+                |row| row.get(0),
+            )?;
+            let mismatched_steps: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM tasks step
+                 JOIN tasks parent ON parent.id = step.parent_task_id
+                 WHERE COALESCE(step.project_id, '') != COALESCE(parent.project_id, '')",
+                [],
+                |row| row.get(0),
+            )?;
+            if projectless_notes > 0 || mismatched_steps > 0 {
+                return Err(anyhow::anyhow!(
+                    "Refusing unhealthy backup: {} projectless scroll(s), {} step mismatch(es)",
+                    projectless_notes,
+                    mismatched_steps
+                ));
+            }
 
             let foreign_key_errors: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM pragma_foreign_key_check",

@@ -1258,7 +1258,17 @@ impl<'a> SyncEngine<'a> {
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
                                     let _ = self.db.conn.execute(
-                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                        "INSERT INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                                         ON CONFLICT(id) DO UPDATE SET
+                                             project_id=excluded.project_id, title=excluded.title,
+                                             description=excluded.description, due_date=excluded.due_date,
+                                             set_date=excluded.set_date, completed=excluded.completed,
+                                             priority=excluded.priority, created_at=excluded.created_at,
+                                             updated_at=excluded.updated_at, owner_identity=excluded.owner_identity,
+                                             owner_username=excluded.owner_username,
+                                             parent_task_id=excluded.parent_task_id,
+                                             xp_awarded=excluded.xp_awarded, recurrence=excluded.recurrence",
                                         params![
                                             t.id.to_string(),
                                             t.project_id.map(|id| id.to_string()),
@@ -1405,7 +1415,14 @@ impl<'a> SyncEngine<'a> {
                                     != 0;
                                 let merged_is_shared = is_shared || local_is_shared;
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    "INSERT INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         name=excluded.name, description=excluded.description,
+                                         created_at=excluded.created_at, archived=excluded.archived,
+                                         completed=excluded.completed, owner_identity=excluded.owner_identity,
+                                         owner_username=excluded.owner_username,
+                                         is_shared=excluded.is_shared",
                                     params![
                                         id, name, desc, created,
                                         if archived { 1 } else { 0 },
@@ -1559,7 +1576,13 @@ impl<'a> SyncEngine<'a> {
                                 serde_json::from_str::<crate::models::Codex>(content)
                             {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                    "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         project_id=excluded.project_id, name=excluded.name,
+                                         created_at=excluded.created_at,
+                                         parent_codex_id=excluded.parent_codex_id,
+                                         collapsed=excluded.collapsed",
                                     params![
                                         c.id.to_string(),
                                         c.project_id.to_string(),
@@ -2268,5 +2291,137 @@ mod tests {
 
         let _ = std::fs::remove_file(&source_path);
         let _ = std::fs::remove_file(&restore_path);
+    }
+
+    #[test]
+    fn remote_parent_upserts_do_not_unlink_children() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_parent_upsert.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::new(&db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let codex_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+
+        let project = Project {
+            id: project_id,
+            name: "Protected project".into(),
+            description: None,
+            created_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        db.insert_project(&project).unwrap();
+        let parent = Task {
+            id: parent_id,
+            project_id: Some(project_id),
+            title: "Parent".into(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now + Duration::minutes(1),
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        db.insert_task(&parent).unwrap();
+        let mut child = parent.clone();
+        child.id = child_id;
+        child.title = "Child".into();
+        child.parent_task_id = Some(parent_id);
+        db.insert_task(&child).unwrap();
+        let codex = Codex {
+            id: codex_id,
+            project_id,
+            name: "Codex".into(),
+            created_at: now,
+            parent_codex_id: None,
+            collapsed: false,
+        };
+        db.insert_codex(&codex).unwrap();
+        db.insert_note(&Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "Scroll".into(),
+            markdown_content: "content".into(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "collaborative".into(),
+            codex_id: Some(codex_id),
+            owner_identity: None,
+        })
+        .unwrap();
+
+        let pull_payload = serde_json::json!({
+            "events": [
+                {
+                    "id": "remote-project-upsert",
+                    "entity_type": "project",
+                    "entity_id": project_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&project).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 1
+                },
+                {
+                    "id": "remote-task-upsert",
+                    "entity_type": "task",
+                    "entity_id": parent_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&parent).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 2
+                },
+                {
+                    "id": "remote-codex-upsert",
+                    "entity_type": "codex",
+                    "entity_id": codex_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&codex).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 3
+                }
+            ],
+            "head_seq": 3,
+            "next_seq": 3,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider { pull_payload }),
+        }
+        .sync()
+        .expect("sync should complete");
+
+        assert_eq!(
+            db.get_task_by_id(child_id).unwrap().parent_task_id,
+            Some(parent_id)
+        );
+        let restored_note = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(restored_note.project_id, Some(project_id));
+        assert_eq!(restored_note.codex_id, Some(codex_id));
+
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
     }
 }
