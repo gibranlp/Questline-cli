@@ -87,18 +87,8 @@ pub fn send_system_notification_with_icon(
             } else {
                 "Questline"
             };
-            if !send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref()) {
-                let script = format!(
-                    "display notification {} with title {} subtitle {}",
-                    applescript_quote(&message),
-                    applescript_quote(&title),
-                    applescript_quote(subtitle),
-                );
-                let _ = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(&script)
-                    .status();
-            }
+            let _ = send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref());
+            send_with_osascript(&title, &message, subtitle);
         }
 
         #[cfg(target_os = "windows")]
@@ -184,6 +174,22 @@ fn terminal_notifier_candidates() -> Vec<PathBuf> {
     candidates.push(PathBuf::from("/opt/homebrew/bin/terminal-notifier"));
     candidates.push(PathBuf::from("/usr/local/bin/terminal-notifier"));
     candidates
+}
+
+#[cfg(target_os = "macos")]
+fn send_with_osascript(title: &str, message: &str, subtitle: &str) {
+    let script = format!(
+        "display notification {} with title {} subtitle {}",
+        applescript_quote(message),
+        applescript_quote(title),
+        applescript_quote(subtitle),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(target_os = "linux")]
