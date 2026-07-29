@@ -69,6 +69,139 @@
       The backlog has not shrunk. But at least it now has a proper domain.
     </p>
 
+    <!-- v1.1.3 -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v1.1.3</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— The Chronicle Remembers</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-07-29</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — Nothing Written Is Left Behind</span>
+
+  The Chronicle was built on a simple promise:
+
+  If a hero wrote it, the Realm would remember it.
+
+  Then the sync halls learned an unpleasant truth.
+  Memory can be copied incorrectly.
+  An old device can arrive carrying yesterday as if it were today.
+  A step can cross the cloud without its parent.
+  A scroll can wake beneath the wrong campaign.
+  Progress can return from another machine wearing a lower number
+  and insist that the hero has somehow become less accomplished.
+
+  The Notification Swarm did not need to destroy the Chronicle.
+  It only needed to make the Chronicle uncertain.
+
+  <span class="hi">The sync wards have been rebuilt.</span>
+
+  Projects, quests, steps, scrolls, codices, and earned progress are now checked
+  before older or incomplete records are allowed to cross devices.
+  Suspicious events are quarantined without trapping the healthy records beside them.
+  When the Realm cannot prove that a change is safe, automatic sync pauses
+  and asks the hero to inspect the disturbance.
+
+  Losing conflict versions are preserved in revisions.
+  Legacy relationship damage is repaired locally without deleting the work.
+  An older machine can no longer lower a hero's level or steal earned XP
+  merely because it arrived late and spoke confidently.
+
+  The Sync screen now reveals more of what the wards are doing:
+  the local position, the cloud position, the remaining activity,
+  the state of the backup, and the progress of long transfers.
+  Restore operations begin from the correct point in history.
+  Transfer codes remain sealed until their backup is complete.
+  Automatic sync waits after a restore until the hero declares the device ready.
+
+  And when ordinary repair is not enough, the recovery chamber has tools.
+  Old local sync history can be cleared.
+  A trusted device can reseed the cloud with its complete state.
+  Recovery is no longer a ritual performed with crossed fingers
+  and a suspiciously named database copy on the desktop.
+
+  Fellowship campaigns received the same protection.
+  Campaign links, parent steps, scroll locations, companion work, and deletions
+  now travel more faithfully between members.
+  Even a scroll moved from one shared campaign to another leaves the correct hall
+  and arrives in the correct archive.
+
+  <span class="hi">The Scrollkeepers have opened the roads between campaigns.</span>
+
+  Press <span class="hi">R</span> on a scroll to choose another campaign,
+  leave it ungrouped there, or file it directly into one of its codices.
+  Press <span class="hi">Ctrl+N</span> from the Dashboard to create a Quick Note,
+  or summon Create Note through the Command Palette.
+  Name it, choose its campaign, and begin writing before the thought escapes.
+
+  The editor has become a more trustworthy desk.
+  <span class="hi">Ctrl+S</span> saves without closing.
+  Changed scrolls quietly autosave every few seconds without sounds or popups,
+  leaving only a small Autosaved message in the status bar.
+  Closing a changed scroll asks whether to save, discard, or continue editing.
+  An unchanged scroll simply closes, having no drama to contribute.
+  Large pastes arrive together, paragraphs and accented characters survive,
+  wrapped text scrolls properly, and the cursor no longer invents spaces
+  while attempting to remain visible.
+
+  The Timekeepers contributed a calendar.
+  Press <span class="hi">C</span> from Campaigns or a campaign workspace
+  to see due quests across the Realm in a complete month view.
+  New quests can be written directly onto a selected day,
+  and due dates now anchor daily, weekly, monthly, and yearly recurrences.
+
+  The Focus Sanctuary grew quieter and clearer.
+  Its countdown now stands large at the center of the chamber.
+  Beneath it, a restrained compass shows progress, elapsed time,
+  remaining time, and the expected moment of return.
+  It informs the hero without asking for the hero's attention.
+
+  Elsewhere, the Realm's smaller guilds completed important repairs.
+  macOS alerts found more reliable messengers and gained a simple test.
+  The Music screen became easier to browse and control,
+  and now opens with the local player ready by default.
+  Forest, Rain, Ocean, and interface sounds were tuned.
+  The Achievement Library now explains requirements, progress, unlock dates,
+  and the soundscapes a collector has not yet heard.
+  Hydration reminders can cross every screen, survive overnight schedules,
+  and explain when they are paused or preparing the next reminder.
+
+  More lists now understand <span class="hi">h, j, k, and l</span>.
+  Selected rows remain visible across more themes.
+  Campaign totals now distinguish open quests, steps, and scrolls at a glance.
+
+  The Chronicle does not claim that nothing will ever go wrong.
+  It makes a stronger and more useful promise:
+
+  <span class="hi">Nothing written will be abandoned without a trace.</span>
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  Safer multi-device sync protects projects, quests, steps, scrolls, codices, and earned progress</span>
+<span class="cmd">  ✓  Unsafe cloud events are quarantined; automatic sync pauses for review and revisions preserve conflicts</span>
+<span class="cmd">  ✓  Sync health now shows local/cloud positions, remaining activity, backup state, and transfer progress</span>
+<span class="cmd">  ✓  Restores use the correct cloud position, stay paused until ready, and lock transfer codes until backup</span>
+<span class="cmd">  ✓  Recovery controls clean old local sync history or rebuild cloud state from a trusted device</span>
+<span class="cmd">  ✓  Older devices can no longer reduce a hero's level or earned XP</span>
+<span class="cmd">  ✓  Fellowship sync better preserves campaign links, step parents, scroll locations, work, and deletions</span>
+<span class="cmd">  ✓  macOS notifications are more reliable and include a direct alert test</span>
+<span class="cmd">  ✓  Music opens to the local player; browsing, controls, soundscapes, and interface playback improved</span>
+<span class="cmd">  ✓  Achievement Library shows requirements, progress, unlock dates, and missing soundscapes</span>
+<span class="cmd">  ✓  Hydration reminders work across screens and overnight schedules with clearer paused/next states</span>
+<span class="cmd">  ✓  h/j/k/l navigation and selected-row visibility improved across more lists and themes</span>
+<span class="cmd">  ✓  Ctrl+N or the Command Palette opens Quick Notes with title and campaign selection</span>
+<span class="cmd">  ✓  R moves scrolls between campaigns, into destination codices, or into ungrouped storage</span>
+<span class="cmd">  ✓  Focus Sanctuary gains a large responsive timer and quiet progress/finish-time compass</span>
+<span class="cmd">  ✓  Ctrl+S saves without closing; changed scrolls offer save/discard choices while unchanged ones close</span>
+<span class="cmd">  ✓  Changed scrolls autosave silently every few seconds with a small Autosaved status message</span>
+<span class="cmd">  ✓  Large pastes, paragraphs, accents, wrapped scrolling, and cursor visibility are preserved correctly</span>
+<span class="cmd">  ✓  Campaign totals label open quests as !(n), steps as -&gt;(n), and scrolls as #(n)</span>
+<span class="cmd">  ✓  Quest Calendar opens with C, spans all campaigns, creates dated quests, and anchors recurrences</span>
+<span class="cmd">  –  The Chronicle has stopped accepting “the cloud probably has it” as a recovery strategy.</span>
+        </pre>
+      </div>
+    </div>
+
     <!-- v1.1.2 -->
     <div style="margin-top:2.5rem;">
       <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">

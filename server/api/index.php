@@ -900,18 +900,21 @@ try {
                 if (($invalid['entity_type'] ?? '') === 'task') $invalidTaskEvents++;
                 if (($invalid['entity_type'] ?? '') === 'note') $invalidScrollEvents++;
             }
-            $rejectInvalidBatch = $invalidTaskEvents > 0 || $invalidScrollEvents > 0;
-            if ($rejectInvalidBatch) {
-                log_api_event($pdo, $userId, $deviceId, 'SYNC_REJECTED', "Rejected invalid sync batch: " . json_encode(array_slice($invalidEvents, 0, 10)));
-                http_response_code(400);
-                echo json_encode([
-                    "error" => "Invalid sync payload: refusing unsafe task or scroll events",
-                    "rejected" => count($invalidEvents),
-                    "invalid_scrolls" => $invalidScrollEvents,
-                    "invalid_tasks" => $invalidTaskEvents,
-                    "examples" => array_slice($invalidEvents, 0, 10)
-                ]);
-                exit;
+            if (!empty($invalidEvents)) {
+                // Quarantine only unsafe entities. Rejecting the whole request used to block
+                // unrelated healthy quests and scrolls that happened to share the same batch.
+                $invalidIds = [];
+                foreach ($invalidEvents as $invalid) {
+                    $invalidIds[(string)($invalid['id'] ?? '')] = true;
+                }
+                $entries = array_values(array_filter(
+                    $entries,
+                    static function ($entry) use ($invalidIds) {
+                        return is_array($entry)
+                            && !isset($invalidIds[(string)($entry['id'] ?? '')]);
+                    }
+                ));
+                log_api_event($pdo, $userId, $deviceId, 'SYNC_QUARANTINED', "Quarantined invalid sync events: " . json_encode(array_slice($invalidEvents, 0, 10)));
             }
             
             $inserted = 0;
@@ -927,6 +930,13 @@ try {
             foreach ($entries as $e) {
                 if (empty($e['id'])) continue;
                 $eventDeviceId = $e['device_id'] ?? $deviceId ?? '';
+                $previousProjectId = null;
+                if (($e['entity_type'] ?? '') === 'note' && ($e['operation'] ?? '') !== 'delete') {
+                    // Capture the old campaign before inserting the move event. Companions who
+                    // only belong to the old campaign must receive a tombstone for the moved scroll.
+                    $entityProjectStmt->execute([$userId, 'note', $e['entity_id']]);
+                    $previousProjectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
+                }
                 $stmt->execute([
                     $e['id'],
                     $userId,
@@ -957,6 +967,30 @@ try {
                     $projectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
                 }
 
+                if ($previousProjectId && $projectId && $previousProjectId !== $projectId) {
+                    $memberStmt->execute([$previousProjectId, $identity]);
+                    $previousMembers = $memberStmt->fetchAll(PDO::FETCH_COLUMN);
+                    foreach ($previousMembers as $memberPubKey) {
+                        $userIdStmt->execute([$memberPubKey]);
+                        $targetUserId = $userIdStmt->fetchColumn();
+                        if ($targetUserId) {
+                            // Insert this before the destination update. A companion belonging to
+                            // both campaigns receives delete then update, leaving the scroll visible.
+                            $replicatedDeleteId = md5($e['id'] . $targetUserId . $previousProjectId . ':moved');
+                            $replicateInsertStmt->execute([
+                                $replicatedDeleteId,
+                                $targetUserId,
+                                'note',
+                                $e['entity_id'],
+                                'delete',
+                                '',
+                                $e['timestamp'],
+                                $eventDeviceId
+                            ]);
+                        }
+                    }
+                }
+
                 if ($projectId) {
                     $memberStmt->execute([$projectId, $identity]);
                     $members = $memberStmt->fetchAll(PDO::FETCH_COLUMN);
@@ -980,7 +1014,22 @@ try {
                 }
             }
             $pdo->commit();
-            echo json_encode(["status" => "success", "pushed" => $inserted]);
+            if (!empty($invalidEvents)) {
+                // Healthy entries have already been committed, but the client must not mark the
+                // quarantined local outbox rows as synced. A 422 keeps them pending for repair.
+                http_response_code(422);
+            }
+            echo json_encode([
+                "status" => empty($invalidEvents) ? "success" : "partial",
+                "pushed" => $inserted,
+                "rejected" => count($invalidEvents),
+                "invalid_scrolls" => $invalidScrollEvents,
+                "invalid_tasks" => $invalidTaskEvents,
+                "error" => empty($invalidEvents)
+                    ? null
+                    : "Unsafe events were quarantined; healthy events were accepted",
+                "examples" => array_slice($invalidEvents, 0, 10)
+            ]);
             break;
             
         case 'sync/pull':

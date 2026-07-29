@@ -254,6 +254,8 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **Hydration reliability:** Water reminders can appear over every screen, overnight schedules work correctly, and the dashboard clearly shows when hydration is paused or preparing its next reminder.
 - **More keyboard navigation:** `h`, `j`, `k`, and `l` now work in more lists and menus, with clearer selected rows across themes.
 - **Quick Notes:** Press `Ctrl+N` or choose Create Note from the Command Palette to open a scroll over the Dashboard, write its title, choose its campaign, and begin editing immediately.
+- **Cross-campaign scroll filing:** Press `R` on a scroll to move it to another campaign, leave it ungrouped there, or file it directly into one of that campaign's codices.
+- **Clearer Focus Sanctuary:** Active sessions now feature a large responsive countdown plus a quiet progress compass showing elapsed time, remaining time, completion percentage, and expected finish time.
 - **Safer note editing:** `Ctrl+S` saves without closing the editor. Closing a changed scroll asks whether to save, discard, or keep editing, while an unchanged scroll closes immediately.
 - **Silent note autosave:** Changed scrolls save automatically every few seconds without sounds or popups. A small `Autosaved` message appears in the editor status bar.
 - **Better pasting and scrolling:** Large clipboard pastes are inserted at once, paragraphs and accented characters are preserved, wrapped text scrolls inside the editor, and the cursor remains visible without adding spaces inside words.

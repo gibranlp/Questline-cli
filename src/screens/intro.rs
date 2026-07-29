@@ -156,7 +156,7 @@ pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Them
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(current_color))
                 .title(Span::styled(
-                    format!(" [ build {} ] ", build_info::build_label()),
+                    format!(" [ {} ] ", build_info::version_label()),
                     Style::default()
                         .fg(Color::Rgb(249, 115, 22))
                         .add_modifier(Modifier::BOLD),
