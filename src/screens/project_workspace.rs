@@ -1397,10 +1397,7 @@ fn draw_tasks_tab(
             Line::from("  Description:"),
         ];
         for line in desc.lines() {
-            text.push(Line::from(Span::styled(
-                format!("  {}", line),
-                Style::default().fg(theme.text),
-            )));
+            text.push(md_line(line, theme));
         }
         // Los steps de esta tarea van al final del panel de detalles
         let steps: Vec<&Task> = all_tasks

@@ -1016,9 +1016,12 @@ pub struct App {
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
-    content
-        .split_whitespace()
-        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+    content.split_whitespace().find_map(|word| {
+        let start = word.find("https://").or_else(|| word.find("http://"))?;
+        let url = word[start..]
+            .trim_end_matches([')', ']', '}', '>', '"', '\'', ',', '.', ';', ':', '!', '?']);
+        (!url.is_empty()).then_some(url)
+    })
 }
 
 pub fn open_url(url: &str) {
@@ -2726,18 +2729,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
-                    if self.active_project_id.is_some() {
-                        self.active_screen = ActiveScreen::Workspace;
-                        self.workspace_tab_idx = 1;
-                        self.modal_state = ModalType::NewJournalEntry {
-                            content: String::new(),
-                        };
-                    } else {
-                        self.modal_state = ModalType::SelectProjectForAction {
-                            action_id: "create_note",
-                            selected_idx: 0,
-                        };
-                    }
+                    self.open_quick_note_editor();
                     return Ok(());
                 }
                 _ => {}
@@ -5213,8 +5205,8 @@ impl App {
                         };
                     }
                     KeyCode::Enter if !projects.is_empty() => {
-                        let project = projects[sel];
-                        self.active_project_id = Some(project.id);
+                        let project_id = projects[sel].id;
+                        self.active_project_id = Some(project_id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.reload_data()?;
                         if action_id == "create_task" {
@@ -5233,9 +5225,23 @@ impl App {
                             };
                         } else {
                             self.workspace_tab_idx = 1;
-                            self.modal_state = ModalType::NewJournalEntry {
-                                content: String::new(),
-                            };
+                            let mut state =
+                                EditorState::new(project_id, None, String::new(), String::new());
+                            state.quick_note = true;
+                            state.project_choices = self
+                                .projects
+                                .iter()
+                                .filter(|p| !p.archived && !p.completed)
+                                .map(|p| (p.id, p.name.clone()))
+                                .collect();
+                            state.project_choice_idx = state
+                                .project_choices
+                                .iter()
+                                .position(|(id, _)| *id == project_id)
+                                .unwrap_or(0);
+                            self.editor_state = Some(state);
+                            self.modal_state = ModalType::None;
+                            self.active_screen = ActiveScreen::Editor;
                         }
                     }
                     _ => {}
@@ -5992,8 +5998,300 @@ impl App {
         Ok(())
     }
 
+    fn save_editor_note(&mut self, close_after_save: bool, silent_autosave: bool) -> Result<()> {
+        let Some(state) = self.editor_state.as_ref() else {
+            return Ok(());
+        };
+        let notification_count = self.notifications.len();
+        let previous_modal = self.modal_state.clone();
+        let previous_overlay = self.overlay_modal.clone();
+        let previous_fragment = self.fragment_notification.clone();
+        let raw_title = state.title.clone();
+        let note_title = if raw_title.trim().is_empty() {
+            "Untitled Scroll".to_string()
+        } else {
+            raw_title.trim().to_string()
+        };
+        let content = state.get_content();
+        let project_id = state.project_id;
+        let existing_note_id = state.note_id;
+        let codex_id = state.codex_id;
+        let quick_note = state.quick_note;
+        let has_unsaved_changes = state.has_unsaved_changes();
+        let word_count = content.len();
+        let is_new_note = existing_note_id.is_none();
+        let saved_note_id = existing_note_id.unwrap_or_else(Uuid::new_v4);
+
+        if existing_note_id.is_some() && !has_unsaved_changes {
+            if close_after_save {
+                self.close_editor_without_saving();
+            } else if !silent_autosave {
+                self.notifications
+                    .push(Notification::info("Scroll already saved."));
+            }
+            return Ok(());
+        }
+
+        let xp_service = XPService::new(&self.db);
+        if let Some(note_id) = existing_note_id {
+            let mut note = Note {
+                id: note_id,
+                project_id: Some(project_id),
+                title: note_title,
+                markdown_content: content,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sharing_permission: "collaborative".to_string(),
+                codex_id: None,
+                owner_identity: None,
+            };
+            if let Ok(notes) = self.db.get_notes() {
+                if let Some(orig) = notes.iter().find(|n| n.id == note_id) {
+                    note.created_at = orig.created_at;
+                    note.sharing_permission = orig.sharing_permission.clone();
+                    note.codex_id = orig.codex_id;
+                    note.owner_identity = orig.owner_identity.clone();
+                }
+            }
+            self.db.update_note(&note)?;
+            if !silent_autosave {
+                if let Some(ref mut u) = self.user {
+                    let mut xp_gain = 2;
+                    if word_count > 500 {
+                        xp_gain += 10;
+                    }
+                    let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
+                    if leveled_up {
+                        self.notifications.push(Notification::info(format!(
+                            "LEVEL UP! You reached Level {}!",
+                            u.level
+                        )));
+                    }
+                }
+            }
+        } else {
+            let note = Note {
+                id: saved_note_id,
+                project_id: Some(project_id),
+                title: note_title,
+                markdown_content: content,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sharing_permission: "collaborative".to_string(),
+                codex_id,
+                owner_identity: Some(self.identity.public_key.clone()),
+            };
+            self.db.insert_note(&note)?;
+            self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
+            if let Some(ref mut u) = self.user {
+                let mut xp_gain = 5;
+                if word_count > 500 {
+                    xp_gain += 10;
+                }
+                let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
+                if leveled_up {
+                    self.notifications.push(Notification::info(format!(
+                        "LEVEL UP! You reached Level {}!",
+                        u.level
+                    )));
+                }
+            }
+            self.complete_productive_action()?;
+            self.update_daily_adventure_progress("write_note", 1)?;
+            self.check_action_achievements()?;
+        }
+
+        self.mark_dirty();
+        if !silent_autosave || is_new_note {
+            self.apply_class_passive(
+                if is_new_note {
+                    "note_create"
+                } else {
+                    "note_edit"
+                },
+                word_count,
+            )?;
+        }
+        if let Some(state) = self.editor_state.as_mut() {
+            state.mark_saved(saved_note_id);
+            if silent_autosave {
+                state.record_autosaved();
+            }
+        }
+        self.reload_data()?;
+
+        if close_after_save {
+            self.editor_state = None;
+            if quick_note {
+                self.active_screen = ActiveScreen::Dashboard;
+                self.active_tab_idx = 0;
+            } else {
+                self.active_screen = ActiveScreen::Workspace;
+                self.workspace_tab_idx = 1;
+            }
+        } else if !silent_autosave {
+            self.notifications
+                .push(Notification::info("Scroll saved. Continue writing."));
+        }
+        if silent_autosave {
+            self.notifications.truncate(notification_count);
+            self.modal_state = previous_modal;
+            self.overlay_modal = previous_overlay;
+            self.fragment_notification = previous_fragment;
+        }
+        Ok(())
+    }
+
+    pub fn tick_note_autosave(&mut self) -> Result<()> {
+        const NOTE_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let autosave_due = self.active_screen == ActiveScreen::Editor
+            && self
+                .editor_state
+                .as_ref()
+                .map(|state| state.autosave_due(NOTE_AUTOSAVE_INTERVAL))
+                .unwrap_or(false);
+        if autosave_due {
+            self.save_editor_note(false, true)?;
+        }
+        Ok(())
+    }
+
+    fn paste_into_task_description(
+        modal: &mut ModalType,
+        editor: &mut Option<EditorState>,
+        project_id: Uuid,
+        text: &str,
+    ) -> bool {
+        let (desc, desc_cursor) = match modal {
+            ModalType::NewTask {
+                desc,
+                desc_cursor,
+                focus_idx: 1,
+                ..
+            }
+            | ModalType::EditTask {
+                desc,
+                desc_cursor,
+                focus_idx: 1,
+                ..
+            } => (desc.clone(), *desc_cursor),
+            _ => return false,
+        };
+
+        let needs_new_editor = editor
+            .as_ref()
+            .map(|state| state.get_content() != desc)
+            .unwrap_or(true);
+        if needs_new_editor {
+            *editor = Some(Self::task_desc_editor_from_text(
+                project_id,
+                desc,
+                desc_cursor,
+                true,
+            ));
+        }
+
+        let Some(state) = editor.as_mut() else {
+            return false;
+        };
+        state.insert_text(text);
+        let pasted_desc = state.get_content();
+        let pasted_cursor = Self::task_desc_cursor_from_editor(state);
+
+        match modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            }
+            | ModalType::EditTask {
+                desc, desc_cursor, ..
+            } => {
+                *desc = pasted_desc;
+                *desc_cursor = pasted_cursor;
+            }
+            _ => unreachable!("task description modal changed while pasting"),
+        }
+        true
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        let project_id = self.active_project_id.unwrap_or_else(Uuid::nil);
+
+        // A new-step overlay sits above the parent quest modal and must receive
+        // the paste exclusively, just like regular key events do.
+        if self.overlay_modal != ModalType::None {
+            Self::paste_into_task_description(
+                &mut self.overlay_modal,
+                &mut self.task_desc_editor,
+                project_id,
+                text,
+            );
+            return;
+        }
+
+        if Self::paste_into_task_description(
+            &mut self.modal_state,
+            &mut self.task_desc_editor,
+            project_id,
+            text,
+        ) {
+            return;
+        }
+
+        if self.active_screen == ActiveScreen::Editor {
+            if let Some(state) = self.editor_state.as_mut() {
+                if !state.confirm_close && !state.show_help && !state.editing_project {
+                    state.insert_text(text);
+                }
+            }
+        }
+    }
+
+    fn close_editor_without_saving(&mut self) {
+        let quick_note = self
+            .editor_state
+            .as_ref()
+            .map(|state| state.quick_note)
+            .unwrap_or(false);
+        self.editor_state = None;
+        if quick_note {
+            self.active_screen = ActiveScreen::Dashboard;
+            self.active_tab_idx = 0;
+        } else {
+            self.active_screen = ActiveScreen::Workspace;
+            self.workspace_tab_idx = 1;
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) -> Result<()> {
         use crate::screens::editor::EditorMode;
+
+        if self
+            .editor_state
+            .as_ref()
+            .map(|state| state.confirm_close)
+            .unwrap_or(false)
+        {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('y') => {
+                    self.save_editor_note(true, false)?;
+                }
+                KeyCode::Char('d') | KeyCode::Char('n') => {
+                    self.close_editor_without_saving();
+                }
+                KeyCode::Esc => {
+                    if let Some(state) = self.editor_state.as_mut() {
+                        state.confirm_close = false;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.save_editor_note(false, false)?;
+            return Ok(());
+        }
 
         let home_end_whole_text = if matches!(key.code, KeyCode::Home | KeyCode::End) {
             Some(self.consume_home_end_double_press(key.code))
@@ -6008,7 +6306,7 @@ impl App {
             return Ok(());
         };
 
-        if key.code == KeyCode::Char('?') && !state.editing_title {
+        if key.code == KeyCode::Char('?') && !state.editing_title && !state.editing_project {
             if let EditorMode::Normal = state.mode {
                 state.show_help = !state.show_help;
                 state.pending_cmd.clear();
@@ -6021,96 +6319,6 @@ impl App {
             return Ok(());
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            let note_title = if state.title.trim().is_empty() {
-                "Untitled Scroll".to_string()
-            } else {
-                state.title.trim().to_string()
-            };
-            let content = state.get_content();
-            let word_count = content.len();
-
-            let is_new_note = state.note_id.is_none();
-            let xp_service = XPService::new(&self.db);
-            if let Some(note_id) = state.note_id {
-                let mut note = Note {
-                    id: note_id,
-                    project_id: Some(state.project_id),
-                    title: note_title,
-                    markdown_content: content,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    sharing_permission: "collaborative".to_string(),
-                    codex_id: None,
-                    owner_identity: None,
-                };
-                if let Ok(notes) = self.db.get_notes() {
-                    if let Some(orig) = notes.iter().find(|n| n.id == note_id) {
-                        note.created_at = orig.created_at;
-                        note.sharing_permission = orig.sharing_permission.clone();
-                        note.codex_id = orig.codex_id;
-                        note.owner_identity = orig.owner_identity.clone();
-                    }
-                }
-                self.db.update_note(&note)?;
-                if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 2;
-                    if word_count > 500 {
-                        xp_gain += 10;
-                    }
-                    let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
-                    if leveled_up {
-                        self.notifications.push(Notification::info(format!(
-                            "LEVEL UP! You reached Level {}!",
-                            u.level
-                        )));
-                    }
-                }
-            } else {
-                let note = Note {
-                    id: Uuid::new_v4(),
-                    project_id: Some(state.project_id),
-                    title: note_title,
-                    markdown_content: content,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    sharing_permission: "collaborative".to_string(),
-                    codex_id: state.codex_id,
-                    owner_identity: Some(self.identity.public_key.clone()),
-                };
-                self.db.insert_note(&note)?;
-                self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
-                if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 5;
-                    if word_count > 500 {
-                        xp_gain += 10;
-                    }
-                    let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
-                    if leveled_up {
-                        self.notifications.push(Notification::info(format!(
-                            "LEVEL UP! You reached Level {}!",
-                            u.level
-                        )));
-                    }
-                }
-                self.complete_productive_action()?;
-                self.update_daily_adventure_progress("write_note", 1)?;
-                self.check_action_achievements()?;
-            }
-            self.mark_dirty();
-            let note_trigger = if is_new_note {
-                "note_create"
-            } else {
-                "note_edit"
-            };
-            self.apply_class_passive(note_trigger, word_count)?;
-            self.reload_data()?;
-            self.editor_state = None;
-            self.active_screen = ActiveScreen::Workspace;
-            self.workspace_tab_idx = 1;
-            return Ok(());
-        }
-
         if state.editing_title {
             match key.code {
                 KeyCode::Esc => {
@@ -6118,17 +6326,27 @@ impl App {
                         // Editing existing note — Esc returns to body without discarding
                         state.editing_title = false;
                         state.mode = EditorMode::Normal;
+                    } else if state.has_unsaved_changes() {
+                        state.confirm_close = true;
                     } else {
-                        // New note — Esc cancels creation
+                        let quick_note = state.quick_note;
                         self.editor_state = None;
-                        self.active_screen = ActiveScreen::Workspace;
+                        self.active_screen = if quick_note {
+                            ActiveScreen::Dashboard
+                        } else {
+                            ActiveScreen::Workspace
+                        };
                     }
                 }
                 KeyCode::Enter | KeyCode::Tab | KeyCode::Down => {
                     state.editing_title = false;
-                    state.cursor_y = 0;
-                    state.cursor_x = 0;
-                    state.mode = EditorMode::Insert;
+                    if state.quick_note {
+                        state.editing_project = true;
+                    } else {
+                        state.cursor_y = 0;
+                        state.cursor_x = 0;
+                        state.mode = EditorMode::Insert;
+                    }
                 }
                 KeyCode::Backspace => {
                     if is_ctrl_backspace(key) {
@@ -6141,6 +6359,41 @@ impl App {
                     if state.title.len() < 50 {
                         state.title.push(c);
                     }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if state.editing_project {
+            match key.code {
+                KeyCode::Esc | KeyCode::BackTab => {
+                    state.editing_project = false;
+                    state.editing_title = true;
+                }
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                    let len = state.project_choices.len();
+                    if len > 0 {
+                        state.project_choice_idx = if state.project_choice_idx > 0 {
+                            state.project_choice_idx - 1
+                        } else {
+                            len - 1
+                        };
+                        state.project_id = state.project_choices[state.project_choice_idx].0;
+                    }
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => {
+                    let len = state.project_choices.len();
+                    if len > 0 {
+                        state.project_choice_idx = (state.project_choice_idx + 1) % len;
+                        state.project_id = state.project_choices[state.project_choice_idx].0;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    state.editing_project = false;
+                    state.cursor_y = 0;
+                    state.cursor_x = 0;
+                    state.mode = EditorMode::Insert;
                 }
                 _ => {}
             }
@@ -6161,9 +6414,16 @@ impl App {
                 EditorMode::Normal => {
                     if !state.pending_cmd.is_empty() {
                         state.pending_cmd.clear();
+                    } else if state.has_unsaved_changes() {
+                        state.confirm_close = true;
                     } else {
+                        let quick_note = state.quick_note;
                         self.editor_state = None;
-                        self.active_screen = ActiveScreen::Workspace;
+                        self.active_screen = if quick_note {
+                            ActiveScreen::Dashboard
+                        } else {
+                            ActiveScreen::Workspace
+                        };
                     }
                 }
             }
@@ -6189,7 +6449,11 @@ impl App {
                 KeyCode::Enter => state.handle_enter(),
                 KeyCode::Tab => state.handle_tab(),
                 KeyCode::BackTab => {
-                    state.editing_title = true;
+                    if state.quick_note {
+                        state.editing_project = true;
+                    } else {
+                        state.editing_title = true;
+                    }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -12956,7 +13220,7 @@ impl App {
             },
             CommandAction {
                 name: "Create Note",
-                description: "Create a new note, with campaign picker if needed",
+                description: "Open a new scroll and choose its campaign",
                 shortcut: "Ctrl+N",
                 id: "create_note",
             },
@@ -13028,6 +13292,26 @@ impl App {
                 .into_iter()
                 .map(|(_, action)| action)
                 .collect()
+        }
+    }
+
+    fn open_quick_note_editor(&mut self) {
+        let project_choices: Vec<(Uuid, String)> = self
+            .projects
+            .iter()
+            .filter(|project| !project.archived && !project.completed)
+            .map(|project| (project.id, project.name.clone()))
+            .collect();
+
+        if let Some(state) = EditorState::new_quick_note(project_choices, self.active_project_id) {
+            self.modal_state = ModalType::None;
+            self.editor_state = Some(state);
+            self.active_screen = ActiveScreen::Editor;
+        } else {
+            self.modal_state = ModalType::None;
+            self.notifications.push(Notification::warning(
+                "Create an active campaign before writing a scroll.",
+            ));
         }
     }
 
@@ -13124,20 +13408,7 @@ impl App {
                     };
                 }
             }
-            "create_note" => {
-                if self.active_project_id.is_some() {
-                    self.active_screen = ActiveScreen::Workspace;
-                    self.workspace_tab_idx = 1;
-                    self.modal_state = ModalType::NewJournalEntry {
-                        content: String::new(),
-                    };
-                } else {
-                    self.modal_state = ModalType::SelectProjectForAction {
-                        action_id: "create_note",
-                        selected_idx: 0,
-                    };
-                }
-            }
+            "create_note" => self.open_quick_note_editor(),
             "start_focus" => {
                 self.active_screen = ActiveScreen::Focus;
             }
@@ -13268,7 +13539,7 @@ impl App {
             xp_service.grant_xp(u, label, bonus_xp)?;
         }
 
-        // Warlock Daemon Sync XP is shown in the sync footer instead of a notification
+        // Warlock Daemon Sync XP is shown in the sync footer instead of a notification.
         if class == ClassType::CodeWarlock && trigger == "sync_complete" {
             self.last_sync_warlock_xp = bonus_xp;
             return Ok(());
@@ -17029,7 +17300,7 @@ impl App {
 
         let now = chrono::Local::now();
         let hour = now.hour();
-        let in_active_hours = hour >= self.hydration_active_from && hour < self.hydration_active_to;
+        let in_active_hours = self.hydration_is_active_at_hour(hour);
 
         if !in_active_hours {
             // Outside active window — clear any pending timer so it rearms when active hours resume
@@ -17075,6 +17346,17 @@ impl App {
         }
 
         Ok(())
+    }
+
+    pub fn hydration_is_active_at_hour(&self, hour: u32) -> bool {
+        if self.hydration_active_from == self.hydration_active_to {
+            return true;
+        }
+        if self.hydration_active_from < self.hydration_active_to {
+            hour >= self.hydration_active_from && hour < self.hydration_active_to
+        } else {
+            hour >= self.hydration_active_from || hour < self.hydration_active_to
+        }
     }
 
     fn record_hydration_drink(&mut self, enforce_wait: bool) -> Result<()> {
@@ -17509,6 +17791,81 @@ mod app_tests {
             }
             _ => panic!("Expected completed quest to build an EditTask modal"),
         }
+    }
+
+    #[test]
+    fn test_paste_into_quest_and_step_descriptions() {
+        let project_id = Uuid::new_v4();
+        let mut editor = None;
+        let mut quest_modal = ModalType::NewTask {
+            title: "Quest".to_string(),
+            desc: "Before  after".to_string(),
+            desc_cursor: "Before ".len(),
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: None,
+            recurrence: None,
+        };
+
+        assert!(App::paste_into_task_description(
+            &mut quest_modal,
+            &mut editor,
+            project_id,
+            "línea uno\r\nlínea dos"
+        ));
+        match quest_modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            } => {
+                assert_eq!(desc, "Before línea uno\nlínea dos after");
+                assert_eq!(desc_cursor, "Before línea uno\nlínea dos".len());
+            }
+            _ => panic!("Expected a quest modal"),
+        }
+
+        let mut step_modal = ModalType::NewTask {
+            title: "Step".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: Some(Uuid::new_v4()),
+            recurrence: None,
+        };
+        assert!(App::paste_into_task_description(
+            &mut step_modal,
+            &mut editor,
+            project_id,
+            "pasted step"
+        ));
+        match step_modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            } => {
+                assert_eq!(desc, "pasted step");
+                assert_eq!(desc_cursor, "pasted step".len());
+            }
+            _ => panic!("Expected a step modal"),
+        }
+    }
+
+    #[test]
+    fn test_extract_url_supports_bare_and_markdown_links() {
+        assert_eq!(
+            extract_url("Visit https://questlinecli.com/docs."),
+            Some("https://questlinecli.com/docs")
+        );
+        assert_eq!(
+            extract_url("Read [the guide](https://questlinecli.com/guide)."),
+            Some("https://questlinecli.com/guide")
+        );
+        assert_eq!(extract_url("No link here."), None);
     }
 
     #[test]
@@ -18093,6 +18450,88 @@ mod app_tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.task_sort, "DueDate");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn test_quick_note_shortcut_and_palette_action_save_a_scroll() {
+        let db_file = Path::new("test_questline_quick_note.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.config.sync_enabled = false;
+
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Quick Scribe".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: Utc::now(),
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Selected Campaign".to_string(),
+            description: None,
+            archived: false,
+            completed: false,
+            created_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.reload_data().unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .unwrap();
+        let editor = app.editor_state.as_ref().expect("quick-note editor");
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert!(editor.quick_note);
+        assert_eq!(editor.project_id, project.id);
+
+        // Cancelling the dashboard shortcut returns to the dashboard.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
+
+        // The command-palette action opens the same title → campaign → body flow.
+        app.execute_command_action("create_note").unwrap();
+        for c in "Fast Note".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+                .unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.editor_state.as_ref().unwrap().editing_project);
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert_eq!(app.editor_state.as_ref().unwrap().note_id.is_some(), true);
+        assert!(!app.editor_state.as_ref().unwrap().has_unsaved_changes());
+        let notes = app.db.get_notes_for_project(project.id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Fast Note");
+        assert_eq!(notes[0].markdown_content, "Hi");
+
+        // A clean editor closes without prompting: Insert → Normal → close.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         let _ = std::fs::remove_file(db_file);
     }

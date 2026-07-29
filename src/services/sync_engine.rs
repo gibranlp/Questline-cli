@@ -155,6 +155,13 @@ impl CloudProvider for FileCloudProvider {
 
 use crate::services::ApiClient;
 
+fn total_user_progress_xp(user: &crate::models::User) -> i64 {
+    let completed_levels: i64 = (1..user.level.max(1))
+        .map(|level| crate::models::User::xp_for_next_level(level) as i64)
+        .sum();
+    completed_levels + user.xp.max(0) as i64
+}
+
 pub struct HttpCloudProvider {
     pub client: ApiClient,
 }
@@ -1200,11 +1207,30 @@ impl<'a> SyncEngine<'a> {
                 if let Some(ref content) = log.content {
                     match log.entity_type.as_str() {
                         "user" => {
-                            if let Ok(u) = serde_json::from_str::<crate::models::User>(content) {
-                                // Clear the table first to enforce singleton constraint and avoid duplicating users
-                                let _ = self.db.conn.execute("DELETE FROM users", []);
+                            if let Ok(mut u) = serde_json::from_str::<crate::models::User>(content)
+                            {
+                                // Progression is monotonic. An older device snapshot must never
+                                // reduce level/XP earned on another device.
+                                let mut preserved_local_progress = false;
+                                if let Ok(Some(local)) = self.db.get_user() {
+                                    if total_user_progress_xp(&local) > total_user_progress_xp(&u) {
+                                        u.level = local.level;
+                                        u.xp = local.xp;
+                                        preserved_local_progress = true;
+                                    }
+                                }
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO users (id, username, class, level, xp, created_at, specialization) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    "DELETE FROM users WHERE id != ?1",
+                                    params![u.id.to_string()],
+                                );
+                                let _ = self.db.conn.execute(
+                                    "INSERT INTO users (id, username, class, level, xp, created_at, specialization)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         username=excluded.username, class=excluded.class,
+                                         level=excluded.level, xp=excluded.xp,
+                                         created_at=excluded.created_at,
+                                         specialization=excluded.specialization",
                                     params![
                                         u.id.to_string(),
                                         u.username,
@@ -1215,6 +1241,9 @@ impl<'a> SyncEngine<'a> {
                                         u.specialization
                                     ],
                                 );
+                                if preserved_local_progress {
+                                    let _ = self.db.log_change("user", &u.id.to_string(), "upsert");
+                                }
                                 pulled_count += 1;
                             }
                         }
@@ -2069,6 +2098,27 @@ mod tests {
         assert_eq!(page.head_seq, 100);
         assert!(page.has_more);
         assert!(page.metadata_supported);
+    }
+
+    #[test]
+    fn user_progress_comparison_includes_completed_levels() {
+        let now = Utc::now();
+        let mut lower = crate::models::User {
+            id: Uuid::new_v4(),
+            username: "Hero".into(),
+            class: crate::models::ClassType::CodeWarlock,
+            level: 19,
+            xp: 1872,
+            created_at: now,
+            specialization: None,
+        };
+        let mut higher = lower.clone();
+        higher.xp = 2019;
+        assert!(total_user_progress_xp(&higher) > total_user_progress_xp(&lower));
+
+        lower.level = 20;
+        lower.xp = 0;
+        assert!(total_user_progress_xp(&lower) > total_user_progress_xp(&higher));
     }
 
     #[test]

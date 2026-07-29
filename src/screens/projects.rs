@@ -131,19 +131,19 @@ pub fn draw(
     )];
     if total_open_tasks > 0 {
         all_spans.push(Span::styled(
-            format!("({}) ", total_open_tasks),
+            format!("!({}) ", total_open_tasks),
             all_task_count_style,
         ));
     }
     if total_steps > 0 {
         all_spans.push(Span::styled(
-            format!("({}) ", total_steps),
+            format!("->({}) ", total_steps),
             all_step_count_style,
         ));
     }
     if total_scrolls > 0 {
         all_spans.push(Span::styled(
-            format!("({}) ", total_scrolls),
+            format!("#({}) ", total_scrolls),
             all_scroll_count_style,
         ));
     }
@@ -213,16 +213,19 @@ pub fn draw(
             };
             let mut spans = vec![Span::styled(format!("  {} ", p.name), name_style)];
             if open_tasks > 0 {
-                spans.push(Span::styled(format!("({}) ", open_tasks), task_count_style));
+                spans.push(Span::styled(
+                    format!("!({}) ", open_tasks),
+                    task_count_style,
+                ));
             }
             if total_steps > 0 {
                 spans.push(Span::styled(
-                    format!("({}) ", total_steps),
+                    format!("->({}) ", total_steps),
                     step_count_style,
                 ));
             }
             if scrolls > 0 {
-                spans.push(Span::styled(format!("({}) ", scrolls), scroll_count_style));
+                spans.push(Span::styled(format!("#({}) ", scrolls), scroll_count_style));
             }
             list_items.push(ListItem::new(Line::from(spans)));
         }

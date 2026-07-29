@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -414,7 +414,7 @@ async fn main() -> Result<()> {
     // Órale, a preparar la terminal — raw mode, pantalla alterna, backend de crossterm
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -429,7 +429,7 @@ async fn main() -> Result<()> {
             print!("\x1b]111\x07");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             disable_raw_mode()?;
-            execute!(io::stdout(), LeaveAlternateScreen)?;
+            execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
             return Err(e);
         }
     };
@@ -500,10 +500,12 @@ async fn main() -> Result<()> {
     loop {
         // Primero checar si hay tecla presionada antes de dibujar — así el input se siente más rápido
         if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
                     app.handle_key_event(key)?;
                 }
+                Event::Paste(text) => app.handle_paste(&text),
+                _ => {}
             }
         }
 
@@ -519,6 +521,7 @@ async fn main() -> Result<()> {
         app.terminal_width = terminal_size.map(|s| s.width).unwrap_or(120);
         app.terminal_height = terminal_size.map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
+        app.tick_note_autosave()?;
         app.tick_auto_sync()?;
         let sync_busy = app.sync_in_progress;
         if !sync_busy {
@@ -613,8 +616,25 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveScreen::Editor => {
+                    let quick_note = app
+                        .editor_state
+                        .as_ref()
+                        .map(|state| state.quick_note)
+                        .unwrap_or(false);
+                    if quick_note {
+                        let dashboard_area = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(5), Constraint::Length(3)])
+                            .split(size)[0];
+                        screens::dashboard::draw(f, &app, &theme, dashboard_area);
+                    }
                     if let Some(ref mut s) = app.editor_state {
-                        screens::editor::draw(f, s, &theme);
+                        if quick_note {
+                            let area = screens::intro::centered_rect(84, 86, size);
+                            screens::editor::draw_in_area(f, s, &theme, area);
+                        } else {
+                            screens::editor::draw(f, s, &theme);
+                        }
                     }
                 }
                 ActiveScreen::Workspace => {
@@ -2244,6 +2264,7 @@ async fn main() -> Result<()> {
                 let mut lines = vec![
                     Line::from(Span::styled("Global Shortcuts:", Style::default().fg(theme.primary).add_modifier(Modifier::UNDERLINED | Modifier::BOLD))),
                     Line::from("  Ctrl+P / : / Ctrl+K / F1  Command Palette (Fuzzy Navigation & Commands)"),
+                    Line::from("  Ctrl+N       Quick Note (title, campaign, then scroll editor)"),
                     Line::from("  ?            Show Keyboard Shortcuts Help (Context-Sensitive)"),
                     Line::from("  1-8          Switch sections directly"),
                     Line::from("  Tab          Cycle input focus/fields"),
@@ -2260,6 +2281,7 @@ async fn main() -> Result<()> {
 
                 match app.active_screen {
                     ActiveScreen::Dashboard => {
+                        lines.push(Line::from("  Ctrl+N       Write a Quick Note"));
                         lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
                         lines.push(Line::from("  f            Quick start Focus Session"));
                         lines.push(Line::from("  m            Go to Music Screen"));
@@ -2433,7 +2455,11 @@ async fn main() -> Result<()> {
     print!("\x1b]111\x07");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     // Si el usuario aceptó el update, corre el installer después de limpiar la terminal

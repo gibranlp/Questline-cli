@@ -1203,8 +1203,10 @@ fn draw_hydration_widget(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
         } else {
             format!("{}m {:02}s", secs / 60, secs % 60)
         }
+    } else if !app.hydration_is_active_at_hour(chrono::Local::now().hour()) {
+        format!("Paused to {:02}:00", app.hydration_active_from)
     } else {
-        "--".to_string()
+        "Arming...".to_string()
     };
 
     let lines = vec![
