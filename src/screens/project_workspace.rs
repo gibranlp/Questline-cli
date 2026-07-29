@@ -14,7 +14,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, Paragraph},
+    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
 };
 
 // El jefe máximo de renderizado — desde aquí se coordina todo el workspace
@@ -637,8 +637,12 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         ModalType::RenameCodex { name, .. } => {
             draw_rename_codex_modal(f, name, theme);
         }
-        ModalType::RefileScroll { selected_idx, .. } => {
-            draw_refile_scroll_modal(f, &app.codices, *selected_idx, theme);
+        ModalType::RefileScroll {
+            selected_idx,
+            destinations,
+            ..
+        } => {
+            draw_refile_scroll_modal(f, destinations, *selected_idx, theme);
         }
         ModalType::RefileCodex {
             codex_id,
@@ -783,7 +787,7 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         Line::from(vec![k("  n"), d("          New scroll")]),
         Line::from(vec![k("  Enter / e"), d("    Edit scroll")]),
         Line::from(vec![k("  d"), d("           New codex")]),
-        Line::from(vec![k("  r"), d("           Move to codex")]),
+        Line::from(vec![k("  r"), d("           Move to campaign / codex")]),
         Line::from(vec![k("  Delete"), d("      Delete scroll")]),
         Line::from(vec![]),
         Line::from(vec![h("  JOURNAL (Section 3)")]),
@@ -908,17 +912,17 @@ fn draw_rename_codex_modal(f: &mut Frame, name: &str, theme: &Theme) {
     f.render_widget(p, inner);
 }
 
-// Modal para mover un scroll (note) a otro codex — lista todos los codices disponibles
+// Modal para mover un scroll entre campañas y sus codices.
 fn draw_refile_scroll_modal(
     f: &mut Frame,
-    codices: &[crate::models::Codex],
+    destinations: &[crate::app::ScrollDestination],
     selected_idx: usize,
     theme: &Theme,
 ) {
     let size = f.size();
-    let item_count = (codices.len() + 1) as u16; // +1 por la opción "Ungrouped"
+    let item_count = destinations.len() as u16;
     let height = (item_count + 4).min(size.height.saturating_sub(4));
-    let width = (size.width / 3).max(36).min(50);
+    let width = (size.width / 2).clamp(48, 68);
     let area = ratatui::layout::Rect {
         x: (size.width.saturating_sub(width)) / 2,
         y: (size.height.saturating_sub(height)) / 2,
@@ -934,7 +938,7 @@ fn draw_refile_scroll_modal(
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(theme.primary))
-        .title(" Move Scroll to Codex ");
+        .title(" Move Scroll to Campaign / Codex ");
     f.render_widget(block, area);
 
     use ratatui::layout::Margin;
@@ -944,42 +948,30 @@ fn draw_refile_scroll_modal(
     });
 
     let mut items: Vec<ListItem> = Vec::new();
-    // Option 0: Ungrouped
-    let ungrouped_style = if selected_idx == 0 {
-        Style::default()
-            .fg(Color::Black)
-            .bg(theme.selection)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(theme.muted)
-    };
-    items.push(ListItem::new("  ── Ungrouped ──").style(ungrouped_style));
-    // Options 1..=n: each codex, indented if it has a parent
-    for (i, codex) in codices.iter().enumerate() {
-        let style = if selected_idx == i + 1 {
+    for (i, destination) in destinations.iter().enumerate() {
+        let style = if selected_idx == i {
             Style::default()
                 .fg(Color::Black)
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD)
+        } else if destination.codex_id.is_none() {
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(Color::White)
         };
-        let indent = if codex.parent_codex_id.is_some() {
-            "    "
+        let label = if let Some(codex_name) = destination.codex_name.as_deref() {
+            let parent_hint = destination
+                .parent_codex_name
+                .as_deref()
+                .map(|parent| format!(" ↳ {}", parent))
+                .unwrap_or_default();
+            format!("    ◆ {}{}", codex_name, parent_hint)
         } else {
-            "  "
+            format!("  ▣ {} / Ungrouped", destination.project_name)
         };
-        let parent_hint = if let Some(pid) = codex.parent_codex_id {
-            codices
-                .iter()
-                .find(|c| c.id == pid)
-                .map(|p| format!(" ↳ {}", p.name))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        items
-            .push(ListItem::new(format!("{}◆ {}{}", indent, codex.name, parent_hint)).style(style));
+        items.push(ListItem::new(label).style(style));
     }
 
     let hint = Paragraph::new("↑↓ navigate · Enter confirm · Esc cancel")
@@ -991,7 +983,9 @@ fn draw_refile_scroll_modal(
         .constraints([Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    f.render_widget(List::new(items), chunks[0]);
+    let mut list_state = ListState::default();
+    list_state.select((!destinations.is_empty()).then_some(selected_idx));
+    f.render_stateful_widget(List::new(items), chunks[0], &mut list_state);
     f.render_widget(hint, chunks[1]);
 }
 

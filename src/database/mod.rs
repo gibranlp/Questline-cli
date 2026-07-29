@@ -57,6 +57,155 @@ fn normalize_legacy_task_dates(
     (due_date.or(set_date), None)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LegacyRelationshipRepair {
+    repaired_parents: usize,
+    repaired_steps: usize,
+    recovered_scrolls: usize,
+    created_recovery_project: bool,
+}
+
+fn repair_legacy_sync_relationships(conn: &Connection) -> Result<LegacyRelationshipRepair> {
+    let tx = conn.unchecked_transaction()?;
+    let now = Utc::now().to_rfc3339();
+    let mut repair = LegacyRelationshipRepair::default();
+
+    // The old sync bug could clear a quest's campaign while leaving all of its steps
+    // attached to the original campaign. Only infer the parent when every linked step
+    // agrees, so an ambiguous tree is never silently moved.
+    let inferred_parents = {
+        let mut stmt = tx.prepare(
+            "SELECT parent.id, MIN(step.project_id)
+             FROM tasks parent
+             JOIN tasks step ON step.parent_task_id = parent.id
+             WHERE parent.project_id IS NULL AND step.project_id IS NOT NULL
+             GROUP BY parent.id
+             HAVING COUNT(DISTINCT step.project_id) = 1",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (parent_id, project_id) in inferred_parents {
+        if tx.execute(
+            "UPDATE tasks SET project_id = ?1, updated_at = ?2
+             WHERE id = ?3 AND project_id IS NULL",
+            params![project_id, now, parent_id],
+        )? > 0
+        {
+            Database::log_change_on(&tx, "task", &parent_id, "update")?;
+            repair.repaired_parents += 1;
+        }
+    }
+
+    // Once the parent is trustworthy, its steps must live in the same campaign.
+    let mismatched_steps = {
+        let mut stmt = tx.prepare(
+            "SELECT step.id, parent.project_id
+             FROM tasks step
+             JOIN tasks parent ON parent.id = step.parent_task_id
+             WHERE parent.project_id IS NOT NULL
+               AND COALESCE(step.project_id, '') != parent.project_id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (step_id, project_id) in mismatched_steps {
+        tx.execute(
+            "UPDATE tasks SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![project_id, now, step_id],
+        )?;
+        Database::log_change_on(&tx, "task", &step_id, "update")?;
+        repair.repaired_steps += 1;
+    }
+
+    // A codex is an unambiguous source for a scroll's missing campaign.
+    let codex_scrolls = {
+        let mut stmt = tx.prepare(
+            "SELECT note.id, codex.project_id
+             FROM notes note
+             JOIN codices codex ON codex.id = note.codex_id
+             WHERE note.project_id IS NULL",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (note_id, project_id) in codex_scrolls {
+        tx.execute(
+            "UPDATE notes SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![project_id, now, note_id],
+        )?;
+        Database::log_change_on(&tx, "note", &note_id, "update")?;
+        repair.recovered_scrolls += 1;
+    }
+
+    let remaining_scroll_ids = {
+        let mut stmt = tx.prepare("SELECT id FROM notes WHERE project_id IS NULL")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !remaining_scroll_ids.is_empty() {
+        let recovery_project_id = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'recovered_scrolls_project_id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|id| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let project_exists: bool = tx.query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            params![recovery_project_id],
+            |row| row.get::<_, i64>(0).map(|count| count > 0),
+        )?;
+        if !project_exists {
+            tx.execute(
+                "INSERT INTO projects
+                    (id, name, description, created_at, updated_at, archived, completed, is_shared)
+                 VALUES
+                    (?1, 'Recovered Scrolls',
+                     'Scrolls recovered from an older Questline sync issue.',
+                     ?2, ?2, 0, 0, 0)",
+                params![recovery_project_id, now],
+            )?;
+            Database::log_change_on(&tx, "project", &recovery_project_id, "create")?;
+            repair.created_recovery_project = true;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value)
+             VALUES ('recovered_scrolls_project_id', ?1)",
+            params![recovery_project_id],
+        )?;
+
+        for note_id in remaining_scroll_ids {
+            tx.execute(
+                "UPDATE notes SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![recovery_project_id, now, note_id],
+            )?;
+            Database::log_change_on(&tx, "note", &note_id, "update")?;
+            repair.recovered_scrolls += 1;
+        }
+    }
+
+    tx.commit()?;
+    Ok(repair)
+}
+
 const DEFAULT_STREAK_WORKDAY_MASK: u8 = 0b111_1111;
 const STREAK_WORKDAY_MASK_KEY: &str = "streak_workday_mask";
 const STREAK_ACTIVE_FROM_KEY: &str = "streak_active_from";
@@ -556,6 +705,7 @@ impl Database {
         ] {
             ensure_updated_at_column(&conn, table)?;
         }
+        repair_legacy_sync_relationships(&conn)?;
 
         let has_ritual_completion_count: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('ritual_history') WHERE name='completion_count'",
@@ -1523,6 +1673,26 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn move_note(&self, note_id: Uuid, project_id: Uuid, codex_id: Option<Uuid>) -> Result<()> {
+        if let Some(codex_id) = codex_id {
+            let codex_project_id: String = self.conn.query_row(
+                "SELECT project_id FROM codices WHERE id = ?1",
+                params![codex_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if codex_project_id != project_id.to_string() {
+                return Err(anyhow::anyhow!(
+                    "Cannot move scroll: the selected codex belongs to another campaign"
+                ));
+            }
+        }
+
+        let mut note = self.get_note_by_id(note_id)?;
+        note.project_id = Some(project_id);
+        note.codex_id = codex_id;
+        self.update_note(&note)
     }
 
     pub fn delete_note(&self, id: Uuid) -> Result<()> {
@@ -3340,7 +3510,7 @@ impl Database {
                 |row| row.get(0),
             )
             .unwrap_or(0);
-        if total_notes > 0 && projectless_notes * 2 >= total_notes {
+        if projectless_notes > 0 {
             return Err(anyhow::anyhow!(
                 "Refusing full-state sync: {} of {} scrolls are missing project links",
                 projectless_notes,
@@ -5301,6 +5471,151 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn legacy_relationship_repair_recovers_steps_and_projectless_scrolls() {
+        let db_file = Path::new("test_questline_legacy_relationship_repair.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let inferred_parent_id = Uuid::new_v4().to_string();
+        let inferred_step_id = Uuid::new_v4().to_string();
+        let known_parent_id = Uuid::new_v4().to_string();
+        let mismatched_step_id = Uuid::new_v4().to_string();
+        let codex_id = Uuid::new_v4().to_string();
+        let codex_note_id = Uuid::new_v4().to_string();
+        let loose_note_id = Uuid::new_v4().to_string();
+
+        db.conn
+            .execute(
+                "INSERT INTO projects
+                    (id, name, created_at, updated_at, archived, completed, is_shared)
+                 VALUES (?1, 'Original Campaign', ?2, ?2, 0, 0, 0)",
+                params![project_id, now],
+            )
+            .unwrap();
+        let insert_task = |id: &str, task_project: Option<&str>, parent: Option<&str>| {
+            db.conn
+                .execute(
+                    "INSERT INTO tasks
+                        (id, project_id, title, completed, priority, created_at, updated_at,
+                         parent_task_id, xp_awarded)
+                     VALUES (?1, ?2, ?1, 0, 'Medium', ?3, ?3, ?4, 0)",
+                    params![id, task_project, now, parent],
+                )
+                .unwrap();
+        };
+        insert_task(&inferred_parent_id, None, None);
+        insert_task(
+            &inferred_step_id,
+            Some(&project_id),
+            Some(&inferred_parent_id),
+        );
+        insert_task(&known_parent_id, Some(&project_id), None);
+        insert_task(&mismatched_step_id, None, Some(&known_parent_id));
+
+        db.conn
+            .execute(
+                "INSERT INTO codices
+                    (id, project_id, name, created_at, updated_at, collapsed)
+                 VALUES (?1, ?2, 'Recovered Codex', ?3, ?3, 0)",
+                params![codex_id, project_id, now],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO notes
+                    (id, project_id, title, markdown_content, created_at, updated_at,
+                     sharing_permission, codex_id)
+                 VALUES (?1, NULL, 'Codex Scroll', 'preserved', ?2, ?2, 'collaborative', ?3)",
+                params![codex_note_id, now, codex_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO notes
+                    (id, project_id, title, markdown_content, created_at, updated_at,
+                     sharing_permission)
+                 VALUES (?1, NULL, 'Loose Scroll', 'also preserved', ?2, ?2, 'collaborative')",
+                params![loose_note_id, now],
+            )
+            .unwrap();
+
+        let repaired = repair_legacy_sync_relationships(&db.conn).unwrap();
+        assert_eq!(
+            repaired,
+            LegacyRelationshipRepair {
+                repaired_parents: 1,
+                repaired_steps: 1,
+                recovered_scrolls: 2,
+                created_recovery_project: true,
+            }
+        );
+
+        for task_id in [
+            inferred_parent_id.as_str(),
+            inferred_step_id.as_str(),
+            known_parent_id.as_str(),
+            mismatched_step_id.as_str(),
+        ] {
+            let saved_project: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved_project.as_deref(), Some(project_id.as_str()));
+        }
+        let codex_note_project: String = db
+            .conn
+            .query_row(
+                "SELECT project_id FROM notes WHERE id = ?1",
+                params![codex_note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_note_project, project_id);
+        let loose_note_project: String = db
+            .conn
+            .query_row(
+                "SELECT project_id FROM notes WHERE id = ?1",
+                params![loose_note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(loose_note_project, project_id);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT name FROM projects WHERE id = ?1",
+                    params![loose_note_project],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Recovered Scrolls"
+        );
+
+        let pending_repairs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_log WHERE synced = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_repairs, 5);
+        assert_eq!(
+            repair_legacy_sync_relationships(&db.conn).unwrap(),
+            LegacyRelationshipRepair::default(),
+            "repair must be idempotent"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn hydration_counts_12_glasses_in_one_day() {
         let db_file = Path::new("test_questline_db_hydration_12.db");
         let _ = std::fs::remove_file(db_file);
@@ -5503,6 +5818,83 @@ mod tests {
         let saved = db.get_note_by_id(note.id).unwrap();
         assert_eq!(saved.sharing_permission, "read_only");
         assert!(saved.updated_at > old_time);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn moving_a_scroll_across_campaigns_preserves_content_and_syncs_destination() {
+        let db_file = Path::new("test_questline_cross_campaign_scroll_move.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now();
+        let source_project_id = Uuid::new_v4();
+        let destination_project_id = Uuid::new_v4();
+        for (id, name) in [
+            (source_project_id, "Source"),
+            (destination_project_id, "Destination"),
+        ] {
+            db.insert_project(&Project {
+                id,
+                name: name.to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .unwrap();
+        }
+        let destination_codex_id = Uuid::new_v4();
+        db.insert_codex(&Codex {
+            id: destination_codex_id,
+            project_id: destination_project_id,
+            name: "Destination Codex".to_string(),
+            created_at: now,
+            updated_at: now,
+            parent_codex_id: None,
+            collapsed: false,
+        })
+        .unwrap();
+        let note_id = Uuid::new_v4();
+        db.insert_note(&Note {
+            id: note_id,
+            project_id: Some(source_project_id),
+            title: "Movable Scroll".to_string(),
+            markdown_content: "Content must survive the journey.".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "collaborative".to_string(),
+            codex_id: None,
+            owner_identity: None,
+        })
+        .unwrap();
+        db.conn
+            .execute("UPDATE sync_log SET synced = 1", [])
+            .unwrap();
+
+        db.move_note(note_id, destination_project_id, Some(destination_codex_id))
+            .unwrap();
+
+        let moved = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(moved.project_id, Some(destination_project_id));
+        assert_eq!(moved.codex_id, Some(destination_codex_id));
+        assert_eq!(moved.markdown_content, "Content must survive the journey.");
+        let pending = db.get_pending_sync_logs().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "note");
+        assert_eq!(pending[0].2, note_id.to_string());
+        assert_eq!(pending[0].3, "update");
+
+        let wrong_project = db.move_note(note_id, source_project_id, Some(destination_codex_id));
+        assert!(wrong_project.is_err());
+        let unchanged = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(unchanged.project_id, Some(destination_project_id));
+        assert_eq!(unchanged.codex_id, Some(destination_codex_id));
 
         drop(db);
         let _ = std::fs::remove_file(db_file);

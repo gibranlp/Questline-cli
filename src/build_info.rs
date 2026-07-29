@@ -1,5 +1,3 @@
-pub const BUILD_NUMBER: u32 = 43;
-
-pub fn build_label() -> String {
-    format!("v{}.{:04}", env!("CARGO_PKG_VERSION"), BUILD_NUMBER)
+pub fn version_label() -> String {
+    format!("v{}", env!("CARGO_PKG_VERSION"))
 }

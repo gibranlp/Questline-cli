@@ -286,6 +286,15 @@ pub struct CommandAction {
     pub id: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollDestination {
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub codex_id: Option<Uuid>,
+    pub codex_name: Option<String>,
+    pub parent_codex_name: Option<String>,
+}
+
 // Todos los modales posibles de la app — hay más de 20, cada uno con su propio estado interno
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModalType {
@@ -510,6 +519,7 @@ pub enum ModalType {
     RefileScroll {
         note_id: Uuid,
         selected_idx: usize,
+        destinations: Vec<ScrollDestination>,
     },
     UpdateAvailable {
         latest_version: String,
@@ -3486,40 +3496,48 @@ impl App {
             ModalType::RefileScroll {
                 note_id,
                 selected_idx,
+                ref destinations,
             } => {
                 let nid = note_id;
                 let mut sel = selected_idx;
-                let total = self.codices.len() + 1; // 0 = Ungrouped, 1..=n = codices
+                let destinations = destinations.clone();
+                let total = destinations.len();
                 match key.code {
                     KeyCode::Esc => {
                         self.modal_state = ModalType::None;
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up | KeyCode::Char('k') if total > 0 => {
                         sel = if sel > 0 { sel - 1 } else { total - 1 };
                         self.modal_state = ModalType::RefileScroll {
                             note_id: nid,
                             selected_idx: sel,
+                            destinations,
                         };
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down | KeyCode::Char('j') if total > 0 => {
                         sel = (sel + 1) % total;
                         self.modal_state = ModalType::RefileScroll {
                             note_id: nid,
                             selected_idx: sel,
+                            destinations,
                         };
                     }
                     KeyCode::Enter => {
-                        if let Some(mut note) = self.db.get_note_by_id(nid).ok() {
-                            note.codex_id = if sel == 0 {
-                                None
-                            } else {
-                                self.codices.get(sel - 1).map(|c| c.id)
-                            };
-                            note.updated_at = chrono::Utc::now();
-                            self.db.update_note(&note)?;
+                        if let Some(destination) = destinations.get(sel) {
+                            self.db
+                                .move_note(nid, destination.project_id, destination.codex_id)?;
                             self.mark_dirty();
                             self.selected_notes_flat_idx = 0;
                             self.reload_data()?;
+                            let location = destination
+                                .codex_name
+                                .as_deref()
+                                .map(|codex| format!("{} / {}", destination.project_name, codex))
+                                .unwrap_or_else(|| {
+                                    format!("{} / Ungrouped", destination.project_name)
+                                });
+                            self.notifications
+                                .push(Notification::info(format!("Scroll moved to {}.", location)));
                         }
                         self.modal_state = ModalType::None;
                     }
@@ -9160,6 +9178,51 @@ impl App {
             .collect()
     }
 
+    pub fn build_scroll_destinations(
+        projects: &[Project],
+        codices: &[crate::models::Codex],
+    ) -> Vec<ScrollDestination> {
+        let mut destinations = Vec::new();
+        for project in projects.iter().filter(|project| !project.archived) {
+            destinations.push(ScrollDestination {
+                project_id: project.id,
+                project_name: project.name.clone(),
+                codex_id: None,
+                codex_name: None,
+                parent_codex_name: None,
+            });
+            for codex in codices
+                .iter()
+                .filter(|codex| codex.project_id == project.id)
+            {
+                destinations.push(ScrollDestination {
+                    project_id: project.id,
+                    project_name: project.name.clone(),
+                    codex_id: Some(codex.id),
+                    codex_name: Some(codex.name.clone()),
+                    parent_codex_name: codex.parent_codex_id.and_then(|parent_id| {
+                        codices
+                            .iter()
+                            .find(|candidate| candidate.id == parent_id)
+                            .map(|parent| parent.name.clone())
+                    }),
+                });
+            }
+        }
+        destinations
+    }
+
+    fn scroll_destinations(&self) -> Result<Vec<ScrollDestination>> {
+        let mut all_codices = Vec::new();
+        for project in self.projects.iter().filter(|project| !project.archived) {
+            all_codices.extend(self.db.get_codices_for_project(project.id)?);
+        }
+        Ok(Self::build_scroll_destinations(
+            &self.projects,
+            &all_codices,
+        ))
+    }
+
     fn reset_workspace_pane_focus(&mut self) {
         self.workspace_sidebar_focused = false;
         self.note_preview_focused = false;
@@ -9674,19 +9737,25 @@ impl App {
                     parent_codex_id,
                 };
             }
-            KeyCode::Char('r') if self.workspace_tab_idx == 1 => {
+            KeyCode::Char('r') | KeyCode::Char('R') if self.workspace_tab_idx == 1 => {
                 let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
                 match flat.get(self.selected_notes_flat_idx) {
                     Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                         let note_id = proj_notes[*note_idx].id;
+                        let current_project_id = proj_notes[*note_idx].project_id;
                         let current_codex_id = proj_notes[*note_idx].codex_id;
-                        let selected_idx = current_codex_id
-                            .and_then(|cid| self.codices.iter().position(|c| c.id == cid))
-                            .map(|pos| pos + 1)
+                        let destinations = self.scroll_destinations()?;
+                        let selected_idx = destinations
+                            .iter()
+                            .position(|destination| {
+                                Some(destination.project_id) == current_project_id
+                                    && destination.codex_id == current_codex_id
+                            })
                             .unwrap_or(0);
                         self.modal_state = ModalType::RefileScroll {
                             note_id,
                             selected_idx,
+                            destinations,
                         };
                     }
                     Some((Some(codex_id), None)) => {
@@ -17619,8 +17688,97 @@ fn build_project_stats(
 #[cfg(test)]
 mod app_tests {
     use super::*;
-    use crate::models::Season;
+    use crate::models::{Codex, Season};
     use std::path::Path;
+
+    #[test]
+    fn scroll_destinations_include_campaign_roots_and_codices() {
+        let now = Utc::now();
+        let first_project_id = Uuid::new_v4();
+        let second_project_id = Uuid::new_v4();
+        let archived_project_id = Uuid::new_v4();
+        let projects = vec![
+            Project {
+                id: first_project_id,
+                name: "Alpha".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+            Project {
+                id: second_project_id,
+                name: "Beta".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+            Project {
+                id: archived_project_id,
+                name: "Archived".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: true,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+        ];
+        let alpha_codex_id = Uuid::new_v4();
+        let beta_codex_id = Uuid::new_v4();
+        let codices = vec![
+            Codex {
+                id: alpha_codex_id,
+                project_id: first_project_id,
+                name: "Alpha Codex".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            },
+            Codex {
+                id: beta_codex_id,
+                project_id: second_project_id,
+                name: "Beta Codex".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            },
+        ];
+
+        let destinations = App::build_scroll_destinations(&projects, &codices);
+
+        assert_eq!(destinations.len(), 4);
+        assert_eq!(
+            destinations
+                .iter()
+                .map(|destination| (destination.project_id, destination.codex_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_project_id, None),
+                (first_project_id, Some(alpha_codex_id)),
+                (second_project_id, None),
+                (second_project_id, Some(beta_codex_id)),
+            ]
+        );
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination.project_id != archived_project_id)
+        );
+    }
 
     #[test]
     fn recurring_quest_copies_steps_and_resets_completion() {

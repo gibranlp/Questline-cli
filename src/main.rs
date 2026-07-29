@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-v" | "version" => {
-                println!("questline {}", questline::build_info::build_label());
+                println!("questline {}", questline::build_info::version_label());
                 return Ok(());
             }
             _ => {
@@ -2317,7 +2317,7 @@ async fn main() -> Result<()> {
                                 lines.push(Line::from("  n            Create New Note (in current codex if one is selected)"));
                                 lines.push(Line::from("  Enter        Open selected Note in Editor / Drill into Codex"));
                                 lines.push(Line::from("  e            Rename selected Codex"));
-                                lines.push(Line::from("  r            Move Note or Codex to a different Codex"));
+                                lines.push(Line::from("  r            Move Scroll to a campaign/codex, or move a Codex"));
                                 lines.push(Line::from("  d            Create new Codex (sub-codex if inside one)"));
                                 lines.push(Line::from("  →            Drill into selected Codex"));
                                 lines.push(Line::from("  ←  / Esc    Go back up one Codex level"));
