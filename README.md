@@ -258,6 +258,7 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **Silent note autosave:** Changed scrolls save automatically every few seconds without sounds or popups. A small `Autosaved` message appears in the editor status bar.
 - **Better pasting and scrolling:** Large clipboard pastes are inserted at once, paragraphs and accented characters are preserved, wrapped text scrolls inside the editor, and the cursor remains visible without adding spaces inside words.
 - **Clearer campaign totals:** The Campaigns list now labels open quests as `!(n)`, steps as `->(n)`, and scrolls as `#(n)`.
+- **Quest Calendar:** Press `C` from Campaigns or a campaign workspace to view due quests from all campaigns in a full month calendar and create a new quest directly on any selected day. Due dates also anchor daily, weekly, monthly, and yearly recurring quests.
 
 ---
 

@@ -13,6 +13,8 @@ pub struct JournalEntry {
     pub entry_date: NaiveDate,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::models::default_sync_timestamp")]
+    pub updated_at: DateTime<Utc>,
     pub visibility: String, // "Private", "Project Visible", "Fellowship Visible"
     pub author_username: String,
 }
