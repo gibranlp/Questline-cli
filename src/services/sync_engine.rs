@@ -788,11 +788,43 @@ impl<'a> SyncEngine<'a> {
             }
         }
         if destructive_note_unlinks >= 5 || destructive_task_unlinks >= 5 {
-            let _ = self.db.set_setting("sync_restore_hold", "1");
-            return Err(anyhow::anyhow!(
-                "Refusing remote sync page: would unlink {} scrolls and {} tasks",
-                destructive_note_unlinks,
-                destructive_task_unlinks
+            let quarantined_to = remote_next_seq.max(
+                remote_logs
+                    .iter()
+                    .map(|log| log.seq)
+                    .max()
+                    .unwrap_or(since_seq),
+            );
+            if quarantined_to > since_seq {
+                let _ = self
+                    .db
+                    .set_setting("last_pull_seq", &quarantined_to.to_string());
+            }
+            let last_remote_head_seq = remote_head_seq.max(quarantined_to);
+            let _ = self
+                .db
+                .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
+            let lag = last_remote_head_seq.saturating_sub(quarantined_to);
+            let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+            let _ = self.db.set_setting(
+                "last_quarantined_remote_page",
+                &format!(
+                    "Skipped remote page at seq {}..{} because it would unlink {} scrolls and {} tasks",
+                    since_seq, quarantined_to, destructive_note_unlinks, destructive_task_unlinks
+                ),
+            );
+            let _ = self.db.mark_remote_events_processed(
+                &remote_logs
+                    .iter()
+                    .map(|log| log.id.clone())
+                    .collect::<Vec<_>>(),
+            );
+            return Ok((
+                pushed_count,
+                pulled_count,
+                conflicts,
+                remote_downloaded,
+                remote_has_more && remote_downloaded > 0,
             ));
         }
 

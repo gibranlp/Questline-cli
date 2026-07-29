@@ -196,7 +196,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
-            "   [i] Restore Identity (adding a new device: use this first) | [p] Prune",
+            "   [i] Restore Identity | [p] Prune Tasks | [C] Clean Local History | [R] Reset Cloud Sync",
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),

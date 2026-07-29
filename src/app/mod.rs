@@ -477,6 +477,11 @@ pub enum ModalType {
         days: i64,
         count: usize,
     },
+    ConfirmCleanupLocalHistory {
+        sync_logs: usize,
+        processed_events: usize,
+        revisions: usize,
+    },
     RefileScroll {
         note_id: Uuid,
         selected_idx: usize,
@@ -3411,6 +3416,37 @@ impl App {
                             }
                             Err(e) => {
                                 self.sync_status_msg = format!("Prune failed: {}", e);
+                            }
+                        }
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::ConfirmCleanupLocalHistory { .. } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        match self.db.cleanup_local_history() {
+                            Ok((sync_logs, processed_events, revisions)) => {
+                                let _ = self
+                                    .db
+                                    .conn
+                                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+                                self.sync_status_msg = format!(
+                                    "Cleaned local history: {} sync logs, {} processed IDs, {} revisions.",
+                                    sync_logs, processed_events, revisions
+                                );
+                                self.notifications.push(Notification::info(
+                                    "Local history cleanup complete.".to_string(),
+                                ));
+                                self.reload_data()?;
+                            }
+                            Err(e) => {
+                                self.sync_status_msg = format!("Cleanup failed: {}", e);
                             }
                         }
                         self.modal_state = ModalType::None;
@@ -6829,7 +6865,7 @@ impl App {
                                     .push_pending_only()
                                     .map_err(|e| format!("Full-state upload failed: {}", e))?;
                                 let json = db
-                                    .export_to_json()
+                                    .export_to_recovery_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
                                 let client = crate::services::api_client::ApiClient::new(
                                     &server_url,
@@ -6854,7 +6890,15 @@ impl App {
                     }
                     return Ok(());
                 }
+                KeyCode::Char('R') => {
+                    self.start_cloud_sync_reset();
+                    return Ok(());
+                }
                 KeyCode::Char('r') => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.start_cloud_sync_reset();
+                        return Ok(());
+                    }
                     if self.config.sync_enabled {
                         // Show progress modal immediately and run the restore in the background
                         self.modal_state = ModalType::CloudRestoreProgress {
@@ -6948,7 +6992,7 @@ impl App {
                                             format!("Full-state upload failed: {}", e)
                                         })?;
                                         let fresh_json = db
-                                            .export_to_json()
+                                            .export_to_recovery_json()
                                             .map_err(|e| format!("Export failed: {}", e))?;
                                         let client = crate::services::api_client::ApiClient::new(
                                             &server_url,
@@ -7006,6 +7050,37 @@ impl App {
                     self.modal_state = ModalType::ConfirmPruneTasks {
                         days: PRUNE_DAYS,
                         count,
+                    };
+                    return Ok(());
+                }
+                KeyCode::Char('C') => {
+                    let sync_logs = self
+                        .db
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sync_log WHERE synced = 1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap_or(0) as usize;
+                    let processed_events = self
+                        .db
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM processed_remote_events", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap_or(0) as usize;
+                    let revisions = self
+                        .db
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM revisions", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap_or(0) as usize;
+                    self.modal_state = ModalType::ConfirmCleanupLocalHistory {
+                        sync_logs,
+                        processed_events,
+                        revisions,
                     };
                     return Ok(());
                 }
@@ -14539,6 +14614,156 @@ impl App {
         }
     }
 
+    fn local_db_is_safe_for_cloud_reset(db: &crate::database::Database) -> Result<()> {
+        let (notes_total, projectless_notes, orphan_codex_refs, mismatched_steps): (
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = db.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes),
+                (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id))",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )?;
+
+        if notes_total > 0 && projectless_notes > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} scrolls are missing project links",
+                projectless_notes
+            ));
+        }
+        if orphan_codex_refs > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} scrolls reference missing codices",
+                orphan_codex_refs
+            ));
+        }
+        if mismatched_steps > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} steps do not match their parent project",
+                mismatched_steps
+            ));
+        }
+        Ok(())
+    }
+
+    fn start_cloud_sync_reset(&mut self) {
+        if self.sync_in_progress {
+            self.sync_status_msg = "S󰓦".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
+        if !self.config.sync_enabled {
+            self.sync_status_msg = "Cloud reset requires Cloud Sync enabled".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        self.sync_in_progress = true;
+        self.sync_status_msg = "Resetting cloud sync from this device...".to_string();
+        self.modal_state = ModalType::SyncProgress {
+            step: 0,
+            message: "Resetting cloud sync from local truth...".to_string(),
+        };
+
+        let result_slot = std::sync::Arc::clone(&self.sync_result);
+        let identity = self.identity.clone();
+        let device_id = self.device_id.clone();
+        let server_url = self.server_url.clone();
+
+        let _ = std::thread::spawn(move || {
+            let outcome: Result<(usize, usize, Vec<String>)> = (|| {
+                let storage_dir = crate::storage::get_storage_dir()?;
+                let db_path = storage_dir.join("questline.db");
+                let db = crate::database::Database::new(&db_path)?;
+                let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
+
+                Self::local_db_is_safe_for_cloud_reset(&db)?;
+
+                let client = crate::services::api_client::ApiClient::new(
+                    &server_url,
+                    identity.clone(),
+                    &device_id,
+                );
+                client.send_request("POST", "sync/reset", "{}")?;
+
+                let queued = db.queue_full_state_sync()?;
+                let sync_engine = crate::services::sync_engine::SyncEngine::new(
+                    &db,
+                    &identity,
+                    &device_id,
+                    Some(&server_url),
+                )?;
+                let pushed = sync_engine.push_pending_only()?;
+
+                match db.export_to_recovery_json() {
+                    Ok(json) => match client.send_request("POST", "recovery", &json) {
+                        Ok(_) => {
+                            let _ = db
+                                .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                        }
+                        Err(e) => {
+                            let _ = db.set_setting(
+                                "last_recovery_upload_error",
+                                &format!("Cloud sync reset reseeded sync, but recovery upload failed: {}", e),
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        let _ = db.set_setting(
+                            "last_recovery_upload_error",
+                            &format!(
+                                "Cloud sync reset reseeded sync, but recovery export failed: {}",
+                                e
+                            ),
+                        );
+                    }
+                }
+
+                if let Ok(head_resp) = client.send_request("GET", "sync/head", "") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&head_resp) {
+                        if let Some(seq) = value.get("seq").and_then(|v| v.as_i64()) {
+                            let _ = db.set_setting("last_pull_seq", &seq.to_string());
+                            let _ = db.set_setting("last_remote_head_seq", &seq.to_string());
+                            let _ = db.set_setting("last_sync_lag", "0");
+                        }
+                    }
+                }
+                let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                let _ = db.set_setting("sync_restore_hold", "0");
+                let _ = db.set_setting("conflict_count", "0");
+                let _ = db.set_setting(
+                    "last_quarantined_remote_page",
+                    "Cloud sync reset from clean local database",
+                );
+
+                Ok((pushed.max(queued), 0, Vec::new()))
+            })();
+
+            let bg = match outcome {
+                Ok((pushed, pulled, conflicts)) => BackgroundSyncResult {
+                    pushed,
+                    pulled,
+                    conflicts,
+                    error: None,
+                },
+                Err(e) => BackgroundSyncResult {
+                    pushed: 0,
+                    pulled: 0,
+                    conflicts: Vec::new(),
+                    error: Some(e.to_string()),
+                },
+            };
+            if let Ok(mut guard) = result_slot.lock() {
+                *guard = Some(bg);
+            }
+        });
+    }
+
     fn start_forced_sync(&mut self) {
         if self.sync_in_progress {
             self.sync_status_msg = "S󰓦".to_string();
@@ -14840,7 +15065,7 @@ impl App {
                     }
                 };
                 if should_backup && conflicts.is_empty() {
-                    if let Ok(json) = db.export_to_json() {
+                    if let Ok(json) = db.export_to_recovery_json() {
                         if client.send_request("POST", "recovery", &json).is_ok() {
                             let _ = db
                                 .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
