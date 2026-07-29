@@ -6874,25 +6874,12 @@ impl App {
                                 let db_path = storage_dir.join("questline.db");
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
-                                let _ = db
-                                    .queue_full_state_sync()
-                                    .map_err(|e| format!("Full-state queue failed: {}", e))?;
-                                let sync_engine = crate::services::sync_engine::SyncEngine::new(
-                                    &db,
-                                    &identity,
-                                    &device_id,
-                                    Some(&server_url),
-                                )
-                                .map_err(|e| format!("Sync init failed: {}", e))?;
-                                sync_engine
-                                    .push_pending_only()
-                                    .map_err(|e| format!("Full-state upload failed: {}", e))?;
                                 let json = db
                                     .export_to_recovery_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
                                 let client = crate::services::api_client::ApiClient::new(
                                     &server_url,
-                                    identity,
+                                    identity.clone(),
                                     &device_id,
                                 );
                                 client
@@ -6902,7 +6889,24 @@ impl App {
                                     "last_auto_backup",
                                     &chrono::Utc::now().to_rfc3339(),
                                 );
-                                Ok("Cloud Backup Successful!".to_string())
+
+                                let sync_result = db.queue_full_state_sync().and_then(|_| {
+                                    crate::services::sync_engine::SyncEngine::new(
+                                        &db,
+                                        &identity,
+                                        &device_id,
+                                        Some(&server_url),
+                                    )?
+                                    .push_pending_only()
+                                    .map(|_| ())
+                                });
+                                match sync_result {
+                                    Ok(()) => Ok("Cloud Backup Successful!".to_string()),
+                                    Err(error) => Ok(format!(
+                                        "Cloud Backup Successful! Sync snapshot warning: {}",
+                                        error
+                                    )),
+                                }
                             })();
                             if let Ok(mut slot) = result_slot.lock() {
                                 *slot = Some(outcome);
@@ -7000,34 +7004,35 @@ impl App {
                                         let db_path = storage_dir.join("questline.db");
                                         let db = crate::database::Database::new(&db_path)
                                             .map_err(|e| format!("Database error: {}", e))?;
-                                        let _ = db.queue_full_state_sync().map_err(|e| {
-                                            format!("Full-state queue failed: {}", e)
-                                        })?;
-                                        let sync_engine =
-                                            crate::services::sync_engine::SyncEngine::new(
-                                                &db,
-                                                &identity,
-                                                &device_id,
-                                                Some(&server_url),
-                                            )
-                                            .map_err(|e| format!("Sync init failed: {}", e))?;
-                                        sync_engine.push_pending_only().map_err(|e| {
-                                            format!("Full-state upload failed: {}", e)
-                                        })?;
                                         let fresh_json = db
                                             .export_to_recovery_json()
                                             .map_err(|e| format!("Export failed: {}", e))?;
                                         let client = crate::services::api_client::ApiClient::new(
                                             &server_url,
-                                            identity,
+                                            identity.clone(),
                                             &device_id,
                                         );
                                         client
                                             .send_request("POST", "recovery", &fresh_json)
                                             .map_err(|e| format!("Upload failed: {}", e))?;
+                                        let sync_result =
+                                            db.queue_full_state_sync().and_then(|_| {
+                                                crate::services::sync_engine::SyncEngine::new(
+                                                    &db,
+                                                    &identity,
+                                                    &device_id,
+                                                    Some(&server_url),
+                                                )?
+                                                .push_pending_only()
+                                                .map(|_| ())
+                                            });
+                                        let warning = sync_result
+                                            .err()
+                                            .map(|e| format!(" Sync snapshot warning: {}", e))
+                                            .unwrap_or_default();
                                         Ok(format!(
-                                            "Profile exported & cloud backup saved! Local: {}",
-                                            backup_display
+                                            "Profile exported & cloud backup saved! Local: {}{}",
+                                            backup_display, warning
                                         ))
                                     })(
                                     );
@@ -14702,7 +14707,7 @@ impl App {
                 (SELECT COUNT(*) FROM tasks),
                 (SELECT COUNT(*) FROM tasks WHERE project_id IS NULL),
                 (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
-                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id))",
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE COALESCE(s.project_id, '') != COALESCE(p.project_id, ''))",
             [],
             |row| {
                 Ok((
@@ -14757,7 +14762,7 @@ impl App {
             "SELECT
                 (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
                 (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
-                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE p.project_id IS NOT NULL AND (s.project_id IS NULL OR s.project_id != p.project_id))",
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE COALESCE(s.project_id, '') != COALESCE(p.project_id, ''))",
             [],
             |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
         );
