@@ -1487,6 +1487,12 @@ try {
                 echo json_encode(["error" => "Backup payload too large"]);
                 exit;
             }
+            $backupError = validate_recovery_snapshot($body);
+            if ($backupError !== null) {
+                http_response_code(400);
+                echo json_encode(["error" => "Refusing unhealthy backup", "details" => $backupError]);
+                exit;
+            }
             // Sobreescribe el backup anterior — solo se guarda el más reciente, pues
             $stmt = $pdo->prepare("INSERT INTO backups (user_id, backup_data) VALUES (?, ?) ON DUPLICATE KEY UPDATE backup_data = ?, created_at = CURRENT_TIMESTAMP");
             $stmt->execute([$userId, $body, $body]);
@@ -1900,6 +1906,50 @@ function sync_validation_error($event, $reason) {
         "entity_id" => $event['entity_id'] ?? '',
         "reason" => $reason
     ];
+}
+
+function validate_recovery_snapshot($body) {
+    $snapshot = json_decode($body, true);
+    if (!is_array($snapshot)) {
+        return "backup is not valid JSON";
+    }
+    $projects = [];
+    foreach (($snapshot['projects'] ?? []) as $project) {
+        if (is_array($project) && !empty($project['id'])) {
+            $projects[(string)$project['id']] = true;
+        }
+    }
+    foreach (($snapshot['notes'] ?? []) as $note) {
+        $projectId = is_array($note) ? ($note['project_id'] ?? null) : null;
+        if (empty($projectId) || !isset($projects[(string)$projectId])) {
+            return "scroll is missing a valid project link";
+        }
+    }
+
+    $tasks = [];
+    foreach (($snapshot['tasks'] ?? []) as $task) {
+        if (is_array($task) && !empty($task['id'])) {
+            $tasks[(string)$task['id']] = $task;
+        }
+    }
+    foreach ($tasks as $task) {
+        $projectId = !empty($task['project_id']) ? (string)$task['project_id'] : null;
+        if ($projectId !== null && !isset($projects[$projectId])) {
+            return "task references a missing project";
+        }
+        $parentId = !empty($task['parent_task_id']) ? (string)$task['parent_task_id'] : null;
+        if ($parentId === null) continue;
+        if (!isset($tasks[$parentId])) {
+            return "step references a missing parent task";
+        }
+        $parentProjectId = !empty($tasks[$parentId]['project_id'])
+            ? (string)$tasks[$parentId]['project_id']
+            : null;
+        if ($projectId !== $parentProjectId) {
+            return "step project does not match its parent";
+        }
+    }
+    return null;
 }
 
 function decode_sync_event_payload($event, &$error) {
