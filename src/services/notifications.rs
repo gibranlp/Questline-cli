@@ -335,6 +335,7 @@ fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(&relative));
     }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative));
 
     candidates.into_iter().find(|path| path.exists())
 }

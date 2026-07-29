@@ -3114,6 +3114,25 @@ impl Database {
                 total_notes
             ));
         }
+        let total_tasks: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap_or(0);
+        let projectless_tasks: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE project_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if total_tasks > 0 && projectless_tasks * 2 >= total_tasks {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} of {} tasks are missing project links",
+                projectless_tasks,
+                total_tasks
+            ));
+        }
         let mut queued = 0usize;
 
         if let Ok(Some(user)) = self.get_user() {
