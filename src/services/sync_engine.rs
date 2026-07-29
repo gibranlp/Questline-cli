@@ -776,7 +776,8 @@ impl<'a> SyncEngine<'a> {
                 }
                 "task" if log.operation != "delete" => {
                     if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
-                        if remote_task.project_id.is_none() {
+                        if remote_task.project_id.is_none() && remote_task.parent_task_id.is_some()
+                        {
                             invalid_task_payloads += 1;
                             if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
                                 if local_task.project_id.is_some() {
@@ -914,7 +915,10 @@ impl<'a> SyncEngine<'a> {
                                 .content
                                 .as_ref()
                                 .and_then(|content| serde_json::from_str::<Task>(content).ok())
-                                .map(|remote_task| remote_task.project_id.is_some())
+                                .map(|remote_task| {
+                                    remote_task.project_id.is_some()
+                                        || remote_task.parent_task_id.is_none()
+                                })
                                 .unwrap_or(false),
                         }
                     }
@@ -1193,7 +1197,7 @@ impl<'a> SyncEngine<'a> {
                                         t.project_id = local.project_id;
                                     }
                                 }
-                                if t.project_id.is_none() {
+                                if t.project_id.is_none() && t.parent_task_id.is_some() {
                                     conflicts.push(format!(
                                         "Task '{}' rejected: missing project link",
                                         t.title
