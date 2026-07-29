@@ -802,6 +802,7 @@ impl<'a> SyncEngine<'a> {
             let lag = last_remote_head_seq.saturating_sub(since_seq);
             let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
             let _ = self.db.set_setting("sync_restore_hold", "1");
+            let _ = self.db.set_setting("auto_sync", "false");
             let _ = self.db.set_setting(
                 "last_quarantined_remote_page",
                 &format!(
@@ -810,6 +811,10 @@ impl<'a> SyncEngine<'a> {
                     , since_seq
                 ),
             );
+            conflicts.push(format!(
+                "Remote sync page quarantined: would unlink {} scrolls and {} tasks",
+                destructive_note_unlinks, destructive_task_unlinks
+            ));
             return Ok((
                 pushed_count,
                 pulled_count,
