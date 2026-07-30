@@ -12,6 +12,9 @@ use crate::database::Database;
 use crate::models::{Note, Task};
 use crate::services::Identity;
 
+const PULL_PAGE_SIZE: usize = 1000;
+const MAX_DRAIN_PAGES: usize = 100;
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncLogEntry {
     pub id: String,
@@ -25,6 +28,56 @@ pub struct SyncLogEntry {
     // seq — cursor incremental del servidor para no descargar toda la historia en cada sync
     #[serde(default)]
     pub seq: i64,
+}
+
+#[derive(Debug)]
+struct PullPage {
+    events: Vec<SyncLogEntry>,
+    head_seq: i64,
+    next_seq: i64,
+    has_more: bool,
+    metadata_supported: bool,
+}
+
+#[derive(Deserialize)]
+struct PullPageEnvelope {
+    events: Vec<SyncLogEntry>,
+    #[serde(default)]
+    head_seq: i64,
+    #[serde(default)]
+    next_seq: i64,
+    #[serde(default)]
+    has_more: bool,
+}
+
+fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
+    if let Ok(envelope) = serde_json::from_str::<PullPageEnvelope>(data) {
+        let max_event_seq = envelope
+            .events
+            .iter()
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(since_seq);
+        let next_seq = envelope.next_seq.max(max_event_seq).max(since_seq);
+        let head_seq = envelope.head_seq.max(next_seq);
+        return Ok(PullPage {
+            events: envelope.events,
+            head_seq,
+            next_seq,
+            has_more: envelope.has_more,
+            metadata_supported: true,
+        });
+    }
+
+    let events: Vec<SyncLogEntry> = serde_json::from_str(data)?;
+    let next_seq = events.iter().map(|e| e.seq).max().unwrap_or(since_seq);
+    Ok(PullPage {
+        has_more: events.len() >= PULL_PAGE_SIZE,
+        head_seq: next_seq,
+        next_seq,
+        events,
+        metadata_supported: false,
+    })
 }
 
 pub trait CloudProvider {
@@ -102,6 +155,13 @@ impl CloudProvider for FileCloudProvider {
 
 use crate::services::ApiClient;
 
+fn total_user_progress_xp(user: &crate::models::User) -> i64 {
+    let completed_levels: i64 = (1..user.level.max(1))
+        .map(|level| crate::models::User::xp_for_next_level(level) as i64)
+        .sum();
+    completed_levels + user.xp.max(0) as i64
+}
+
 pub struct HttpCloudProvider {
     pub client: ApiClient,
 }
@@ -117,8 +177,14 @@ impl CloudProvider for HttpCloudProvider {
     }
 
     fn pull(&self, _public_key: &str, _signature: &str, since_seq: i64) -> Result<String> {
-        self.client
-            .send_request("POST", &format!("sync/pull?since_seq={}", since_seq), "")
+        self.client.send_request(
+            "POST",
+            &format!(
+                "sync/pull?since_seq={}&limit={}&include_meta=1",
+                since_seq, PULL_PAGE_SIZE
+            ),
+            "",
+        )
     }
 }
 
@@ -150,13 +216,190 @@ impl<'a> SyncEngine<'a> {
         })
     }
 
-    // CRÍTICO: el orden push-antes-pull no es negociable — así los cambios locales no se pisan con lo remoto
+    fn save_local_revision_before_delete(&self, entity_type: &str, entity_id: &str) {
+        match entity_type {
+            "task" => {
+                if let Ok(id) = Uuid::parse_str(entity_id) {
+                    if let Ok(task) = self.db.get_task_by_id(id) {
+                        if let Ok(content) = serde_json::to_string(&task) {
+                            let _ = self.db.create_revision("task", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "note" => {
+                if let Ok(id) = Uuid::parse_str(entity_id) {
+                    if let Ok(note) = self.db.get_note_by_id(id) {
+                        if let Ok(content) = serde_json::to_string(&note) {
+                            let _ = self.db.create_revision("note", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "project" => {
+                if let Ok(projects) = self.db.get_projects() {
+                    if let Some(project) =
+                        projects.into_iter().find(|p| p.id.to_string() == entity_id)
+                    {
+                        if let Ok(content) = serde_json::to_string(&project) {
+                            let _ = self.db.create_revision("project", entity_id, &content);
+                        }
+                    }
+                }
+            }
+            "milestone" => {
+                let _ = self.db.conn.query_row(
+                    "SELECT json_object(
+                        'id', id,
+                        'project_id', project_id,
+                        'name', name,
+                        'description', description,
+                        'completed', completed != 0,
+                        'xp_reward', xp_reward,
+                        'created_at', created_at,
+                        'tier', tier,
+                        'template_id', template_id
+                    ) FROM milestones WHERE id = ?1",
+                    params![entity_id],
+                    |row| {
+                        let content: String = row.get(0)?;
+                        let _ = self.db.create_revision("milestone", entity_id, &content);
+                        Ok(())
+                    },
+                );
+            }
+            "codex" => {
+                if let Ok(codex) = self.db.get_codex_by_id(entity_id) {
+                    if let Ok(content) = serde_json::to_string(&codex) {
+                        let _ = self.db.create_revision("codex", entity_id, &content);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn task_payload_project_is_valid(
+        &self,
+        task: &Task,
+        remote_task_projects: &std::collections::HashMap<Uuid, Option<Uuid>>,
+    ) -> bool {
+        let Some(parent_id) = task.parent_task_id else {
+            return true;
+        };
+
+        if let Some(parent_project_id) = remote_task_projects.get(&parent_id) {
+            return task.project_id == *parent_project_id;
+        }
+
+        self.db
+            .get_task_by_id(parent_id)
+            .map(|parent| task.project_id == parent.project_id)
+            .unwrap_or(false)
+    }
+
+    fn timestamp_or_epoch(value: Option<&str>) -> DateTime<Utc> {
+        value
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc))
+            .unwrap_or_else(crate::models::default_sync_timestamp)
+    }
+
+    fn incoming_entity_is_newer(&self, table: &str, log: &SyncLogEntry) -> bool {
+        let incoming = if log.operation == "delete" {
+            Self::timestamp_or_epoch(Some(&log.timestamp))
+        } else {
+            let value = log
+                .content
+                .as_ref()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+            Self::timestamp_or_epoch(
+                value
+                    .as_ref()
+                    .and_then(|value| value["updated_at"].as_str()),
+            )
+        };
+        let sql = format!("SELECT updated_at FROM {} WHERE id = ?1", table);
+        match self
+            .db
+            .conn
+            .query_row(&sql, params![log.entity_id], |row| row.get::<_, String>(0))
+        {
+            Ok(local) => incoming > Self::timestamp_or_epoch(Some(&local)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
+        // Pull and drain remote history first, then push local changes. This keeps restore and
+        // normal sync incremental: a device learns the server head before it publishes anything.
+        let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
+            self.sync_once(false, true)?;
+        let mut drain_pages = 0usize;
+
+        while has_more && drain_pages < MAX_DRAIN_PAGES {
+            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+                self.sync_once(false, true)?;
+            pushed += more_pushed;
+            pulled += more_pulled;
+            downloaded += more_downloaded;
+            conflicts.extend(more_conflicts);
+            has_more = more_has_more && more_downloaded > 0;
+            drain_pages += 1;
+        }
+
+        let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+            self.sync_once(true, true)?;
+        pushed += more_pushed;
+        pulled += more_pulled;
+        downloaded += more_downloaded;
+        conflicts.extend(more_conflicts);
+        has_more = more_has_more && more_downloaded > 0;
+
+        while has_more && drain_pages < MAX_DRAIN_PAGES {
+            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
+                self.sync_once(false, true)?;
+            pushed += more_pushed;
+            pulled += more_pulled;
+            downloaded += more_downloaded;
+            conflicts.extend(more_conflicts);
+            has_more = more_has_more && more_downloaded > 0;
+            drain_pages += 1;
+        }
+
+        let _ = self
+            .db
+            .set_setting("last_sync_downloaded", &downloaded.to_string());
+        Ok((pushed, pulled, conflicts))
+    }
+
+    /// Pushes pending local/full-state logs without pulling remote events.
+    ///
+    /// Cloud backup/export uses this so a known-good local snapshot can be uploaded even when the
+    /// remote event stream still contains older destructive updates that must not be applied.
+    pub fn push_pending_only(&self) -> Result<usize> {
+        let (pushed, _, _, _, _) = self.sync_once(true, false)?;
+        Ok(pushed)
+    }
+
+    // One page of sync. `sync()` calls this in pull-before-push order; when `push_local` is true
+    // this normally performs a small post-push pull so the cursor catches any concurrent events.
+    fn sync_once(
+        &self,
+        push_local: bool,
+        pull_remote: bool,
+    ) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
         let mut pulled_count = 0;
 
-        let pending = self.db.get_pending_sync_logs()?;
+        let pending = if push_local {
+            self.db.compact_pending_sync_logs()?;
+            self.db.get_pending_sync_logs()?
+        } else {
+            Vec::new()
+        };
         let mut local_payload = Vec::new();
 
         for (log_id, entity_type, entity_id, operation, timestamp) in pending {
@@ -179,22 +422,24 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                     .and_then(|n| serde_json::to_string(&n).ok()),
                 "project" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared FROM projects WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared FROM projects WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id_str: String = row.get(0)?;
                         let name: String = row.get(1)?;
                         let desc: Option<String> = row.get(2)?;
                         let created: String = row.get(3)?;
-                        let archived: i32 = row.get(4)?;
-                        let completed: i32 = row.get(5)?;
-                        let owner_id: Option<String> = row.get(6)?;
-                        let owner_name: Option<String> = row.get(7)?;
-                        let is_shared: i32 = row.get(8)?;
+                        let updated: String = row.get(4)?;
+                        let archived: i32 = row.get(5)?;
+                        let completed: i32 = row.get(6)?;
+                        let owner_id: Option<String> = row.get(7)?;
+                        let owner_name: Option<String> = row.get(8)?;
+                        let is_shared: i32 = row.get(9)?;
                         Ok(serde_json::json!({
                             "id": id_str,
                             "name": name,
                             "description": desc,
                             "created_at": created,
+                            "updated_at": updated,
                             "archived": archived != 0,
                             "completed": completed != 0,
                             "owner_identity": owner_id,
@@ -206,21 +451,23 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                 }
                 "journal_entry" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, entry_date, content, created_at, visibility, author_username FROM journal_entries WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, entry_date, content, created_at, updated_at, visibility, author_username FROM journal_entries WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
                         let pid: String = row.get(1)?;
                         let date: String = row.get(2)?;
                         let content: String = row.get(3)?;
                         let created: String = row.get(4)?;
-                        let visibility: String = row.get(5)?;
-                        let author: String = row.get(6)?;
+                        let updated: String = row.get(5)?;
+                        let visibility: String = row.get(6)?;
+                        let author: String = row.get(7)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "project_id": pid,
                             "entry_date": date,
                             "content": content,
                             "created_at": created,
+                            "updated_at": updated,
                             "visibility": visibility,
                             "author_username": author,
                         })
@@ -229,7 +476,7 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                 }
                 "milestone" => {
-                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, tier, template_id FROM milestones WHERE id = ?1")?;
+                    let mut stmt = self.db.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id FROM milestones WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
                         let pid: String = row.get(1)?;
@@ -238,8 +485,9 @@ impl<'a> SyncEngine<'a> {
                         let completed: i32 = row.get(4)?;
                         let xp: i32 = row.get(5)?;
                         let created: String = row.get(6)?;
-                        let tier: i32 = row.get(7)?;
-                        let template_id: String = row.get(8)?;
+                        let updated: String = row.get(7)?;
+                        let tier: i32 = row.get(8)?;
+                        let template_id: String = row.get(9)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "project_id": pid,
@@ -248,6 +496,7 @@ impl<'a> SyncEngine<'a> {
                             "completed": completed != 0,
                             "xp_reward": xp,
                             "created_at": created,
+                            "updated_at": updated,
                             "tier": tier,
                             "template_id": template_id,
                         })
@@ -293,7 +542,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 "ritual" => {
                     let mut stmt = self.db.conn.prepare(
-                        "SELECT id, name, description, frequency, reward_xp, created_at, daily_target FROM rituals WHERE id = ?1",
+                        "SELECT id, name, description, frequency, reward_xp, created_at, updated_at, daily_target FROM rituals WHERE id = ?1",
                     )?;
                     stmt.query_row(params![entity_id], |row| {
                         let id: String = row.get(0)?;
@@ -302,7 +551,8 @@ impl<'a> SyncEngine<'a> {
                         let freq: String = row.get(3)?;
                         let xp: i32 = row.get(4)?;
                         let created: String = row.get(5)?;
-                        let daily_target: i32 = row.get(6)?;
+                        let updated: String = row.get(6)?;
+                        let daily_target: i32 = row.get(7)?;
                         Ok(serde_json::json!({
                             "id": id,
                             "name": name,
@@ -310,6 +560,7 @@ impl<'a> SyncEngine<'a> {
                             "frequency": freq,
                             "reward_xp": xp,
                             "created_at": created,
+                            "updated_at": updated,
                             "daily_target": daily_target,
                         })
                         .to_string())
@@ -485,7 +736,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Heartbeat del dispositivo — lleva identidad del usuario para actualizar presencia en otros nodos
-        {
+        if push_local {
             let now_str = Utc::now().to_rfc3339();
             let username = self
                 .db
@@ -533,6 +784,14 @@ impl<'a> SyncEngine<'a> {
             Vec::new()
         };
 
+        if !pull_remote {
+            if !pushed_ids.is_empty() {
+                self.db.mark_sync_logs_synced(&pushed_ids)?;
+            }
+            self.db.update_device_sync_time(self.device_id)?;
+            return Ok((pushed_count, 0, Vec::new(), 0, false));
+        }
+
         // El cursor `since_seq` evita descargar toda la historia en cada sync
         let since_seq: i64 = self
             .db
@@ -544,12 +803,121 @@ impl<'a> SyncEngine<'a> {
         let pulled_data = self
             .provider
             .pull(&self.identity.public_key, "", since_seq)?;
-        let remote_logs: Vec<SyncLogEntry> = serde_json::from_str(&pulled_data)?;
+        let pull_page = parse_pull_page(&pulled_data, since_seq)?;
+        let remote_downloaded = pull_page.events.len();
+        let remote_head_seq = pull_page.head_seq;
+        let remote_next_seq = pull_page.next_seq;
+        let metadata_supported = pull_page.metadata_supported;
+        let mut remote_has_more = pull_page.has_more;
+        let remote_logs = pull_page.events;
 
         // Dedup por ID — si el servidor no retorna seq reales (todos llegan con seq=0), este set
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
         let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
         let mut newly_processed_ids: Vec<String> = Vec::new();
+        let remote_task_projects = remote_logs
+            .iter()
+            .filter(|log| {
+                !already_processed.contains(&log.id)
+                    && log.device_id != self.device_id
+                    && log.entity_type == "task"
+                    && log.operation != "delete"
+            })
+            .filter_map(|log| {
+                log.content
+                    .as_ref()
+                    .and_then(|content| serde_json::from_str::<Task>(content).ok())
+            })
+            .map(|task| (task.id, task.project_id))
+            .collect::<std::collections::HashMap<_, _>>();
+
+        let mut destructive_note_unlinks = 0usize;
+        let mut destructive_task_unlinks = 0usize;
+        let mut invalid_note_payloads = 0usize;
+        let mut invalid_task_payloads = 0usize;
+        for log in &remote_logs {
+            if already_processed.contains(&log.id) || log.device_id == self.device_id {
+                continue;
+            }
+            let Some(content) = log.content.as_ref() else {
+                continue;
+            };
+            match log.entity_type.as_str() {
+                "note" if log.operation != "delete" => {
+                    if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
+                        if remote_note.project_id.is_none() {
+                            invalid_note_payloads += 1;
+                            if let Ok(local_note) = self.db.get_note_by_id(remote_note.id) {
+                                if local_note.project_id.is_some()
+                                    && remote_note.project_id.is_none()
+                                {
+                                    destructive_note_unlinks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                "task" if log.operation != "delete" => {
+                    if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
+                        if !self.task_payload_project_is_valid(&remote_task, &remote_task_projects)
+                        {
+                            invalid_task_payloads += 1;
+                            if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
+                                if local_task.project_id.is_some() {
+                                    destructive_task_unlinks += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        if destructive_note_unlinks >= 5
+            || destructive_task_unlinks >= 5
+            || invalid_note_payloads >= 5
+            || invalid_task_payloads >= 5
+        {
+            let quarantined_to = remote_next_seq.max(
+                remote_logs
+                    .iter()
+                    .map(|log| log.seq)
+                    .max()
+                    .unwrap_or(since_seq),
+            );
+            let last_remote_head_seq = remote_head_seq.max(quarantined_to);
+            let _ = self
+                .db
+                .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
+            let lag = last_remote_head_seq.saturating_sub(since_seq);
+            let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+            let _ = self.db.set_setting("sync_restore_hold", "1");
+            let _ = self.db.set_setting("auto_sync", "false");
+            let _ = self.db.set_setting(
+                "last_quarantined_remote_page",
+                &format!(
+                    "Quarantined remote page at seq {}..{} because it contained {} invalid scrolls, {} invalid tasks, and would unlink {} scrolls and {} tasks. Cursor held at {}; reset cloud from a clean device.",
+                    since_seq,
+                    quarantined_to,
+                    invalid_note_payloads,
+                    invalid_task_payloads,
+                    destructive_note_unlinks,
+                    destructive_task_unlinks,
+                    since_seq
+                ),
+            );
+            conflicts.push(format!(
+                "Remote sync page quarantined: {} invalid scrolls, {} invalid tasks",
+                invalid_note_payloads, invalid_task_payloads
+            ));
+            return Ok((
+                pushed_count,
+                pulled_count,
+                conflicts,
+                remote_downloaded,
+                remote_has_more && remote_downloaded > 0,
+            ));
+        }
 
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
@@ -575,26 +943,35 @@ impl<'a> SyncEngine<'a> {
                 // Solo aceptamos usuario remoto si no existe localmente — restauración en dispositivo nuevo
                 "user" => self.db.get_user().map(|u| u.is_none()).unwrap_or(true),
                 "task" => {
-                    // Los deletes (tombstones) siempre se aplican — no tienen conflicto posible
                     if log.operation == "delete" {
-                        true
-                    } else {
                         match self.db.get_task_by_id(ent_uuid) {
                             Ok(local_task) => {
-                                // El más reciente gana — sin democracia
                                 let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                                     .map(|d| d.with_timezone(&Utc))
                                     .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-
-                                if incoming_time > local_task.updated_at {
-                                    if let Some(ref content) = log.content {
-                                        if let Ok(remote_task) =
-                                            serde_json::from_str::<Task>(content)
+                                incoming_time > local_task.updated_at
+                            }
+                            _ => true,
+                        }
+                    } else {
+                        match self.db.get_task_by_id(ent_uuid) {
+                            Ok(local_task) => {
+                                if let Some(ref content) = log.content {
+                                    if let Ok(mut remote_task) =
+                                        serde_json::from_str::<Task>(content)
+                                    {
+                                        remote_task.normalize_schedule();
+                                        if local_task.project_id.is_some()
+                                            && remote_task.project_id.is_none()
                                         {
+                                            false
+                                        } else if remote_task.updated_at > local_task.updated_at {
                                             if remote_task.title != local_task.title
                                                 || remote_task.completed != local_task.completed
+                                                || remote_task.project_id != local_task.project_id
+                                                || remote_task.parent_task_id
+                                                    != local_task.parent_task_id
                                             {
-                                                // Conflicto real — guardamos la versión local antes de pisarla
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_task)
                                                 {
@@ -609,37 +986,61 @@ impl<'a> SyncEngine<'a> {
                                             local_task.title
                                         ));
                                             }
+                                            true
+                                        } else {
+                                            false
                                         }
+                                    } else {
+                                        false
                                     }
-                                    true
                                 } else {
                                     false
                                 }
                             }
-                            _ => true,
+                            _ => log
+                                .content
+                                .as_ref()
+                                .and_then(|content| serde_json::from_str::<Task>(content).ok())
+                                .map(|remote_task| {
+                                    self.task_payload_project_is_valid(
+                                        &remote_task,
+                                        &remote_task_projects,
+                                    )
+                                })
+                                .unwrap_or(false),
                         }
                     }
                 }
                 // Notas: mismo juego que tasks — timestamp gana, pero guardamos la versión local si hay conflicto
                 "note" => {
                     if log.operation == "delete" {
-                        true
-                    } else {
                         match self.db.get_note_by_id(ent_uuid) {
                             Ok(local_note) => {
                                 let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
                                     .map(|d| d.with_timezone(&Utc))
                                     .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-                                if incoming_time > local_note.updated_at {
-                                    if let Some(ref content) = log.content {
-                                        if let Ok(remote_note) =
-                                            serde_json::from_str::<Note>(content)
+                                incoming_time > local_note.updated_at
+                            }
+                            _ => true,
+                        }
+                    } else {
+                        match self.db.get_note_by_id(ent_uuid) {
+                            Ok(local_note) => {
+                                if let Some(ref content) = log.content {
+                                    if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
+                                        if (local_note.project_id.is_some()
+                                            && remote_note.project_id.is_none())
+                                            || (local_note.codex_id.is_some()
+                                                && remote_note.codex_id.is_none())
                                         {
+                                            false
+                                        } else if remote_note.updated_at > local_note.updated_at {
                                             if remote_note.title != local_note.title
                                                 || remote_note.markdown_content
                                                     != local_note.markdown_content
+                                                || remote_note.codex_id != local_note.codex_id
+                                                || remote_note.project_id != local_note.project_id
                                             {
-                                                // Conflicto en nota — archivamos lo local antes de sobreescribir
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_note)
                                                 {
@@ -654,21 +1055,28 @@ impl<'a> SyncEngine<'a> {
                                             local_note.title
                                         ));
                                             }
+                                            true
+                                        } else {
+                                            false
                                         }
+                                    } else {
+                                        false
                                     }
-                                    true
                                 } else {
                                     false
                                 }
                             }
-                            _ => true,
+                            _ => log
+                                .content
+                                .as_ref()
+                                .and_then(|content| serde_json::from_str::<Note>(content).ok())
+                                .map(|remote_note| remote_note.project_id.is_some())
+                                .unwrap_or(false),
                         }
                     }
                 }
-                // Proyectos: siempre aplicamos — INSERT OR REPLACE propaga renombres, archivado, etc.
-                "project" => true,
-                // Entradas de journal: siempre aceptamos — INSERT OR REPLACE en el pull maneja el upsert
-                "journal_entry" => true,
+                "project" => self.incoming_entity_is_newer("projects", &log),
+                "journal_entry" => self.incoming_entity_is_newer("journal_entries", &log),
                 // Logros: solo se sincronizan si no están ya desbloqueados — no se revierten
                 "achievement" => {
                     let unlocked = self
@@ -681,13 +1089,12 @@ impl<'a> SyncEngine<'a> {
                         .unwrap_or(false);
                     !unlocked
                 }
-                "ritual" => true,
+                "ritual" => self.incoming_entity_is_newer("rituals", &log),
                 "ritual_history" => true,
                 "setting" => {
                     crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&log.entity_id.as_str())
                 }
-                // Codex: siempre aplicamos — INSERT OR REPLACE propaga renombres y cambios de parent
-                "codex" => true,
+                "codex" => self.incoming_entity_is_newer("codices", &log),
                 // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
                     self.db
@@ -738,30 +1145,132 @@ impl<'a> SyncEngine<'a> {
                 }
                 // Árbol zen: latest-watered timestamp wins — es una sola fila global por usuario
                 "zen_tree" => {
-                    let incoming_time = DateTime::parse_from_rfc3339(&log.timestamp)
-                        .map(|d| d.with_timezone(&Utc))
-                        .unwrap_or(DateTime::<Utc>::from(std::time::UNIX_EPOCH));
-                    match self.db.get_zen_tree() {
-                        Ok(lt) => lt.last_watered.map(|lw| incoming_time > lw).unwrap_or(true),
-                        Err(_) => true,
+                    if let Some(ref content) = log.content {
+                        if let Ok(remote_tree) =
+                            serde_json::from_str::<crate::models::ZenTree>(content)
+                        {
+                            match self.db.get_zen_tree() {
+                                Ok(local_tree) => {
+                                    remote_tree.growth > local_tree.growth
+                                        || remote_tree.stage > local_tree.stage
+                                        || remote_tree.total_waterings > local_tree.total_waterings
+                                        || remote_tree
+                                            .last_watered
+                                            .zip(local_tree.last_watered)
+                                            .map(|(remote, local)| remote > local)
+                                            .unwrap_or(remote_tree.last_watered.is_some())
+                                }
+                                Err(_) => true,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
                     }
                 }
-                // Milestones: siempre aplicamos — INSERT OR REPLACE maneja create y update
-                "milestone" => true,
+                "milestone" => self.incoming_entity_is_newer("milestones", &log),
                 // Dispositivos: siempre aplicamos — upsert idempotente
                 "device" => true,
                 _ => false,
             };
 
             if is_newer {
+                if log.operation == "delete" {
+                    match log.entity_type.as_str() {
+                        "task" => {
+                            self.save_local_revision_before_delete("task", &log.entity_id);
+                            let _ = self
+                                .db
+                                .conn
+                                .execute("DELETE FROM tasks WHERE id = ?1", params![log.entity_id]);
+                            pulled_count += 1;
+                        }
+                        "note" => {
+                            self.save_local_revision_before_delete("note", &log.entity_id);
+                            let _ = self
+                                .db
+                                .conn
+                                .execute("DELETE FROM notes WHERE id = ?1", params![log.entity_id]);
+                            pulled_count += 1;
+                        }
+                        "project" => {
+                            self.save_local_revision_before_delete("project", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM projects WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "milestone" => {
+                            self.save_local_revision_before_delete("milestone", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM milestones WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "codex" => {
+                            self.save_local_revision_before_delete("codex", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM codices WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "task_assignment" => {
+                            let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                            if parts.len() == 2 {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                                    params![parts[0], parts[1]],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        "project_member" => {
+                            let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                            if parts.len() == 2 {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+                                    params![parts[0], parts[1]],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    newly_processed_ids.push(log.id);
+                    continue;
+                }
+
                 if let Some(ref content) = log.content {
                     match log.entity_type.as_str() {
                         "user" => {
-                            if let Ok(u) = serde_json::from_str::<crate::models::User>(content) {
-                                // Clear the table first to enforce singleton constraint and avoid duplicating users
-                                let _ = self.db.conn.execute("DELETE FROM users", []);
+                            if let Ok(mut u) = serde_json::from_str::<crate::models::User>(content)
+                            {
+                                // Progression is monotonic. An older device snapshot must never
+                                // reduce level/XP earned on another device.
+                                let mut preserved_local_progress = false;
+                                if let Ok(Some(local)) = self.db.get_user() {
+                                    if total_user_progress_xp(&local) > total_user_progress_xp(&u) {
+                                        u.level = local.level;
+                                        u.xp = local.xp;
+                                        preserved_local_progress = true;
+                                    }
+                                }
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO users (id, username, class, level, xp, created_at, specialization) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                                    "DELETE FROM users WHERE id != ?1",
+                                    params![u.id.to_string()],
+                                );
+                                let _ = self.db.conn.execute(
+                                    "INSERT INTO users (id, username, class, level, xp, created_at, specialization)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         username=excluded.username, class=excluded.class,
+                                         level=excluded.level, xp=excluded.xp,
+                                         created_at=excluded.created_at,
+                                         specialization=excluded.specialization",
                                     params![
                                         u.id.to_string(),
                                         u.username,
@@ -772,19 +1281,39 @@ impl<'a> SyncEngine<'a> {
                                         u.specialization
                                     ],
                                 );
+                                if preserved_local_progress {
+                                    let _ = self.db.log_change("user", &u.id.to_string(), "upsert");
+                                }
                                 pulled_count += 1;
                             }
                         }
                         "task" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("task", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM tasks WHERE id = ?1",
                                     params![log.entity_id],
                                 );
                                 pulled_count += 1;
-                            } else if let Ok(t) = serde_json::from_str::<Task>(content) {
+                            } else if let Ok(mut t) = serde_json::from_str::<Task>(content) {
+                                t.normalize_schedule();
                                 // Triquete de completado: si ya está completa localmente, no la regresamos a incompleta
                                 let local_task = self.db.get_task_by_id(ent_uuid).ok();
+                                if let Some(local) = local_task.as_ref() {
+                                    if local.project_id.is_some() && t.project_id.is_none() {
+                                        t.project_id = local.project_id;
+                                    }
+                                }
+                                if !self.task_payload_project_is_valid(&t, &remote_task_projects) {
+                                    conflicts.push(format!(
+                                        "Task '{}' rejected: missing project link",
+                                        t.title
+                                    ));
+                                    let _ = self.db.set_setting("auto_sync", "false");
+                                    let _ = self.db.set_setting("sync_restore_hold", "1");
+                                    newly_processed_ids.push(log.id);
+                                    continue;
+                                }
                                 let local_completed =
                                     local_task.as_ref().map(|lt| lt.completed).unwrap_or(false);
                                 let was_incomplete_locally = !local_completed;
@@ -799,7 +1328,17 @@ impl<'a> SyncEngine<'a> {
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
                                     let _ = self.db.conn.execute(
-                                        "INSERT OR REPLACE INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                                        "INSERT INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+                                         ON CONFLICT(id) DO UPDATE SET
+                                             project_id=excluded.project_id, title=excluded.title,
+                                             description=excluded.description, due_date=excluded.due_date,
+                                             set_date=excluded.set_date, completed=excluded.completed,
+                                             priority=excluded.priority, created_at=excluded.created_at,
+                                             updated_at=excluded.updated_at, owner_identity=excluded.owner_identity,
+                                             owner_username=excluded.owner_username,
+                                             parent_task_id=excluded.parent_task_id,
+                                             xp_awarded=excluded.xp_awarded, recurrence=excluded.recurrence",
                                         params![
                                             t.id.to_string(),
                                             t.project_id.map(|id| id.to_string()),
@@ -873,14 +1412,33 @@ impl<'a> SyncEngine<'a> {
                         }
                         "note" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("note", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM notes WHERE id = ?1",
                                     params![log.entity_id],
                                 );
                                 pulled_count += 1;
-                            } else if let Ok(n) = serde_json::from_str::<Note>(content) {
+                            } else if let Ok(mut n) = serde_json::from_str::<Note>(content) {
+                                if let Ok(local_note) = self.db.get_note_by_id(n.id) {
+                                    if local_note.project_id.is_some() && n.project_id.is_none() {
+                                        n.project_id = local_note.project_id;
+                                    }
+                                    if local_note.codex_id.is_some() && n.codex_id.is_none() {
+                                        n.codex_id = local_note.codex_id;
+                                    }
+                                }
+                                if n.project_id.is_none() {
+                                    conflicts.push(format!(
+                                        "Scroll '{}' rejected: missing project link",
+                                        n.title
+                                    ));
+                                    let _ = self.db.set_setting("auto_sync", "false");
+                                    let _ = self.db.set_setting("sync_restore_hold", "1");
+                                    newly_processed_ids.push(log.id);
+                                    continue;
+                                }
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                                    "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                                     params![
                                         n.id.to_string(),
                                         n.project_id.map(|id| id.to_string()),
@@ -890,6 +1448,7 @@ impl<'a> SyncEngine<'a> {
                                         n.updated_at.to_rfc3339(),
                                         n.sharing_permission,
                                         n.codex_id.map(|id| id.to_string()),
+                                        n.owner_identity,
                                     ],
                                 );
                                 pulled_count += 1;
@@ -897,6 +1456,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "project" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("project", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM projects WHERE id = ?1",
                                     params![log.entity_id],
@@ -908,23 +1468,43 @@ impl<'a> SyncEngine<'a> {
                                 let name = p["name"].as_str().unwrap_or_default();
                                 let desc = p["description"].as_str();
                                 let created = p["created_at"].as_str().unwrap_or_default();
+                                let updated = p["updated_at"].as_str().unwrap_or(created);
                                 let archived = p["archived"].as_bool().unwrap_or(false);
                                 let completed = p["completed"].as_bool().unwrap_or(false);
                                 let owner_id = p["owner_identity"].as_str();
                                 let owner_name = p["owner_username"].as_str();
                                 let is_shared = p["is_shared"].as_bool().unwrap_or(false);
+                                let local_is_shared = self
+                                    .db
+                                    .conn
+                                    .query_row(
+                                        "SELECT is_shared FROM projects WHERE id = ?1",
+                                        params![id],
+                                        |row| row.get::<_, i32>(0),
+                                    )
+                                    .unwrap_or(0)
+                                    != 0;
+                                let merged_is_shared = is_shared || local_is_shared;
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                    "INSERT INTO projects (id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         name=excluded.name, description=excluded.description,
+                                         created_at=excluded.created_at, updated_at=excluded.updated_at,
+                                         archived=excluded.archived,
+                                         completed=excluded.completed, owner_identity=excluded.owner_identity,
+                                         owner_username=excluded.owner_username,
+                                         is_shared=excluded.is_shared",
                                     params![
-                                        id, name, desc, created,
+                                        id, name, desc, created, updated,
                                         if archived { 1 } else { 0 },
                                         if completed { 1 } else { 0 },
                                         owner_id, owner_name,
-                                        if is_shared { 1 } else { 0 }
+                                        if merged_is_shared { 1 } else { 0 }
                                     ],
                                 );
                                 // When a project is shared, ensure owner appears in project_members
-                                if is_shared {
+                                if merged_is_shared {
                                     let owner_id_str =
                                         p["owner_identity"].as_str().unwrap_or_default();
                                     let owner_name_str =
@@ -946,18 +1526,26 @@ impl<'a> SyncEngine<'a> {
                                 let date = j["entry_date"].as_str().unwrap_or_default();
                                 let body = j["content"].as_str().unwrap_or_default();
                                 let created = j["created_at"].as_str().unwrap_or_default();
+                                let updated = j["updated_at"].as_str().unwrap_or(created);
                                 let visibility = j["visibility"].as_str().unwrap_or("Private");
                                 let author = j["author_username"].as_str().unwrap_or("");
 
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO journal_entries (id, project_id, entry_date, content, created_at, visibility, author_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                    params![id, pid, date, body, created, visibility, author],
+                                    "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, updated_at, visibility, author_username)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        project_id=excluded.project_id, entry_date=excluded.entry_date,
+                                        content=excluded.content, created_at=excluded.created_at,
+                                        updated_at=excluded.updated_at, visibility=excluded.visibility,
+                                        author_username=excluded.author_username",
+                                    params![id, pid, date, body, created, updated, visibility, author],
                                 );
                                 pulled_count += 1;
                             }
                         }
                         "milestone" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("milestone", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM milestones WHERE id = ?1",
                                     params![log.entity_id],
@@ -972,12 +1560,20 @@ impl<'a> SyncEngine<'a> {
                                 let completed = m["completed"].as_bool().unwrap_or(false);
                                 let xp = m["xp_reward"].as_i64().unwrap_or(0) as i32;
                                 let created = m["created_at"].as_str().unwrap_or_default();
+                                let updated = m["updated_at"].as_str().unwrap_or(created);
                                 let tier = m["tier"].as_i64().unwrap_or(0) as i32;
                                 let template_id = m["template_id"].as_str().unwrap_or("");
 
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, tier, template_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                    params![id, pid, name, desc, if completed { 1 } else { 0 }, xp, created, tier, template_id],
+                                    "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        project_id=excluded.project_id, name=excluded.name,
+                                        description=excluded.description, completed=excluded.completed,
+                                        xp_reward=excluded.xp_reward, created_at=excluded.created_at,
+                                        updated_at=excluded.updated_at, tier=excluded.tier,
+                                        template_id=excluded.template_id",
+                                    params![id, pid, name, desc, if completed { 1 } else { 0 }, xp, created, updated, tier, template_id],
                                 );
                                 pulled_count += 1;
                             }
@@ -1017,10 +1613,17 @@ impl<'a> SyncEngine<'a> {
                                 let freq = r["frequency"].as_str().unwrap_or("Daily");
                                 let xp = r["reward_xp"].as_i64().unwrap_or(0) as i32;
                                 let created = r["created_at"].as_str().unwrap_or_default();
+                                let updated = r["updated_at"].as_str().unwrap_or(created);
                                 let daily_target = r["daily_target"].as_i64().unwrap_or(1) as i32;
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO rituals (id, name, description, frequency, reward_xp, created_at, daily_target) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                    params![id, name, desc, freq, xp, created, daily_target],
+                                    "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at, updated_at, daily_target)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                        name=excluded.name, description=excluded.description,
+                                        frequency=excluded.frequency, reward_xp=excluded.reward_xp,
+                                        created_at=excluded.created_at, updated_at=excluded.updated_at,
+                                        daily_target=excluded.daily_target",
+                                    params![id, name, desc, freq, xp, created, updated, daily_target],
                                 );
                                 pulled_count += 1;
                             }
@@ -1058,6 +1661,7 @@ impl<'a> SyncEngine<'a> {
                         }
                         "codex" => {
                             if log.operation == "delete" {
+                                self.save_local_revision_before_delete("codex", &log.entity_id);
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM codices WHERE id = ?1",
                                     params![log.entity_id],
@@ -1066,12 +1670,19 @@ impl<'a> SyncEngine<'a> {
                                 serde_json::from_str::<crate::models::Codex>(content)
                             {
                                 let _ = self.db.conn.execute(
-                                    "INSERT OR REPLACE INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                    "INSERT INTO codices (id, project_id, name, created_at, updated_at, parent_codex_id, collapsed)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         project_id=excluded.project_id, name=excluded.name,
+                                         created_at=excluded.created_at, updated_at=excluded.updated_at,
+                                         parent_codex_id=excluded.parent_codex_id,
+                                         collapsed=excluded.collapsed",
                                     params![
                                         c.id.to_string(),
                                         c.project_id.to_string(),
                                         c.name,
                                         c.created_at.to_rfc3339(),
+                                        c.updated_at.to_rfc3339(),
                                         c.parent_codex_id.map(|id| id.to_string()),
                                         c.collapsed as i32,
                                     ],
@@ -1178,17 +1789,28 @@ impl<'a> SyncEngine<'a> {
                         // disparar log_change() de nuevo y crear un loop de sync
                         "zen_tree" => {
                             if let Ok(t) = serde_json::from_str::<crate::models::ZenTree>(content) {
+                                let local_tree = self.db.get_zen_tree().ok();
+                                let local_growth =
+                                    local_tree.as_ref().map(|lt| lt.growth).unwrap_or(0);
+                                let local_health =
+                                    local_tree.as_ref().map(|lt| lt.health).unwrap_or(0);
+                                let local_stage =
+                                    local_tree.as_ref().map(|lt| lt.stage).unwrap_or(1);
                                 let local_water_today =
-                                    self.db.get_zen_tree().map(|lt| lt.water_today).unwrap_or(0);
+                                    local_tree.as_ref().map(|lt| lt.water_today).unwrap_or(0);
+                                let local_total_waterings = local_tree
+                                    .as_ref()
+                                    .map(|lt| lt.total_waterings)
+                                    .unwrap_or(0);
                                 let _ = self.db.conn.execute(
                                     "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
                                     params![
-                                        t.growth,
-                                        t.health,
-                                        t.stage,
+                                        t.growth.max(local_growth),
+                                        t.health.max(local_health),
+                                        t.stage.max(local_stage),
                                         t.last_watered.map(|dt| dt.to_rfc3339()),
                                         t.water_today.max(local_water_today),
-                                        t.total_waterings,
+                                        t.total_waterings.max(local_total_waterings),
                                         t.id.to_string(),
                                     ],
                                 );
@@ -1231,8 +1853,18 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
+        max_seq = max_seq.max(remote_next_seq);
         if max_seq > since_seq {
             let _ = self.db.set_setting("last_pull_seq", &max_seq.to_string());
+        }
+        let last_remote_head_seq = remote_head_seq.max(max_seq);
+        let _ = self
+            .db
+            .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
+        let lag = last_remote_head_seq.saturating_sub(max_seq);
+        let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+        if !metadata_supported {
+            remote_has_more = remote_downloaded >= PULL_PAGE_SIZE && max_seq > since_seq;
         }
 
         // Persistir IDs de eventos aplicados — end del loop infinito de replay
@@ -1248,7 +1880,13 @@ impl<'a> SyncEngine<'a> {
         // Limpiar entradas antiguas de dedup (>90 días) — housekeeping silencioso
         let _ = self.db.cleanup_processed_remote_events(90);
 
-        Ok((pushed_count, pulled_count, conflicts))
+        Ok((
+            pushed_count,
+            pulled_count,
+            conflicts,
+            remote_downloaded,
+            remote_has_more,
+        ))
     }
 
     /// Registra una notificación de Fellowship una sola vez por evento remoto aplicado.
@@ -1275,7 +1913,46 @@ impl<'a> SyncEngine<'a> {
 mod tests {
     use super::*;
     use crate::database::Database;
-    use crate::models::{Note, Task, TaskPriority};
+    use crate::models::{Codex, Note, Project, Ritual, Task, TaskPriority, ZenTree};
+    use chrono::{Duration, Local, TimeZone};
+
+    struct StaticCloudProvider {
+        pull_payload: String,
+    }
+
+    impl CloudProvider for StaticCloudProvider {
+        fn name(&self) -> &str {
+            "Static Test Provider"
+        }
+
+        fn push(&self, _public_key: &str, _signature: &str, _payload: &str) -> Result<()> {
+            Ok(())
+        }
+
+        fn pull(&self, _public_key: &str, _signature: &str, _since_seq: i64) -> Result<String> {
+            Ok(self.pull_payload.clone())
+        }
+    }
+
+    fn test_identity() -> Identity {
+        let mut rng = rand::thread_rng();
+        let signing_key = ed25519_dalek::SigningKey::generate(&mut rng);
+        let verifying_key = signing_key.verifying_key();
+        Identity {
+            user_uuid: Uuid::new_v4(),
+            public_key: verifying_key
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+            secret_key: signing_key
+                .to_bytes()
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect(),
+            created_at: Utc::now().to_rfc3339(),
+        }
+    }
 
     // Verifica que la criptografía ed25519 funcione bien — firma válida pasa, mensaje alterado falla
     #[test]
@@ -1436,5 +2113,660 @@ mod tests {
             entries[0].device_id, "",
             "Expected device_id to default to an empty string"
         );
+    }
+
+    #[test]
+    fn test_pull_page_parses_legacy_array_response() {
+        let json_data = r#"[
+            {
+                "id": "event-1",
+                "entity_type": "task",
+                "entity_id": "task-uuid-1",
+                "operation": "update",
+                "timestamp": "2026-06-21T12:00:00Z",
+                "content": "{}",
+                "device_id": "device-a",
+                "seq": 42
+            }
+        ]"#;
+
+        let page = parse_pull_page(json_data, 10).expect("legacy pull page should parse");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_seq, 42);
+        assert_eq!(page.head_seq, 42);
+        assert!(!page.has_more);
+        assert!(!page.metadata_supported);
+    }
+
+    #[test]
+    fn test_pull_page_parses_metadata_response() {
+        let json_data = r#"{
+            "events": [
+                {
+                    "id": "event-1",
+                    "entity_type": "task",
+                    "entity_id": "task-uuid-1",
+                    "operation": "update",
+                    "timestamp": "2026-06-21T12:00:00Z",
+                    "content": "{}",
+                    "device_id": "device-a",
+                    "seq": 42
+                }
+            ],
+            "head_seq": 100,
+            "next_seq": 42,
+            "has_more": true
+        }"#;
+
+        let page = parse_pull_page(json_data, 10).expect("metadata pull page should parse");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.next_seq, 42);
+        assert_eq!(page.head_seq, 100);
+        assert!(page.has_more);
+        assert!(page.metadata_supported);
+    }
+
+    #[test]
+    fn user_progress_comparison_includes_completed_levels() {
+        let now = Utc::now();
+        let mut lower = crate::models::User {
+            id: Uuid::new_v4(),
+            username: "Hero".into(),
+            class: crate::models::ClassType::CodeWarlock,
+            level: 19,
+            xp: 1872,
+            created_at: now,
+            specialization: None,
+        };
+        let mut higher = lower.clone();
+        higher.xp = 2019;
+        assert!(total_user_progress_xp(&higher) > total_user_progress_xp(&lower));
+
+        lower.level = 20;
+        lower.xp = 0;
+        assert!(total_user_progress_xp(&lower) > total_user_progress_xp(&higher));
+    }
+
+    #[test]
+    fn test_remote_task_delete_older_than_local_edit_is_skipped() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_stale_task_delete.db");
+        if temp_db_path.exists() {
+            let _ = std::fs::remove_file(&temp_db_path);
+        }
+
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let task_id = Uuid::new_v4();
+        let updated_at = Utc::now();
+        let task = Task {
+            id: task_id,
+            project_id: None,
+            title: "Keep newer local task".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: updated_at,
+            updated_at,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        db.insert_task(&task).expect("Failed to insert task");
+
+        let remote_delete = serde_json::json!({
+            "events": [{
+                "id": "remote-delete-task",
+                "entity_type": "task",
+                "entity_id": task_id.to_string(),
+                "operation": "delete",
+                "timestamp": (updated_at - Duration::minutes(5)).to_rfc3339(),
+                "content": null,
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        let sync_engine = SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: remote_delete,
+            }),
+        };
+
+        sync_engine.sync().expect("sync should complete");
+        assert!(
+            db.get_task_by_id(task_id).is_ok(),
+            "stale remote delete removed a newer local task"
+        );
+
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn legacy_remote_set_date_is_imported_as_due_date() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_legacy_set_date_sync.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let scheduled = Utc.with_ymd_and_hms(2026, 10, 1, 12, 0, 0).unwrap();
+        let legacy_task = Task {
+            id: Uuid::new_v4(),
+            project_id: None,
+            title: "Legacy yearly quest".to_string(),
+            description: None,
+            due_date: None,
+            set_date: Some(scheduled),
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: Some(crate::models::RecurrenceType::Yearly),
+        };
+        let payload = serde_json::json!({
+            "events": [{
+                "id": "legacy-set-date-task",
+                "entity_type": "task",
+                "entity_id": legacy_task.id.to_string(),
+                "operation": "create",
+                "timestamp": legacy_task.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&legacy_task).unwrap(),
+                "device_id": "older-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let saved = db.get_task_by_id(legacy_task.id).unwrap();
+        assert_eq!(saved.due_date, Some(scheduled));
+        assert_eq!(saved.set_date, None);
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn project_conflicts_use_updated_at_instead_of_pull_order() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_project_lww.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let local = Project {
+            id: project_id,
+            name: "Newer local campaign".to_string(),
+            description: None,
+            created_at: now - Duration::days(10),
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        db.insert_project(&local).unwrap();
+
+        let mut older_remote = local.clone();
+        older_remote.name = "Stale remote campaign".to_string();
+        older_remote.updated_at = now - Duration::hours(1);
+        let old_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-project-old",
+                "entity_type": "project",
+                "entity_id": project_id.to_string(),
+                "operation": "update",
+                "timestamp": older_remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&older_remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: old_payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_projects().unwrap()[0].name, "Newer local campaign");
+
+        let mut newer_remote = local;
+        newer_remote.name = "Newest remote campaign".to_string();
+        newer_remote.updated_at = now + Duration::hours(1);
+        let new_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-project-new",
+                "entity_type": "project",
+                "entity_id": project_id.to_string(),
+                "operation": "update",
+                "timestamp": newer_remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&newer_remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 2
+            }],
+            "head_seq": 2,
+            "next_seq": 2,
+            "has_more": false
+        })
+        .to_string();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: new_payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_projects().unwrap()[0].name, "Newest remote campaign");
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn remote_ritual_update_preserves_completion_history() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_ritual_history_sync.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let today = Local::now().date_naive();
+        let ritual = Ritual {
+            id: "sync-history-ritual".to_string(),
+            name: "Original ritual".to_string(),
+            description: None,
+            frequency: "Daily".to_string(),
+            reward_xp: 20,
+            daily_target: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_ritual(&ritual).unwrap();
+        db.complete_ritual(&ritual.id, today, Local::now()).unwrap();
+
+        let mut remote = ritual;
+        remote.name = "Updated on another device".to_string();
+        remote.updated_at = now + Duration::hours(1);
+        let payload = serde_json::json!({
+            "events": [{
+                "id": "remote-ritual-update",
+                "entity_type": "ritual",
+                "entity_id": remote.id.clone(),
+                "operation": "update",
+                "timestamp": remote.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&remote).unwrap(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let saved = db
+            .get_rituals()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == "sync-history-ritual")
+            .unwrap();
+        assert_eq!(saved.name, "Updated on another device");
+        assert_eq!(
+            db.get_ritual_day_counts(today)
+                .unwrap()
+                .get("sync-history-ritual"),
+            Some(&(1, 1))
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn test_contentless_remote_note_delete_applies_with_revision() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_contentless_note_delete.db");
+        if temp_db_path.exists() {
+            let _ = std::fs::remove_file(&temp_db_path);
+        }
+
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        let note_id = Uuid::new_v4();
+        let created_at = Utc::now() - Duration::minutes(10);
+        let note = Note {
+            id: note_id,
+            project_id: None,
+            title: "Delete via tombstone".to_string(),
+            markdown_content: "Recoverable content".to_string(),
+            created_at,
+            updated_at: created_at,
+            sharing_permission: "collaborative".to_string(),
+            codex_id: None,
+            owner_identity: None,
+        };
+        db.insert_note(&note).expect("Failed to insert note");
+
+        let remote_delete = serde_json::json!({
+            "events": [{
+                "id": "remote-delete-note",
+                "entity_type": "note",
+                "entity_id": note_id.to_string(),
+                "operation": "delete",
+                "timestamp": Utc::now().to_rfc3339(),
+                "content": null,
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        let sync_engine = SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: remote_delete,
+            }),
+        };
+
+        sync_engine.sync().expect("sync should complete");
+        assert!(
+            db.get_note_by_id(note_id).is_err(),
+            "contentless remote delete did not remove the note"
+        );
+        let revisions = db
+            .get_revisions("note", &note_id.to_string())
+            .expect("Failed to read note revisions");
+        assert!(
+            revisions
+                .iter()
+                .any(|(_, content, _)| content.contains("Recoverable content")),
+            "remote delete did not leave a recoverable note revision"
+        );
+
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn test_export_import_preserves_note_codex_and_zen_tree() {
+        let source_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_export_source.db");
+        let restore_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_export_restore.db");
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&restore_path);
+
+        let source = Database::new(&source_path).expect("Failed to create source DB");
+        let project_id = Uuid::new_v4();
+        let codex_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        source
+            .insert_project(&Project {
+                id: project_id,
+                name: "Gibranlp".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .expect("Failed to insert project");
+        source
+            .insert_codex(&Codex {
+                id: codex_id,
+                project_id,
+                name: "Software".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            })
+            .expect("Failed to insert codex");
+        source
+            .insert_note(&Note {
+                id: note_id,
+                project_id: Some(project_id),
+                title: "Grouped Scroll".to_string(),
+                markdown_content: "Must stay inside Software".to_string(),
+                created_at: now,
+                updated_at: now,
+                sharing_permission: "collaborative".to_string(),
+                codex_id: Some(codex_id),
+                owner_identity: None,
+            })
+            .expect("Failed to insert note");
+        source
+            .update_zen_tree(&ZenTree {
+                id: source.get_zen_tree().unwrap().id,
+                growth: 272,
+                health: 88,
+                stage: 4,
+                last_watered: Some(now),
+                water_today: 1,
+                total_waterings: 12,
+            })
+            .expect("Failed to update tree");
+
+        let json = source.export_to_json().expect("Failed to export source");
+        let restored = Database::new(&restore_path).expect("Failed to create restore DB");
+        restored.import_from_json(&json).expect("Failed to import");
+
+        let restored_note = restored
+            .get_note_by_id(note_id)
+            .expect("Missing restored note");
+        assert_eq!(restored_note.project_id, Some(project_id));
+        assert_eq!(restored_note.codex_id, Some(codex_id));
+        let restored_tree = restored.get_zen_tree().expect("Missing restored tree");
+        assert_eq!(restored_tree.growth, 272);
+        assert_eq!(restored_tree.stage, 4);
+        assert_eq!(restored_tree.total_waterings, 12);
+
+        let _ = std::fs::remove_file(&source_path);
+        let _ = std::fs::remove_file(&restore_path);
+    }
+
+    #[test]
+    fn remote_parent_upserts_do_not_unlink_children() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_parent_upsert.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::new(&db_path).expect("Failed to create test DB");
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let child_id = Uuid::new_v4();
+        let codex_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+
+        let project = Project {
+            id: project_id,
+            name: "Protected project".into(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        db.insert_project(&project).unwrap();
+        let parent = Task {
+            id: parent_id,
+            project_id: Some(project_id),
+            title: "Parent".into(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now + Duration::minutes(1),
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        db.insert_task(&parent).unwrap();
+        let mut child = parent.clone();
+        child.id = child_id;
+        child.title = "Child".into();
+        child.parent_task_id = Some(parent_id);
+        db.insert_task(&child).unwrap();
+        let codex = Codex {
+            id: codex_id,
+            project_id,
+            name: "Codex".into(),
+            created_at: now,
+            updated_at: now,
+            parent_codex_id: None,
+            collapsed: false,
+        };
+        db.insert_codex(&codex).unwrap();
+        db.insert_note(&Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "Scroll".into(),
+            markdown_content: "content".into(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "collaborative".into(),
+            codex_id: Some(codex_id),
+            owner_identity: None,
+        })
+        .unwrap();
+
+        let pull_payload = serde_json::json!({
+            "events": [
+                {
+                    "id": "remote-project-upsert",
+                    "entity_type": "project",
+                    "entity_id": project_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&project).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 1
+                },
+                {
+                    "id": "remote-task-upsert",
+                    "entity_type": "task",
+                    "entity_id": parent_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&parent).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 2
+                },
+                {
+                    "id": "remote-codex-upsert",
+                    "entity_type": "codex",
+                    "entity_id": codex_id.to_string(),
+                    "operation": "upsert",
+                    "timestamp": (now + Duration::minutes(2)).to_rfc3339(),
+                    "content": serde_json::to_string(&codex).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 3
+                }
+            ],
+            "head_seq": 3,
+            "next_seq": 3,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider { pull_payload }),
+        }
+        .sync()
+        .expect("sync should complete");
+
+        assert_eq!(
+            db.get_task_by_id(child_id).unwrap().parent_task_id,
+            Some(parent_id)
+        );
+        let restored_note = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(restored_note.project_id, Some(project_id));
+        assert_eq!(restored_note.codex_id, Some(codex_id));
+
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
     }
 }

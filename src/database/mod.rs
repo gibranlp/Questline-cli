@@ -20,6 +20,192 @@ pub struct Database {
     pub conn: Connection,
 }
 
+fn ensure_updated_at_column(conn: &Connection, table: &str) -> Result<()> {
+    let has_column: bool = conn.query_row(
+        &format!(
+            "SELECT count(*) FROM pragma_table_info('{}') WHERE name='updated_at'",
+            table
+        ),
+        [],
+        |row| row.get::<_, i32>(0).map(|count| count > 0),
+    )?;
+    if !has_column {
+        conn.execute(
+            &format!(
+                "ALTER TABLE {} ADD COLUMN updated_at TEXT NOT NULL DEFAULT '';",
+                table
+            ),
+            [],
+        )?;
+    }
+    conn.execute(
+        &format!(
+            "UPDATE {} SET updated_at = created_at WHERE updated_at = '';",
+            table
+        ),
+        [],
+    )?;
+    Ok(())
+}
+
+fn normalize_legacy_task_dates(
+    due_date: Option<DateTime<Utc>>,
+    set_date: Option<DateTime<Utc>>,
+) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>) {
+    // Set Date was the old scheduling field. Keep the column for wire/schema
+    // compatibility, but expose one canonical Due Date to the application.
+    (due_date.or(set_date), None)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LegacyRelationshipRepair {
+    repaired_parents: usize,
+    repaired_steps: usize,
+    recovered_scrolls: usize,
+    created_recovery_project: bool,
+}
+
+fn repair_legacy_sync_relationships(conn: &Connection) -> Result<LegacyRelationshipRepair> {
+    let tx = conn.unchecked_transaction()?;
+    let now = Utc::now().to_rfc3339();
+    let mut repair = LegacyRelationshipRepair::default();
+
+    // The old sync bug could clear a quest's campaign while leaving all of its steps
+    // attached to the original campaign. Only infer the parent when every linked step
+    // agrees, so an ambiguous tree is never silently moved.
+    let inferred_parents = {
+        let mut stmt = tx.prepare(
+            "SELECT parent.id, MIN(step.project_id)
+             FROM tasks parent
+             JOIN tasks step ON step.parent_task_id = parent.id
+             WHERE parent.project_id IS NULL AND step.project_id IS NOT NULL
+             GROUP BY parent.id
+             HAVING COUNT(DISTINCT step.project_id) = 1",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (parent_id, project_id) in inferred_parents {
+        if tx.execute(
+            "UPDATE tasks SET project_id = ?1, updated_at = ?2
+             WHERE id = ?3 AND project_id IS NULL",
+            params![project_id, now, parent_id],
+        )? > 0
+        {
+            Database::log_change_on(&tx, "task", &parent_id, "update")?;
+            repair.repaired_parents += 1;
+        }
+    }
+
+    // Once the parent is trustworthy, its steps must live in the same campaign.
+    let mismatched_steps = {
+        let mut stmt = tx.prepare(
+            "SELECT step.id, parent.project_id
+             FROM tasks step
+             JOIN tasks parent ON parent.id = step.parent_task_id
+             WHERE parent.project_id IS NOT NULL
+               AND COALESCE(step.project_id, '') != parent.project_id",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (step_id, project_id) in mismatched_steps {
+        tx.execute(
+            "UPDATE tasks SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![project_id, now, step_id],
+        )?;
+        Database::log_change_on(&tx, "task", &step_id, "update")?;
+        repair.repaired_steps += 1;
+    }
+
+    // A codex is an unambiguous source for a scroll's missing campaign.
+    let codex_scrolls = {
+        let mut stmt = tx.prepare(
+            "SELECT note.id, codex.project_id
+             FROM notes note
+             JOIN codices codex ON codex.id = note.codex_id
+             WHERE note.project_id IS NULL",
+        )?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (note_id, project_id) in codex_scrolls {
+        tx.execute(
+            "UPDATE notes SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![project_id, now, note_id],
+        )?;
+        Database::log_change_on(&tx, "note", &note_id, "update")?;
+        repair.recovered_scrolls += 1;
+    }
+
+    let remaining_scroll_ids = {
+        let mut stmt = tx.prepare("SELECT id FROM notes WHERE project_id IS NULL")?;
+        stmt.query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    if !remaining_scroll_ids.is_empty() {
+        let recovery_project_id = tx
+            .query_row(
+                "SELECT value FROM settings WHERE key = 'recovered_scrolls_project_id'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .filter(|id| {
+                tx.query_row(
+                    "SELECT COUNT(*) FROM projects WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0)
+                    > 0
+            })
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+        let project_exists: bool = tx.query_row(
+            "SELECT COUNT(*) FROM projects WHERE id = ?1",
+            params![recovery_project_id],
+            |row| row.get::<_, i64>(0).map(|count| count > 0),
+        )?;
+        if !project_exists {
+            tx.execute(
+                "INSERT INTO projects
+                    (id, name, description, created_at, updated_at, archived, completed, is_shared)
+                 VALUES
+                    (?1, 'Recovered Scrolls',
+                     'Scrolls recovered from an older Questline sync issue.',
+                     ?2, ?2, 0, 0, 0)",
+                params![recovery_project_id, now],
+            )?;
+            Database::log_change_on(&tx, "project", &recovery_project_id, "create")?;
+            repair.created_recovery_project = true;
+        }
+        tx.execute(
+            "INSERT OR REPLACE INTO settings (key, value)
+             VALUES ('recovered_scrolls_project_id', ?1)",
+            params![recovery_project_id],
+        )?;
+
+        for note_id in remaining_scroll_ids {
+            tx.execute(
+                "UPDATE notes SET project_id = ?1, updated_at = ?2 WHERE id = ?3",
+                params![recovery_project_id, now, note_id],
+            )?;
+            Database::log_change_on(&tx, "note", &note_id, "update")?;
+            repair.recovered_scrolls += 1;
+        }
+    }
+
+    tx.commit()?;
+    Ok(repair)
+}
+
 const DEFAULT_STREAK_WORKDAY_MASK: u8 = 0b111_1111;
 const STREAK_WORKDAY_MASK_KEY: &str = "streak_workday_mask";
 const STREAK_ACTIVE_FROM_KEY: &str = "streak_active_from";
@@ -122,6 +308,16 @@ impl StreakSchedule {
 }
 
 impl Database {
+    pub fn database_size_bytes(&self) -> Result<u64> {
+        let page_count: u64 = self
+            .conn
+            .query_row("PRAGMA page_count;", [], |row| row.get(0))?;
+        let page_size: u64 = self
+            .conn
+            .query_row("PRAGMA page_size;", [], |row| row.get(0))?;
+        Ok(page_count.saturating_mul(page_size))
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
 
@@ -189,7 +385,6 @@ impl Database {
                 [],
             )?;
         }
-
         let has_priority_col: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('tasks') WHERE name='priority'",
             [],
@@ -500,6 +695,18 @@ impl Database {
             )?;
         }
 
+        // Conflict timestamps are added only after every legacy table/created_at migration above.
+        for table in [
+            "projects",
+            "codices",
+            "journal_entries",
+            "rituals",
+            "milestones",
+        ] {
+            ensure_updated_at_column(&conn, table)?;
+        }
+        repair_legacy_sync_relationships(&conn)?;
+
         let has_ritual_completion_count: bool = conn.query_row(
             "SELECT count(*) FROM pragma_table_info('ritual_history') WHERE name='completion_count'",
             [], |row| row.get::<_, i32>(0).map(|c| c > 0),
@@ -592,9 +799,10 @@ impl Database {
                 ),
             ];
             for (id, name, desc, freq, xp) in default_rituals {
+                let now = Utc::now().to_rfc3339();
                 conn.execute(
-                    "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![id, name, desc, freq, xp, Utc::now().to_rfc3339()],
+                    "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                    params![id, name, desc, freq, xp, now],
                 )?;
             }
         }
@@ -893,7 +1101,8 @@ impl Database {
     }
 
     pub fn insert_user(&self, user: &User) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO users (id, username, class, level, xp, created_at, specialization) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 user.id.to_string(),
@@ -905,12 +1114,14 @@ impl Database {
                 user.specialization
             ],
         )?;
-        let _ = self.log_change("user", &user.id.to_string(), "create");
+        Self::log_change_on(&tx, "user", &user.id.to_string(), "create")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn update_user(&self, user: &User) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE users SET username = ?1, class = ?2, level = ?3, xp = ?4, specialization = ?5 WHERE id = ?6",
             params![
                 user.username,
@@ -921,18 +1132,21 @@ impl Database {
                 user.id.to_string()
             ],
         )?;
-        let _ = self.log_change("user", &user.id.to_string(), "update");
+        Self::log_change_on(&tx, "user", &user.id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn insert_project(&self, project: &Project) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO projects (id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO projects (id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 project.id.to_string(),
                 project.name,
                 project.description,
                 project.created_at.to_rfc3339(),
+                project.updated_at.to_rfc3339(),
                 if project.archived { 1 } else { 0 },
                 if project.completed { 1 } else { 0 },
                 project.owner_identity,
@@ -940,33 +1154,39 @@ impl Database {
                 if project.is_shared { 1 } else { 0 }
             ],
         )?;
-        let _ = self.log_change("project", &project.id.to_string(), "create");
+        Self::log_change_on(&tx, "project", &project.id.to_string(), "create")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_projects(&self) -> Result<Vec<Project>> {
-        let mut stmt = self.conn.prepare("SELECT id, name, description, created_at, archived, completed, owner_identity, owner_username, is_shared FROM projects")?;
+        let mut stmt = self.conn.prepare("SELECT id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared FROM projects")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let name: String = row.get(1)?;
             let description: Option<String> = row.get(2)?;
             let created_str: String = row.get(3)?;
-            let archived_int: i32 = row.get(4)?;
-            let completed_int: i32 = row.get(5)?;
-            let owner_identity: Option<String> = row.get(6)?;
-            let owner_username: Option<String> = row.get(7)?;
-            let is_shared_int: i32 = row.get(8)?;
+            let updated_str: String = row.get(4)?;
+            let archived_int: i32 = row.get(5)?;
+            let completed_int: i32 = row.get(6)?;
+            let owner_identity: Option<String> = row.get(7)?;
+            let owner_username: Option<String> = row.get(8)?;
+            let is_shared_int: i32 = row.get(9)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
 
             Ok(Project {
                 id,
                 name,
                 description,
                 created_at,
+                updated_at,
                 archived: archived_int != 0,
                 completed: completed_int != 0,
                 owner_identity,
@@ -983,11 +1203,13 @@ impl Database {
     }
 
     pub fn update_project(&self, project: &Project) -> Result<()> {
-        self.conn.execute(
-            "UPDATE projects SET name = ?1, description = ?2, archived = ?3, completed = ?4, owner_identity = ?5, owner_username = ?6, is_shared = ?7 WHERE id = ?8",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE projects SET name = ?1, description = ?2, updated_at = ?3, archived = ?4, completed = ?5, owner_identity = ?6, owner_username = ?7, is_shared = ?8 WHERE id = ?9",
             params![
                 project.name,
                 project.description,
+                Utc::now().to_rfc3339(),
                 if project.archived { 1 } else { 0 },
                 if project.completed { 1 } else { 0 },
                 project.owner_identity,
@@ -996,30 +1218,72 @@ impl Database {
                 project.id.to_string()
             ],
         )?;
-        let _ = self.log_change("project", &project.id.to_string(), "update");
+        Self::log_change_on(&tx, "project", &project.id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_project_permanently(&self, id: Uuid) -> Result<()> {
+        let project = self.get_projects()?.into_iter().find(|p| p.id == id);
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(project) = project {
+            if let Ok(content_json) = serde_json::to_string(&project) {
+                Self::create_revision_on(&tx, "project", &id.to_string(), &content_json)?;
+            }
+        }
         // Tombstone antes de borrar — los otros dispositivos necesitan saber que este proyecto ya no existe
-        let _ = self.log_change("project", &id.to_string(), "delete");
-        self.conn.execute(
+        Self::log_change_on(&tx, "project", &id.to_string(), "delete")?;
+        tx.execute(
             "DELETE FROM projects WHERE id = ?1",
             params![id.to_string()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn insert_task(&self, task: &Task) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        Self::insert_task_on(&tx, task)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Inserts a recurring quest and all of its reusable steps as one unit.
+    /// Either every task and outbox entry is committed, or none of them are.
+    pub fn insert_task_tree(&self, parent: &Task, steps: &[Task]) -> Result<()> {
+        if parent.parent_task_id.is_some() {
+            return Err(anyhow::anyhow!(
+                "A task tree parent cannot itself be a step"
+            ));
+        }
+        if steps.iter().any(|step| {
+            step.parent_task_id != Some(parent.id) || step.project_id != parent.project_id
+        }) {
+            return Err(anyhow::anyhow!(
+                "Every recurring step must belong to its new parent and campaign"
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        Self::insert_task_on(&tx, parent)?;
+        for step in steps {
+            Self::insert_task_on(&tx, step)?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_task_on(conn: &Connection, task: &Task) -> Result<()> {
+        let due_date = task.due_date.or(task.set_date);
+        conn.execute(
             "INSERT INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 task.id.to_string(),
                 task.project_id.map(|id| id.to_string()),
                 task.title,
                 task.description,
-                task.due_date.map(|d| d.to_rfc3339()),
-                task.set_date.map(|d| d.to_rfc3339()),
+                due_date.map(|d| d.to_rfc3339()),
+                Option::<String>::None,
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
                 task.created_at.to_rfc3339(),
@@ -1031,9 +1295,9 @@ impl Database {
                 task.recurrence.map(|r| r.name()),
             ],
         )?;
-        let _ = self.log_change("task", &task.id.to_string(), "create");
+        Self::log_change_on(conn, "task", &task.id.to_string(), "create")?;
         if let Ok(content_json) = serde_json::to_string(task) {
-            let _ = self.create_revision("task", &task.id.to_string(), &content_json);
+            Self::create_revision_on(conn, "task", &task.id.to_string(), &content_json)?;
         }
         Ok(())
     }
@@ -1080,6 +1344,7 @@ impl Database {
                 ),
                 None => None,
             };
+            let (due_date, set_date) = normalize_legacy_task_dates(due_date, set_date);
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
@@ -1162,6 +1427,7 @@ impl Database {
                 ),
                 None => None,
             };
+            let (due_date, set_date) = normalize_legacy_task_dates(due_date, set_date);
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
@@ -1204,15 +1470,17 @@ impl Database {
         let old_task = self.get_task_by_id(task.id).ok();
         let was_completed = old_task.map(|t| t.completed).unwrap_or(false);
 
+        let due_date = task.due_date.or(task.set_date);
         let now = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, set_date = ?5, completed = ?6, priority = ?7, updated_at = ?8, owner_identity = ?9, owner_username = ?10, parent_task_id = ?11, xp_awarded = ?12, recurrence = ?13 WHERE id = ?14",
             params![
                 task.project_id.map(|id| id.to_string()),
                 task.title,
                 task.description,
-                task.due_date.map(|d| d.to_rfc3339()),
-                task.set_date.map(|d| d.to_rfc3339()),
+                due_date.map(|d| d.to_rfc3339()),
+                Option::<String>::None,
                 if task.completed { 1 } else { 0 },
                 task.priority.name(),
                 now,
@@ -1231,23 +1499,32 @@ impl Database {
         } else {
             "update"
         };
-        let _ = self.log_change("task", &task.id.to_string(), op);
+        Self::log_change_on(&tx, "task", &task.id.to_string(), op)?;
         if let Ok(content_json) = serde_json::to_string(task) {
-            let _ = self.create_revision("task", &task.id.to_string(), &content_json);
+            Self::create_revision_on(&tx, "task", &task.id.to_string(), &content_json)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_task(&self, id: Uuid) -> Result<()> {
+        let task = self.get_task_by_id(id).ok();
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(task) = task {
+            if let Ok(content_json) = serde_json::to_string(&task) {
+                Self::create_revision_on(&tx, "task", &id.to_string(), &content_json)?;
+            }
+        }
         // Tombstone — sin esto la tarea resucita en el próximo pull desde otro dispositivo
-        let _ = self.log_change("task", &id.to_string(), "delete");
-        self.conn
-            .execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
+        Self::log_change_on(&tx, "task", &id.to_string(), "delete")?;
+        tx.execute("DELETE FROM tasks WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn insert_note(&self, note: &Note) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 note.id.to_string(),
@@ -1261,10 +1538,11 @@ impl Database {
                 note.owner_identity.as_deref()
             ],
         )?;
-        let _ = self.log_change("note", &note.id.to_string(), "create");
+        Self::log_change_on(&tx, "note", &note.id.to_string(), "create")?;
         if let Ok(content_json) = serde_json::to_string(note) {
-            let _ = self.create_revision("note", &note.id.to_string(), &content_json);
+            Self::create_revision_on(&tx, "note", &note.id.to_string(), &content_json)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1373,29 +1651,61 @@ impl Database {
     }
 
     pub fn update_note(&self, note: &Note) -> Result<()> {
-        self.conn.execute(
+        let updated_at = Utc::now();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE notes SET project_id = ?1, title = ?2, markdown_content = ?3, updated_at = ?4, sharing_permission = ?5, codex_id = ?6 WHERE id = ?7",
             params![
                 note.project_id.map(|id| id.to_string()),
                 note.title,
                 note.markdown_content,
-                note.updated_at.to_rfc3339(),
+                updated_at.to_rfc3339(),
                 note.sharing_permission,
                 note.codex_id.map(|id| id.to_string()),
                 note.id.to_string()
             ],
         )?;
-        let _ = self.log_change("note", &note.id.to_string(), "update");
-        if let Ok(content_json) = serde_json::to_string(note) {
-            let _ = self.create_revision("note", &note.id.to_string(), &content_json);
+        Self::log_change_on(&tx, "note", &note.id.to_string(), "update")?;
+        let mut revision_note = note.clone();
+        revision_note.updated_at = updated_at;
+        if let Ok(content_json) = serde_json::to_string(&revision_note) {
+            Self::create_revision_on(&tx, "note", &note.id.to_string(), &content_json)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
+    pub fn move_note(&self, note_id: Uuid, project_id: Uuid, codex_id: Option<Uuid>) -> Result<()> {
+        if let Some(codex_id) = codex_id {
+            let codex_project_id: String = self.conn.query_row(
+                "SELECT project_id FROM codices WHERE id = ?1",
+                params![codex_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if codex_project_id != project_id.to_string() {
+                return Err(anyhow::anyhow!(
+                    "Cannot move scroll: the selected codex belongs to another campaign"
+                ));
+            }
+        }
+
+        let mut note = self.get_note_by_id(note_id)?;
+        note.project_id = Some(project_id);
+        note.codex_id = codex_id;
+        self.update_note(&note)
+    }
+
     pub fn delete_note(&self, id: Uuid) -> Result<()> {
-        let _ = self.log_change("note", &id.to_string(), "delete");
-        self.conn
-            .execute("DELETE FROM notes WHERE id = ?1", params![id.to_string()])?;
+        let note = self.get_note_by_id(id).ok();
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(note) = note {
+            if let Ok(content_json) = serde_json::to_string(&note) {
+                Self::create_revision_on(&tx, "note", &id.to_string(), &content_json)?;
+            }
+        }
+        Self::log_change_on(&tx, "note", &id.to_string(), "delete")?;
+        tx.execute("DELETE FROM notes WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1442,32 +1752,47 @@ impl Database {
     }
 
     pub fn insert_journal_entry(&self, entry: &JournalEntry) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, visibility, author_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, updated_at, visibility, author_username) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 entry.id.to_string(),
                 entry.project_id.to_string(),
                 entry.entry_date.to_string(),
                 entry.content,
                 entry.created_at.to_rfc3339(),
+                entry.updated_at.to_rfc3339(),
                 entry.visibility,
                 entry.author_username
             ],
         )?;
-        let _ = self.log_change("journal_entry", &entry.id.to_string(), "create");
+        Self::log_change_on(&tx, "journal_entry", &entry.id.to_string(), "create")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_journal_visibility(&self, id: Uuid, visibility: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE journal_entries SET visibility = ?1, updated_at = ?2 WHERE id = ?3",
+            params![visibility, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Self::log_change_on(&tx, "journal_entry", &id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_journal_entries(&self) -> Result<Vec<JournalEntry>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, entry_date, content, created_at, visibility, author_username FROM journal_entries ORDER BY created_at DESC")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, entry_date, content, created_at, updated_at, visibility, author_username FROM journal_entries ORDER BY created_at DESC")?;
         let rows = stmt.query_map([], |row| {
             let id_str: String = row.get(0)?;
             let project_id_str: String = row.get(1)?;
             let date_str: String = row.get(2)?;
             let content: String = row.get(3)?;
             let created_str: String = row.get(4)?;
-            let visibility: String = row.get(5)?;
-            let author_username: String = row.get(6)?;
+            let updated_str: String = row.get(5)?;
+            let visibility: String = row.get(6)?;
+            let author_username: String = row.get(7)?;
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id = Uuid::parse_str(&project_id_str)
@@ -1477,6 +1802,9 @@ impl Database {
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
 
             Ok(JournalEntry {
                 id,
@@ -1484,6 +1812,7 @@ impl Database {
                 entry_date,
                 content,
                 created_at,
+                updated_at,
                 visibility,
                 author_username,
             })
@@ -1539,7 +1868,8 @@ impl Database {
     }
 
     pub fn update_zen_tree(&self, tree: &ZenTree) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
             params![
                 tree.growth,
@@ -1551,7 +1881,8 @@ impl Database {
                 tree.id.to_string(),
             ],
         )?;
-        let _ = self.log_change("zen_tree", &tree.id.to_string(), "update");
+        Self::log_change_on(&tx, "zen_tree", &tree.id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -1624,11 +1955,15 @@ impl Database {
 
     pub fn unlock_achievement(&self, id: &str) -> Result<()> {
         let now_str = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE achievements SET unlocked_at = ?1 WHERE id = ?2 AND unlocked_at IS NULL",
             params![now_str, id],
         )?;
-        let _ = self.log_change("achievement", id, "unlock");
+        if changed > 0 {
+            Self::log_change_on(&tx, "achievement", id, "unlock")?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -1838,7 +2173,8 @@ impl Database {
     }
 
     pub fn insert_focus_session(&self, sess: &FocusSession) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 sess.id.to_string(),
@@ -1851,7 +2187,8 @@ impl Database {
                 sess.owner_identity,
             ],
         )?;
-        let _ = self.log_change("focus_session", &sess.id.to_string(), "insert");
+        Self::log_change_on(&tx, "focus_session", &sess.id.to_string(), "insert")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2043,17 +2380,19 @@ impl Database {
     }
 
     pub fn insert_ritual(&self, r: &Ritual) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO rituals (id, name, description, frequency, reward_xp, daily_target, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![r.id, r.name, r.description, r.frequency, r.reward_xp, r.daily_target, r.created_at.to_rfc3339()],
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO rituals (id, name, description, frequency, reward_xp, daily_target, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![r.id, r.name, r.description, r.frequency, r.reward_xp, r.daily_target, r.created_at.to_rfc3339(), r.updated_at.to_rfc3339()],
         )?;
-        let _ = self.log_change("ritual", &r.id, "create");
+        Self::log_change_on(&tx, "ritual", &r.id, "create")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_rituals(&self) -> Result<Vec<Ritual>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, description, frequency, reward_xp, daily_target, created_at FROM rituals",
+            "SELECT id, name, description, frequency, reward_xp, daily_target, created_at, updated_at FROM rituals",
         )?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
@@ -2063,10 +2402,14 @@ impl Database {
             let reward_xp: i32 = row.get(4)?;
             let daily_target: i32 = row.get(5)?;
             let created_str: String = row.get(6)?;
+            let updated_str: String = row.get(7)?;
 
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
 
             Ok(Ritual {
                 id,
@@ -2076,6 +2419,7 @@ impl Database {
                 reward_xp,
                 daily_target,
                 created_at,
+                updated_at,
             })
         })?;
         let mut list = Vec::new();
@@ -2086,9 +2430,10 @@ impl Database {
     }
 
     pub fn delete_ritual(&self, id: &str) -> Result<()> {
-        self.conn
-            .execute("DELETE FROM rituals WHERE id = ?1", params![id])?;
-        let _ = self.log_change("ritual", id, "delete");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM rituals WHERE id = ?1", params![id])?;
+        Self::log_change_on(&tx, "ritual", id, "delete")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2100,8 +2445,8 @@ impl Database {
         date: NaiveDate,
         completed_at: DateTime<Local>,
     ) -> Result<Option<(i32, i32)>> {
-        let target: i32 = self
-            .conn
+        let tx = self.conn.unchecked_transaction()?;
+        let target: i32 = tx
             .query_row(
                 "SELECT daily_target FROM rituals WHERE id = ?1",
                 params![ritual_id],
@@ -2109,31 +2454,34 @@ impl Database {
             )
             .unwrap_or(1);
 
-        self.conn.execute(
+        tx.execute(
             "INSERT OR IGNORE INTO ritual_history (ritual_id, completed_date, completion_count, completed_at) VALUES (?1, ?2, 0, ?3)",
             params![ritual_id, date.to_string(), completed_at.to_rfc3339()],
         )?;
 
-        let changed = self.conn.execute(
+        let changed = tx.execute(
             "UPDATE ritual_history SET completion_count = completion_count + 1, completed_at = ?4 WHERE ritual_id = ?1 AND completed_date = ?2 AND completion_count < ?3",
             params![ritual_id, date.to_string(), target, completed_at.to_rfc3339()],
         )?;
 
         if changed == 0 {
+            tx.commit()?;
             return Ok(None);
         }
-        let _ = self.log_change(
+        Self::log_change_on(
+            &tx,
             "ritual_history",
             &format!("{}__{}", ritual_id, date),
             "create",
-        );
+        )?;
 
-        let new_count: i32 = self.conn.query_row(
+        let new_count: i32 = tx.query_row(
             "SELECT completion_count FROM ritual_history WHERE ritual_id = ?1 AND completed_date = ?2",
             params![ritual_id, date.to_string()],
             |row| row.get(0),
         ).unwrap_or(1);
 
+        tx.commit()?;
         Ok(Some((new_count, target)))
     }
 
@@ -2363,8 +2711,9 @@ impl Database {
     }
 
     pub fn insert_milestone(&self, m: &Milestone) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, tier, template_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 m.id.to_string(),
                 m.project_id.to_string(),
@@ -2373,16 +2722,18 @@ impl Database {
                 if m.completed { 1 } else { 0 },
                 m.xp_reward,
                 m.created_at.to_rfc3339(),
+                m.updated_at.to_rfc3339(),
                 m.tier as i32,
                 m.template_id,
             ],
         )?;
-        let _ = self.log_change("milestone", &m.id.to_string(), "create");
+        Self::log_change_on(&tx, "milestone", &m.id.to_string(), "create")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_milestones_for_project(&self, project_id: Uuid) -> Result<Vec<Milestone>> {
-        let mut stmt = self.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, tier, template_id FROM milestones WHERE project_id = ?1")?;
+        let mut stmt = self.conn.prepare("SELECT id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id FROM milestones WHERE project_id = ?1")?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let proj_str: String = row.get(1)?;
@@ -2391,8 +2742,9 @@ impl Database {
             let completed_int: i32 = row.get(4)?;
             let xp_reward: i32 = row.get(5)?;
             let created_str: String = row.get(6)?;
-            let tier_int: i32 = row.get(7).unwrap_or(0);
-            let template_id: String = row.get(8).unwrap_or_default();
+            let updated_str: String = row.get(7)?;
+            let tier_int: i32 = row.get(8).unwrap_or(0);
+            let template_id: String = row.get(9).unwrap_or_default();
 
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let project_id =
@@ -2400,6 +2752,9 @@ impl Database {
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .unwrap_or_else(|_| Utc::now());
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
 
             Ok(Milestone {
                 id,
@@ -2409,6 +2764,7 @@ impl Database {
                 completed: completed_int != 0,
                 xp_reward,
                 created_at,
+                updated_at,
                 tier: tier_int.clamp(0, 255) as u8,
                 template_id,
             })
@@ -2421,28 +2777,58 @@ impl Database {
     }
 
     pub fn update_milestone(&self, m: &Milestone) -> Result<()> {
-        self.conn.execute(
-            "UPDATE milestones SET name = ?1, description = ?2, completed = ?3, xp_reward = ?4, tier = ?5, template_id = ?6 WHERE id = ?7",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE milestones SET name = ?1, description = ?2, completed = ?3, xp_reward = ?4, updated_at = ?5, tier = ?6, template_id = ?7 WHERE id = ?8",
             params![
                 m.name,
                 m.description,
                 if m.completed { 1 } else { 0 },
                 m.xp_reward,
+                Utc::now().to_rfc3339(),
                 m.tier as i32,
                 m.template_id,
                 m.id.to_string(),
             ],
         )?;
-        let _ = self.log_change("milestone", &m.id.to_string(), "update");
+        Self::log_change_on(&tx, "milestone", &m.id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_milestone(&self, id: Uuid) -> Result<()> {
-        let _ = self.log_change("milestone", &id.to_string(), "delete");
-        self.conn.execute(
+        let revision = self
+            .conn
+            .query_row(
+                "SELECT json_object(
+                'id', id,
+                'project_id', project_id,
+                'name', name,
+                'description', description,
+                'completed', completed != 0,
+                'xp_reward', xp_reward,
+                'created_at', created_at,
+                'updated_at', updated_at,
+                'tier', tier,
+                'template_id', template_id
+            ) FROM milestones WHERE id = ?1",
+                params![id.to_string()],
+                |row| {
+                    let content: String = row.get(0)?;
+                    Ok(content)
+                },
+            )
+            .ok();
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(content) = revision {
+            Self::create_revision_on(&tx, "milestone", &id.to_string(), &content)?;
+        }
+        Self::log_change_on(&tx, "milestone", &id.to_string(), "delete")?;
+        tx.execute(
             "DELETE FROM milestones WHERE id = ?1",
             params![id.to_string()],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2622,6 +3008,7 @@ impl Database {
                 ),
                 None => None,
             };
+            let (due_date, set_date) = normalize_legacy_task_dates(due_date, set_date);
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
@@ -2706,41 +3093,48 @@ impl Database {
     }
 
     pub fn insert_codex(&self, codex: &Codex) -> Result<()> {
-        self.conn.execute(
-            "INSERT INTO codices (id, project_id, name, created_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO codices (id, project_id, name, created_at, updated_at, parent_codex_id, collapsed) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 codex.id.to_string(),
                 codex.project_id.to_string(),
                 codex.name,
                 codex.created_at.to_rfc3339(),
+                codex.updated_at.to_rfc3339(),
                 codex.parent_codex_id.map(|id| id.to_string()),
                 codex.collapsed as i32,
             ],
         )?;
-        let _ = self.log_change("codex", &codex.id.to_string(), "create");
+        Self::log_change_on(&tx, "codex", &codex.id.to_string(), "create")?;
         if let Ok(json) = serde_json::to_string(codex) {
-            let _ = self.create_revision("codex", &codex.id.to_string(), &json);
+            Self::create_revision_on(&tx, "codex", &codex.id.to_string(), &json)?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn get_codices_for_project(&self, project_id: Uuid) -> Result<Vec<Codex>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at, parent_codex_id, collapsed FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
+            "SELECT id, project_id, name, created_at, updated_at, parent_codex_id, collapsed FROM codices WHERE project_id = ?1 ORDER BY LOWER(name) ASC"
         )?;
         let rows = stmt.query_map(params![project_id.to_string()], |row| {
             let id_str: String = row.get(0)?;
             let pid_str: String = row.get(1)?;
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
-            let parent_str: Option<String> = row.get(4)?;
-            let collapsed: i32 = row.get(5).unwrap_or(0);
+            let updated_str: String = row.get(4)?;
+            let parent_str: Option<String> = row.get(5)?;
+            let collapsed: i32 = row.get(6).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid =
                 Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
             let parent_codex_id = match parent_str {
                 Some(s) => {
                     Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
@@ -2752,6 +3146,7 @@ impl Database {
                 project_id: pid,
                 name,
                 created_at,
+                updated_at,
                 parent_codex_id,
                 collapsed: collapsed != 0,
             })
@@ -2765,21 +3160,25 @@ impl Database {
 
     pub fn get_codex_by_id(&self, id: &str) -> Result<Codex> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, project_id, name, created_at, parent_codex_id, collapsed FROM codices WHERE id = ?1"
+            "SELECT id, project_id, name, created_at, updated_at, parent_codex_id, collapsed FROM codices WHERE id = ?1"
         )?;
         let codex = stmt.query_row(params![id], |row| {
             let id_str: String = row.get(0)?;
             let pid_str: String = row.get(1)?;
             let name: String = row.get(2)?;
             let created_str: String = row.get(3)?;
-            let parent_str: Option<String> = row.get(4)?;
-            let collapsed: i32 = row.get(5).unwrap_or(0);
+            let updated_str: String = row.get(4)?;
+            let parent_str: Option<String> = row.get(5)?;
+            let collapsed: i32 = row.get(6).unwrap_or(0);
             let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let pid =
                 Uuid::parse_str(&pid_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
             let created_at = DateTime::parse_from_rfc3339(&created_str)
                 .map(|dt| dt.with_timezone(&Utc))
                 .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
+            let updated_at = DateTime::parse_from_rfc3339(&updated_str)
+                .map(|dt| dt.with_timezone(&Utc))
+                .unwrap_or(created_at);
             let parent_codex_id = match parent_str {
                 Some(s) => {
                     Some(Uuid::parse_str(&s).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?)
@@ -2791,6 +3190,7 @@ impl Database {
                 project_id: pid,
                 name,
                 created_at,
+                updated_at,
                 parent_codex_id,
                 collapsed: collapsed != 0,
             })
@@ -2799,42 +3199,59 @@ impl Database {
     }
 
     pub fn set_codex_collapsed(&self, id: Uuid, collapsed: bool) -> Result<()> {
-        self.conn.execute(
-            "UPDATE codices SET collapsed = ?1 WHERE id = ?2",
-            params![collapsed as i32, id.to_string()],
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE codices SET collapsed = ?1, updated_at = ?2 WHERE id = ?3",
+            params![collapsed as i32, Utc::now().to_rfc3339(), id.to_string()],
         )?;
-        let _ = self.log_change("codex", &id.to_string(), "update");
+        Self::log_change_on(&tx, "codex", &id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn update_codex_name(&self, id: Uuid, name: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE codices SET name = ?1 WHERE id = ?2",
-            params![name, id.to_string()],
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE codices SET name = ?1, updated_at = ?2 WHERE id = ?3",
+            params![name, Utc::now().to_rfc3339(), id.to_string()],
         )?;
-        let _ = self.log_change("codex", &id.to_string(), "update");
+        Self::log_change_on(&tx, "codex", &id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn update_codex_parent(&self, id: Uuid, parent_codex_id: Option<Uuid>) -> Result<()> {
-        self.conn.execute(
-            "UPDATE codices SET parent_codex_id = ?1 WHERE id = ?2",
-            params![parent_codex_id.map(|p| p.to_string()), id.to_string()],
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE codices SET parent_codex_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![
+                parent_codex_id.map(|p| p.to_string()),
+                Utc::now().to_rfc3339(),
+                id.to_string()
+            ],
         )?;
-        let _ = self.log_change("codex", &id.to_string(), "update");
+        Self::log_change_on(&tx, "codex", &id.to_string(), "update")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn delete_codex(&self, id: Uuid) -> Result<()> {
+        let codex = self.get_codex_by_id(&id.to_string()).ok();
+        let tx = self.conn.unchecked_transaction()?;
+        if let Some(codex) = codex {
+            if let Ok(content_json) = serde_json::to_string(&codex) {
+                Self::create_revision_on(&tx, "codex", &id.to_string(), &content_json)?;
+            }
+        }
+        Self::log_change_on(&tx, "codex", &id.to_string(), "delete")?;
         // los sub-codices huérfanos suben a raíz en vez de borrarse — el usuario no pierde jerarquía de golpe
-        self.conn.execute(
+        tx.execute(
             "UPDATE codices SET parent_codex_id = NULL WHERE parent_codex_id = ?1",
             params![id.to_string()],
         )?;
         // el ON DELETE SET NULL del schema ya desagrupa las notas — no hace falta UPDATE manual aquí
-        self.conn
-            .execute("DELETE FROM codices WHERE id = ?1", params![id.to_string()])?;
-        let _ = self.log_change("codex", &id.to_string(), "delete");
+        tx.execute("DELETE FROM codices WHERE id = ?1", params![id.to_string()])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2847,9 +3264,18 @@ impl Database {
 
     // synced=0 al insertar — el motor de sync sólo toma los pendientes; no tocar este default
     pub fn log_change(&self, entity_type: &str, entity_id: &str, operation: &str) -> Result<()> {
+        Self::log_change_on(&self.conn, entity_type, entity_id, operation)
+    }
+
+    fn log_change_on(
+        conn: &Connection,
+        entity_type: &str,
+        entity_id: &str,
+        operation: &str,
+    ) -> Result<()> {
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO sync_log (id, entity_type, entity_id, operation, timestamp, synced) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
             params![id, entity_type, entity_id, operation, timestamp],
         )?;
@@ -2858,14 +3284,23 @@ impl Database {
 
     // el número de revisión se calcula como MAX+1 por entidad, no global — dos entidades distintas pueden tener rev 1
     pub fn create_revision(&self, entity_type: &str, entity_id: &str, content: &str) -> Result<()> {
-        let next_rev: i32 = self.conn.query_row(
+        Self::create_revision_on(&self.conn, entity_type, entity_id, content)
+    }
+
+    fn create_revision_on(
+        conn: &Connection,
+        entity_type: &str,
+        entity_id: &str,
+        content: &str,
+    ) -> Result<()> {
+        let next_rev: i32 = conn.query_row(
             "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM revisions WHERE entity_type = ?1 AND entity_id = ?2",
             params![entity_type, entity_id],
             |row| row.get(0),
         )?;
         let id = Uuid::new_v4().to_string();
         let timestamp = Utc::now().to_rfc3339();
-        self.conn.execute(
+        conn.execute(
             "INSERT INTO revisions (id, entity_type, entity_id, revision_number, content, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, entity_type, entity_id, next_rev, content, timestamp],
         )?;
@@ -2955,7 +3390,7 @@ impl Database {
     }
 
     pub fn get_pending_sync_logs(&self) -> Result<Vec<(String, String, String, String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0")?;
+        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0 ORDER BY rowid ASC")?;
         let rows = stmt.query_map([], |row| {
             let id: String = row.get(0)?;
             let et: String = row.get(1)?;
@@ -2969,6 +3404,23 @@ impl Database {
             logs.push(r?);
         }
         Ok(logs)
+    }
+
+    /// Keep only the newest unsynced event per entity. Sync payloads contain the entity's
+    /// complete current state, so older pending edits are redundant and can resurrect stale data.
+    pub fn compact_pending_sync_logs(&self) -> Result<usize> {
+        let deleted = self.conn.execute(
+            "DELETE FROM sync_log
+             WHERE synced = 0
+               AND rowid NOT IN (
+                   SELECT MAX(rowid)
+                   FROM sync_log
+                   WHERE synced = 0
+                   GROUP BY entity_type, entity_id
+               )",
+            [],
+        )?;
+        Ok(deleted)
     }
 
     // el IN dinámico con placeholders numerados es necesario porque rusqlite no acepta slices directamente en execute
@@ -3046,6 +3498,58 @@ impl Database {
     /// second PC can pull forever and never receive those existing tasks/steps.
     /// A forced/manual sync uses this to reseed the server from the current DB.
     pub fn queue_full_state_sync(&self) -> Result<usize> {
+        let total_notes: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM notes", [], |row| row.get(0))
+            .unwrap_or(0);
+        let projectless_notes: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes WHERE project_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if projectless_notes > 0 {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} of {} scrolls are missing project links",
+                projectless_notes,
+                total_notes
+            ));
+        }
+        let total_tasks: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM tasks", [], |row| row.get(0))
+            .unwrap_or(0);
+        let projectless_tasks: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE project_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if total_tasks > 0 && projectless_tasks * 2 >= total_tasks {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} of {} tasks are missing project links",
+                projectless_tasks,
+                total_tasks
+            ));
+        }
+        let mismatched_steps: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM tasks step
+             JOIN tasks parent ON parent.id = step.parent_task_id
+             WHERE COALESCE(step.project_id, '') != COALESCE(parent.project_id, '')",
+            [],
+            |row| row.get(0),
+        )?;
+        if mismatched_steps > 0 {
+            return Err(anyhow::anyhow!(
+                "Refusing full-state sync: {} step(s) do not match their parent project",
+                mismatched_steps
+            ));
+        }
         let mut queued = 0usize;
 
         if let Ok(Some(user)) = self.get_user() {
@@ -3055,6 +3559,7 @@ impl Database {
 
         let simple_tables = [
             ("project", "projects", "id"),
+            ("codex", "codices", "id"),
             ("task", "tasks", "id"),
             ("note", "notes", "id"),
             ("journal_entry", "journal_entries", "id"),
@@ -3062,7 +3567,6 @@ impl Database {
             ("achievement", "achievements", "id"),
             ("ritual", "rituals", "id"),
             ("focus_session", "focus_sessions", "id"),
-            ("codex", "codices", "id"),
             ("chronicle_message", "chronicle_messages", "id"),
         ];
 
@@ -3172,23 +3676,24 @@ impl Database {
         let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
 
         // CUIDADO: los tombstones van antes del DELETE — si se hace al revés, otros dispositivos resucitan la tarea en el siguiente pull
-        let mut stmt = self.conn.prepare(
-            "SELECT id FROM tasks WHERE completed = 1 AND (
-                (updated_at != '' AND updated_at < ?1) OR
-                (updated_at = '' AND created_at < ?1)
-            )",
-        )?;
-        let ids: Vec<String> = stmt
-            .query_map(params![cutoff], |row| row.get::<_, String>(0))?
-            .filter_map(|r| r.ok())
-            .collect();
+        let ids: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT id FROM tasks WHERE completed = 1 AND (
+                    (updated_at != '' AND updated_at < ?1) OR
+                    (updated_at = '' AND created_at < ?1)
+                )",
+            )?;
+            stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
         let count = ids.len();
+        let tx = self.conn.unchecked_transaction()?;
         for id in &ids {
-            let _ = self.log_change("task", id, "delete");
+            Self::log_change_on(&tx, "task", id, "delete")?;
         }
 
         // el CASCADE del schema borra las subtareas automáticamente al borrar la tarea raíz
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NULL AND (
                 (updated_at != '' AND updated_at < ?1) OR
                 (updated_at = '' AND created_at < ?1)
@@ -3196,7 +3701,7 @@ impl Database {
             params![cutoff],
         )?;
         // subtareas completadas cuyo padre sobrevivió la poda — hay que borrarlas por separado
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL AND (
                 (updated_at != '' AND updated_at < ?1) OR
                 (updated_at = '' AND created_at < ?1)
@@ -3204,7 +3709,31 @@ impl Database {
             params![cutoff],
         )?;
 
+        tx.commit()?;
         Ok(count)
+    }
+
+    pub fn cleanup_local_history(&self) -> Result<(usize, usize, usize)> {
+        let sync_logs = self
+            .conn
+            .execute("DELETE FROM sync_log WHERE synced = 1", [])?;
+        let processed = self
+            .conn
+            .execute("DELETE FROM processed_remote_events", [])?;
+        let revisions = self.conn.execute("DELETE FROM revisions", [])?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_restore_hold', '1')",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_sync', 'false')",
+            [],
+        )?;
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('conflict_count', '0')",
+            [],
+        )?;
+        Ok((sync_logs, processed, revisions))
     }
 
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
@@ -3273,17 +3802,27 @@ impl Database {
     }
 
     pub fn queue_streak_schedule_sync(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
         for key in SYNCED_STREAK_SETTING_KEYS {
-            self.conn.execute(
+            tx.execute(
                 "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
                 params![key],
             )?;
-            self.log_change("setting", key, "upsert")?;
+            Self::log_change_on(&tx, "setting", key, "upsert")?;
         }
+        tx.commit()?;
         Ok(())
     }
 
     pub fn export_to_json(&self) -> Result<String> {
+        self.export_to_json_skipping(&[])
+    }
+
+    pub fn export_to_recovery_json(&self) -> Result<String> {
+        self.export_to_json_skipping(&["processed_remote_events", "revisions", "sync_log"])
+    }
+
+    fn export_to_json_skipping(&self, skipped_tables: &[&str]) -> Result<String> {
         let mut map = serde_json::Map::new();
         let mut metadata = serde_json::Map::new();
         metadata.insert(
@@ -3293,6 +3832,14 @@ impl Database {
         metadata.insert(
             "version".to_string(),
             serde_json::Value::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
+        metadata.insert(
+            "format".to_string(),
+            serde_json::Value::String(if skipped_tables.is_empty() {
+                "full".to_string()
+            } else {
+                "recovery_compact".to_string()
+            }),
         );
         metadata.insert(
             "export_date".to_string(),
@@ -3337,6 +3884,9 @@ impl Database {
             .collect();
 
         for table in tables {
+            if skipped_tables.contains(&table.as_str()) {
+                continue;
+            }
             let mut rows_list = Vec::new();
             let mut row_stmt = self.conn.prepare(&format!("SELECT * FROM {}", table))?;
             let col_names: Vec<String> = row_stmt
@@ -3407,8 +3957,13 @@ impl Database {
             )
             .ok();
 
-        // FK off para importar sin importar el orden de tablas — se reactiva al final pase lo que pase
+        // Import all tables atomically. Foreign keys are disabled only while the transaction
+        // is active because exports are not required to list parent tables first.
         self.conn.execute("PRAGMA foreign_keys = OFF;", [])?;
+        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
+            let _ = self.conn.execute("PRAGMA foreign_keys = ON;", []);
+            return Err(error.into());
+        }
 
         let res = (|| -> Result<()> {
             for (table_name, rows_val) in map {
@@ -3506,34 +4061,106 @@ impl Database {
             // making sync silently diverge after the first restart post-restore.
             match pre_import_device_id {
                 Some(ref id) => {
-                    let _ = self.conn.execute(
+                    self.conn.execute(
                         "INSERT OR REPLACE INTO settings (key, value) VALUES ('device_id', ?1)",
                         params![id],
-                    );
+                    )?;
                 }
                 None => {
                     // This machine had no device_id before the import either; let App::new()
                     // generate a fresh one on next launch.
-                    let _ = self
-                        .conn
-                        .execute("DELETE FROM settings WHERE key = 'device_id'", []);
+                    self.conn
+                        .execute("DELETE FROM settings WHERE key = 'device_id'", [])?;
                 }
             }
             // Reset the pull cursor — the restored machine must pull the full event history
             // so it reaches the same state as the backup source.
-            let _ = self
-                .conn
-                .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", []);
+            self.conn
+                .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", [])?;
+            self.conn.execute("UPDATE sync_log SET synced = 1", [])?;
             // Clear dedup IDs from the backup source — they belong to a different device's
             // view of the event stream and would cause this machine to skip events it has
             // never actually applied.
-            let _ = self.conn.execute("DELETE FROM processed_remote_events", []);
+            self.conn
+                .execute("DELETE FROM processed_remote_events", [])?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_sync', 'false')",
+                [],
+            )?;
+            self.conn.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('sync_restore_hold', '1')",
+                [],
+            )?;
+
+            // Older backups predate per-entity conflict timestamps. Give restored rows a
+            // stable timestamp instead of leaving an empty value that could defeat LWW.
+            for table in [
+                "projects",
+                "codices",
+                "journal_entries",
+                "rituals",
+                "milestones",
+            ] {
+                self.conn.execute(
+                    &format!(
+                        "UPDATE {table} SET updated_at = created_at WHERE updated_at IS NULL OR updated_at = ''"
+                    ),
+                    [],
+                )?;
+            }
+
+            let projectless_notes: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM notes WHERE project_id IS NULL OR project_id = ''",
+                [],
+                |row| row.get(0),
+            )?;
+            let mismatched_steps: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM tasks step
+                 JOIN tasks parent ON parent.id = step.parent_task_id
+                 WHERE COALESCE(step.project_id, '') != COALESCE(parent.project_id, '')",
+                [],
+                |row| row.get(0),
+            )?;
+            if projectless_notes > 0 || mismatched_steps > 0 {
+                return Err(anyhow::anyhow!(
+                    "Refusing unhealthy backup: {} projectless scroll(s), {} step mismatch(es)",
+                    projectless_notes,
+                    mismatched_steps
+                ));
+            }
+
+            let foreign_key_errors: i64 = self.conn.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if foreign_key_errors > 0 {
+                return Err(anyhow::anyhow!(
+                    "Imported backup contains {} foreign key violation(s)",
+                    foreign_key_errors
+                ));
+            }
 
             Ok(())
         })();
 
-        self.conn.execute("PRAGMA foreign_keys = ON;", [])?;
-        res
+        let transaction_result = match res {
+            Ok(()) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    let _ = self.conn.execute_batch("ROLLBACK");
+                    Err(error.into())
+                }
+            },
+            Err(error) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        };
+        let foreign_key_result = self.conn.execute("PRAGMA foreign_keys = ON;", []);
+        transaction_result?;
+        foreign_key_result?;
+        Ok(())
     }
 
     pub fn get_recent_revisions(&self) -> Result<Vec<(String, String, String, i32, String)>> {
@@ -3560,12 +4187,14 @@ impl Database {
         username: &str,
         role: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
             params![project_id, identity, username, role],
         )?;
         let compound_id = format!("{}__{}", project_id, identity);
-        let _ = self.log_change("project_member", &compound_id, "add");
+        Self::log_change_on(&tx, "project_member", &compound_id, "add")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3652,10 +4281,16 @@ impl Database {
     }
 
     pub fn remove_project_member(&self, project_id: &str, identity: &str) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
             params![project_id, identity],
         )?;
+        if changed > 0 {
+            let compound_id = format!("{}__{}", project_id, identity);
+            Self::log_change_on(&tx, "project_member", &compound_id, "delete")?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3730,11 +4365,13 @@ impl Database {
     ) -> Result<String> {
         let id = Uuid::new_v4().to_string();
         let ts = Utc::now().to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![id, project_id, sender_identity, sender_username, content, msg_type, ts],
         )?;
-        let _ = self.log_change("chronicle_message", &id, "create");
+        Self::log_change_on(&tx, "chronicle_message", &id, "create")?;
+        tx.commit()?;
         Ok(id)
     }
 
@@ -3975,12 +4612,14 @@ impl Database {
         user_identity: &str,
         user_username: &str,
     ) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
             params![task_id, user_identity, user_username],
         )?;
         let compound_id = format!("{}__{}", task_id, user_identity);
-        let _ = self.log_change("task_assignment", &compound_id, "assign");
+        Self::log_change_on(&tx, "task_assignment", &compound_id, "assign")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -4357,14 +4996,17 @@ impl Database {
 
     pub fn unlock_lore_entry(&self, id: &str) -> Result<bool> {
         // el WHERE unlocked = 0 hace esto atómico — elimina la carrera SELECT→UPDATE y retorna 0 si ya estaba desbloqueado
-        let changed = self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
             "UPDATE lore_library SET unlocked = 1, unlocked_at = ?2 WHERE id = ?1 AND unlocked = 0",
             params![id, Utc::now().to_rfc3339()],
         )?;
         if changed > 0 {
-            let _ = self.log_change("lore_unlock", id, "unlock");
+            Self::log_change_on(&tx, "lore_unlock", id, "unlock")?;
+            tx.commit()?;
             Ok(true)
         } else {
+            tx.commit()?;
             Ok(false)
         }
     }
@@ -4829,6 +5471,151 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn legacy_relationship_repair_recovers_steps_and_projectless_scrolls() {
+        let db_file = Path::new("test_questline_legacy_relationship_repair.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now().to_rfc3339();
+        let project_id = Uuid::new_v4().to_string();
+        let inferred_parent_id = Uuid::new_v4().to_string();
+        let inferred_step_id = Uuid::new_v4().to_string();
+        let known_parent_id = Uuid::new_v4().to_string();
+        let mismatched_step_id = Uuid::new_v4().to_string();
+        let codex_id = Uuid::new_v4().to_string();
+        let codex_note_id = Uuid::new_v4().to_string();
+        let loose_note_id = Uuid::new_v4().to_string();
+
+        db.conn
+            .execute(
+                "INSERT INTO projects
+                    (id, name, created_at, updated_at, archived, completed, is_shared)
+                 VALUES (?1, 'Original Campaign', ?2, ?2, 0, 0, 0)",
+                params![project_id, now],
+            )
+            .unwrap();
+        let insert_task = |id: &str, task_project: Option<&str>, parent: Option<&str>| {
+            db.conn
+                .execute(
+                    "INSERT INTO tasks
+                        (id, project_id, title, completed, priority, created_at, updated_at,
+                         parent_task_id, xp_awarded)
+                     VALUES (?1, ?2, ?1, 0, 'Medium', ?3, ?3, ?4, 0)",
+                    params![id, task_project, now, parent],
+                )
+                .unwrap();
+        };
+        insert_task(&inferred_parent_id, None, None);
+        insert_task(
+            &inferred_step_id,
+            Some(&project_id),
+            Some(&inferred_parent_id),
+        );
+        insert_task(&known_parent_id, Some(&project_id), None);
+        insert_task(&mismatched_step_id, None, Some(&known_parent_id));
+
+        db.conn
+            .execute(
+                "INSERT INTO codices
+                    (id, project_id, name, created_at, updated_at, collapsed)
+                 VALUES (?1, ?2, 'Recovered Codex', ?3, ?3, 0)",
+                params![codex_id, project_id, now],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO notes
+                    (id, project_id, title, markdown_content, created_at, updated_at,
+                     sharing_permission, codex_id)
+                 VALUES (?1, NULL, 'Codex Scroll', 'preserved', ?2, ?2, 'collaborative', ?3)",
+                params![codex_note_id, now, codex_id],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO notes
+                    (id, project_id, title, markdown_content, created_at, updated_at,
+                     sharing_permission)
+                 VALUES (?1, NULL, 'Loose Scroll', 'also preserved', ?2, ?2, 'collaborative')",
+                params![loose_note_id, now],
+            )
+            .unwrap();
+
+        let repaired = repair_legacy_sync_relationships(&db.conn).unwrap();
+        assert_eq!(
+            repaired,
+            LegacyRelationshipRepair {
+                repaired_parents: 1,
+                repaired_steps: 1,
+                recovered_scrolls: 2,
+                created_recovery_project: true,
+            }
+        );
+
+        for task_id in [
+            inferred_parent_id.as_str(),
+            inferred_step_id.as_str(),
+            known_parent_id.as_str(),
+            mismatched_step_id.as_str(),
+        ] {
+            let saved_project: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT project_id FROM tasks WHERE id = ?1",
+                    params![task_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(saved_project.as_deref(), Some(project_id.as_str()));
+        }
+        let codex_note_project: String = db
+            .conn
+            .query_row(
+                "SELECT project_id FROM notes WHERE id = ?1",
+                params![codex_note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(codex_note_project, project_id);
+        let loose_note_project: String = db
+            .conn
+            .query_row(
+                "SELECT project_id FROM notes WHERE id = ?1",
+                params![loose_note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_ne!(loose_note_project, project_id);
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT name FROM projects WHERE id = ?1",
+                    params![loose_note_project],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Recovered Scrolls"
+        );
+
+        let pending_repairs: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_log WHERE synced = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_repairs, 5);
+        assert_eq!(
+            repair_legacy_sync_relationships(&db.conn).unwrap(),
+            LegacyRelationshipRepair::default(),
+            "repair must be idempotent"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn hydration_counts_12_glasses_in_one_day() {
         let db_file = Path::new("test_questline_db_hydration_12.db");
         let _ = std::fs::remove_file(db_file);
@@ -4863,6 +5650,253 @@ mod tests {
         let last_drink_at = db.hydration_last_drink_at().unwrap().unwrap();
         assert_eq!(last_drink_at.timestamp(), now.timestamp());
 
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn failed_json_import_rolls_back_all_changes() {
+        let db_file = Path::new("test_questline_db_import_rollback.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        db.set_setting("import_rollback_test", "preserved").unwrap();
+
+        let result = db.import_from_json(r#"{"settings":[42]}"#);
+
+        assert!(result.is_err());
+        assert_eq!(
+            db.get_setting("import_rollback_test").unwrap().as_deref(),
+            Some("preserved")
+        );
+        let foreign_keys_enabled: i64 = db
+            .conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(foreign_keys_enabled, 1);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn pending_sync_compaction_keeps_only_latest_entity_state() {
+        let db_file = Path::new("test_questline_db_sync_compaction.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+
+        db.log_change("task", "task-a", "create").unwrap();
+        db.log_change("task", "task-a", "update").unwrap();
+        db.log_change("task", "task-a", "delete").unwrap();
+        db.log_change("task", "task-b", "create").unwrap();
+
+        assert_eq!(db.compact_pending_sync_logs().unwrap(), 2);
+        let pending = db.get_pending_sync_logs().unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.2 == "task-a" && row.3 == "delete")
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|row| row.2 == "task-b" && row.3 == "create")
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn task_insert_rolls_back_when_sync_outbox_is_unavailable() {
+        let db_file = Path::new("test_questline_atomic_task_outbox.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        db.conn.execute("DROP TABLE sync_log", []).unwrap();
+
+        let now = Utc::now();
+        let task = Task {
+            id: Uuid::new_v4(),
+            project_id: None,
+            title: "Must be atomic".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+
+        assert!(db.insert_task(&task).is_err());
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM tasks WHERE id = ?1",
+                params![task.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "task survived without its sync outbox event");
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn recurring_task_tree_inserts_parent_steps_and_outbox_together() {
+        let db_file = Path::new("test_questline_recurring_task_tree.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now();
+        let parent = Task {
+            id: Uuid::new_v4(),
+            project_id: None,
+            title: "Weekly review".to_string(),
+            description: None,
+            due_date: None,
+            set_date: Some(now),
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: Some(RecurrenceType::Weekly),
+        };
+        let step = Task {
+            id: Uuid::new_v4(),
+            title: "Clear inbox".to_string(),
+            parent_task_id: Some(parent.id),
+            recurrence: None,
+            ..parent.clone()
+        };
+
+        db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+
+        let saved = db.get_tasks().unwrap();
+        assert_eq!(saved.len(), 2);
+        let saved_parent = saved.iter().find(|task| task.id == parent.id).unwrap();
+        assert_eq!(saved_parent.due_date, Some(now));
+        assert_eq!(saved_parent.set_date, None);
+        assert!(saved.iter().any(|task| task.id == step.id));
+        let pending = db.get_pending_sync_logs().unwrap();
+        assert!(pending.iter().any(|row| row.2 == parent.id.to_string()));
+        assert!(pending.iter().any(|row| row.2 == step.id.to_string()));
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn note_updates_always_advance_conflict_timestamp() {
+        let db_file = Path::new("test_questline_note_update_timestamp.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let old_time = Utc::now() - chrono::Duration::days(1);
+        let mut note = Note {
+            id: Uuid::new_v4(),
+            project_id: None,
+            title: "Permissions".to_string(),
+            markdown_content: String::new(),
+            created_at: old_time,
+            updated_at: old_time,
+            sharing_permission: "collaborative".to_string(),
+            codex_id: None,
+            owner_identity: None,
+        };
+        db.insert_note(&note).unwrap();
+        note.sharing_permission = "read_only".to_string();
+        db.update_note(&note).unwrap();
+
+        let saved = db.get_note_by_id(note.id).unwrap();
+        assert_eq!(saved.sharing_permission, "read_only");
+        assert!(saved.updated_at > old_time);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn moving_a_scroll_across_campaigns_preserves_content_and_syncs_destination() {
+        let db_file = Path::new("test_questline_cross_campaign_scroll_move.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now();
+        let source_project_id = Uuid::new_v4();
+        let destination_project_id = Uuid::new_v4();
+        for (id, name) in [
+            (source_project_id, "Source"),
+            (destination_project_id, "Destination"),
+        ] {
+            db.insert_project(&Project {
+                id,
+                name: name.to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .unwrap();
+        }
+        let destination_codex_id = Uuid::new_v4();
+        db.insert_codex(&Codex {
+            id: destination_codex_id,
+            project_id: destination_project_id,
+            name: "Destination Codex".to_string(),
+            created_at: now,
+            updated_at: now,
+            parent_codex_id: None,
+            collapsed: false,
+        })
+        .unwrap();
+        let note_id = Uuid::new_v4();
+        db.insert_note(&Note {
+            id: note_id,
+            project_id: Some(source_project_id),
+            title: "Movable Scroll".to_string(),
+            markdown_content: "Content must survive the journey.".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "collaborative".to_string(),
+            codex_id: None,
+            owner_identity: None,
+        })
+        .unwrap();
+        db.conn
+            .execute("UPDATE sync_log SET synced = 1", [])
+            .unwrap();
+
+        db.move_note(note_id, destination_project_id, Some(destination_codex_id))
+            .unwrap();
+
+        let moved = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(moved.project_id, Some(destination_project_id));
+        assert_eq!(moved.codex_id, Some(destination_codex_id));
+        assert_eq!(moved.markdown_content, "Content must survive the journey.");
+        let pending = db.get_pending_sync_logs().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1, "note");
+        assert_eq!(pending[0].2, note_id.to_string());
+        assert_eq!(pending[0].3, "update");
+
+        let wrong_project = db.move_note(note_id, source_project_id, Some(destination_codex_id));
+        assert!(wrong_project.is_err());
+        let unchanged = db.get_note_by_id(note_id).unwrap();
+        assert_eq!(unchanged.project_id, Some(destination_project_id));
+        assert_eq!(unchanged.codex_id, Some(destination_codex_id));
+
+        drop(db);
         let _ = std::fs::remove_file(db_file);
     }
 }

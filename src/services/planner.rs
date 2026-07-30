@@ -91,12 +91,6 @@ fn score_task(task: &Task, today: NaiveDate) -> (i32, &'static str) {
     (score, reason)
 }
 
-fn is_available_today(task: &Task, today: NaiveDate) -> bool {
-    task.set_date
-        .map(|d| d.date_naive() <= today)
-        .unwrap_or(true)
-}
-
 // Genera el plan del día: quest principal, siguiente quest, victorias rápidas y carga total
 pub fn generate_plan(
     all_tasks: &[Task],
@@ -117,7 +111,7 @@ pub fn generate_plan(
 
     let parent_tasks: Vec<&Task> = all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none() && is_available_today(t, today))
+        .filter(|t| !t.completed && t.parent_task_id.is_none())
         .collect();
     let parents_with_open_steps: HashSet<uuid::Uuid> = all_tasks
         .iter()
@@ -209,7 +203,7 @@ pub fn generate_plan(
 pub fn find_main_quest(all_tasks: &[Task], today: NaiveDate) -> Option<Task> {
     let mut candidates: Vec<&Task> = all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none() && is_available_today(t, today))
+        .filter(|t| !t.completed && t.parent_task_id.is_none())
         .collect();
     candidates.sort_by(|a, b| {
         let (sa, _) = score_task(a, today);

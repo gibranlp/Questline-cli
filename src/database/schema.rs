@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL,
     description TEXT,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     archived INTEGER NOT NULL DEFAULT 0,
     completed INTEGER NOT NULL DEFAULT 0,
     owner_identity TEXT,
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS codices (
     project_id TEXT NOT NULL,
     name TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     parent_codex_id TEXT,
     collapsed INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
@@ -91,6 +93,7 @@ CREATE TABLE IF NOT EXISTS journal_entries (
     entry_date TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
     visibility TEXT NOT NULL DEFAULT 'Private',
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
@@ -150,7 +153,8 @@ CREATE TABLE IF NOT EXISTS rituals (
     frequency TEXT NOT NULL,
     reward_xp INTEGER NOT NULL,
     daily_target INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS ritual_history (
@@ -174,6 +178,7 @@ CREATE TABLE IF NOT EXISTS milestones (
     description TEXT,
     completed INTEGER NOT NULL DEFAULT 0,
     xp_reward INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT '',
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 

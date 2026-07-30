@@ -27,7 +27,11 @@ CREATE TABLE IF NOT EXISTS sync_events (
     operation VARCHAR(20) NOT NULL,
     payload LONGTEXT NOT NULL,
     created_at VARCHAR(50) NOT NULL, -- Client timestamp string for Latest Edit Wins
-    INDEX idx_sync_events_user_entity (user_id, entity_type, entity_id)
+    device_id VARCHAR(36) NOT NULL DEFAULT '',
+    seq BIGINT NOT NULL AUTO_INCREMENT UNIQUE,
+    INDEX idx_sync_events_user_entity (user_id, entity_type, entity_id),
+    INDEX idx_sync_events_device (user_id, device_id),
+    INDEX idx_sync_events_seq (user_id, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE IF NOT EXISTS project_members (

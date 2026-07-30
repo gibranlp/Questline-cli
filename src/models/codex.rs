@@ -11,6 +11,8 @@ pub struct Codex {
     pub project_id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::models::default_sync_timestamp")]
+    pub updated_at: DateTime<Utc>,
     pub parent_codex_id: Option<Uuid>,
     #[serde(default)]
     pub collapsed: bool,

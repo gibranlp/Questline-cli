@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::app::ModalType;
-use crate::models::{Project, Task};
+use crate::models::{Note, Project, Task};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
 use ratatui::{
@@ -19,6 +19,7 @@ pub fn draw(
     f: &mut Frame,
     projects: &[Project],
     all_tasks: &[Task],
+    all_notes: &[Note],
     selected_idx: usize,
     all_selected: bool,
     modal: &ModalType,
@@ -64,7 +65,7 @@ pub fn draw(
                 && t.parent_task_id.is_none()
         })
         .count();
-    let total_open_steps = all_tasks
+    let total_steps = all_tasks
         .iter()
         .filter(|t| {
             t.project_id
@@ -72,6 +73,14 @@ pub fn draw(
                 .unwrap_or(false)
                 && !t.completed
                 && t.parent_task_id.is_some()
+        })
+        .count();
+    let total_scrolls = all_notes
+        .iter()
+        .filter(|n| {
+            n.project_id
+                .map(|id| active_ids.contains(&id))
+                .unwrap_or(false)
         })
         .count();
 
@@ -106,20 +115,36 @@ pub fn draw(
             .fg(theme.secondary)
             .add_modifier(Modifier::BOLD)
     };
+    let all_scroll_count_style = if all_selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.warning)
+            .add_modifier(Modifier::BOLD)
+    };
     let mut all_spans = vec![Span::styled(
         format!("  {} All Campaigns ", if all_selected { "▶" } else { "◈" }),
         all_selected_style,
     )];
     if total_open_tasks > 0 {
         all_spans.push(Span::styled(
-            format!("({}) ", total_open_tasks),
+            format!("!({}) ", total_open_tasks),
             all_task_count_style,
         ));
     }
-    if total_open_steps > 0 {
+    if total_steps > 0 {
         all_spans.push(Span::styled(
-            format!("({}) ", total_open_steps),
+            format!("->({}) ", total_steps),
             all_step_count_style,
+        ));
+    }
+    if total_scrolls > 0 {
+        all_spans.push(Span::styled(
+            format!("#({}) ", total_scrolls),
+            all_scroll_count_style,
         ));
     }
     list_items.push(ListItem::new(Line::from(all_spans)));
@@ -137,11 +162,15 @@ pub fn draw(
                     t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_none()
                 })
                 .count();
-            let open_steps = all_tasks
+            let total_steps = all_tasks
                 .iter()
                 .filter(|t| {
                     t.project_id == Some(p.id) && !t.completed && t.parent_task_id.is_some()
                 })
+                .count();
+            let scrolls = all_notes
+                .iter()
+                .filter(|n| n.project_id == Some(p.id))
                 .count();
             let selected = !all_selected && i == selected_idx;
             let name_style = if selected {
@@ -172,12 +201,31 @@ pub fn draw(
                     .fg(theme.secondary)
                     .add_modifier(Modifier::BOLD)
             };
+            let scroll_count_style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD)
+            };
             let mut spans = vec![Span::styled(format!("  {} ", p.name), name_style)];
             if open_tasks > 0 {
-                spans.push(Span::styled(format!("({}) ", open_tasks), task_count_style));
+                spans.push(Span::styled(
+                    format!("!({}) ", open_tasks),
+                    task_count_style,
+                ));
             }
-            if open_steps > 0 {
-                spans.push(Span::styled(format!("({}) ", open_steps), step_count_style));
+            if total_steps > 0 {
+                spans.push(Span::styled(
+                    format!("->({}) ", total_steps),
+                    step_count_style,
+                ));
+            }
+            if scrolls > 0 {
+                spans.push(Span::styled(format!("#({}) ", scrolls), scroll_count_style));
             }
             list_items.push(ListItem::new(Line::from(spans)));
         }
@@ -340,6 +388,13 @@ pub fn draw(
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" Edit | ", Style::default().fg(theme.muted)),
+        Span::styled(
+            "C",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Calendar | ", Style::default().fg(theme.muted)),
         Span::styled(
             "d",
             Style::default()

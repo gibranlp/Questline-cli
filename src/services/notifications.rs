@@ -87,35 +87,8 @@ pub fn send_system_notification_with_icon(
             } else {
                 "Questline"
             };
-            let mut used_terminal_notifier = false;
-            if let Some(path) = icon_path.as_ref() {
-                if std::process::Command::new("terminal-notifier")
-                    .arg("-title")
-                    .arg(&title)
-                    .arg("-subtitle")
-                    .arg(subtitle)
-                    .arg("-message")
-                    .arg(&message)
-                    .arg("-appIcon")
-                    .arg(path)
-                    .status()
-                    .is_ok()
-                {
-                    used_terminal_notifier = true;
-                }
-            }
-            if !used_terminal_notifier {
-                let script = format!(
-                    "display notification {} with title {} subtitle {}",
-                    applescript_quote(&message),
-                    applescript_quote(&title),
-                    applescript_quote(subtitle),
-                );
-                let _ = std::process::Command::new("osascript")
-                    .arg("-e")
-                    .arg(&script)
-                    .status();
-            }
+            let _ = send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref());
+            send_with_osascript(&title, &message, subtitle);
         }
 
         #[cfg(target_os = "windows")]
@@ -165,6 +138,58 @@ pub fn send_system_notification_with_icon(
                 .status();
         }
     });
+}
+
+#[cfg(target_os = "macos")]
+fn send_with_terminal_notifier(
+    title: &str,
+    message: &str,
+    subtitle: &str,
+    icon_path: Option<&PathBuf>,
+) -> bool {
+    for command in terminal_notifier_candidates() {
+        let mut cmd = std::process::Command::new(&command);
+        cmd.arg("-title")
+            .arg(title)
+            .arg("-subtitle")
+            .arg(subtitle)
+            .arg("-message")
+            .arg(message)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(path) = icon_path {
+            cmd.arg("-appIcon").arg(path);
+        }
+        let status = cmd.status();
+        if status.map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn terminal_notifier_candidates() -> Vec<PathBuf> {
+    let mut candidates = vec![PathBuf::from("terminal-notifier")];
+    candidates.push(PathBuf::from("/opt/homebrew/bin/terminal-notifier"));
+    candidates.push(PathBuf::from("/usr/local/bin/terminal-notifier"));
+    candidates
+}
+
+#[cfg(target_os = "macos")]
+fn send_with_osascript(title: &str, message: &str, subtitle: &str) {
+    let script = format!(
+        "display notification {} with title {} subtitle {}",
+        applescript_quote(message),
+        applescript_quote(title),
+        applescript_quote(subtitle),
+    );
+    let _ = std::process::Command::new("osascript")
+        .arg("-e")
+        .arg(&script)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 #[cfg(target_os = "linux")]
@@ -310,6 +335,7 @@ fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
     if let Ok(cwd) = std::env::current_dir() {
         candidates.push(cwd.join(&relative));
     }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative));
 
     candidates.into_iter().find(|path| path.exists())
 }

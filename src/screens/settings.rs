@@ -33,10 +33,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 " "
             };
             let style = if selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(theme.primary)
-                    .add_modifier(Modifier::BOLD)
+                theme.primary_selected_style()
             } else if equipped {
                 Style::default()
                     .fg(theme.success)
@@ -374,10 +371,7 @@ fn settings_row(
 ) -> Line<'static> {
     let focused = app.selected_settings_focus_idx == idx;
     let base = if focused {
-        Style::default()
-            .fg(Color::Black)
-            .bg(theme.primary)
-            .add_modifier(Modifier::BOLD)
+        theme.primary_selected_style()
     } else {
         Style::default().fg(theme.text)
     };

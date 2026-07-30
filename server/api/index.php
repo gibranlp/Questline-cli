@@ -710,15 +710,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && !empty($body)) {
 }
 
 
-// ── Paso 6: Rate limiting básico — 100 req/min, Redis sería lo ideal pero MySQL jala ──
+// ── Paso 6: Rate limiting básico — sync needs room for paged recovery/reseed flows.
 try {
     $stmt = $pdo->prepare("SELECT COUNT(*) FROM nonces WHERE user_id = ? AND created_at > SUBDATE(NOW(), INTERVAL 1 MINUTE)");
     $stmt->execute([$userId]);
-    $requestCount = $stmt->fetchColumn();
-    if ($requestCount > 100) {
-        log_api_event($pdo, $userId, $deviceId, 'API_ERROR', 'Rate limit exceeded');
+    $requestCount = (int)$stmt->fetchColumn();
+    $syncRoutes = ['sync/pull', 'sync/full', 'sync/push', 'sync/head', 'sync/status', 'sync/reset', 'recovery', 'recovery/latest'];
+    $rateLimit = in_array($route, $syncRoutes, true) ? 1000 : 100;
+    if ($requestCount > $rateLimit) {
+        log_api_event($pdo, $userId, $deviceId, 'API_ERROR', "Rate limit exceeded on {$route}: {$requestCount}/{$rateLimit}");
         http_response_code(429);
-        echo json_encode(["error" => "Rate limit exceeded. Try again in a minute."]);
+        header("Retry-After: 60");
+        echo json_encode([
+            "error" => "Rate limit exceeded. Try again in a minute.",
+            "route" => $route,
+            "limit" => $rateLimit,
+            "count" => $requestCount
+        ]);
         exit;
     }
 } catch (PDOException $e) {
@@ -885,6 +893,29 @@ try {
                 echo json_encode(["error" => "Payload must be a JSON array of sync events"]);
                 exit;
             }
+            $invalidEvents = find_invalid_sync_events($entries, $pdo, $userId);
+            $invalidTaskEvents = 0;
+            $invalidScrollEvents = 0;
+            foreach ($invalidEvents as $invalid) {
+                if (($invalid['entity_type'] ?? '') === 'task') $invalidTaskEvents++;
+                if (($invalid['entity_type'] ?? '') === 'note') $invalidScrollEvents++;
+            }
+            if (!empty($invalidEvents)) {
+                // Quarantine only unsafe entities. Rejecting the whole request used to block
+                // unrelated healthy quests and scrolls that happened to share the same batch.
+                $invalidIds = [];
+                foreach ($invalidEvents as $invalid) {
+                    $invalidIds[(string)($invalid['id'] ?? '')] = true;
+                }
+                $entries = array_values(array_filter(
+                    $entries,
+                    static function ($entry) use ($invalidIds) {
+                        return is_array($entry)
+                            && !isset($invalidIds[(string)($entry['id'] ?? '')]);
+                    }
+                ));
+                log_api_event($pdo, $userId, $deviceId, 'SYNC_QUARANTINED', "Quarantined invalid sync events: " . json_encode(array_slice($invalidEvents, 0, 10)));
+            }
             
             $inserted = 0;
             $pdo->beginTransaction();
@@ -899,6 +930,13 @@ try {
             foreach ($entries as $e) {
                 if (empty($e['id'])) continue;
                 $eventDeviceId = $e['device_id'] ?? $deviceId ?? '';
+                $previousProjectId = null;
+                if (($e['entity_type'] ?? '') === 'note' && ($e['operation'] ?? '') !== 'delete') {
+                    // Capture the old campaign before inserting the move event. Companions who
+                    // only belong to the old campaign must receive a tombstone for the moved scroll.
+                    $entityProjectStmt->execute([$userId, 'note', $e['entity_id']]);
+                    $previousProjectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
+                }
                 $stmt->execute([
                     $e['id'],
                     $userId,
@@ -929,6 +967,30 @@ try {
                     $projectId = extract_project_id_from_payload($entityProjectStmt->fetchColumn() ?: '');
                 }
 
+                if ($previousProjectId && $projectId && $previousProjectId !== $projectId) {
+                    $memberStmt->execute([$previousProjectId, $identity]);
+                    $previousMembers = $memberStmt->fetchAll(PDO::FETCH_COLUMN);
+                    foreach ($previousMembers as $memberPubKey) {
+                        $userIdStmt->execute([$memberPubKey]);
+                        $targetUserId = $userIdStmt->fetchColumn();
+                        if ($targetUserId) {
+                            // Insert this before the destination update. A companion belonging to
+                            // both campaigns receives delete then update, leaving the scroll visible.
+                            $replicatedDeleteId = md5($e['id'] . $targetUserId . $previousProjectId . ':moved');
+                            $replicateInsertStmt->execute([
+                                $replicatedDeleteId,
+                                $targetUserId,
+                                'note',
+                                $e['entity_id'],
+                                'delete',
+                                '',
+                                $e['timestamp'],
+                                $eventDeviceId
+                            ]);
+                        }
+                    }
+                }
+
                 if ($projectId) {
                     $memberStmt->execute([$projectId, $identity]);
                     $members = $memberStmt->fetchAll(PDO::FETCH_COLUMN);
@@ -952,7 +1014,22 @@ try {
                 }
             }
             $pdo->commit();
-            echo json_encode(["status" => "success", "pushed" => $inserted]);
+            if (!empty($invalidEvents)) {
+                // Healthy entries have already been committed, but the client must not mark the
+                // quarantined local outbox rows as synced. A 422 keeps them pending for repair.
+                http_response_code(422);
+            }
+            echo json_encode([
+                "status" => empty($invalidEvents) ? "success" : "partial",
+                "pushed" => $inserted,
+                "rejected" => count($invalidEvents),
+                "invalid_scrolls" => $invalidScrollEvents,
+                "invalid_tasks" => $invalidTaskEvents,
+                "error" => empty($invalidEvents)
+                    ? null
+                    : "Unsafe events were quarantined; healthy events were accepted",
+                "examples" => array_slice($invalidEvents, 0, 10)
+            ]);
             break;
             
         case 'sync/pull':
@@ -962,11 +1039,34 @@ try {
             }
             // Filtramos propios eventos y aplicamos cursor incremental para no descargar todo en cada sync
             $pullDeviceId = $deviceId ?? '';
-            $sinceSeq = isset($_GET['since_seq']) ? (int)$_GET['since_seq'] : 0;
-            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp, device_id, seq FROM sync_events WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT 500");
+            $sinceSeq = isset($_GET['since_seq']) ? max(0, (int)$_GET['since_seq']) : 0;
+            $limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 500;
+            $limit = max(1, min($limit, 1000));
+            $includeMeta = isset($_GET['include_meta']) && $_GET['include_meta'] === '1';
+            $stmt = $pdo->prepare("SELECT id, entity_type, entity_id, operation, payload as content, created_at as timestamp, device_id, seq FROM sync_events WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT {$limit}");
             $stmt->execute([$userId, $pullDeviceId, $sinceSeq]);
             $events = $stmt->fetchAll();
-            echo json_encode($events);
+
+            if ($includeMeta) {
+                $headStmt = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_events WHERE user_id = ? AND device_id != ?");
+                $headStmt->execute([$userId, $pullDeviceId]);
+                $headSeq = (int)$headStmt->fetchColumn();
+                $nextSeq = $sinceSeq;
+                foreach ($events as $event) {
+                    $eventSeq = isset($event['seq']) ? (int)$event['seq'] : 0;
+                    if ($eventSeq > $nextSeq) {
+                        $nextSeq = $eventSeq;
+                    }
+                }
+                echo json_encode([
+                    "events" => $events,
+                    "head_seq" => $headSeq,
+                    "next_seq" => $nextSeq,
+                    "has_more" => $nextSeq < $headSeq
+                ]);
+            } else {
+                echo json_encode($events);
+            }
             break;
 
         case 'sync/head':
@@ -976,6 +1076,43 @@ try {
             $stmt = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) AS seq FROM sync_events WHERE user_id = ?");
             $stmt->execute([$userId]);
             echo json_encode(["seq" => (int)$stmt->fetchColumn()]);
+            break;
+
+        case 'sync/status':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
+                send_method_not_allowed();
+            }
+            echo json_encode(sync_event_status($pdo, $userId));
+            break;
+
+        case 'sync/reset':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+                send_method_not_allowed();
+            }
+            $before = sync_event_status($pdo, $userId);
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("DELETE FROM sync_events WHERE user_id = ?");
+            $stmt->execute([$userId]);
+            $deleted = $stmt->rowCount();
+            log_api_event($pdo, $userId, $deviceId, 'SYNC_RESET', "Deleted {$deleted} sync events for fresh reseed");
+            $pdo->commit();
+            $after = sync_event_status($pdo, $userId);
+            if ((int)($after['total_events'] ?? 0) !== 0) {
+                http_response_code(500);
+                echo json_encode([
+                    "error" => "Sync reset incomplete: events remain after delete",
+                    "before" => $before,
+                    "after" => $after,
+                    "deleted" => $deleted
+                ]);
+                exit;
+            }
+            echo json_encode([
+                "status" => "success",
+                "deleted" => $deleted,
+                "before" => $before,
+                "after" => $after
+            ]);
             break;
             
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
@@ -1399,6 +1536,12 @@ try {
                 echo json_encode(["error" => "Backup payload too large"]);
                 exit;
             }
+            $backupError = validate_recovery_snapshot($body);
+            if ($backupError !== null) {
+                http_response_code(400);
+                echo json_encode(["error" => "Refusing unhealthy backup", "details" => $backupError]);
+                exit;
+            }
             // Sobreescribe el backup anterior — solo se guarda el más reciente, pues
             $stmt = $pdo->prepare("INSERT INTO backups (user_id, backup_data) VALUES (?, ?) ON DUPLICATE KEY UPDATE backup_data = ?, created_at = CURRENT_TIMESTAMP");
             $stmt->execute([$userId, $body, $body]);
@@ -1803,6 +1946,257 @@ function extract_project_id_from_payload($payload) {
         return null;
     }
     return $payloadObj['project_id'];
+}
+
+function sync_validation_error($event, $reason) {
+    return [
+        "id" => $event['id'] ?? '',
+        "entity_type" => $event['entity_type'] ?? '',
+        "entity_id" => $event['entity_id'] ?? '',
+        "reason" => $reason
+    ];
+}
+
+function validate_recovery_snapshot($body) {
+    $snapshot = json_decode($body, true);
+    if (!is_array($snapshot)) {
+        return "backup is not valid JSON";
+    }
+    $projects = [];
+    foreach (($snapshot['projects'] ?? []) as $project) {
+        if (is_array($project) && !empty($project['id'])) {
+            $projects[(string)$project['id']] = true;
+        }
+    }
+    foreach (($snapshot['notes'] ?? []) as $note) {
+        $projectId = is_array($note) ? ($note['project_id'] ?? null) : null;
+        if (empty($projectId) || !isset($projects[(string)$projectId])) {
+            return "scroll is missing a valid project link";
+        }
+    }
+
+    $tasks = [];
+    foreach (($snapshot['tasks'] ?? []) as $task) {
+        if (is_array($task) && !empty($task['id'])) {
+            $tasks[(string)$task['id']] = $task;
+        }
+    }
+    foreach ($tasks as $task) {
+        $projectId = !empty($task['project_id']) ? (string)$task['project_id'] : null;
+        if ($projectId !== null && !isset($projects[$projectId])) {
+            return "task references a missing project";
+        }
+        $parentId = !empty($task['parent_task_id']) ? (string)$task['parent_task_id'] : null;
+        if ($parentId === null) continue;
+        if (!isset($tasks[$parentId])) {
+            return "step references a missing parent task";
+        }
+        $parentProjectId = !empty($tasks[$parentId]['project_id'])
+            ? (string)$tasks[$parentId]['project_id']
+            : null;
+        if ($projectId !== $parentProjectId) {
+            return "step project does not match its parent";
+        }
+    }
+    return null;
+}
+
+function decode_sync_event_payload($event, &$error) {
+    $payload = $event['content'] ?? $event['payload'] ?? '';
+    if (!is_string($payload) || trim($payload) === '') {
+        $error = sync_validation_error($event, "payload is empty");
+        return null;
+    }
+    $decoded = json_decode($payload, true);
+    if (!is_array($decoded)) {
+        $error = sync_validation_error($event, "payload is not valid JSON");
+        return null;
+    }
+    $error = null;
+    return $decoded;
+}
+
+function validate_sync_event_payload($event) {
+    $entityType = $event['entity_type'] ?? '';
+    $operation = $event['operation'] ?? '';
+    if ($operation === 'delete') {
+        return null;
+    }
+    if ($entityType !== 'task' && $entityType !== 'note') {
+        return null;
+    }
+
+    $error = null;
+    $decoded = decode_sync_event_payload($event, $error);
+    if ($error !== null) return $error;
+
+    if ($entityType === 'note' && empty($decoded['project_id'])) {
+        return sync_validation_error($event, "scroll missing project_id");
+    }
+
+    return null;
+}
+
+function latest_server_task_payload($pdo, $userId, $taskId) {
+    $stmt = $pdo->prepare("
+        SELECT operation, payload
+        FROM sync_events
+        WHERE user_id = ? AND entity_type = 'task' AND entity_id = ?
+        ORDER BY seq DESC
+        LIMIT 1
+    ");
+    $stmt->execute([$userId, $taskId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$row || ($row['operation'] ?? '') === 'delete') {
+        return null;
+    }
+    $decoded = json_decode($row['payload'] ?? '', true);
+    return is_array($decoded) ? $decoded : null;
+}
+
+function resolve_task_project_state($taskId, $batchTasks, $pdo, $userId, &$cache, &$resolving) {
+    if (array_key_exists($taskId, $cache)) {
+        return $cache[$taskId];
+    }
+    if (isset($resolving[$taskId])) {
+        return ["resolved" => false, "project_id" => null];
+    }
+
+    $resolving[$taskId] = true;
+    $task = array_key_exists($taskId, $batchTasks)
+        ? $batchTasks[$taskId]
+        : latest_server_task_payload($pdo, $userId, $taskId);
+    if (!is_array($task)) {
+        unset($resolving[$taskId]);
+        return $cache[$taskId] = ["resolved" => false, "project_id" => null];
+    }
+
+    $projectId = !empty($task['project_id']) ? (string)$task['project_id'] : null;
+    $parentId = !empty($task['parent_task_id']) ? (string)$task['parent_task_id'] : null;
+    if ($parentId === null) {
+        unset($resolving[$taskId]);
+        return $cache[$taskId] = ["resolved" => true, "project_id" => $projectId];
+    }
+
+    $parentState = resolve_task_project_state(
+        $parentId,
+        $batchTasks,
+        $pdo,
+        $userId,
+        $cache,
+        $resolving
+    );
+    unset($resolving[$taskId]);
+    if (!$parentState['resolved'] || $parentState['project_id'] !== $projectId) {
+        return $cache[$taskId] = ["resolved" => false, "project_id" => $projectId];
+    }
+    return $cache[$taskId] = ["resolved" => true, "project_id" => $projectId];
+}
+
+function find_invalid_sync_events($events, $pdo, $userId) {
+    $invalid = [];
+    $batchTasks = [];
+
+    // Resolve parents against the final task state represented by this push, regardless
+    // of event order. A null value means the task is deleted in this batch.
+    foreach ($events as $event) {
+        if (!is_array($event) || ($event['entity_type'] ?? '') !== 'task') continue;
+        $taskId = (string)($event['entity_id'] ?? '');
+        if ($taskId === '') continue;
+        if (($event['operation'] ?? '') === 'delete') {
+            $batchTasks[$taskId] = null;
+            continue;
+        }
+        $error = null;
+        $batchTasks[$taskId] = decode_sync_event_payload($event, $error);
+    }
+
+    $taskStateCache = [];
+    foreach ($events as $event) {
+        if (!is_array($event)) {
+            $invalid[] = [
+                "id" => "",
+                "entity_type" => "",
+                "entity_id" => "",
+                "reason" => "event is not an object"
+            ];
+            continue;
+        }
+        $error = validate_sync_event_payload($event);
+        if ($error !== null) {
+            $invalid[] = $error;
+            continue;
+        }
+
+        if (($event['entity_type'] ?? '') === 'task' && ($event['operation'] ?? '') !== 'delete') {
+            $taskId = (string)($event['entity_id'] ?? '');
+            $incomingTask = $batchTasks[$taskId] ?? null;
+            $incomingProjectId = is_array($incomingTask) && !empty($incomingTask['project_id'])
+                ? (string)$incomingTask['project_id']
+                : null;
+            if ($incomingProjectId === null) {
+                $previousTask = latest_server_task_payload($pdo, $userId, $taskId);
+                if (is_array($previousTask) && !empty($previousTask['project_id'])) {
+                    $invalid[] = sync_validation_error(
+                        $event,
+                        "task update would remove an existing project link"
+                    );
+                    continue;
+                }
+            }
+
+            $resolving = [];
+            $state = resolve_task_project_state(
+                $taskId,
+                $batchTasks,
+                $pdo,
+                $userId,
+                $taskStateCache,
+                $resolving
+            );
+            if (!$state['resolved']) {
+                $invalid[] = sync_validation_error(
+                    $event,
+                    "task project does not match its parent or parent is missing"
+                );
+            }
+        }
+    }
+    return $invalid;
+}
+
+function sync_event_status($pdo, $userId) {
+    $stmt = $pdo->prepare("
+        SELECT
+            COUNT(*) AS total_events,
+            COALESCE(MAX(seq), 0) AS head_seq,
+            SUM(CASE
+                WHEN entity_type = 'task'
+                     AND operation <> 'delete'
+                     AND payload <> ''
+                     AND (JSON_VALID(payload) = 0 OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) IS NULL OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) = '')
+                THEN 1 ELSE 0 END) AS invalid_tasks,
+            SUM(CASE
+                WHEN entity_type = 'note'
+                     AND operation <> 'delete'
+                     AND payload <> ''
+                     AND (
+                         JSON_VALID(payload) = 0
+                         OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) IS NULL
+                         OR JSON_UNQUOTE(JSON_EXTRACT(payload, '$.project_id')) = ''
+                     )
+                THEN 1 ELSE 0 END) AS invalid_scrolls
+        FROM sync_events
+        WHERE user_id = ?
+    ");
+    $stmt->execute([$userId]);
+    $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+    return [
+        "total_events" => (int)($row['total_events'] ?? 0),
+        "head_seq" => (int)($row['head_seq'] ?? 0),
+        "invalid_tasks" => (int)($row['invalid_tasks'] ?? 0),
+        "invalid_scrolls" => (int)($row['invalid_scrolls'] ?? 0)
+    ];
 }
 
 function backfill_project_sync_events($pdo, $sourceUserId, $targetUserId, $projectId) {
