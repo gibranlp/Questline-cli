@@ -7,7 +7,7 @@ use crate::models::{Project, Task};
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
 use crate::theme::Theme;
-use chrono::Utc;
+use chrono::{Duration, Local, Utc};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
@@ -76,25 +76,36 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 // Renderiza el timer en vivo — aquí es donde la sesión ya está corriendo, órale a trabajar
 fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
     let active = app.active_focus_session.as_ref().unwrap();
-    let total_seconds = (active.duration_mins * 60) as i64;
     let now = active.paused_at.unwrap_or_else(Utc::now);
-    let elapsed_seconds = (now - active.start_time).num_seconds();
-    // remaining nunca baja de 0, por si el timer se pasa un poco
-    let remaining = std::cmp::max(0, total_seconds - elapsed_seconds);
+    let (elapsed_seconds, remaining, progress_percent) =
+        focus_session_progress(active.duration_mins, active.start_time, now);
     let mins = remaining / 60;
     let secs = remaining % 60;
     let timer_str = format!("{:02}:{:02}", mins, secs);
     let is_paused = active.paused_at.is_some();
     let pauses_left = (active.pause_limit - active.pauses_used).max(0);
+    let elapsed_mins = elapsed_seconds / 60;
+    let remaining_mins = (remaining + 59) / 60;
+    let finish_time = (Local::now() + Duration::seconds(remaining))
+        .format("%-I:%M %p")
+        .to_string();
+    let filled_segments = ((progress_percent as usize * 20) / 100).min(20);
+    let progress_bar = format!(
+        "{}{}",
+        "█".repeat(filled_segments),
+        "░".repeat(20 - filled_segments)
+    );
+    let use_large_timer = size.height >= 27 && size.width >= 42;
+    let timer_box_height = if use_large_timer { 11 } else { 8 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Length(8), // Big Timer Box
-            Constraint::Length(5), // Visualizador de música
-            Constraint::Min(5),    // Zen Tree & Motivación
-            Constraint::Length(3), // Footer
+            Constraint::Length(3),                // Header
+            Constraint::Length(timer_box_height), // Big Timer Box
+            Constraint::Length(5),                // Visualizador de música
+            Constraint::Min(5),                   // Zen Tree & Motivación
+            Constraint::Length(3),                // Footer
         ])
         .split(size);
 
@@ -136,31 +147,62 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         "General Mind Cleansing".to_string()
     };
 
-    let timer_text = vec![
-        Line::from(vec![
-            Span::styled("ACTIVE FOCUS: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("{} mins", active.duration_mins),
-                Style::default().fg(theme.warning),
-            ),
-            Span::styled("  |  Status: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                if is_paused { "PAUSED" } else { "RUNNING" },
-                Style::default()
-                    .fg(if is_paused {
-                        theme.warning
-                    } else {
-                        theme.success
-                    })
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("  |  Pauses: ", Style::default().fg(theme.muted)),
-            Span::styled(
-                format!("{}/{}", pauses_left, active.pause_limit),
-                Style::default().fg(theme.primary),
-            ),
-        ]),
-        Line::from(vec![
+    let mut timer_text = vec![Line::from(vec![
+        Span::styled("ACTIVE FOCUS: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format!("{} mins", active.duration_mins),
+            Style::default().fg(theme.warning),
+        ),
+        Span::styled("  |  Status: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            if is_paused { "PAUSED" } else { "RUNNING" },
+            Style::default()
+                .fg(if is_paused {
+                    theme.warning
+                } else {
+                    theme.success
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  |  Pauses: ", Style::default().fg(theme.muted)),
+        Span::styled(
+            format!("{}/{}", pauses_left, active.pause_limit),
+            Style::default().fg(theme.primary),
+        ),
+    ])];
+
+    if use_large_timer {
+        timer_text.extend(large_timer_rows(&timer_str).into_iter().enumerate().map(
+            |(row_idx, row)| {
+                let (left_bracket, right_bracket) = match row_idx {
+                    0 => ("⎡ ", " ⎤"),
+                    4 => ("⎣ ", " ⎦"),
+                    _ => ("⎢ ", " ⎥"),
+                };
+                Line::from(vec![
+                    Span::styled(
+                        left_bracket,
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        row,
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        right_bracket,
+                        Style::default()
+                            .fg(theme.primary)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            },
+        ));
+    } else {
+        timer_text.push(Line::from(vec![
             Span::styled(
                 " [ ",
                 Style::default()
@@ -179,7 +221,10 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
                     .fg(theme.primary)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]),
+        ]));
+    }
+
+    timer_text.extend([
         Line::from(vec![
             Span::styled(" Campaign: ", Style::default().fg(theme.muted)),
             Span::styled(project_name, Style::default().fg(Color::White)),
@@ -193,7 +238,36 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
             Span::styled("  |  Soundscape: ", Style::default().fg(theme.muted)),
             Span::styled(active.soundscape.clone(), Style::default().fg(Color::Cyan)),
         ]),
-    ];
+        Line::from(vec![
+            Span::styled(progress_bar, Style::default().fg(theme.primary)),
+            Span::styled(
+                format!("  {}%", progress_percent),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("{}m elapsed", elapsed_mins),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled("  •  ", Style::default().fg(theme.border)),
+            Span::styled(
+                format!("{}m remaining", remaining_mins),
+                Style::default().fg(theme.text),
+            ),
+            Span::styled("  •  ", Style::default().fg(theme.border)),
+            Span::styled(
+                if is_paused {
+                    "Finish time updates when resumed".to_string()
+                } else {
+                    format!("Ends {}", finish_time)
+                },
+                Style::default().fg(theme.muted),
+            ),
+        ]),
+    ]);
 
     let timer_box = Paragraph::new(timer_text)
         .block(
@@ -327,6 +401,48 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
     ];
     let footer = Paragraph::new(footer_text).alignment(Alignment::Center);
     f.render_widget(footer, chunks[4]);
+}
+
+fn focus_session_progress(
+    duration_mins: i32,
+    start_time: chrono::DateTime<Utc>,
+    now: chrono::DateTime<Utc>,
+) -> (i64, i64, u16) {
+    let total_seconds = i64::from(duration_mins.max(1)) * 60;
+    let elapsed_seconds = (now - start_time).num_seconds().clamp(0, total_seconds);
+    let remaining_seconds = total_seconds - elapsed_seconds;
+    let progress_percent = ((elapsed_seconds * 100) / total_seconds) as u16;
+    (elapsed_seconds, remaining_seconds, progress_percent)
+}
+
+fn large_timer_rows(timer: &str) -> Vec<String> {
+    const DIGITS: [[&str; 5]; 10] = [
+        ["███", "█ █", "█ █", "█ █", "███"],
+        [" █ ", "██ ", " █ ", " █ ", "███"],
+        ["███", "  █", "███", "█  ", "███"],
+        ["███", "  █", "███", "  █", "███"],
+        ["█ █", "█ █", "███", "  █", "  █"],
+        ["███", "█  ", "███", "  █", "███"],
+        ["███", "█  ", "███", "█ █", "███"],
+        ["███", "  █", "  █", "  █", "  █"],
+        ["███", "█ █", "███", "█ █", "███"],
+        ["███", "█ █", "███", "  █", "███"],
+    ];
+    const COLON: [&str; 5] = [" ", "█", " ", "█", " "];
+
+    (0..5)
+        .map(|row| {
+            timer
+                .chars()
+                .map(|character| match character {
+                    '0'..='9' => DIGITS[character.to_digit(10).unwrap() as usize][row],
+                    ':' => COLON[row],
+                    _ => "   ",
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
 }
 
 // Pantalla de configuración — el user elige duración, proyecto, tarea y soundscape antes de arrancar
@@ -776,4 +892,37 @@ fn draw_visualizer(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             )),
     );
     f.render_widget(vis, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn focus_progress_is_bounded_and_reports_remaining_time() {
+        let start = Utc::now();
+
+        assert_eq!(focus_session_progress(25, start, start), (0, 1_500, 0));
+        assert_eq!(
+            focus_session_progress(25, start, start + Duration::seconds(750)),
+            (750, 750, 50)
+        );
+        assert_eq!(
+            focus_session_progress(25, start, start + Duration::seconds(2_000)),
+            (1_500, 0, 100)
+        );
+        assert_eq!(
+            focus_session_progress(25, start, start - Duration::seconds(10)),
+            (0, 1_500, 0)
+        );
+    }
+
+    #[test]
+    fn large_timer_uses_five_equal_width_rows() {
+        let rows = large_timer_rows("00:53");
+
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().all(|row| row.chars().count() == 17));
+        assert!(rows.iter().any(|row| row.contains('█')));
+    }
 }

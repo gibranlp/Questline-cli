@@ -14,7 +14,7 @@
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -401,7 +401,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "--version" | "-v" | "version" => {
-                println!("questline {}", env!("CARGO_PKG_VERSION"));
+                println!("questline {}", questline::build_info::version_label());
                 return Ok(());
             }
             _ => {
@@ -414,7 +414,7 @@ async fn main() -> Result<()> {
     // Órale, a preparar la terminal — raw mode, pantalla alterna, backend de crossterm
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -429,7 +429,7 @@ async fn main() -> Result<()> {
             print!("\x1b]111\x07");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             disable_raw_mode()?;
-            execute!(io::stdout(), LeaveAlternateScreen)?;
+            execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
             return Err(e);
         }
     };
@@ -500,10 +500,12 @@ async fn main() -> Result<()> {
     loop {
         // Primero checar si hay tecla presionada antes de dibujar — así el input se siente más rápido
         if event::poll(tick_rate)? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind == event::KeyEventKind::Press {
+            match event::read()? {
+                Event::Key(key) if key.kind == event::KeyEventKind::Press => {
                     app.handle_key_event(key)?;
                 }
+                Event::Paste(text) => app.handle_paste(&text),
+                _ => {}
             }
         }
 
@@ -519,6 +521,7 @@ async fn main() -> Result<()> {
         app.terminal_width = terminal_size.map(|s| s.width).unwrap_or(120);
         app.terminal_height = terminal_size.map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
+        app.tick_note_autosave()?;
         app.tick_auto_sync()?;
         let sync_busy = app.sync_in_progress;
         if !sync_busy {
@@ -613,8 +616,25 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveScreen::Editor => {
+                    let quick_note = app
+                        .editor_state
+                        .as_ref()
+                        .map(|state| state.quick_note)
+                        .unwrap_or(false);
+                    if quick_note {
+                        let dashboard_area = Layout::default()
+                            .direction(Direction::Vertical)
+                            .constraints([Constraint::Min(5), Constraint::Length(3)])
+                            .split(size)[0];
+                        screens::dashboard::draw(f, &app, &theme, dashboard_area);
+                    }
                     if let Some(ref mut s) = app.editor_state {
-                        screens::editor::draw(f, s, &theme);
+                        if quick_note {
+                            let area = screens::intro::centered_rect(84, 86, size);
+                            screens::editor::draw_in_area(f, s, &theme, area);
+                        } else {
+                            screens::editor::draw(f, s, &theme);
+                        }
                     }
                 }
                 ActiveScreen::Workspace => {
@@ -645,7 +665,17 @@ async fn main() -> Result<()> {
                             screens::focus::draw(f, &app, &theme);
                         },
                         ActiveScreen::Projects => {
-                            screens::projects::draw(f, &app.projects, &app.all_tasks, app.selected_project_idx, app.projects_all_selected, &app.modal_state, &theme, chunks[0]);
+                            screens::projects::draw(
+                                f,
+                                &app.projects,
+                                &app.all_tasks,
+                                &app.all_notes,
+                                app.selected_project_idx,
+                                app.projects_all_selected,
+                                &app.modal_state,
+                                &theme,
+                                chunks[0],
+                            );
                         }
 
                         ActiveScreen::Character => {
@@ -785,10 +815,7 @@ async fn main() -> Result<()> {
                         if app.active_screen == *screen {
                             tab_spans.push(Span::styled(
                                 format!("[{}]{}", num, name),
-                                Style::default()
-                                    .fg(Color::Black)
-                                    .bg(theme.primary)
-                                    .add_modifier(Modifier::BOLD),
+                                theme.primary_selected_style(),
                             ));
                         } else {
                             tab_spans.push(Span::styled(
@@ -802,10 +829,7 @@ async fn main() -> Result<()> {
                     if app.active_screen == ActiveScreen::About {
                         tab_spans.push(Span::styled(
                             "[?]About",
-                            Style::default()
-                                .fg(Color::Black)
-                                .bg(theme.primary)
-                                .add_modifier(Modifier::BOLD),
+                            theme.primary_selected_style(),
                         ));
                     } else {
                         tab_spans.push(Span::styled("?", Style::default().fg(muted)));
@@ -858,6 +882,16 @@ async fn main() -> Result<()> {
                     f.render_widget(left_p, footer_cols[0]);
                     f.render_widget(sync_p, footer_cols[1]);
                 }
+            }
+
+            if let Some(calendar) = app.task_calendar {
+                screens::project_workspace::draw_task_calendar(
+                    f,
+                    app.active_project_id,
+                    &app.all_tasks,
+                    calendar,
+                    &theme,
+                );
             }
 
             // Limpia notificaciones viejas cada frame — solo duran 4 segundos y bye
@@ -1425,25 +1459,35 @@ async fn main() -> Result<()> {
                         let is_selected = idx == selected_idx;
                         let prefix = if is_selected { "> " } else { "  " };
                         let style = if is_selected {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::Rgb(200, 200, 200))
                         };
                         let type_style = if is_selected {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(theme.secondary)
                         };
+                        let detail_style = if is_selected {
+                            Style::default().fg(theme.selected_fg())
+                        } else {
+                            Style::default().fg(Color::Rgb(140, 140, 140))
+                        };
+                        let prefix_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                        };
 
                         let item_line = Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(format!("[{}] ", r.result_type.label()), type_style),
                             Span::styled(&r.title, style),
-                            Span::styled(format!(" - {}", r.details), Style::default().fg(Color::Rgb(140, 140, 140))),
+                            Span::styled(format!(" - {}", r.details), detail_style),
                         ]);
 
                         let list_item = if is_selected {
-                            ListItem::new(item_line).style(Style::default().bg(Color::Rgb(30, 30, 40)))
+                            ListItem::new(item_line).style(theme.selected_style())
                         } else {
                             ListItem::new(item_line)
                         };
@@ -1499,21 +1543,35 @@ async fn main() -> Result<()> {
                         let is_selected = idx == selected_idx;
                         let prefix = if is_selected { "> " } else { "  " };
                         let name_style = if is_selected {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::White)
                         };
-                        let shortcut_style = Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD);
+                        let shortcut_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                        };
+                        let description_style = if is_selected {
+                            Style::default().fg(theme.selected_fg())
+                        } else {
+                            Style::default().fg(Color::Rgb(200, 200, 200))
+                        };
+                        let prefix_style = if is_selected {
+                            Style::default().fg(theme.selected_fg()).add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)
+                        };
 
                         let item_line = Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(act.name, name_style),
-                            Span::styled(format!(" - {}", act.description), Style::default().fg(Color::Rgb(200, 200, 200))),
+                            Span::styled(format!(" - {}", act.description), description_style),
                             Span::styled(if act.shortcut.is_empty() { "".to_string() } else { format!("  [{}]", act.shortcut) }, shortcut_style),
                         ]);
 
                         let list_item = if is_selected {
-                            ListItem::new(item_line).style(Style::default().bg(Color::Rgb(30, 30, 40)))
+                            ListItem::new(item_line).style(theme.selected_style())
                         } else {
                             ListItem::new(item_line)
                         };
@@ -1563,13 +1621,18 @@ async fn main() -> Result<()> {
                     projects.iter().enumerate().map(|(i, p)| {
                         let is_sel = i == selected_idx;
                         let style = if is_sel {
-                            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD).bg(Color::Rgb(30, 30, 40))
+                            theme.selected_style()
                         } else {
                             Style::default().fg(Color::White)
                         };
                         let prefix = if is_sel { "> " } else { "  " };
+                        let prefix_style = if is_sel {
+                            theme.selected_style()
+                        } else {
+                            Style::default().fg(theme.primary)
+                        };
                         ListItem::new(Line::from(vec![
-                            Span::styled(prefix, Style::default().fg(theme.primary)),
+                            Span::styled(prefix, prefix_style),
                             Span::styled(p.name.clone(), style),
                         ]))
                     }).collect()
@@ -2098,6 +2161,56 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
+            if let questline::app::ModalType::ConfirmCleanupLocalHistory {
+                sync_logs,
+                processed_events,
+                revisions,
+            } = app.modal_state
+            {
+                let overlay_area = centered_rect_fixed_height(62, 12, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(
+                    Block::default().style(Style::default().bg(theme.background)),
+                    overlay_area,
+                );
+
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                    .title(Span::styled(
+                        " Clean Local History ",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    ));
+
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  This removes disposable local history only.",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from(format!("  Synced sync logs:      {}", sync_logs)),
+                    Line::from(format!("  Processed remote IDs:  {}", processed_events)),
+                    Line::from(format!("  Revisions:             {}", revisions)),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Keeps current tasks, scrolls, projects, codices, XP, lore, and journals.",
+                        Style::default().fg(Color::Rgb(180, 180, 180)),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "  Clean local history?  [Y] Yes   [N] No / Esc",
+                        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                    )),
+                ];
+
+                let p = Paragraph::new(lines)
+                    .block(block)
+                    .wrap(ratatui::widgets::Wrap { trim: false });
+                f.render_widget(p, overlay_area);
+            }
+
             // Avisa que hay una versión nueva disponible — Y para instalar directo desde el app
             if let questline::app::ModalType::UpdateAvailable { ref latest_version } = app.modal_state {
                 let overlay_area = centered_rect_fixed_height(62, 12, size);
@@ -2161,6 +2274,7 @@ async fn main() -> Result<()> {
                 let mut lines = vec![
                     Line::from(Span::styled("Global Shortcuts:", Style::default().fg(theme.primary).add_modifier(Modifier::UNDERLINED | Modifier::BOLD))),
                     Line::from("  Ctrl+P / : / Ctrl+K / F1  Command Palette (Fuzzy Navigation & Commands)"),
+                    Line::from("  Ctrl+N       Quick Note (title, campaign, then scroll editor)"),
                     Line::from("  ?            Show Keyboard Shortcuts Help (Context-Sensitive)"),
                     Line::from("  1-8          Switch sections directly"),
                     Line::from("  Tab          Cycle input focus/fields"),
@@ -2177,6 +2291,7 @@ async fn main() -> Result<()> {
 
                 match app.active_screen {
                     ActiveScreen::Dashboard => {
+                        lines.push(Line::from("  Ctrl+N       Write a Quick Note"));
                         lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
                         lines.push(Line::from("  f            Quick start Focus Session"));
                         lines.push(Line::from("  m            Go to Music Screen"));
@@ -2202,7 +2317,7 @@ async fn main() -> Result<()> {
                                 lines.push(Line::from("  n            Create New Note (in current codex if one is selected)"));
                                 lines.push(Line::from("  Enter        Open selected Note in Editor / Drill into Codex"));
                                 lines.push(Line::from("  e            Rename selected Codex"));
-                                lines.push(Line::from("  r            Move Note or Codex to a different Codex"));
+                                lines.push(Line::from("  r            Move Scroll to a campaign/codex, or move a Codex"));
                                 lines.push(Line::from("  d            Create new Codex (sub-codex if inside one)"));
                                 lines.push(Line::from("  →            Drill into selected Codex"));
                                 lines.push(Line::from("  ←  / Esc    Go back up one Codex level"));
@@ -2298,7 +2413,7 @@ async fn main() -> Result<()> {
                 let type_spans: Vec<Span> = types.iter().flat_map(|t| {
                     let selected = *t == modal.report_type;
                     let style = if selected {
-                        Style::default().fg(Color::Black).bg(theme.primary).add_modifier(Modifier::BOLD)
+                        theme.primary_selected_style()
                     } else {
                         Style::default().fg(Color::Rgb(140, 140, 140))
                     };
@@ -2350,7 +2465,11 @@ async fn main() -> Result<()> {
     print!("\x1b]111\x07");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
 
     // Si el usuario aceptó el update, corre el installer después de limpiar la terminal

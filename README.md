@@ -238,6 +238,32 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v1.1.3 — The Chronicle Remembers
+*Released 2026-07-29*
+
+- **Safer multi-device sync:** Sync now protects projects, quests, steps, scrolls, codices, and earned progress from older or incomplete data arriving from another device.
+- **Better conflict protection:** Suspicious cloud changes are stopped before they can unlink or remove local work, and automatic sync pauses when Questline needs the user to review a problem.
+- **Clearer sync health:** The Sync screen now shows local and cloud positions, remaining activity, backup state, and clearer progress while transferring a large history.
+- **Stronger restore and device transfer:** Restored devices begin from the correct cloud position, automatic sync stays paused until the user is ready, and transfer codes remain locked until their backup is complete.
+- **New recovery controls:** Added simple options to clean old local sync history or rebuild cloud sync from a trusted device when recovery is needed.
+- **Progress is protected:** An older device can no longer reduce the hero's level or XP after newer progress has already been earned.
+- **Improved shared campaigns:** Sync better preserves campaign links, step parents, scroll locations, companion work, and deletions across Fellowship devices.
+- **macOS notification fixes:** Alerts now work more reliably on macOS, with better support for the notification tools available on each system and an easy alert test.
+- **Improved Music screen:** Local music is easier to browse and control, the local player opens by default, and Forest, Rain, Ocean, and interface sounds received playback improvements.
+- **Achievement Library:** Achievements can now be explored in the Library with their requirements, current progress, unlock dates, and missing soundscapes.
+- **Hydration reliability:** Water reminders can appear over every screen, overnight schedules work correctly, and the dashboard clearly shows when hydration is paused or preparing its next reminder.
+- **More keyboard navigation:** `h`, `j`, `k`, and `l` now work in more lists and menus, with clearer selected rows across themes.
+- **Quick Notes:** Press `Ctrl+N` or choose Create Note from the Command Palette to open a scroll over the Dashboard, write its title, choose its campaign, and begin editing immediately.
+- **Cross-campaign scroll filing:** Press `R` on a scroll to move it to another campaign, leave it ungrouped there, or file it directly into one of that campaign's codices.
+- **Clearer Focus Sanctuary:** Active sessions now feature a large responsive countdown plus a quiet progress compass showing elapsed time, remaining time, completion percentage, and expected finish time.
+- **Safer note editing:** `Ctrl+S` saves without closing the editor. Closing a changed scroll asks whether to save, discard, or keep editing, while an unchanged scroll closes immediately.
+- **Silent note autosave:** Changed scrolls save automatically every few seconds without sounds or popups. A small `Autosaved` message appears in the editor status bar.
+- **Better pasting and scrolling:** Large clipboard pastes are inserted at once, paragraphs and accented characters are preserved, wrapped text scrolls inside the editor, and the cursor remains visible without adding spaces inside words.
+- **Clearer campaign totals:** The Campaigns list now labels open quests as `!(n)`, steps as `->(n)`, and scrolls as `#(n)`.
+- **Quest Calendar:** Press `C` from Campaigns or a campaign workspace to view due quests from all campaigns in a full month calendar and create a new quest directly on any selected day. Due dates also anchor daily, weekly, monthly, and yearly recurring quests.
+
+---
+
 ### v1.1.2 — The Command Center Holds
 *Released 2026-07-26*
 

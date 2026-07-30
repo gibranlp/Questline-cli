@@ -1,6 +1,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // screens/intro.rs — la pantalla de splash/intro antes de que arranque todo
 // ─────────────────────────────────────────────────────────────────────────────
+use crate::build_info;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -155,7 +156,7 @@ pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Them
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(current_color))
                 .title(Span::styled(
-                    concat!(" [ v", env!("CARGO_PKG_VERSION"), " ] "),
+                    format!(" [ {} ] ", build_info::version_label()),
                     Style::default()
                         .fg(Color::Rgb(249, 115, 22))
                         .add_modifier(Modifier::BOLD),

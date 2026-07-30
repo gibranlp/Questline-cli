@@ -20,7 +20,7 @@ use crate::models::{
 use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
 use crate::screens::onboarding::OnboardingFocus;
-use crate::services::{ThemeService, XPService};
+use crate::services::{Identity, ThemeService, XPService};
 use crate::theme::ThemeChoice;
 
 pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
@@ -213,6 +213,31 @@ impl DueDateType {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TaskCalendarState {
+    pub selected: NaiveDate,
+    pub planner_mode: bool,
+    pub show_all_projects: bool,
+}
+
+impl TaskCalendarState {
+    fn date_picker(selected: NaiveDate) -> Self {
+        Self {
+            selected,
+            planner_mode: false,
+            show_all_projects: false,
+        }
+    }
+
+    fn month_planner(selected: NaiveDate) -> Self {
+        Self {
+            selected,
+            planner_mode: true,
+            show_all_projects: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchResultType {
     Project,
@@ -259,6 +284,15 @@ pub struct CommandAction {
     pub description: &'static str,
     pub shortcut: &'static str,
     pub id: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrollDestination {
+    pub project_id: Uuid,
+    pub project_name: String,
+    pub codex_id: Option<Uuid>,
+    pub codex_name: Option<String>,
+    pub parent_codex_name: Option<String>,
 }
 
 // Todos los modales posibles de la app — hay más de 20, cada uno con su propio estado interno
@@ -477,9 +511,15 @@ pub enum ModalType {
         days: i64,
         count: usize,
     },
+    ConfirmCleanupLocalHistory {
+        sync_logs: usize,
+        processed_events: usize,
+        revisions: usize,
+    },
     RefileScroll {
         note_id: Uuid,
         selected_idx: usize,
+        destinations: Vec<ScrollDestination>,
     },
     UpdateAvailable {
         latest_version: String,
@@ -826,6 +866,8 @@ pub struct App {
     pub overlay_modal: ModalType,
     pub editor_state: Option<EditorState>,
     pub task_desc_editor: Option<EditorState>,
+    pub task_calendar: Option<TaskCalendarState>,
+    pub pending_calendar_due_date: Option<NaiveDate>,
 
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
@@ -1011,9 +1053,12 @@ pub struct App {
 }
 
 pub fn extract_url(content: &str) -> Option<&str> {
-    content
-        .split_whitespace()
-        .find(|w| w.starts_with("http://") || w.starts_with("https://"))
+    content.split_whitespace().find_map(|word| {
+        let start = word.find("https://").or_else(|| word.find("http://"))?;
+        let url = word[start..]
+            .trim_end_matches([')', ']', '}', '>', '"', '\'', ',', '.', ';', ':', '!', '?']);
+        (!url.is_empty()).then_some(url)
+    })
 }
 
 pub fn open_url(url: &str) {
@@ -1046,7 +1091,7 @@ enum DashboardCommandTarget {
 }
 
 fn edit_task_modal_from_task(task: &Task) -> ModalType {
-    let (due_date_type, due_date_val) = match task.due_date {
+    let (due_date_type, due_date_val) = match task.due_date.or(task.set_date) {
         None => (DueDateType::None, String::new()),
         Some(d) => {
             let today = Local::now().date_naive();
@@ -1073,10 +1118,7 @@ fn edit_task_modal_from_task(task: &Task) -> ModalType {
         priority: task.priority,
         due_date_type,
         due_date_val,
-        set_date_val: task
-            .set_date
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_default(),
+        set_date_val: String::new(),
         focus_idx: 0,
         step_selected_idx: 0,
         is_step: task.parent_task_id.is_some(),
@@ -1923,13 +1965,26 @@ impl App {
         // If a full Questline DB folder is copied to another PC, it carries the old device_id too.
         // The server filters pulls with `device_id != current_device`, so cloned IDs make both PCs
         // hide each other's events. Bind the id to the first hostname that used it and repair copies.
+        let preserve_restore_cursor = |db: &crate::database::Database| {
+            if let Ok(Some(head_seq)) = db.get_setting("last_remote_head_seq") {
+                if head_seq.parse::<i64>().unwrap_or(0) > 0 {
+                    let _ = db.set_setting("last_pull_seq", &head_seq);
+                    let _ = db.set_setting("last_sync_lag", "0");
+                    let _ = db.set_setting("sync_restore_hold", "1");
+                    let _ = db.set_setting("auto_sync", "false");
+                    return;
+                }
+            }
+            let _ = db.set_setting("last_pull_seq", "0");
+        };
+
         let device_id = match db.get_setting("device_id")? {
             Some(id) => match db.get_setting("device_bound_name")? {
                 Some(bound_name) if bound_name != device_name => {
                     let new_id = Uuid::new_v4().to_string();
                     db.set_setting("device_id", &new_id)?;
                     db.set_setting("device_bound_name", &device_name)?;
-                    let _ = db.set_setting("last_pull_seq", "0");
+                    preserve_restore_cursor(&db);
                     let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                     new_id
                 }
@@ -1951,7 +2006,7 @@ impl App {
                         let new_id = Uuid::new_v4().to_string();
                         db.set_setting("device_id", &new_id)?;
                         db.set_setting("device_bound_name", &device_name)?;
-                        let _ = db.set_setting("last_pull_seq", "0");
+                        preserve_restore_cursor(&db);
                         let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                         new_id
                     } else {
@@ -1969,7 +2024,8 @@ impl App {
         };
         db.register_device(&device_id, &device_name)?;
 
-        // La config tiene prioridad sobre los settings de la DB — archivo > DB
+        // La URL/config base viven en config.toml, pero el toggle visible de Auto Sync
+        // debe persistir desde la DB porque el usuario lo cambia dentro del TUI con [a].
         let config = crate::services::config::Config::load().unwrap_or_default();
         let server_url = if config.sync_enabled {
             config.server_url.clone()
@@ -1977,13 +2033,10 @@ impl App {
             db.get_setting("server_url")?
                 .unwrap_or_else(|| "http://localhost:8080".to_string())
         };
-        let auto_sync = if config.sync_enabled {
-            config.auto_sync
-        } else {
-            db.get_setting("auto_sync")?
-                .map(|s| s == "true")
-                .unwrap_or(false)
-        };
+        let mut auto_sync = db
+            .get_setting("auto_sync")?
+            .map(|s| s == "true")
+            .unwrap_or(config.auto_sync);
         let external_notifications = db
             .get_setting("external_notifications")?
             .map(|s| s == "true")
@@ -2027,7 +2080,15 @@ impl App {
                         .and_then(|b| String::from_utf8(b).ok())
                         .unwrap_or(json);
                     if db.import_from_json(&decoded).is_ok() {
-                        let _ = App::set_pull_cursor_to_remote_head(&db, &client);
+                        let _ = App::anchor_restore_to_sync_head(
+                            &db,
+                            &identity,
+                            &device_id,
+                            &server_url,
+                        );
+                        let _ = db.set_setting("sync_restore_hold", "1");
+                        let _ = db.set_setting("auto_sync", "false");
+                        auto_sync = false;
                         user = db.get_user()?;
                     }
                 }
@@ -2123,6 +2184,8 @@ impl App {
             overlay_modal: ModalType::None,
             editor_state: None,
             task_desc_editor: None,
+            task_calendar: None,
+            pending_calendar_due_date: None,
             dashboard_task_focus: true,
             selected_dashboard_task_idx: 0,
             searching: false,
@@ -2601,6 +2664,11 @@ impl App {
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         let key = normalize_ctrl_backspace(key);
 
+        if self.task_calendar.is_some() {
+            self.handle_task_calendar_key(key);
+            return Ok(());
+        }
+
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.notifications.push(Notification::info(
                 "Use [q] to quit — seals the Chronicle and syncs before exit.",
@@ -2678,6 +2746,7 @@ impl App {
         if !in_text_entry && key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('t') => {
+                    self.pending_calendar_due_date = None;
                     if self.active_project_id.is_some() {
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
@@ -2686,8 +2755,8 @@ impl App {
                             desc: String::new(),
                             desc_cursor: 0,
                             priority: crate::models::task::TaskPriority::Medium,
-                            due_date_type: DueDateType::InDays,
-                            due_date_val: "1".to_string(),
+                            due_date_type: DueDateType::None,
+                            due_date_val: String::new(),
                             set_date_val: String::new(),
                             focus_idx: 0,
                             parent_task_id: None,
@@ -2702,18 +2771,7 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
-                    if self.active_project_id.is_some() {
-                        self.active_screen = ActiveScreen::Workspace;
-                        self.workspace_tab_idx = 1;
-                        self.modal_state = ModalType::NewJournalEntry {
-                            content: String::new(),
-                        };
-                    } else {
-                        self.modal_state = ModalType::SelectProjectForAction {
-                            action_id: "create_note",
-                            selected_idx: 0,
-                        };
-                    }
+                    self.open_quick_note_editor();
                     return Ok(());
                 }
                 _ => {}
@@ -3404,43 +3462,82 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::ConfirmCleanupLocalHistory { .. } => {
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        match self.db.cleanup_local_history() {
+                            Ok((sync_logs, processed_events, revisions)) => {
+                                let _ = self
+                                    .db
+                                    .conn
+                                    .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); VACUUM;");
+                                self.sync_status_msg = format!(
+                                    "Cleaned local history: {} sync logs, {} processed IDs, {} revisions.",
+                                    sync_logs, processed_events, revisions
+                                );
+                                self.notifications.push(Notification::info(
+                                    "Local history cleanup complete.".to_string(),
+                                ));
+                                self.reload_data()?;
+                            }
+                            Err(e) => {
+                                self.sync_status_msg = format!("Cleanup failed: {}", e);
+                            }
+                        }
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::RefileScroll {
                 note_id,
                 selected_idx,
+                ref destinations,
             } => {
                 let nid = note_id;
                 let mut sel = selected_idx;
-                let total = self.codices.len() + 1; // 0 = Ungrouped, 1..=n = codices
+                let destinations = destinations.clone();
+                let total = destinations.len();
                 match key.code {
                     KeyCode::Esc => {
                         self.modal_state = ModalType::None;
                     }
-                    KeyCode::Up | KeyCode::Char('k') => {
+                    KeyCode::Up | KeyCode::Char('k') if total > 0 => {
                         sel = if sel > 0 { sel - 1 } else { total - 1 };
                         self.modal_state = ModalType::RefileScroll {
                             note_id: nid,
                             selected_idx: sel,
+                            destinations,
                         };
                     }
-                    KeyCode::Down | KeyCode::Char('j') => {
+                    KeyCode::Down | KeyCode::Char('j') if total > 0 => {
                         sel = (sel + 1) % total;
                         self.modal_state = ModalType::RefileScroll {
                             note_id: nid,
                             selected_idx: sel,
+                            destinations,
                         };
                     }
                     KeyCode::Enter => {
-                        if let Some(mut note) = self.db.get_note_by_id(nid).ok() {
-                            note.codex_id = if sel == 0 {
-                                None
-                            } else {
-                                self.codices.get(sel - 1).map(|c| c.id)
-                            };
-                            note.updated_at = chrono::Utc::now();
-                            self.db.update_note(&note)?;
+                        if let Some(destination) = destinations.get(sel) {
+                            self.db
+                                .move_note(nid, destination.project_id, destination.codex_id)?;
                             self.mark_dirty();
                             self.selected_notes_flat_idx = 0;
                             self.reload_data()?;
+                            let location = destination
+                                .codex_name
+                                .as_deref()
+                                .map(|codex| format!("{} / {}", destination.project_name, codex))
+                                .unwrap_or_else(|| {
+                                    format!("{} / Ungrouped", destination.project_name)
+                                });
+                            self.notifications
+                                .push(Notification::info(format!("Scroll moved to {}.", location)));
                         }
                         self.modal_state = ModalType::None;
                     }
@@ -3557,9 +3654,21 @@ impl App {
                     }
                     KeyCode::Char('c') => {
                         if let ModalType::ExportProfile {
-                            ref transfer_code, ..
+                            ref transfer_code,
+                            backup_in_progress,
+                            ..
                         } = self.modal_state.clone()
                         {
+                            if backup_in_progress {
+                                self.sync_status_msg =
+                                    "Transfer Code locked until cloud backup completes."
+                                        .to_string();
+                                self.notifications.push(Notification::warning(
+                                    "Wait for the chronicle backup to finish before importing."
+                                        .to_string(),
+                                ));
+                                return Ok(true);
+                            }
                             match crate::services::identity::copy_to_clipboard(transfer_code) {
                                 Ok(_) => {
                                     self.sync_status_msg =
@@ -3668,8 +3777,14 @@ impl App {
                                                 .and_then(|b| String::from_utf8(b).ok())
                                                 .unwrap_or(json);
                                             if self.db.import_from_json(&decoded).is_ok() {
-                                                let _ = App::set_pull_cursor_to_remote_head(
-                                                    &self.db, &client,
+                                                let _ = App::anchor_restore_to_sync_head(
+                                                    &self.db,
+                                                    &self.identity,
+                                                    &self.device_id,
+                                                    &self.server_url,
+                                                );
+                                                self.pause_auto_sync(
+                                                    "Restore complete. Auto Sync disabled; toggle [a] when ready.",
                                                 );
                                                 self.notifications.push(Notification::info(
                                                     "Data restored from cloud backup!".to_string(),
@@ -4120,6 +4235,7 @@ impl App {
                                         reward_xp: xp_val,
                                         daily_target,
                                         created_at: Utc::now(),
+                                        updated_at: Utc::now(),
                                     };
                                     self.db.insert_ritual(&rit)?;
                                     self.mark_dirty();
@@ -4223,6 +4339,7 @@ impl App {
                                 completed: false,
                                 xp_reward: tmpl.xp_reward,
                                 created_at: Utc::now(),
+                                updated_at: Utc::now(),
                                 tier: tmpl.tier as u8,
                                 template_id: tmpl.id.to_string(),
                             };
@@ -4869,10 +4986,8 @@ impl App {
                     KeyCode::Enter => {
                         let vis_options = ["Private", "Campaign Visible", "Fellowship Visible"];
                         let selected_vis = vis_options[idx].to_string();
-                        self.db.conn.execute(
-                            "UPDATE journal_entries SET visibility = ?1 WHERE id = ?2",
-                            params![selected_vis, entry_id.to_string()],
-                        )?;
+                        self.db.update_journal_visibility(entry_id, &selected_vis)?;
+                        self.mark_dirty();
                         self.modal_state = ModalType::None;
                         self.reload_data()?;
                     }
@@ -5117,6 +5232,9 @@ impl App {
                 let mut sel = selected_idx;
                 match key.code {
                     KeyCode::Esc => {
+                        if action_id == "create_task" {
+                            self.pending_calendar_due_date = None;
+                        }
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
@@ -5140,29 +5258,48 @@ impl App {
                         };
                     }
                     KeyCode::Enter if !projects.is_empty() => {
-                        let project = projects[sel];
-                        self.active_project_id = Some(project.id);
+                        let project_id = projects[sel].id;
+                        self.active_project_id = Some(project_id);
                         self.active_screen = ActiveScreen::Workspace;
                         self.reload_data()?;
                         if action_id == "create_task" {
                             self.workspace_tab_idx = 0;
-                            self.modal_state = ModalType::NewTask {
-                                title: String::new(),
-                                desc: String::new(),
-                                desc_cursor: 0,
-                                priority: crate::models::task::TaskPriority::Medium,
-                                due_date_type: crate::app::DueDateType::InDays,
-                                due_date_val: "1".to_string(),
-                                set_date_val: String::new(),
-                                focus_idx: 0,
-                                parent_task_id: None,
-                                recurrence: None,
-                            };
+                            self.modal_state =
+                                if let Some(date) = self.pending_calendar_due_date.take() {
+                                    Self::new_task_modal_for_calendar_date(date)
+                                } else {
+                                    ModalType::NewTask {
+                                        title: String::new(),
+                                        desc: String::new(),
+                                        desc_cursor: 0,
+                                        priority: crate::models::task::TaskPriority::Medium,
+                                        due_date_type: crate::app::DueDateType::None,
+                                        due_date_val: String::new(),
+                                        set_date_val: String::new(),
+                                        focus_idx: 0,
+                                        parent_task_id: None,
+                                        recurrence: None,
+                                    }
+                                };
                         } else {
                             self.workspace_tab_idx = 1;
-                            self.modal_state = ModalType::NewJournalEntry {
-                                content: String::new(),
-                            };
+                            let mut state =
+                                EditorState::new(project_id, None, String::new(), String::new());
+                            state.quick_note = true;
+                            state.project_choices = self
+                                .projects
+                                .iter()
+                                .filter(|p| !p.archived && !p.completed)
+                                .map(|p| (p.id, p.name.clone()))
+                                .collect();
+                            state.project_choice_idx = state
+                                .project_choices
+                                .iter()
+                                .position(|(id, _)| *id == project_id)
+                                .unwrap_or(0);
+                            self.editor_state = Some(state);
+                            self.modal_state = ModalType::None;
+                            self.active_screen = ActiveScreen::Editor;
                         }
                     }
                     _ => {}
@@ -5184,7 +5321,9 @@ impl App {
 
     /// Maneja las teclas de la pantalla de selección inicial — navega entre las dos opciones y confirma.
     fn handle_gateway_key(&mut self, key: KeyEvent) -> Result<()> {
-        match key.code {
+        let nav_code = Self::navigation_key_code(key);
+
+        match nav_code {
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.gateway_selected_idx > 0 {
                     self.gateway_selected_idx -= 1;
@@ -5300,8 +5439,15 @@ impl App {
                                         .and_then(|b| String::from_utf8(b).ok())
                                         .unwrap_or(json);
                                     if self.db.import_from_json(&decoded).is_ok() {
-                                        let _ =
-                                            App::set_pull_cursor_to_remote_head(&self.db, &client);
+                                        let _ = App::anchor_restore_to_sync_head(
+                                            &self.db,
+                                            &self.identity,
+                                            &self.device_id,
+                                            &self.server_url,
+                                        );
+                                        self.pause_auto_sync(
+                                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
+                                        );
                                         restored_from_cloud = true;
                                         if let Ok(Some(u)) = self.db.get_user() {
                                             self.identity.user_uuid = u.id;
@@ -5910,8 +6056,300 @@ impl App {
         Ok(())
     }
 
+    fn save_editor_note(&mut self, close_after_save: bool, silent_autosave: bool) -> Result<()> {
+        let Some(state) = self.editor_state.as_ref() else {
+            return Ok(());
+        };
+        let notification_count = self.notifications.len();
+        let previous_modal = self.modal_state.clone();
+        let previous_overlay = self.overlay_modal.clone();
+        let previous_fragment = self.fragment_notification.clone();
+        let raw_title = state.title.clone();
+        let note_title = if raw_title.trim().is_empty() {
+            "Untitled Scroll".to_string()
+        } else {
+            raw_title.trim().to_string()
+        };
+        let content = state.get_content();
+        let project_id = state.project_id;
+        let existing_note_id = state.note_id;
+        let codex_id = state.codex_id;
+        let quick_note = state.quick_note;
+        let has_unsaved_changes = state.has_unsaved_changes();
+        let word_count = content.len();
+        let is_new_note = existing_note_id.is_none();
+        let saved_note_id = existing_note_id.unwrap_or_else(Uuid::new_v4);
+
+        if existing_note_id.is_some() && !has_unsaved_changes {
+            if close_after_save {
+                self.close_editor_without_saving();
+            } else if !silent_autosave {
+                self.notifications
+                    .push(Notification::info("Scroll already saved."));
+            }
+            return Ok(());
+        }
+
+        let xp_service = XPService::new(&self.db);
+        if let Some(note_id) = existing_note_id {
+            let mut note = Note {
+                id: note_id,
+                project_id: Some(project_id),
+                title: note_title,
+                markdown_content: content,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sharing_permission: "collaborative".to_string(),
+                codex_id: None,
+                owner_identity: None,
+            };
+            if let Ok(notes) = self.db.get_notes() {
+                if let Some(orig) = notes.iter().find(|n| n.id == note_id) {
+                    note.created_at = orig.created_at;
+                    note.sharing_permission = orig.sharing_permission.clone();
+                    note.codex_id = orig.codex_id;
+                    note.owner_identity = orig.owner_identity.clone();
+                }
+            }
+            self.db.update_note(&note)?;
+            if !silent_autosave {
+                if let Some(ref mut u) = self.user {
+                    let mut xp_gain = 2;
+                    if word_count > 500 {
+                        xp_gain += 10;
+                    }
+                    let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
+                    if leveled_up {
+                        self.notifications.push(Notification::info(format!(
+                            "LEVEL UP! You reached Level {}!",
+                            u.level
+                        )));
+                    }
+                }
+            }
+        } else {
+            let note = Note {
+                id: saved_note_id,
+                project_id: Some(project_id),
+                title: note_title,
+                markdown_content: content,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                sharing_permission: "collaborative".to_string(),
+                codex_id,
+                owner_identity: Some(self.identity.public_key.clone()),
+            };
+            self.db.insert_note(&note)?;
+            self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
+            if let Some(ref mut u) = self.user {
+                let mut xp_gain = 5;
+                if word_count > 500 {
+                    xp_gain += 10;
+                }
+                let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
+                if leveled_up {
+                    self.notifications.push(Notification::info(format!(
+                        "LEVEL UP! You reached Level {}!",
+                        u.level
+                    )));
+                }
+            }
+            self.complete_productive_action()?;
+            self.update_daily_adventure_progress("write_note", 1)?;
+            self.check_action_achievements()?;
+        }
+
+        self.mark_dirty();
+        if !silent_autosave || is_new_note {
+            self.apply_class_passive(
+                if is_new_note {
+                    "note_create"
+                } else {
+                    "note_edit"
+                },
+                word_count,
+            )?;
+        }
+        if let Some(state) = self.editor_state.as_mut() {
+            state.mark_saved(saved_note_id);
+            if silent_autosave {
+                state.record_autosaved();
+            }
+        }
+        self.reload_data()?;
+
+        if close_after_save {
+            self.editor_state = None;
+            if quick_note {
+                self.active_screen = ActiveScreen::Dashboard;
+                self.active_tab_idx = 0;
+            } else {
+                self.active_screen = ActiveScreen::Workspace;
+                self.workspace_tab_idx = 1;
+            }
+        } else if !silent_autosave {
+            self.notifications
+                .push(Notification::info("Scroll saved. Continue writing."));
+        }
+        if silent_autosave {
+            self.notifications.truncate(notification_count);
+            self.modal_state = previous_modal;
+            self.overlay_modal = previous_overlay;
+            self.fragment_notification = previous_fragment;
+        }
+        Ok(())
+    }
+
+    pub fn tick_note_autosave(&mut self) -> Result<()> {
+        const NOTE_AUTOSAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+        let autosave_due = self.active_screen == ActiveScreen::Editor
+            && self
+                .editor_state
+                .as_ref()
+                .map(|state| state.autosave_due(NOTE_AUTOSAVE_INTERVAL))
+                .unwrap_or(false);
+        if autosave_due {
+            self.save_editor_note(false, true)?;
+        }
+        Ok(())
+    }
+
+    fn paste_into_task_description(
+        modal: &mut ModalType,
+        editor: &mut Option<EditorState>,
+        project_id: Uuid,
+        text: &str,
+    ) -> bool {
+        let (desc, desc_cursor) = match modal {
+            ModalType::NewTask {
+                desc,
+                desc_cursor,
+                focus_idx: 1,
+                ..
+            }
+            | ModalType::EditTask {
+                desc,
+                desc_cursor,
+                focus_idx: 1,
+                ..
+            } => (desc.clone(), *desc_cursor),
+            _ => return false,
+        };
+
+        let needs_new_editor = editor
+            .as_ref()
+            .map(|state| state.get_content() != desc)
+            .unwrap_or(true);
+        if needs_new_editor {
+            *editor = Some(Self::task_desc_editor_from_text(
+                project_id,
+                desc,
+                desc_cursor,
+                true,
+            ));
+        }
+
+        let Some(state) = editor.as_mut() else {
+            return false;
+        };
+        state.insert_text(text);
+        let pasted_desc = state.get_content();
+        let pasted_cursor = Self::task_desc_cursor_from_editor(state);
+
+        match modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            }
+            | ModalType::EditTask {
+                desc, desc_cursor, ..
+            } => {
+                *desc = pasted_desc;
+                *desc_cursor = pasted_cursor;
+            }
+            _ => unreachable!("task description modal changed while pasting"),
+        }
+        true
+    }
+
+    pub fn handle_paste(&mut self, text: &str) {
+        let project_id = self.active_project_id.unwrap_or_else(Uuid::nil);
+
+        // A new-step overlay sits above the parent quest modal and must receive
+        // the paste exclusively, just like regular key events do.
+        if self.overlay_modal != ModalType::None {
+            Self::paste_into_task_description(
+                &mut self.overlay_modal,
+                &mut self.task_desc_editor,
+                project_id,
+                text,
+            );
+            return;
+        }
+
+        if Self::paste_into_task_description(
+            &mut self.modal_state,
+            &mut self.task_desc_editor,
+            project_id,
+            text,
+        ) {
+            return;
+        }
+
+        if self.active_screen == ActiveScreen::Editor {
+            if let Some(state) = self.editor_state.as_mut() {
+                if !state.confirm_close && !state.show_help && !state.editing_project {
+                    state.insert_text(text);
+                }
+            }
+        }
+    }
+
+    fn close_editor_without_saving(&mut self) {
+        let quick_note = self
+            .editor_state
+            .as_ref()
+            .map(|state| state.quick_note)
+            .unwrap_or(false);
+        self.editor_state = None;
+        if quick_note {
+            self.active_screen = ActiveScreen::Dashboard;
+            self.active_tab_idx = 0;
+        } else {
+            self.active_screen = ActiveScreen::Workspace;
+            self.workspace_tab_idx = 1;
+        }
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) -> Result<()> {
         use crate::screens::editor::EditorMode;
+
+        if self
+            .editor_state
+            .as_ref()
+            .map(|state| state.confirm_close)
+            .unwrap_or(false)
+        {
+            match key.code {
+                KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('y') => {
+                    self.save_editor_note(true, false)?;
+                }
+                KeyCode::Char('d') | KeyCode::Char('n') => {
+                    self.close_editor_without_saving();
+                }
+                KeyCode::Esc => {
+                    if let Some(state) = self.editor_state.as_mut() {
+                        state.confirm_close = false;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.save_editor_note(false, false)?;
+            return Ok(());
+        }
 
         let home_end_whole_text = if matches!(key.code, KeyCode::Home | KeyCode::End) {
             Some(self.consume_home_end_double_press(key.code))
@@ -5926,7 +6364,7 @@ impl App {
             return Ok(());
         };
 
-        if key.code == KeyCode::Char('?') && !state.editing_title {
+        if key.code == KeyCode::Char('?') && !state.editing_title && !state.editing_project {
             if let EditorMode::Normal = state.mode {
                 state.show_help = !state.show_help;
                 state.pending_cmd.clear();
@@ -5939,96 +6377,6 @@ impl App {
             return Ok(());
         }
 
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
-            let note_title = if state.title.trim().is_empty() {
-                "Untitled Scroll".to_string()
-            } else {
-                state.title.trim().to_string()
-            };
-            let content = state.get_content();
-            let word_count = content.len();
-
-            let is_new_note = state.note_id.is_none();
-            let xp_service = XPService::new(&self.db);
-            if let Some(note_id) = state.note_id {
-                let mut note = Note {
-                    id: note_id,
-                    project_id: Some(state.project_id),
-                    title: note_title,
-                    markdown_content: content,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    sharing_permission: "collaborative".to_string(),
-                    codex_id: None,
-                    owner_identity: None,
-                };
-                if let Ok(notes) = self.db.get_notes() {
-                    if let Some(orig) = notes.iter().find(|n| n.id == note_id) {
-                        note.created_at = orig.created_at;
-                        note.sharing_permission = orig.sharing_permission.clone();
-                        note.codex_id = orig.codex_id;
-                        note.owner_identity = orig.owner_identity.clone();
-                    }
-                }
-                self.db.update_note(&note)?;
-                if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 2;
-                    if word_count > 500 {
-                        xp_gain += 10;
-                    }
-                    let leveled_up = xp_service.grant_xp(u, "Edit Scroll Note", xp_gain)?;
-                    if leveled_up {
-                        self.notifications.push(Notification::info(format!(
-                            "LEVEL UP! You reached Level {}!",
-                            u.level
-                        )));
-                    }
-                }
-            } else {
-                let note = Note {
-                    id: Uuid::new_v4(),
-                    project_id: Some(state.project_id),
-                    title: note_title,
-                    markdown_content: content,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    sharing_permission: "collaborative".to_string(),
-                    codex_id: state.codex_id,
-                    owner_identity: Some(self.identity.public_key.clone()),
-                };
-                self.db.insert_note(&note)?;
-                self.push_great_chronicle_async("ScrollCreated", "wrote a scroll.", true);
-                if let Some(ref mut u) = self.user {
-                    let mut xp_gain = 5;
-                    if word_count > 500 {
-                        xp_gain += 10;
-                    }
-                    let leveled_up = xp_service.grant_xp(u, "Write New Scroll Note", xp_gain)?;
-                    if leveled_up {
-                        self.notifications.push(Notification::info(format!(
-                            "LEVEL UP! You reached Level {}!",
-                            u.level
-                        )));
-                    }
-                }
-                self.complete_productive_action()?;
-                self.update_daily_adventure_progress("write_note", 1)?;
-                self.check_action_achievements()?;
-            }
-            self.mark_dirty();
-            let note_trigger = if is_new_note {
-                "note_create"
-            } else {
-                "note_edit"
-            };
-            self.apply_class_passive(note_trigger, word_count)?;
-            self.reload_data()?;
-            self.editor_state = None;
-            self.active_screen = ActiveScreen::Workspace;
-            self.workspace_tab_idx = 1;
-            return Ok(());
-        }
-
         if state.editing_title {
             match key.code {
                 KeyCode::Esc => {
@@ -6036,17 +6384,27 @@ impl App {
                         // Editing existing note — Esc returns to body without discarding
                         state.editing_title = false;
                         state.mode = EditorMode::Normal;
+                    } else if state.has_unsaved_changes() {
+                        state.confirm_close = true;
                     } else {
-                        // New note — Esc cancels creation
+                        let quick_note = state.quick_note;
                         self.editor_state = None;
-                        self.active_screen = ActiveScreen::Workspace;
+                        self.active_screen = if quick_note {
+                            ActiveScreen::Dashboard
+                        } else {
+                            ActiveScreen::Workspace
+                        };
                     }
                 }
                 KeyCode::Enter | KeyCode::Tab | KeyCode::Down => {
                     state.editing_title = false;
-                    state.cursor_y = 0;
-                    state.cursor_x = 0;
-                    state.mode = EditorMode::Insert;
+                    if state.quick_note {
+                        state.editing_project = true;
+                    } else {
+                        state.cursor_y = 0;
+                        state.cursor_x = 0;
+                        state.mode = EditorMode::Insert;
+                    }
                 }
                 KeyCode::Backspace => {
                     if is_ctrl_backspace(key) {
@@ -6059,6 +6417,41 @@ impl App {
                     if state.title.len() < 50 {
                         state.title.push(c);
                     }
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
+
+        if state.editing_project {
+            match key.code {
+                KeyCode::Esc | KeyCode::BackTab => {
+                    state.editing_project = false;
+                    state.editing_title = true;
+                }
+                KeyCode::Left | KeyCode::Up | KeyCode::Char('h') | KeyCode::Char('k') => {
+                    let len = state.project_choices.len();
+                    if len > 0 {
+                        state.project_choice_idx = if state.project_choice_idx > 0 {
+                            state.project_choice_idx - 1
+                        } else {
+                            len - 1
+                        };
+                        state.project_id = state.project_choices[state.project_choice_idx].0;
+                    }
+                }
+                KeyCode::Right | KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('l') => {
+                    let len = state.project_choices.len();
+                    if len > 0 {
+                        state.project_choice_idx = (state.project_choice_idx + 1) % len;
+                        state.project_id = state.project_choices[state.project_choice_idx].0;
+                    }
+                }
+                KeyCode::Enter | KeyCode::Tab => {
+                    state.editing_project = false;
+                    state.cursor_y = 0;
+                    state.cursor_x = 0;
+                    state.mode = EditorMode::Insert;
                 }
                 _ => {}
             }
@@ -6079,9 +6472,16 @@ impl App {
                 EditorMode::Normal => {
                     if !state.pending_cmd.is_empty() {
                         state.pending_cmd.clear();
+                    } else if state.has_unsaved_changes() {
+                        state.confirm_close = true;
                     } else {
+                        let quick_note = state.quick_note;
                         self.editor_state = None;
-                        self.active_screen = ActiveScreen::Workspace;
+                        self.active_screen = if quick_note {
+                            ActiveScreen::Dashboard
+                        } else {
+                            ActiveScreen::Workspace
+                        };
                     }
                 }
             }
@@ -6107,7 +6507,11 @@ impl App {
                 KeyCode::Enter => state.handle_enter(),
                 KeyCode::Tab => state.handle_tab(),
                 KeyCode::BackTab => {
-                    state.editing_title = true;
+                    if state.quick_note {
+                        state.editing_project = true;
+                    } else {
+                        state.editing_title = true;
+                    }
                 }
                 KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -6661,6 +7065,8 @@ impl App {
     }
 
     fn handle_top_screen_key(&mut self, key: KeyEvent) -> Result<()> {
+        let nav_code = Self::navigation_key_code(key);
+
         if self.active_screen == ActiveScreen::GreatChronicle
             && key.code == KeyCode::Esc
             && self.chapter_panel_focused
@@ -6670,7 +7076,7 @@ impl App {
         }
 
         if self.active_screen == ActiveScreen::GreatChronicle
-            && key.code == KeyCode::Left
+            && nav_code == KeyCode::Left
             && self.chapter_panel_focused
         {
             self.chapter_panel_focused = false;
@@ -6678,7 +7084,7 @@ impl App {
         }
 
         if self.active_screen == ActiveScreen::GreatChronicle
-            && key.code == KeyCode::Right
+            && nav_code == KeyCode::Right
             && !self.chapter_panel_focused
         {
             self.chapter_panel_focused = true;
@@ -6687,7 +7093,7 @@ impl App {
 
         if self.active_screen == ActiveScreen::SyncSettings {
             match key.code {
-                KeyCode::Char('s') | KeyCode::Enter => {
+                KeyCode::Enter => {
                     if self.config.sync_enabled {
                         self.start_forced_sync();
                     } else {
@@ -6734,6 +7140,21 @@ impl App {
                     );
                     return Ok(());
                 }
+                KeyCode::Char('T') => {
+                    if self.external_notifications {
+                        crate::services::notifications::send_system_notification_with_icon(
+                            "Questline OS Alert Test",
+                            "If you can see this, macOS notifications are working.",
+                            false,
+                            crate::services::notifications::NotificationIcon::Info,
+                        );
+                        self.sync_status_msg = "OS alert test sent.".to_string();
+                    } else {
+                        self.sync_status_msg =
+                            "OS Alerts are disabled. Press [n] to enable them.".to_string();
+                    }
+                    return Ok(());
+                }
                 KeyCode::Char('c') => {
                     match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
                         Ok(_) => {
@@ -6776,11 +7197,11 @@ impl App {
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
                                 let json = db
-                                    .export_to_json()
+                                    .export_to_recovery_json()
                                     .map_err(|e| format!("Export failed: {}", e))?;
                                 let client = crate::services::api_client::ApiClient::new(
                                     &server_url,
-                                    identity,
+                                    identity.clone(),
                                     &device_id,
                                 );
                                 client
@@ -6790,7 +7211,24 @@ impl App {
                                     "last_auto_backup",
                                     &chrono::Utc::now().to_rfc3339(),
                                 );
-                                Ok("Cloud Backup Successful!".to_string())
+
+                                let sync_result = db.queue_full_state_sync().and_then(|_| {
+                                    crate::services::sync_engine::SyncEngine::new(
+                                        &db,
+                                        &identity,
+                                        &device_id,
+                                        Some(&server_url),
+                                    )?
+                                    .push_pending_only()
+                                    .map(|_| ())
+                                });
+                                match sync_result {
+                                    Ok(()) => Ok("Cloud Backup Successful!".to_string()),
+                                    Err(error) => Ok(format!(
+                                        "Cloud Backup Successful! Sync snapshot warning: {}",
+                                        error
+                                    )),
+                                }
                             })();
                             if let Ok(mut slot) = result_slot.lock() {
                                 *slot = Some(outcome);
@@ -6801,7 +7239,15 @@ impl App {
                     }
                     return Ok(());
                 }
+                KeyCode::Char('R') => {
+                    self.start_cloud_sync_reset();
+                    return Ok(());
+                }
                 KeyCode::Char('r') => {
+                    if key.modifiers.contains(KeyModifiers::SHIFT) {
+                        self.start_cloud_sync_reset();
+                        return Ok(());
+                    }
                     if self.config.sync_enabled {
                         // Show progress modal immediately and run the restore in the background
                         self.modal_state = ModalType::CloudRestoreProgress {
@@ -6869,43 +7315,54 @@ impl App {
                             let (backup_in_progress, backup_message) = if self.config.sync_enabled {
                                 // El upload a nube corre en hilo aparte — el modal se abre sin esperar
                                 let result_slot = std::sync::Arc::clone(&self.export_backup_result);
-                                if let Ok(json) = self.db.export_to_json() {
-                                    let server_url = self.server_url.clone();
-                                    let identity = self.identity.clone();
-                                    let device_id = self.device_id.clone();
-                                    let backup_display = backup_path.display().to_string();
-                                    std::thread::spawn(move || {
+                                let server_url = self.server_url.clone();
+                                let identity = self.identity.clone();
+                                let device_id = self.device_id.clone();
+                                let backup_display = backup_path.display().to_string();
+                                std::thread::spawn(move || {
+                                    let outcome: Result<String, String> = (|| {
+                                        let storage_dir = crate::storage::get_storage_dir()
+                                            .map_err(|e| format!("Storage error: {}", e))?;
+                                        let db_path = storage_dir.join("questline.db");
+                                        let db = crate::database::Database::new(&db_path)
+                                            .map_err(|e| format!("Database error: {}", e))?;
+                                        let fresh_json = db
+                                            .export_to_recovery_json()
+                                            .map_err(|e| format!("Export failed: {}", e))?;
                                         let client = crate::services::api_client::ApiClient::new(
                                             &server_url,
-                                            identity,
+                                            identity.clone(),
                                             &device_id,
                                         );
-                                        let outcome = match client
-                                            .send_request("POST", "recovery", &json)
-                                        {
-                                            Ok(_) => Ok(format!(
-                                                "Profile exported & cloud backup saved! Local: {}",
-                                                backup_display
-                                            )),
-                                            Err(e) => Err(format!(
-                                                "Profile exported to {} (cloud backup failed: {})",
-                                                backup_display, e
-                                            )),
-                                        };
-                                        if let Ok(mut slot) = result_slot.lock() {
-                                            *slot = Some(outcome);
-                                        }
-                                    });
-                                    (true, "Sealing your chronicle into the Æther... do not import on the new device until the backup completes.".to_string())
-                                } else {
-                                    (
-                                        false,
-                                        format!(
-                                            "Profile exported! Backup saved to {}",
-                                            backup_path.display()
-                                        ),
-                                    )
-                                }
+                                        client
+                                            .send_request("POST", "recovery", &fresh_json)
+                                            .map_err(|e| format!("Upload failed: {}", e))?;
+                                        let sync_result =
+                                            db.queue_full_state_sync().and_then(|_| {
+                                                crate::services::sync_engine::SyncEngine::new(
+                                                    &db,
+                                                    &identity,
+                                                    &device_id,
+                                                    Some(&server_url),
+                                                )?
+                                                .push_pending_only()
+                                                .map(|_| ())
+                                            });
+                                        let warning = sync_result
+                                            .err()
+                                            .map(|e| format!(" Sync snapshot warning: {}", e))
+                                            .unwrap_or_default();
+                                        Ok(format!(
+                                            "Profile exported & cloud backup saved! Local: {}{}",
+                                            backup_display, warning
+                                        ))
+                                    })(
+                                    );
+                                    if let Ok(mut slot) = result_slot.lock() {
+                                        *slot = Some(outcome);
+                                    }
+                                });
+                                (true, "Sealing your chronicle into the Æther... do not import on the new device until this completes.".to_string())
                             } else {
                                 (
                                     false,
@@ -6946,6 +7403,37 @@ impl App {
                     };
                     return Ok(());
                 }
+                KeyCode::Char('C') => {
+                    let sync_logs = self
+                        .db
+                        .conn
+                        .query_row(
+                            "SELECT COUNT(*) FROM sync_log WHERE synced = 1",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap_or(0) as usize;
+                    let processed_events = self
+                        .db
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM processed_remote_events", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap_or(0) as usize;
+                    let revisions = self
+                        .db
+                        .conn
+                        .query_row("SELECT COUNT(*) FROM revisions", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .unwrap_or(0) as usize;
+                    self.modal_state = ModalType::ConfirmCleanupLocalHistory {
+                        sync_logs,
+                        processed_events,
+                        revisions,
+                    };
+                    return Ok(());
+                }
                 _ => {}
             }
         }
@@ -6955,7 +7443,7 @@ impl App {
             return Ok(());
         }
 
-        match key.code {
+        match nav_code {
             // Los atajos 1-9 solo aplican fuera del Workspace — ahí el 1-4 son sub-tabs.
             KeyCode::Char('1') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Dashboard;
@@ -7085,6 +7573,25 @@ impl App {
             KeyCode::Char('A') if self.active_screen == ActiveScreen::Projects => {
                 self.active_screen = ActiveScreen::Archive;
                 self.active_tab_idx = 10;
+            }
+            KeyCode::Char('C') if self.active_screen == ActiveScreen::Projects => {
+                let active: Vec<&Project> = self
+                    .projects
+                    .iter()
+                    .filter(|project| !project.archived && !project.completed)
+                    .collect();
+                if self.projects_all_selected {
+                    self.active_project_id = None;
+                    self.task_calendar =
+                        Some(TaskCalendarState::month_planner(Local::now().date_naive()));
+                } else if let Some(project) = active.get(self.selected_project_idx) {
+                    self.active_project_id = Some(project.id);
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 0;
+                    self.reload_data()?;
+                    self.task_calendar =
+                        Some(TaskCalendarState::month_planner(Local::now().date_naive()));
+                }
             }
             KeyCode::Char('g') | KeyCode::Char('G')
                 if self.active_screen == ActiveScreen::Library =>
@@ -7752,6 +8259,7 @@ impl App {
                                         name: invite.2.clone(),
                                         description: Some("Fellowship shared project".to_string()),
                                         created_at: Utc::now(),
+                                        updated_at: Utc::now(),
                                         archived: false,
                                         completed: false,
                                         owner_identity: Some(invite.3.clone()),
@@ -8145,6 +8653,20 @@ impl App {
         Ok(())
     }
 
+    fn navigation_key_code(key: KeyEvent) -> KeyCode {
+        if !key.modifiers.is_empty() {
+            return key.code;
+        }
+
+        match key.code {
+            KeyCode::Char('h') => KeyCode::Left,
+            KeyCode::Char('j') => KeyCode::Down,
+            KeyCode::Char('k') => KeyCode::Up,
+            KeyCode::Char('l') => KeyCode::Right,
+            _ => key.code,
+        }
+    }
+
     fn handle_project_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let (mut name, mut name_cursor, mut desc, mut desc_cursor, mut focus_idx, is_edit, p_id) =
             match self.modal_state {
@@ -8522,6 +9044,7 @@ impl App {
                 name: name.trim().to_string(),
                 description: project_desc,
                 created_at: Utc::now(),
+                updated_at: Utc::now(),
                 archived: false,
                 completed: false,
                 owner_identity: Some(self.identity.public_key.clone()),
@@ -8559,19 +9082,30 @@ impl App {
         project_id: Uuid,
     ) -> Vec<(Option<Uuid>, Option<usize>)> {
         let mut flat: Vec<(Option<Uuid>, Option<usize>)> = Vec::new();
+        let project_codices: Vec<crate::models::Codex> = codices
+            .iter()
+            .filter(|c| c.project_id == project_id)
+            .cloned()
+            .collect();
         let proj_notes: Vec<(usize, &Note)> = notes
             .iter()
             .enumerate()
-            .filter(|(_, n)| n.project_id == Some(project_id))
+            .filter(|(_, n)| {
+                n.project_id == Some(project_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| project_codices.iter().any(|c| c.id == codex_id))
+                            .unwrap_or(true))
+            })
             .collect();
 
-        Self::append_codex_subtree(&mut flat, &proj_notes, codices, None);
+        Self::append_codex_subtree(&mut flat, &proj_notes, &project_codices, None);
 
         // grouped includes ALL notes in a codex, even inside collapsed ones (so they don't appear as ungrouped)
         let grouped: std::collections::HashSet<usize> = proj_notes
             .iter()
             .filter(|(_, n)| {
-                n.codex_id.is_some() && codices.iter().any(|c| Some(c.id) == n.codex_id)
+                n.codex_id.is_some() && project_codices.iter().any(|c| Some(c.id) == n.codex_id)
             })
             .map(|(i, _)| *i)
             .collect();
@@ -8581,7 +9115,7 @@ impl App {
             .map(|(i, n)| (*i, *n))
             .collect();
         ungrouped.sort_by(|(_, a), (_, b)| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
-        if !codices.is_empty() && !ungrouped.is_empty() {
+        if !ungrouped.is_empty() {
             flat.push((None, None)); // divider
         }
         for (idx, _) in ungrouped {
@@ -8642,6 +9176,91 @@ impl App {
             .filter(|c| c.id != codex_id && !descendants.contains(&c.id))
             .map(|c| c.id)
             .collect()
+    }
+
+    pub fn build_scroll_destinations(
+        projects: &[Project],
+        codices: &[crate::models::Codex],
+    ) -> Vec<ScrollDestination> {
+        let mut destinations = Vec::new();
+        for project in projects.iter().filter(|project| !project.archived) {
+            destinations.push(ScrollDestination {
+                project_id: project.id,
+                project_name: project.name.clone(),
+                codex_id: None,
+                codex_name: None,
+                parent_codex_name: None,
+            });
+            for codex in codices
+                .iter()
+                .filter(|codex| codex.project_id == project.id)
+            {
+                destinations.push(ScrollDestination {
+                    project_id: project.id,
+                    project_name: project.name.clone(),
+                    codex_id: Some(codex.id),
+                    codex_name: Some(codex.name.clone()),
+                    parent_codex_name: codex.parent_codex_id.and_then(|parent_id| {
+                        codices
+                            .iter()
+                            .find(|candidate| candidate.id == parent_id)
+                            .map(|parent| parent.name.clone())
+                    }),
+                });
+            }
+        }
+        destinations
+    }
+
+    fn scroll_destinations(&self) -> Result<Vec<ScrollDestination>> {
+        let mut all_codices = Vec::new();
+        for project in self.projects.iter().filter(|project| !project.archived) {
+            all_codices.extend(self.db.get_codices_for_project(project.id)?);
+        }
+        Ok(Self::build_scroll_destinations(
+            &self.projects,
+            &all_codices,
+        ))
+    }
+
+    fn reset_workspace_pane_focus(&mut self) {
+        self.workspace_sidebar_focused = false;
+        self.note_preview_focused = false;
+    }
+
+    fn cycle_workspace_pane_focus(&mut self, reverse: bool) {
+        match self.workspace_tab_idx {
+            // Quests and Overview have two focusable panes: workspace menu and content.
+            0 | 3 => {
+                self.note_preview_focused = false;
+                self.workspace_sidebar_focused = !self.workspace_sidebar_focused;
+            }
+            // Scrolls has three focusable panes: workspace menu, scroll list, and preview.
+            1 => {
+                let current = if self.workspace_sidebar_focused {
+                    0
+                } else if self.note_preview_focused {
+                    2
+                } else {
+                    1
+                };
+                let next = if reverse {
+                    if current == 0 { 2 } else { current - 1 }
+                } else {
+                    (current + 1) % 3
+                };
+                self.workspace_sidebar_focused = next == 0;
+                self.note_preview_focused = next == 2;
+                if self.note_preview_focused {
+                    self.note_preview_scroll = 0;
+                }
+            }
+            // Chronicles currently has only one content pane, so Tab stays local/no-op there.
+            _ => {
+                self.workspace_sidebar_focused = false;
+                self.note_preview_focused = false;
+            }
+        }
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -8709,7 +9328,17 @@ impl App {
         let proj_notes: Vec<Note> = self
             .all_notes
             .iter()
-            .filter(|n| n.project_id == Some(p_id))
+            .filter(|n| {
+                n.project_id == Some(p_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| {
+                                self.codices
+                                    .iter()
+                                    .any(|c| c.id == codex_id && c.project_id == p_id)
+                            })
+                            .unwrap_or(true))
+            })
             .filter(|n| {
                 if !self.search_query.is_empty() {
                     n.title
@@ -8738,7 +9367,9 @@ impl App {
             .cloned()
             .collect();
 
-        match key.code {
+        let nav_code = Self::navigation_key_code(key);
+
+        match nav_code {
             KeyCode::Esc => {
                 if self.note_preview_focused {
                     self.note_preview_focused = false;
@@ -8757,56 +9388,39 @@ impl App {
                 self.searching = true;
                 self.search_query.clear();
             }
+            KeyCode::Char('C') => {
+                self.task_calendar =
+                    Some(TaskCalendarState::month_planner(Local::now().date_naive()));
+            }
             KeyCode::Char('1') => {
                 self.workspace_tab_idx = 0;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('2') => {
                 self.workspace_tab_idx = 1;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('3') => {
                 self.workspace_tab_idx = 2;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Char('4') => {
                 self.workspace_tab_idx = 3;
-                self.workspace_sidebar_focused = false;
+                self.reset_workspace_pane_focus();
             }
             KeyCode::Tab => {
-                self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
-                self.workspace_sidebar_focused = false;
+                self.cycle_workspace_pane_focus(false);
             }
             KeyCode::BackTab => {
-                self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
-                    self.workspace_tab_idx - 1
-                } else {
-                    3
-                };
-                self.workspace_sidebar_focused = false;
-            }
-            KeyCode::Left if self.note_preview_focused => {
-                self.note_preview_focused = false;
+                self.cycle_workspace_pane_focus(true);
             }
             KeyCode::Left
-                if !self.workspace_sidebar_focused
-                    && self.viewing_step_for_task.is_some()
-                    && self.workspace_tab_idx == 0 =>
+                if self.viewing_step_for_task.is_some()
+                    && self.workspace_tab_idx == 0
+                    && !self.workspace_sidebar_focused =>
             {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
-            }
-            KeyCode::Left if !self.workspace_sidebar_focused => {
-                self.workspace_sidebar_focused = true;
-            }
-            // → en tab de notas mueve el foco al panel de preview
-            KeyCode::Right
-                if !self.workspace_sidebar_focused
-                    && self.workspace_tab_idx == 1
-                    && !self.note_preview_focused =>
-            {
-                self.note_preview_focused = true;
-                self.note_preview_scroll = 0;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right
@@ -8823,18 +9437,17 @@ impl App {
                     }
                 }
             }
-            KeyCode::Right if self.workspace_sidebar_focused => {
-                self.workspace_sidebar_focused = false;
-            }
             KeyCode::Up if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
                     self.workspace_tab_idx - 1
                 } else {
                     3
                 };
+                self.note_preview_focused = false;
             }
             KeyCode::Down if self.workspace_sidebar_focused => {
                 self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
+                self.note_preview_focused = false;
             }
             KeyCode::Up if self.note_preview_focused => {
                 self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
@@ -8964,6 +9577,7 @@ impl App {
                             self.db.update_task(&t)?;
                             self.mark_dirty();
                             self.audio_player.play_task_complete();
+                            self.notify_task_completed(&t, true);
                             if !task.xp_awarded {
                                 let is_high = t.priority == TaskPriority::High;
                                 let xp = if is_high { 50 } else { 25 };
@@ -9034,6 +9648,7 @@ impl App {
                                 self.db.update_task(&t)?;
                                 self.mark_dirty();
                                 self.audio_player.play_task_complete();
+                                self.notify_task_completed(&t, false);
                                 if !task.xp_awarded {
                                     let is_high = t.priority == TaskPriority::High;
                                     let val = if is_high { 50 } else { 25 };
@@ -9088,35 +9703,9 @@ impl App {
                                     true,
                                 );
                                 self.maybe_spawn_task_completion_sprite();
-                                // Tarea recurrente — genera la siguiente ocurrencia automáticamente
-                                if let Some(recurrence) = t.recurrence {
-                                    let next_due = Self::advance_recurrence_date(
-                                        t.set_date.or(t.due_date),
-                                        recurrence,
-                                    );
-                                    let next_task = Task {
-                                        id: Uuid::new_v4(),
-                                        project_id: t.project_id,
-                                        title: t.title.clone(),
-                                        description: t.description.clone(),
-                                        due_date: Some(next_due),
-                                        set_date: Some(next_due),
-                                        completed: false,
-                                        priority: t.priority,
-                                        created_at: Utc::now(),
-                                        updated_at: Utc::now(),
-                                        owner_identity: t.owner_identity.clone(),
-                                        owner_username: t.owner_username.clone(),
-                                        parent_task_id: None,
-                                        xp_awarded: false,
-                                        recurrence: Some(recurrence),
-                                    };
-                                    let _ = self.db.insert_task(&next_task);
-                                    let recur_label = recurrence.name();
-                                    self.notifications.push(Notification::info(format!(
-                                        "Quest recurring! Next {} occurrence queued for {}.",
-                                        recur_label,
-                                        next_due.with_timezone(&Local).format("%Y-%m-%d")
+                                if let Err(error) = self.queue_next_recurring_quest(&t) {
+                                    self.notifications.push(Notification::warning(format!(
+                                        "The quest was completed, but its next recurrence could not be created: {error}"
                                     )));
                                 }
                                 self.reload_data()?;
@@ -9148,19 +9737,25 @@ impl App {
                     parent_codex_id,
                 };
             }
-            KeyCode::Char('r') if self.workspace_tab_idx == 1 => {
+            KeyCode::Char('r') | KeyCode::Char('R') if self.workspace_tab_idx == 1 => {
                 let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
                 match flat.get(self.selected_notes_flat_idx) {
                     Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
                         let note_id = proj_notes[*note_idx].id;
+                        let current_project_id = proj_notes[*note_idx].project_id;
                         let current_codex_id = proj_notes[*note_idx].codex_id;
-                        let selected_idx = current_codex_id
-                            .and_then(|cid| self.codices.iter().position(|c| c.id == cid))
-                            .map(|pos| pos + 1)
+                        let destinations = self.scroll_destinations()?;
+                        let selected_idx = destinations
+                            .iter()
+                            .position(|destination| {
+                                Some(destination.project_id) == current_project_id
+                                    && destination.codex_id == current_codex_id
+                            })
                             .unwrap_or(0);
                         self.modal_state = ModalType::RefileScroll {
                             note_id,
                             selected_idx,
+                            destinations,
                         };
                     }
                     Some((Some(codex_id), None)) => {
@@ -9516,11 +10111,10 @@ impl App {
                 is_step,
                 recurrence,
             } => {
-                // índice del bloque de steps — depende de si hay campo de valor de fecha
+                // índice del bloque de steps — depende de si hay valor de fecha y recurrencia
                 let has_due_value =
                     matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-                let set_date_focus = if has_due_value { 5usize } else { 4usize };
-                let recurrence_focus = set_date_focus + 1;
+                let recurrence_focus = if has_due_value { 5usize } else { 4usize };
                 let steps_focus = recurrence_focus + 1;
 
                 // Handle step-section keys when focus is on the steps list
@@ -9536,7 +10130,8 @@ impl App {
                         .into_iter()
                         .filter(|t| t.parent_task_id == Some(id))
                         .collect();
-                    match key.code {
+                    let nav_code = Self::navigation_key_code(key);
+                    match nav_code {
                         KeyCode::Up => {
                             let new_idx = if step_selected_idx > 0 {
                                 step_selected_idx - 1
@@ -9596,6 +10191,7 @@ impl App {
                                     self.db.update_task(&s)?;
                                     self.mark_dirty();
                                     self.audio_player.play_task_complete();
+                                    self.notify_task_completed(&s, true);
                                     if !step.xp_awarded {
                                         let is_high = s.priority == TaskPriority::High;
                                         let xp = if is_high { 50 } else { 25 };
@@ -9678,7 +10274,7 @@ impl App {
                         KeyCode::Char('e') => {
                             if let Some(step) = steps.get(step_selected_idx) {
                                 let today = Local::now().date_naive();
-                                let (due_type, due_val) = match step.due_date {
+                                let (due_type, due_val) = match step.due_date.or(step.set_date) {
                                     None => (DueDateType::None, String::new()),
                                     Some(d) => {
                                         let d_naive = d.with_timezone(&Local).date_naive();
@@ -9706,12 +10302,7 @@ impl App {
                                     priority: step.priority,
                                     due_date_type: due_type,
                                     due_date_val: due_val,
-                                    set_date_val: step
-                                        .set_date
-                                        .map(|d| {
-                                            d.with_timezone(&Local).format("%Y-%m-%d").to_string()
-                                        })
-                                        .unwrap_or_default(),
+                                    set_date_val: String::new(),
                                     focus_idx: 0,
                                     step_selected_idx: 0,
                                     is_step: true,
@@ -9761,6 +10352,7 @@ impl App {
                             project_id,
                             name: name.trim().to_string(),
                             created_at: Utc::now(),
+                            updated_at: Utc::now(),
                             parent_codex_id: pcid,
                             collapsed: false,
                         };
@@ -9850,7 +10442,7 @@ impl App {
         mut priority: TaskPriority,
         mut due_date_type: DueDateType,
         mut due_date_val: String,
-        mut set_date_val: String,
+        set_date_val: String,
         mut focus_idx: usize,
         parent_task_id: Option<Uuid>,
         step_selected_idx: usize,
@@ -9860,10 +10452,12 @@ impl App {
         // Recurrencia disponible solo para tareas padre (no pasos ni subtareas)
         let show_recurrence = !is_step && parent_task_id.is_none();
         let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
-        let set_date_focus: usize = if has_due_value { 5 } else { 4 };
-        // índice dinámico del campo de recurrencia — viene después de Set Date
-        let recurrence_focus: usize = set_date_focus + 1;
-        let steps_focus: usize = recurrence_focus + 1;
+        let recurrence_focus: usize = if has_due_value { 5 } else { 4 };
+        let steps_focus: usize = if show_recurrence {
+            recurrence_focus + 1
+        } else {
+            recurrence_focus
+        };
 
         let has_steps_section = task_id.is_some() && !is_step;
         let max_fields = if has_steps_section {
@@ -9871,12 +10465,23 @@ impl App {
         } else if show_recurrence {
             recurrence_focus
         } else if has_due_value {
-            set_date_focus
+            4
         } else {
-            set_date_focus
+            3
         };
         let next_focus = |idx: usize| -> usize { (idx + 1) % (max_fields + 1) };
         let prev_focus = |idx: usize| -> usize { if idx > 0 { idx - 1 } else { max_fields } };
+
+        if key.code == KeyCode::Char('c') && matches!(focus_idx, 3 | 4) {
+            let selected = if due_date_type == DueDateType::Specific {
+                NaiveDate::parse_from_str(due_date_val.trim(), "%Y-%m-%d")
+                    .unwrap_or_else(|_| Local::now().date_naive())
+            } else {
+                Local::now().date_naive()
+            };
+            self.task_calendar = Some(TaskCalendarState::date_picker(selected));
+            return Ok(());
+        }
 
         if focus_idx == 1 {
             self.ensure_task_desc_editor(project_id, &desc, desc_cursor, true);
@@ -9904,15 +10509,7 @@ impl App {
                     DueDateType::Specific => due_date_val.trim().to_string(),
                 };
                 let due_parsed = self.parse_due_date_input(&due_str);
-                let set_parsed = if set_date_val.trim().is_empty() {
-                    None
-                } else {
-                    self.parse_due_date_input(set_date_val.trim())
-                };
                 if due_date_type != DueDateType::None && due_parsed.is_none() {
-                    return Ok(());
-                }
-                if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                     return Ok(());
                 }
                 let xp_service = XPService::new(&self.db);
@@ -9923,7 +10520,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
-                        set_date: set_parsed,
+                        set_date: None,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -9958,7 +10555,7 @@ impl App {
                         title: title.trim().to_string(),
                         description: task_desc,
                         due_date: due_parsed,
-                        set_date: set_parsed,
+                        set_date: None,
                         completed: false,
                         priority,
                         created_at: Utc::now(),
@@ -10341,9 +10938,6 @@ impl App {
                     4 if has_due_value && due_date_val.len() < 20 => {
                         due_date_val.push(c);
                     }
-                    _ if focus_idx == set_date_focus && set_date_val.len() < 10 => {
-                        set_date_val.push(c);
-                    }
                     _ if show_recurrence && focus_idx == recurrence_focus && c == ' ' => {
                         recurrence = match recurrence {
                             None => Some(RecurrenceType::Daily),
@@ -10402,13 +10996,6 @@ impl App {
                             due_date_val.pop();
                         }
                     }
-                    _ if focus_idx == set_date_focus => {
-                        if is_ctrl_backspace(key) {
-                            delete_last_word(&mut set_date_val);
-                        } else {
-                            set_date_val.pop();
-                        }
-                    }
                     _ => {}
                 }
                 self.update_task_modal_state(
@@ -10463,17 +11050,8 @@ impl App {
                         DueDateType::Specific => due_date_val.trim().to_string(),
                     };
                     let due_parsed = self.parse_due_date_input(&due_str);
-                    let set_parsed = if set_date_val.trim().is_empty() {
-                        None
-                    } else {
-                        self.parse_due_date_input(set_date_val.trim())
-                    };
-
                     if due_date_type != DueDateType::None && due_parsed.is_none() {
                         // Do not save, wait for valid input
-                        return Ok(());
-                    }
-                    if !set_date_val.trim().is_empty() && set_parsed.is_none() {
                         return Ok(());
                     }
 
@@ -10485,7 +11063,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
-                            set_date: set_parsed,
+                            set_date: None,
                             completed: false, // kept
                             priority,
                             created_at: Utc::now(),
@@ -10529,7 +11107,7 @@ impl App {
                             title: title.trim().to_string(),
                             description: task_desc,
                             due_date: due_parsed,
-                            set_date: set_parsed,
+                            set_date: None,
                             completed: false,
                             priority,
                             created_at: Utc::now(),
@@ -10669,6 +11247,7 @@ impl App {
                     entry_date: Utc::now().date_naive(),
                     content: content.trim().to_string(),
                     created_at: Utc::now(),
+                    updated_at: Utc::now(),
                     visibility: "Private".to_string(),
                     author_username: author,
                 };
@@ -10690,48 +11269,6 @@ impl App {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    fn sync_screen_tab(&mut self) {
-        self.active_screen = match self.active_tab_idx {
-            0 => ActiveScreen::Dashboard,
-            1 => ActiveScreen::Projects,
-            2 => ActiveScreen::Character,
-            3 => ActiveScreen::Character,
-            4 => ActiveScreen::Library,
-            5 => ActiveScreen::Legends,
-            6 => ActiveScreen::Focus,
-            7 => ActiveScreen::Soundscapes,
-            8 => {
-                self.pull_invitations_async();
-                ActiveScreen::Fellowship
-            }
-            9 => ActiveScreen::Settings,
-            10 => ActiveScreen::Archive,
-            11 => ActiveScreen::Dashboard,
-            12 => ActiveScreen::SyncSettings,
-            13 => {
-                self.about_scroll = 0;
-                use rand::Rng;
-                self.about_fact_seed = rand::thread_rng().r#gen();
-                ActiveScreen::About
-            }
-            14 => {
-                self.great_chronicle_scroll = 0;
-                self.chapter_panel_scroll = 0;
-                self.chapter_panel_focused = false;
-                self.great_chronicle_entries =
-                    self.db.get_global_chronicle_entries().unwrap_or_default();
-                self.pull_great_chronicle_async();
-                self.pull_chapter_progress_async();
-                ActiveScreen::GreatChronicle
-            }
-            _ => ActiveScreen::Dashboard,
-        };
-        self.active_project_id = None; // Reset workspace focus
-        self.stats_cache.active_project_milestones.clear();
-        self.stats_cache.active_project_days = 0;
-    }
-
     // Calcula la siguiente fecha de una tarea recurrente — avanza por el período correcto
     fn advance_recurrence_date(
         due_date: Option<DateTime<Utc>>,
@@ -10749,6 +11286,204 @@ impl App {
                 .checked_add_months(Months::new(12))
                 .unwrap_or(base + chrono::Duration::days(365)),
         }
+    }
+
+    fn shift_calendar_month(date: NaiveDate, delta: i32) -> NaiveDate {
+        use chrono::Datelike;
+        let month_index = date.year() * 12 + date.month0() as i32 + delta;
+        let year = month_index.div_euclid(12);
+        let month = month_index.rem_euclid(12) as u32 + 1;
+        let next_month_index = month_index + 1;
+        let next_year = next_month_index.div_euclid(12);
+        let next_month = next_month_index.rem_euclid(12) as u32 + 1;
+        let last_day = NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .expect("valid calendar month")
+            .pred_opt()
+            .expect("calendar month has a previous day")
+            .day();
+        NaiveDate::from_ymd_opt(year, month, date.day().min(last_day))
+            .expect("clamped calendar date")
+    }
+
+    fn apply_calendar_date(modal: &mut ModalType, selected: NaiveDate) {
+        let value = selected.format("%Y-%m-%d").to_string();
+        match modal {
+            ModalType::NewTask {
+                due_date_type,
+                due_date_val,
+                focus_idx,
+                ..
+            }
+            | ModalType::EditTask {
+                due_date_type,
+                due_date_val,
+                focus_idx,
+                ..
+            } => {
+                *due_date_type = DueDateType::Specific;
+                *due_date_val = value;
+                *focus_idx = 4;
+            }
+            _ => {}
+        }
+    }
+
+    fn new_task_modal_for_calendar_date(selected: NaiveDate) -> ModalType {
+        ModalType::NewTask {
+            title: String::new(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::Specific,
+            due_date_val: selected.format("%Y-%m-%d").to_string(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        }
+    }
+
+    fn begin_task_from_calendar(&mut self, selected: NaiveDate) {
+        if self.active_project_id.is_some() {
+            self.modal_state = Self::new_task_modal_for_calendar_date(selected);
+        } else {
+            self.pending_calendar_due_date = Some(selected);
+            self.modal_state = ModalType::SelectProjectForAction {
+                action_id: "create_task",
+                selected_idx: 0,
+            };
+        }
+        self.task_calendar = None;
+    }
+
+    fn handle_task_calendar_key(&mut self, key: KeyEvent) {
+        let Some(mut calendar) = self.task_calendar else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.task_calendar = None;
+                return;
+            }
+            KeyCode::Left | KeyCode::Char('h') => {
+                calendar.selected -= chrono::Duration::days(1);
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                calendar.selected += chrono::Duration::days(1);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                calendar.selected -= chrono::Duration::days(7);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                calendar.selected += chrono::Duration::days(7);
+            }
+            KeyCode::PageUp | KeyCode::Char('[') => {
+                calendar.selected = Self::shift_calendar_month(calendar.selected, -1);
+            }
+            KeyCode::PageDown | KeyCode::Char(']') => {
+                calendar.selected = Self::shift_calendar_month(calendar.selected, 1);
+            }
+            KeyCode::Home | KeyCode::Char('g') => {
+                calendar.selected = Local::now().date_naive();
+            }
+            KeyCode::Char('a') if calendar.planner_mode && self.active_project_id.is_some() => {
+                calendar.show_all_projects = !calendar.show_all_projects;
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if calendar.planner_mode {
+                    self.begin_task_from_calendar(calendar.selected);
+                } else if self.overlay_modal != ModalType::None {
+                    Self::apply_calendar_date(&mut self.overlay_modal, calendar.selected);
+                } else {
+                    Self::apply_calendar_date(&mut self.modal_state, calendar.selected);
+                }
+                self.task_calendar = None;
+                return;
+            }
+            KeyCode::Char('n') if calendar.planner_mode => {
+                self.begin_task_from_calendar(calendar.selected);
+                return;
+            }
+            _ => {}
+        }
+        self.task_calendar = Some(calendar);
+    }
+
+    fn build_next_recurring_quest(
+        source: &Task,
+        source_steps: &[Task],
+        now: DateTime<Utc>,
+    ) -> Option<(Task, Vec<Task>, DateTime<Utc>)> {
+        let recurrence = source.recurrence?;
+        let next_due =
+            Self::advance_recurrence_date(source.due_date.or(source.set_date), recurrence);
+        let next_id = Uuid::new_v4();
+        let next_task = Task {
+            id: next_id,
+            project_id: source.project_id,
+            title: source.title.clone(),
+            description: source.description.clone(),
+            due_date: Some(next_due),
+            set_date: None,
+            completed: false,
+            priority: source.priority,
+            created_at: now,
+            updated_at: now,
+            owner_identity: source.owner_identity.clone(),
+            owner_username: source.owner_username.clone(),
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: Some(recurrence),
+        };
+        let next_steps = source_steps
+            .iter()
+            .filter(|step| step.parent_task_id == Some(source.id))
+            .map(|step| Task {
+                id: Uuid::new_v4(),
+                project_id: source.project_id,
+                title: step.title.clone(),
+                description: step.description.clone(),
+                due_date: step
+                    .due_date
+                    .or(step.set_date)
+                    .map(|date| Self::advance_recurrence_date(Some(date), recurrence)),
+                set_date: None,
+                completed: false,
+                priority: step.priority,
+                created_at: now,
+                updated_at: now,
+                owner_identity: step.owner_identity.clone(),
+                owner_username: step.owner_username.clone(),
+                parent_task_id: Some(next_id),
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .collect();
+        Some((next_task, next_steps, next_due))
+    }
+
+    fn queue_next_recurring_quest(&mut self, source: &Task) -> Result<()> {
+        let source_steps: Vec<Task> = self
+            .all_tasks
+            .iter()
+            .filter(|task| task.parent_task_id == Some(source.id))
+            .cloned()
+            .collect();
+        let Some((next_task, next_steps, next_due)) =
+            Self::build_next_recurring_quest(source, &source_steps, Utc::now())
+        else {
+            return Ok(());
+        };
+        self.db.insert_task_tree(&next_task, &next_steps)?;
+        let recurrence = source.recurrence.expect("recurrence checked above");
+        self.notifications.push(Notification::info(format!(
+            "Quest recurring! Next {} occurrence queued for {} with {} reusable step{}.",
+            recurrence.name(),
+            next_due.with_timezone(&Local).format("%Y-%m-%d"),
+            next_steps.len(),
+            if next_steps.len() == 1 { "" } else { "s" }
+        )));
+        Ok(())
     }
 
     // Helper function to parse due date inputs, including today, tomorrow, and 'in X days'.
@@ -11019,7 +11754,8 @@ impl App {
         let Some(target) = local_days_from_now_at_noon(days) else {
             return Ok(());
         };
-        task.set_date = Some(target);
+        task.due_date = Some(target);
+        task.set_date = None;
         self.db.update_task(&task)?;
         self.mark_dirty();
         let label = if days == 1 {
@@ -11111,6 +11847,7 @@ impl App {
         self.db.update_task(&t)?;
         self.mark_dirty();
         self.audio_player.play_task_complete();
+        self.notify_task_completed(&t, false);
         if !already_awarded {
             let is_high = t.priority == TaskPriority::High;
             let val = if is_high { 50 } else { 25 };
@@ -11158,26 +11895,10 @@ impl App {
         };
         self.push_great_chronicle_async("QuestComplete", &chronicle_desc, true);
         self.maybe_spawn_task_completion_sprite();
-        if let Some(recurrence) = t.recurrence {
-            let next_due = Self::advance_recurrence_date(t.set_date.or(t.due_date), recurrence);
-            let next_task = Task {
-                id: Uuid::new_v4(),
-                project_id: t.project_id,
-                title: t.title.clone(),
-                description: t.description.clone(),
-                due_date: Some(next_due),
-                set_date: Some(next_due),
-                completed: false,
-                priority: t.priority,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-                owner_identity: t.owner_identity.clone(),
-                owner_username: t.owner_username.clone(),
-                parent_task_id: None,
-                xp_awarded: false,
-                recurrence: Some(recurrence),
-            };
-            let _ = self.db.insert_task(&next_task);
+        if let Err(error) = self.queue_next_recurring_quest(&t) {
+            self.notifications.push(Notification::warning(format!(
+                "The quest was completed, but its next recurrence could not be created: {error}"
+            )));
         }
         self.reload_data()?;
         self.maybe_show_support_realm_prompt()?;
@@ -12431,7 +13152,7 @@ impl App {
                     self.note_preview_focused = true;
                     if let Ok(note_uuid) = uuid::Uuid::parse_str(&result.item_id) {
                         self.reload_data()?;
-                        let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
+                        let notes = self.db.get_notes().unwrap_or_default();
                         let Some(note_idx) = notes.iter().position(|n| n.id == note_uuid) else {
                             return Ok(());
                         };
@@ -12451,7 +13172,7 @@ impl App {
                         }
 
                         self.reload_data()?;
-                        let notes = self.db.get_notes_for_project(p_id).unwrap_or_default();
+                        let notes = self.db.get_notes().unwrap_or_default();
                         let codices = self.db.get_codices_for_project(p_id).unwrap_or_default();
                         let Some(note_idx) = notes.iter().position(|n| n.id == note_uuid) else {
                             return Ok(());
@@ -12730,7 +13451,7 @@ impl App {
             },
             CommandAction {
                 name: "Create Note",
-                description: "Create a new note, with campaign picker if needed",
+                description: "Open a new scroll and choose its campaign",
                 shortcut: "Ctrl+N",
                 id: "create_note",
             },
@@ -12805,6 +13526,26 @@ impl App {
         }
     }
 
+    fn open_quick_note_editor(&mut self) {
+        let project_choices: Vec<(Uuid, String)> = self
+            .projects
+            .iter()
+            .filter(|project| !project.archived && !project.completed)
+            .map(|project| (project.id, project.name.clone()))
+            .collect();
+
+        if let Some(state) = EditorState::new_quick_note(project_choices, self.active_project_id) {
+            self.modal_state = ModalType::None;
+            self.editor_state = Some(state);
+            self.active_screen = ActiveScreen::Editor;
+        } else {
+            self.modal_state = ModalType::None;
+            self.notifications.push(Notification::warning(
+                "Create an active campaign before writing a scroll.",
+            ));
+        }
+    }
+
     pub fn execute_command_action(&mut self, action_id: &str) -> Result<()> {
         self.modal_state = ModalType::None;
         match action_id {
@@ -12876,6 +13617,7 @@ impl App {
                 };
             }
             "create_task" => {
+                self.pending_calendar_due_date = None;
                 if self.active_project_id.is_some() {
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
@@ -12884,8 +13626,8 @@ impl App {
                         desc: String::new(),
                         desc_cursor: 0,
                         priority: TaskPriority::Medium,
-                        due_date_type: DueDateType::InDays,
-                        due_date_val: "1".to_string(),
+                        due_date_type: DueDateType::None,
+                        due_date_val: String::new(),
                         set_date_val: String::new(),
                         focus_idx: 0,
                         parent_task_id: None,
@@ -12898,20 +13640,7 @@ impl App {
                     };
                 }
             }
-            "create_note" => {
-                if self.active_project_id.is_some() {
-                    self.active_screen = ActiveScreen::Workspace;
-                    self.workspace_tab_idx = 1;
-                    self.modal_state = ModalType::NewJournalEntry {
-                        content: String::new(),
-                    };
-                } else {
-                    self.modal_state = ModalType::SelectProjectForAction {
-                        action_id: "create_note",
-                        selected_idx: 0,
-                    };
-                }
-            }
+            "create_note" => self.open_quick_note_editor(),
             "start_focus" => {
                 self.active_screen = ActiveScreen::Focus;
             }
@@ -13042,7 +13771,7 @@ impl App {
             xp_service.grant_xp(u, label, bonus_xp)?;
         }
 
-        // Warlock Daemon Sync XP is shown in the sync footer instead of a notification
+        // Warlock Daemon Sync XP is shown in the sync footer instead of a notification.
         if class == ClassType::CodeWarlock && trigger == "sync_complete" {
             self.last_sync_warlock_xp = bonus_xp;
             return Ok(());
@@ -13702,9 +14431,15 @@ impl App {
                     None => {
                         self.sync_failure_count = 0;
                         self.sync_conflicts = bg.conflicts;
+                        if self.db.get_setting("auto_sync").ok().flatten().as_deref()
+                            == Some("false")
+                        {
+                            self.auto_sync = false;
+                        }
                         if !self.sync_conflicts.is_empty() {
+                            self.pause_auto_sync("Auto Sync disabled after sync conflicts.");
                             self.notifications.push(Notification::warning(format!(
-                                "{} sync conflict(s) detected — check revision history",
+                                "{} sync conflict(s) detected — automatic sync paused",
                                 self.sync_conflicts.len()
                             )));
                         }
@@ -13855,18 +14590,6 @@ impl App {
                 };
             }
         }
-    }
-
-    fn set_pull_cursor_to_remote_head(
-        db: &crate::database::Database,
-        client: &crate::services::api_client::ApiClient,
-    ) -> Result<()> {
-        let resp = client.send_request("GET", "sync/head", "")?;
-        let val: serde_json::Value = serde_json::from_str(&resp)?;
-        let seq = val["seq"].as_i64().unwrap_or(0);
-        db.set_setting("last_pull_seq", &seq.to_string())?;
-        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
-        Ok(())
     }
 
     fn local_folder_selected(&self) -> bool {
@@ -14130,12 +14853,16 @@ impl App {
                 };
                 match self.db.import_from_json(&decoded_json) {
                     Ok(_) => {
-                        let client = crate::services::api_client::ApiClient::new(
-                            &self.server_url,
-                            self.identity.clone(),
+                        let _ = App::anchor_restore_to_sync_head(
+                            &self.db,
+                            &self.identity,
                             &self.device_id,
+                            &self.server_url,
                         );
-                        let _ = App::set_pull_cursor_to_remote_head(&self.db, &client);
+                        let _ = self.db.set_setting("conflict_count", "0");
+                        self.pause_auto_sync(
+                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
+                        );
                         self.reload_data()?;
                         self.notifications.push(Notification::info(
                             "Chronicle restored from cloud!".to_string(),
@@ -14143,12 +14870,9 @@ impl App {
                         self.modal_state = ModalType::CloudRestoreProgress {
                             step: 2,
                             message:
-                                "Restore complete! Future sync starts from the current cloud state."
+                                "Restore complete. Automatic sync is paused until you manually sync."
                                     .to_string(),
                         };
-                        // Backup restore is a full snapshot. Set the cursor to server HEAD first
-                        // so old event-log history cannot replay over the restored database.
-                        self.start_background_sync();
                     }
                     Err(e) => {
                         self.modal_state = ModalType::CloudRestoreProgress {
@@ -14383,8 +15107,308 @@ impl App {
         Ok(())
     }
 
+    fn anchor_restore_to_sync_head(
+        db: &crate::database::Database,
+        identity: &Identity,
+        device_id: &str,
+        server_url: &str,
+    ) -> Result<()> {
+        let client =
+            crate::services::api_client::ApiClient::new(server_url, identity.clone(), device_id);
+        let response =
+            client.send_request("POST", "sync/pull?since_seq=0&limit=1&include_meta=1", "")?;
+        let value: serde_json::Value = serde_json::from_str(&response)?;
+        let head_seq = value
+            .get("head_seq")
+            .and_then(|v| v.as_i64())
+            .or_else(|| {
+                value.as_array().and_then(|events| {
+                    events
+                        .iter()
+                        .filter_map(|event| event.get("seq").and_then(|seq| seq.as_i64()))
+                        .max()
+                })
+            })
+            .unwrap_or(0);
+
+        db.set_setting("last_pull_seq", &head_seq.to_string())?;
+        db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
+        db.set_setting("last_sync_lag", "0")?;
+        db.set_setting("sync_restore_hold", "1")?;
+        db.set_setting("auto_sync", "false")?;
+        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+        let _ = db.conn.execute("UPDATE sync_log SET synced = 1", []);
+        Ok(())
+    }
+
     fn start_background_sync(&mut self) {
+        if !self.auto_sync {
+            self.sync_status_msg = "Auto Sync disabled. Toggle [a] to enable it.".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
         self.do_background_sync(false);
+    }
+
+    fn pause_auto_sync(&mut self, reason: &str) {
+        self.auto_sync = false;
+        let _ = self.db.set_setting("auto_sync", "false");
+        let _ = self.db.set_setting("sync_restore_hold", "1");
+        self.sync_status_msg = reason.to_string();
+        self.last_sync_status_time = Some(std::time::Instant::now());
+    }
+
+    fn scroll_links_are_safe_for_full_sync(&self) -> bool {
+        let counts = self.db.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes),
+                (SELECT COALESCE(SUM(project_id IS NULL), 0) FROM notes),
+                (SELECT COUNT(*) FROM tasks),
+                (SELECT COALESCE(SUM(project_id IS NULL), 0) FROM tasks)",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        );
+        match counts {
+            Ok((notes_total, projectless_notes, tasks_total, projectless_tasks)) => {
+                (notes_total == 0 || projectless_notes * 2 < notes_total)
+                    && (tasks_total == 0 || projectless_tasks * 2 < tasks_total)
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn local_db_is_safe_for_cloud_reset(db: &crate::database::Database) -> Result<()> {
+        let quick_check: String = db
+            .conn
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap_or_else(|e| format!("quick_check failed: {}", e));
+        if quick_check != "ok" {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: local database is malformed ({})",
+                quick_check
+            ));
+        }
+
+        let (
+            notes_total,
+            projectless_notes,
+            tasks_total,
+            projectless_tasks,
+            orphan_codex_refs,
+            mismatched_steps,
+        ): (i64, i64, i64, i64, i64, i64) = db.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes),
+                (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM tasks),
+                (SELECT COUNT(*) FROM tasks WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE COALESCE(s.project_id, '') != COALESCE(p.project_id, ''))",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )?;
+
+        if notes_total > 0 && projectless_notes > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} scrolls are missing project links",
+                projectless_notes
+            ));
+        }
+        if tasks_total > 0 && projectless_tasks * 2 >= tasks_total {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} of {} tasks are missing project links",
+                projectless_tasks,
+                tasks_total
+            ));
+        }
+        if orphan_codex_refs > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} scrolls reference missing codices",
+                orphan_codex_refs
+            ));
+        }
+        if mismatched_steps > 0 {
+            return Err(anyhow::anyhow!(
+                "Cloud reset refused: {} steps do not match their parent project",
+                mismatched_steps
+            ));
+        }
+        Ok(())
+    }
+
+    fn local_db_health_error(db: &crate::database::Database) -> Option<String> {
+        let quick_check: String = db
+            .conn
+            .query_row("PRAGMA quick_check;", [], |row| row.get(0))
+            .unwrap_or_else(|e| format!("quick_check failed: {}", e));
+        if quick_check != "ok" {
+            return Some(format!("local database is malformed ({})", quick_check));
+        }
+
+        let counts = db.conn.query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM notes WHERE project_id IS NULL),
+                (SELECT COUNT(*) FROM notes n LEFT JOIN codices c ON c.id = n.codex_id WHERE n.codex_id IS NOT NULL AND c.id IS NULL),
+                (SELECT COUNT(*) FROM tasks s JOIN tasks p ON p.id = s.parent_task_id WHERE COALESCE(s.project_id, '') != COALESCE(p.project_id, ''))",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)),
+        );
+        match counts {
+            Ok((projectless_notes, orphan_codices, mismatched_steps)) => {
+                if projectless_notes > 0 || orphan_codices > 0 || mismatched_steps > 0 {
+                    Some(format!(
+                        "{} projectless scrolls, {} orphan codices, {} step mismatches",
+                        projectless_notes, orphan_codices, mismatched_steps
+                    ))
+                } else {
+                    None
+                }
+            }
+            Err(e) => Some(format!("health check failed: {}", e)),
+        }
+    }
+
+    fn start_cloud_sync_reset(&mut self) {
+        if self.sync_in_progress {
+            self.sync_status_msg = "S󰓦".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
+        if !self.config.sync_enabled {
+            self.sync_status_msg = "Cloud reset requires Cloud Sync enabled".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            return;
+        }
+
+        self.sync_in_progress = true;
+        self.sync_status_msg = "Resetting cloud sync from this device...".to_string();
+        self.modal_state = ModalType::SyncProgress {
+            step: 0,
+            message: "Resetting cloud sync from local truth...".to_string(),
+        };
+
+        let result_slot = std::sync::Arc::clone(&self.sync_result);
+        let identity = self.identity.clone();
+        let device_id = self.device_id.clone();
+        let server_url = self.server_url.clone();
+
+        let _ = std::thread::spawn(move || {
+            let outcome: Result<(usize, usize, Vec<String>)> = (|| {
+                let storage_dir = crate::storage::get_storage_dir()?;
+                let db_path = storage_dir.join("questline.db");
+                let db = crate::database::Database::new(&db_path)?;
+                let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
+
+                Self::local_db_is_safe_for_cloud_reset(&db)?;
+
+                let client = crate::services::api_client::ApiClient::new(
+                    &server_url,
+                    identity.clone(),
+                    &device_id,
+                );
+                client.send_request("POST", "sync/reset", "{}")?;
+                if let Ok(status_resp) = client.send_request("GET", "sync/status", "") {
+                    if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status_resp) {
+                        let total = status
+                            .get("total_events")
+                            .and_then(|v| v.as_i64())
+                            .unwrap_or(-1);
+                        if total != 0 {
+                            return Err(anyhow::anyhow!(
+                                "Cloud reset verification failed: {} sync events remain",
+                                total
+                            ));
+                        }
+                    }
+                }
+
+                let queued = db.queue_full_state_sync()?;
+                let sync_engine = crate::services::sync_engine::SyncEngine::new(
+                    &db,
+                    &identity,
+                    &device_id,
+                    Some(&server_url),
+                )?;
+                let pushed = sync_engine.push_pending_only()?;
+
+                match db.export_to_recovery_json() {
+                    Ok(json) => match client.send_request("POST", "recovery", &json) {
+                        Ok(_) => {
+                            let _ = db
+                                .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
+                        }
+                        Err(e) => {
+                            let _ = db.set_setting(
+                                "last_recovery_upload_error",
+                                &format!("Cloud sync reset reseeded sync, but recovery upload failed: {}", e),
+                            );
+                        }
+                    },
+                    Err(e) => {
+                        let _ = db.set_setting(
+                            "last_recovery_upload_error",
+                            &format!(
+                                "Cloud sync reset reseeded sync, but recovery export failed: {}",
+                                e
+                            ),
+                        );
+                    }
+                }
+
+                if let Ok(head_resp) = client.send_request("GET", "sync/head", "") {
+                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&head_resp) {
+                        if let Some(seq) = value.get("seq").and_then(|v| v.as_i64()) {
+                            let _ = db.set_setting("last_pull_seq", &seq.to_string());
+                            let _ = db.set_setting("last_remote_head_seq", &seq.to_string());
+                            let _ = db.set_setting("last_sync_lag", "0");
+                        }
+                    }
+                }
+                let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                let _ = db.set_setting("sync_restore_hold", "0");
+                let _ = db.set_setting("conflict_count", "0");
+                let _ = db.set_setting(
+                    "last_quarantined_remote_page",
+                    "Cloud sync reset from clean local database",
+                );
+
+                Ok((pushed.max(queued), 0, Vec::new()))
+            })();
+
+            let bg = match outcome {
+                Ok((pushed, pulled, conflicts)) => BackgroundSyncResult {
+                    pushed,
+                    pulled,
+                    conflicts,
+                    error: None,
+                },
+                Err(e) => BackgroundSyncResult {
+                    pushed: 0,
+                    pulled: 0,
+                    conflicts: Vec::new(),
+                    error: Some(e.to_string()),
+                },
+            };
+            if let Ok(mut guard) = result_slot.lock() {
+                *guard = Some(bg);
+            }
+        });
     }
 
     fn start_forced_sync(&mut self) {
@@ -14393,11 +15417,17 @@ impl App {
             self.last_sync_status_time = Some(std::time::Instant::now());
             return;
         }
+        if !self.scroll_links_are_safe_for_full_sync() {
+            self.pause_auto_sync("Sync blocked: project links need recovery first.");
+            self.modal_state = ModalType::None;
+            return;
+        }
         self.sync_status_msg = "S󰓦".to_string();
         self.modal_state = ModalType::SyncProgress {
             step: 0,
             message: "Preparing full synchronization...".to_string(),
         };
+        let _ = self.db.set_setting("sync_restore_hold", "0");
         self.do_background_sync(true);
     }
 
@@ -14429,24 +15459,19 @@ impl App {
                     Some(server_url.as_str()),
                 )?;
                 if include_contributions {
-                    let _ = db.queue_full_state_sync();
+                    let _ = db.set_setting("sync_restore_hold", "0");
+                    db.queue_full_state_sync()
+                        .map_err(|e| anyhow::anyhow!("Full-state queue failed: {}", e))?;
                 }
-                let (pushed, first_pulled, mut conflicts) = sync_engine.sync()?;
-                // Drain: a pull returns up to 500 events per call. If exactly 500 came back
-                // there are likely more waiting — keep pulling until the batch is smaller.
-                // This matters after a restore when last_pull_seq resets to 0 and the device
-                // must catch up on thousands of events instead of waiting 30s per batch.
-                let mut total_pulled = first_pulled;
-                let mut last_batch = first_pulled;
-                let mut drain_iters = 0;
-                while last_batch >= 500 && drain_iters < 100 {
-                    let (_, more, more_conflicts) = sync_engine.sync()?;
-                    conflicts.extend(more_conflicts);
-                    total_pulled += more;
-                    last_batch = more;
-                    drain_iters += 1;
+                let (pushed, pulled, conflicts) = sync_engine.sync()?;
+                if let Some(health_error) = Self::local_db_health_error(&db) {
+                    let _ = db.set_setting("auto_sync", "false");
+                    let _ = db.set_setting("sync_restore_hold", "1");
+                    return Err(anyhow::anyhow!(
+                        "Sync left local DB unhealthy: {}",
+                        health_error
+                    ));
                 }
-                let pulled = total_pulled;
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);
@@ -14686,8 +15711,8 @@ impl App {
                             .unwrap_or(true)
                     }
                 };
-                if should_backup {
-                    if let Ok(json) = db.export_to_json() {
+                if should_backup && conflicts.is_empty() {
+                    if let Ok(json) = db.export_to_recovery_json() {
                         if client.send_request("POST", "recovery", &json).is_ok() {
                             let _ = db
                                 .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
@@ -15038,6 +16063,23 @@ impl App {
             return false;
         }
         true
+    }
+
+    fn notify_task_completed(&self, task: &Task, is_step: bool) {
+        if !self.external_notifications {
+            return;
+        }
+        let title = if is_step {
+            "Step completed"
+        } else {
+            "Quest completed"
+        };
+        crate::services::notifications::send_system_notification_with_icon(
+            title,
+            &task.title,
+            false,
+            crate::services::notifications::NotificationIcon::TaskCompleted,
+        );
     }
 
     /// Called after a task is marked complete — occasionally spawns a Swarm response.
@@ -16490,7 +17532,7 @@ impl App {
 
         let now = chrono::Local::now();
         let hour = now.hour();
-        let in_active_hours = hour >= self.hydration_active_from && hour < self.hydration_active_to;
+        let in_active_hours = self.hydration_is_active_at_hour(hour);
 
         if !in_active_hours {
             // Outside active window — clear any pending timer so it rearms when active hours resume
@@ -16536,6 +17578,17 @@ impl App {
         }
 
         Ok(())
+    }
+
+    pub fn hydration_is_active_at_hour(&self, hour: u32) -> bool {
+        if self.hydration_active_from == self.hydration_active_to {
+            return true;
+        }
+        if self.hydration_active_from < self.hydration_active_to {
+            hour >= self.hydration_active_from && hour < self.hydration_active_to
+        } else {
+            hour >= self.hydration_active_from || hour < self.hydration_active_to
+        }
     }
 
     fn record_hydration_drink(&mut self, enforce_wait: bool) -> Result<()> {
@@ -16635,8 +17688,209 @@ fn build_project_stats(
 #[cfg(test)]
 mod app_tests {
     use super::*;
-    use crate::models::Season;
+    use crate::models::{Codex, Season};
     use std::path::Path;
+
+    #[test]
+    fn scroll_destinations_include_campaign_roots_and_codices() {
+        let now = Utc::now();
+        let first_project_id = Uuid::new_v4();
+        let second_project_id = Uuid::new_v4();
+        let archived_project_id = Uuid::new_v4();
+        let projects = vec![
+            Project {
+                id: first_project_id,
+                name: "Alpha".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+            Project {
+                id: second_project_id,
+                name: "Beta".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+            Project {
+                id: archived_project_id,
+                name: "Archived".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: true,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            },
+        ];
+        let alpha_codex_id = Uuid::new_v4();
+        let beta_codex_id = Uuid::new_v4();
+        let codices = vec![
+            Codex {
+                id: alpha_codex_id,
+                project_id: first_project_id,
+                name: "Alpha Codex".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            },
+            Codex {
+                id: beta_codex_id,
+                project_id: second_project_id,
+                name: "Beta Codex".to_string(),
+                created_at: now,
+                updated_at: now,
+                parent_codex_id: None,
+                collapsed: false,
+            },
+        ];
+
+        let destinations = App::build_scroll_destinations(&projects, &codices);
+
+        assert_eq!(destinations.len(), 4);
+        assert_eq!(
+            destinations
+                .iter()
+                .map(|destination| (destination.project_id, destination.codex_id))
+                .collect::<Vec<_>>(),
+            vec![
+                (first_project_id, None),
+                (first_project_id, Some(alpha_codex_id)),
+                (second_project_id, None),
+                (second_project_id, Some(beta_codex_id)),
+            ]
+        );
+        assert!(
+            destinations
+                .iter()
+                .all(|destination| destination.project_id != archived_project_id)
+        );
+    }
+
+    #[test]
+    fn recurring_quest_copies_steps_and_resets_completion() {
+        let now = Utc::now();
+        let source_id = Uuid::new_v4();
+        let source = Task {
+            id: source_id,
+            project_id: None,
+            title: "Weekly planning".to_string(),
+            description: Some("Prepare the week".to_string()),
+            due_date: Some(now),
+            set_date: Some(now + chrono::Duration::days(3)),
+            completed: true,
+            priority: TaskPriority::High,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: true,
+            recurrence: Some(RecurrenceType::Weekly),
+        };
+        let source_step = Task {
+            id: Uuid::new_v4(),
+            title: "Review calendar".to_string(),
+            description: Some("Look for conflicts".to_string()),
+            due_date: None,
+            set_date: Some(now + chrono::Duration::days(1)),
+            completed: true,
+            priority: TaskPriority::Medium,
+            parent_task_id: Some(source_id),
+            xp_awarded: true,
+            recurrence: None,
+            ..source.clone()
+        };
+
+        let (next, steps, next_due) =
+            App::build_next_recurring_quest(&source, &[source_step], now).unwrap();
+
+        assert_eq!(next_due, now + chrono::Duration::days(7));
+        assert!(!next.completed);
+        assert!(!next.xp_awarded);
+        assert_eq!(next.set_date, None);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].parent_task_id, Some(next.id));
+        assert_eq!(steps[0].title, "Review calendar");
+        assert!(!steps[0].completed);
+        assert!(!steps[0].xp_awarded);
+        assert_eq!(steps[0].recurrence, None);
+        assert_eq!(steps[0].due_date, Some(now + chrono::Duration::days(8)));
+        assert_eq!(steps[0].set_date, None);
+    }
+
+    #[test]
+    fn task_calendar_selects_a_specific_due_date_without_changing_recurrence() {
+        let mut modal = ModalType::NewTask {
+            title: "Fast capture".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 3,
+            parent_task_id: None,
+            recurrence: Some(RecurrenceType::Monthly),
+        };
+        let selected = NaiveDate::from_ymd_opt(2026, 8, 31).unwrap();
+
+        App::apply_calendar_date(&mut modal, selected);
+
+        assert!(matches!(
+            modal,
+            ModalType::NewTask {
+                due_date_type: DueDateType::Specific,
+                ref due_date_val,
+                recurrence: Some(RecurrenceType::Monthly),
+                ..
+            } if due_date_val == "2026-08-31"
+        ));
+        assert_eq!(
+            App::shift_calendar_month(selected, 1),
+            NaiveDate::from_ymd_opt(2026, 9, 30).unwrap()
+        );
+
+        let january_31 = Utc.with_ymd_and_hms(2026, 1, 31, 12, 0, 0).unwrap();
+        assert_eq!(
+            App::advance_recurrence_date(Some(january_31), RecurrenceType::Monthly).date_naive(),
+            NaiveDate::from_ymd_opt(2026, 2, 28).unwrap()
+        );
+        let leap_day = Utc.with_ymd_and_hms(2024, 2, 29, 12, 0, 0).unwrap();
+        assert_eq!(
+            App::advance_recurrence_date(Some(leap_day), RecurrenceType::Yearly).date_naive(),
+            NaiveDate::from_ymd_opt(2025, 2, 28).unwrap()
+        );
+
+        let planner = TaskCalendarState::month_planner(selected);
+        assert!(planner.planner_mode);
+        assert!(planner.show_all_projects);
+        let picker = TaskCalendarState::date_picker(selected);
+        assert!(!picker.planner_mode);
+
+        assert!(matches!(
+            App::new_task_modal_for_calendar_date(selected),
+            ModalType::NewTask {
+                due_date_type: DueDateType::Specific,
+                ref due_date_val,
+                set_date_val: ref legacy_set_date,
+                ..
+            } if due_date_val == "2026-08-31" && legacy_set_date.is_empty()
+        ));
+    }
 
     #[test]
     fn test_delete_word_before_cursor() {
@@ -16892,6 +18146,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -16970,6 +18225,81 @@ mod app_tests {
             }
             _ => panic!("Expected completed quest to build an EditTask modal"),
         }
+    }
+
+    #[test]
+    fn test_paste_into_quest_and_step_descriptions() {
+        let project_id = Uuid::new_v4();
+        let mut editor = None;
+        let mut quest_modal = ModalType::NewTask {
+            title: "Quest".to_string(),
+            desc: "Before  after".to_string(),
+            desc_cursor: "Before ".len(),
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: None,
+            recurrence: None,
+        };
+
+        assert!(App::paste_into_task_description(
+            &mut quest_modal,
+            &mut editor,
+            project_id,
+            "línea uno\r\nlínea dos"
+        ));
+        match quest_modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            } => {
+                assert_eq!(desc, "Before línea uno\nlínea dos after");
+                assert_eq!(desc_cursor, "Before línea uno\nlínea dos".len());
+            }
+            _ => panic!("Expected a quest modal"),
+        }
+
+        let mut step_modal = ModalType::NewTask {
+            title: "Step".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: Some(Uuid::new_v4()),
+            recurrence: None,
+        };
+        assert!(App::paste_into_task_description(
+            &mut step_modal,
+            &mut editor,
+            project_id,
+            "pasted step"
+        ));
+        match step_modal {
+            ModalType::NewTask {
+                desc, desc_cursor, ..
+            } => {
+                assert_eq!(desc, "pasted step");
+                assert_eq!(desc_cursor, "pasted step".len());
+            }
+            _ => panic!("Expected a step modal"),
+        }
+    }
+
+    #[test]
+    fn test_extract_url_supports_bare_and_markdown_links() {
+        assert_eq!(
+            extract_url("Visit https://questlinecli.com/docs."),
+            Some("https://questlinecli.com/docs")
+        );
+        assert_eq!(
+            extract_url("Read [the guide](https://questlinecli.com/guide)."),
+            Some("https://questlinecli.com/guide")
+        );
+        assert_eq!(extract_url("No link here."), None);
     }
 
     #[test]
@@ -17342,6 +18672,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -17358,6 +18689,7 @@ mod app_tests {
             xp_reward: 100,
             // Use a very old created_at so legacy age check passes
             created_at: Utc::now() - chrono::Duration::days(10),
+            updated_at: Utc::now(),
             tier: 0,
             template_id: String::new(), // legacy milestone — uses hardcoded checks
         };
@@ -17401,6 +18733,7 @@ mod app_tests {
             content: "Journal entry".to_string(),
             entry_date: chrono::Utc::now().date_naive(),
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             visibility: "Private".to_string(),
             author_username: String::new(),
         };
@@ -17452,6 +18785,7 @@ mod app_tests {
             reward_xp: 30,
             daily_target: 1,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
         };
         app.db.insert_ritual(&rit).unwrap();
         app.reload_data().unwrap();
@@ -17498,6 +18832,7 @@ mod app_tests {
             archived: false,
             completed: false,
             created_at: Utc::now(),
+            updated_at: Utc::now(),
             owner_identity: None,
             owner_username: None,
             is_shared: false,
@@ -17554,6 +18889,89 @@ mod app_tests {
         app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.task_sort, "DueDate");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn test_quick_note_shortcut_and_palette_action_save_a_scroll() {
+        let db_file = Path::new("test_questline_quick_note.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.config.sync_enabled = false;
+
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Quick Scribe".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: Utc::now(),
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Selected Campaign".to_string(),
+            description: None,
+            archived: false,
+            completed: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.reload_data().unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))
+            .unwrap();
+        let editor = app.editor_state.as_ref().expect("quick-note editor");
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert!(editor.quick_note);
+        assert_eq!(editor.project_id, project.id);
+
+        // Cancelling the dashboard shortcut returns to the dashboard.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
+
+        // The command-palette action opens the same title → campaign → body flow.
+        app.execute_command_action("create_note").unwrap();
+        for c in "Fast Note".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty()))
+                .unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.editor_state.as_ref().unwrap().editing_project);
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('H'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert_eq!(app.editor_state.as_ref().unwrap().note_id.is_some(), true);
+        assert!(!app.editor_state.as_ref().unwrap().has_unsaved_changes());
+        let notes = app.db.get_notes_for_project(project.id).unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(notes[0].title, "Fast Note");
+        assert_eq!(notes[0].markdown_content, "Hi");
+
+        // A clean editor closes without prompting: Insert → Normal → close.
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -17990,6 +19408,7 @@ mod app_tests {
             name: "Test Project".to_string(),
             description: None,
             created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
             archived: false,
             completed: false,
             owner_identity: None,

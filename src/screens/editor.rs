@@ -59,6 +59,17 @@ pub struct EditorState {
     pub note_id: Option<uuid::Uuid>,
     pub project_id: uuid::Uuid,
     pub editing_title: bool,
+    /// Quick notes opened from the dashboard/palette choose their campaign in-place.
+    pub quick_note: bool,
+    pub editing_project: bool,
+    pub project_choices: Vec<(uuid::Uuid, String)>,
+    pub project_choice_idx: usize,
+    pub saved_title: String,
+    pub saved_content: String,
+    pub saved_project_id: uuid::Uuid,
+    pub confirm_close: bool,
+    pub autosave_timer: std::time::Instant,
+    pub last_autosaved_at: Option<std::time::Instant>,
     pub codex_id: Option<uuid::Uuid>,
     // vim
     pub mode: EditorMode,
@@ -105,11 +116,13 @@ impl EditorState {
         initial_title: String,
         initial_content: String,
     ) -> Self {
+        let saved_title = initial_title.clone();
         let lines = if initial_content.is_empty() {
             vec![String::new()]
         } else {
             initial_content.lines().map(String::from).collect()
         };
+        let saved_content = lines.join("\n");
         // Existing notes open in Normal mode in the body; new notes start in title
         let editing_title = note_id.is_none();
         let mode = if note_id.is_some() {
@@ -125,6 +138,16 @@ impl EditorState {
             note_id,
             project_id,
             editing_title,
+            quick_note: false,
+            editing_project: false,
+            project_choices: Vec::new(),
+            project_choice_idx: 0,
+            saved_title,
+            saved_content,
+            saved_project_id: project_id,
+            confirm_close: false,
+            autosave_timer: std::time::Instant::now(),
+            last_autosaved_at: None,
             codex_id: None,
             mode,
             yank_register: String::new(),
@@ -135,6 +158,53 @@ impl EditorState {
             show_help: false,
             scroll_offset: 0,
         }
+    }
+
+    pub fn new_quick_note(
+        project_choices: Vec<(uuid::Uuid, String)>,
+        selected_project_id: Option<uuid::Uuid>,
+    ) -> Option<Self> {
+        let project_choice_idx = selected_project_id
+            .and_then(|id| project_choices.iter().position(|(pid, _)| *pid == id))
+            .unwrap_or(0);
+        let project_id = project_choices.get(project_choice_idx)?.0;
+        let mut state = Self::new(project_id, None, String::new(), String::new());
+        state.quick_note = true;
+        state.project_choices = project_choices;
+        state.project_choice_idx = project_choice_idx;
+        Some(state)
+    }
+
+    pub fn selected_project_name(&self) -> &str {
+        self.project_choices
+            .get(self.project_choice_idx)
+            .map(|(_, name)| name.as_str())
+            .unwrap_or("No active campaign")
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.title != self.saved_title
+            || self.get_content() != self.saved_content
+            || self.project_id != self.saved_project_id
+    }
+
+    pub fn mark_saved(&mut self, note_id: uuid::Uuid) {
+        self.note_id = Some(note_id);
+        self.saved_title = self.title.clone();
+        self.saved_content = self.get_content();
+        self.saved_project_id = self.project_id;
+        self.confirm_close = false;
+        self.autosave_timer = std::time::Instant::now();
+    }
+
+    pub fn autosave_due(&self, interval: std::time::Duration) -> bool {
+        self.has_unsaved_changes()
+            && !self.confirm_close
+            && self.autosave_timer.elapsed() >= interval
+    }
+
+    pub fn record_autosaved(&mut self) {
+        self.last_autosaved_at = Some(std::time::Instant::now());
     }
 
     pub fn get_content(&self) -> String {
@@ -940,6 +1010,46 @@ impl EditorState {
         }
     }
 
+    pub fn insert_text(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self.editing_title {
+            let remaining = 50usize.saturating_sub(self.title.chars().count());
+            self.title
+                .extend(text.replace(['\r', '\n'], " ").chars().take(remaining));
+            self.autosave_timer = std::time::Instant::now();
+            return;
+        }
+
+        self.push_undo();
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        let parts: Vec<&str> = normalized.split('\n').collect();
+        let x = floor_char_boundary(
+            &self.lines[self.cursor_y],
+            self.cursor_x.min(self.lines[self.cursor_y].len()),
+        );
+        let suffix = self.lines[self.cursor_y].split_off(x);
+        self.lines[self.cursor_y].push_str(parts[0]);
+
+        if parts.len() == 1 {
+            self.cursor_x = self.lines[self.cursor_y].len();
+            self.lines[self.cursor_y].push_str(&suffix);
+        } else {
+            let insert_at = self.cursor_y + 1;
+            for (offset, part) in parts[1..parts.len() - 1].iter().enumerate() {
+                self.lines.insert(insert_at + offset, (*part).to_string());
+            }
+            let mut last_line = parts.last().copied().unwrap_or_default().to_string();
+            self.cursor_y += parts.len() - 1;
+            self.cursor_x = last_line.len();
+            last_line.push_str(&suffix);
+            self.lines.insert(self.cursor_y, last_line);
+        }
+        self.mode = EditorMode::Insert;
+        self.autosave_timer = std::time::Instant::now();
+    }
+
     pub fn handle_backspace(&mut self) {
         if self.editing_title {
             self.title.pop();
@@ -1088,7 +1198,7 @@ pub(crate) fn render_body_line<'a>(
     state: &EditorState,
     theme: &Theme,
 ) -> Line<'a> {
-    let is_cursor_line = !state.editing_title && line_i == state.cursor_y;
+    let is_cursor_line = !state.editing_title && !state.editing_project && line_i == state.cursor_y;
     let sel = line_sel_range(line_i, line, state);
 
     if let Some((sel_s, sel_e)) = sel {
@@ -1118,17 +1228,58 @@ pub(crate) fn render_body_line<'a>(
             spans.push(Span::raw(after));
         }
         Line::from(spans)
+    } else if is_cursor_line && state.mode == EditorMode::Insert {
+        // Inside text, highlight the character under the cursor without adding
+        // another terminal cell (which would look like a space in the word).
+        // At end-of-line, use a visible glyph because styled trailing spaces are
+        // commonly discarded by terminals.
+        let x = floor_char_boundary(line, state.cursor_x.min(line.len()));
+        let before = &line[..x];
+        let (cursor_ch, after, cursor_style): (String, &str, Style) = if x < line.len() {
+            let end = char_end(line, x);
+            (
+                line[x..end].to_string(),
+                &line[end..],
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else {
+            (
+                "│".to_string(),
+                "",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
+        let mut spans: Vec<Span<'a>> = Vec::new();
+        if !before.is_empty() {
+            spans.push(Span::raw(before));
+        }
+        spans.push(Span::styled(cursor_ch, cursor_style));
+        if !after.is_empty() {
+            spans.push(Span::raw(after));
+        }
+        Line::from(spans)
     } else if is_cursor_line {
-        // Normal/Insert cursor — single char highlighted
+        // Normal mode keeps the Vim-style block cursor over the current char.
         let x = floor_char_boundary(line, state.cursor_x.min(line.len()));
         let before = &line[..x];
         let (cursor_ch, after): (String, &str) = if x < line.len() {
             let end = char_end(line, x);
             (line[x..end].to_string(), &line[end..])
         } else {
-            (" ".to_string(), "")
+            ("█".to_string(), "")
         };
-        let cur_style = Style::default().fg(Color::Black).bg(theme.selection);
+        let cur_style = if x < line.len() {
+            Style::default().fg(Color::Black).bg(theme.selection)
+        } else {
+            Style::default()
+                .fg(theme.selection)
+                .add_modifier(Modifier::BOLD)
+        };
         let mut spans: Vec<Span<'a>> = Vec::new();
         if !before.is_empty() {
             spans.push(Span::raw(before));
@@ -1143,20 +1294,77 @@ pub(crate) fn render_body_line<'a>(
     }
 }
 
+fn cursor_visual_row(state: &EditorState, width: u16) -> usize {
+    if width == 0 {
+        return 0;
+    }
+
+    let mut cursor_lines: Vec<Line<'static>> = state.lines[..state.cursor_y]
+        .iter()
+        .cloned()
+        .map(Line::from)
+        .collect();
+    let line = &state.lines[state.cursor_y];
+    let x = floor_char_boundary(line, state.cursor_x.min(line.len()));
+    let cursor_line = if state.mode == EditorMode::Insert && x < line.len() {
+        line[..char_end(line, x)].to_string()
+    } else if state.mode == EditorMode::Insert {
+        format!("{}│", &line[..x])
+    } else if x < line.len() {
+        line[..char_end(line, x)].to_string()
+    } else {
+        format!("{line}█")
+    };
+    cursor_lines.push(Line::from(cursor_line));
+
+    Paragraph::new(cursor_lines)
+        .wrap(Wrap { trim: false })
+        .line_count(width)
+        .saturating_sub(1)
+}
+
 // ── draw ──────────────────────────────────────────────────────────────────────
 
 pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
-    let size = f.size();
+    draw_in_area(f, state, theme, f.size());
+}
+
+pub fn draw_in_area(f: &mut Frame, state: &mut EditorState, theme: &Theme, size: Rect) {
     let accent = theme.primary;
+
+    if state.quick_note {
+        f.render_widget(Clear, size);
+        f.render_widget(
+            Block::default()
+                .style(Style::default().bg(theme.background))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(accent))
+                .title(Span::styled(
+                    " Quick Scroll ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )),
+            size,
+        );
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(3), // Title
-            Constraint::Min(5),    // Body
-            Constraint::Length(3), // Status bar
-        ])
+        .constraints(if state.quick_note {
+            vec![
+                Constraint::Length(3), // Title
+                Constraint::Length(3), // Campaign
+                Constraint::Min(5),    // Body
+                Constraint::Length(3), // Status bar
+            ]
+        } else {
+            vec![
+                Constraint::Length(3), // Title
+                Constraint::Min(5),    // Body
+                Constraint::Length(3), // Status bar
+            ]
+        })
         .split(size);
 
     // ── Title ─────────────────────────────────────────────────────────────────
@@ -1166,14 +1374,18 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         Style::default().fg(theme.border)
     };
     let title_text = if state.editing_title {
-        format!("{}_", state.title)
+        state.title.clone()
     } else if state.title.is_empty() {
         "Untitled Scroll".to_string()
     } else {
         state.title.clone()
     };
     let title_block_label = if state.editing_title {
-        " Scroll Title  Tab/Enter: Body "
+        if state.quick_note {
+            " Scroll Title  Tab/Enter: Campaign "
+        } else {
+            " Scroll Title  Tab/Enter: Body "
+        }
     } else {
         " Scroll Title  Shift+Tab: edit "
     };
@@ -1188,33 +1400,67 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         chunks[0],
     );
 
-    // ── Body ──────────────────────────────────────────────────────────────────
-    let body_height = chunks[1].height.saturating_sub(2) as usize;
+    let body_idx = if state.quick_note { 2 } else { 1 };
+    let status_idx = if state.quick_note { 3 } else { 2 };
 
-    // Keep scroll_offset so cursor stays visible
-    if !state.editing_title {
-        if state.cursor_y < state.scroll_offset {
-            state.scroll_offset = state.cursor_y;
-        } else if body_height > 0 && state.cursor_y >= state.scroll_offset + body_height {
-            state.scroll_offset = state.cursor_y + 1 - body_height;
+    // ── Campaign ──────────────────────────────────────────────────────────────
+    if state.quick_note {
+        let project_style = if state.editing_project {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.border)
+        };
+        let project_text = if state.editing_project {
+            format!("◀  {}  ▶", state.selected_project_name())
+        } else {
+            state.selected_project_name().to_string()
+        };
+        let project_label = if state.editing_project {
+            " Campaign  ↑/↓: choose  Enter: Editor "
+        } else {
+            " Campaign  Shift+Tab: change "
+        };
+        f.render_widget(
+            Paragraph::new(project_text).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(project_style)
+                    .title(project_label),
+            ),
+            chunks[1],
+        );
+    }
+
+    // ── Body ──────────────────────────────────────────────────────────────────
+    let body_height = chunks[body_idx].height.saturating_sub(2) as usize;
+    let body_width = chunks[body_idx].width.saturating_sub(2);
+
+    // Paragraph wraps long logical lines into several terminal rows. Track the
+    // cursor in those visual rows so pasted text cannot continue below the box.
+    if !state.editing_title && !state.editing_project && body_height > 0 && body_width > 0 {
+        let cursor_row = cursor_visual_row(state, body_width);
+        // Keep one spare row when possible. Word wrapping can move the current
+        // word down one row after the text following the cursor is considered.
+        let visible_cursor_height = body_height.saturating_sub(1).max(1);
+        if cursor_row < state.scroll_offset {
+            state.scroll_offset = cursor_row;
+        } else if cursor_row >= state.scroll_offset + visible_cursor_height {
+            state.scroll_offset = cursor_row + 1 - visible_cursor_height;
         }
     }
 
-    let body_border_style = if !state.editing_title {
+    let body_border_style = if !state.editing_title && !state.editing_project {
         Style::default().fg(accent).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(theme.border)
     };
 
-    // Collect line spans (only visible range for large documents)
-    let visible_end = (state.scroll_offset + body_height + 5).min(state.lines.len());
-    let lines_to_render: Vec<Line> = state.lines[state.scroll_offset..visible_end]
+    let lines_to_render: Vec<Line> = state
+        .lines
         .iter()
         .enumerate()
-        .map(|(rel_i, line)| {
-            let abs_i = rel_i + state.scroll_offset;
-            render_body_line(line, abs_i, state, theme)
-        })
+        .map(|(line_i, line)| render_body_line(line, line_i, state, theme))
         .collect();
 
     f.render_widget(
@@ -1226,8 +1472,9 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
                     .border_style(body_border_style)
                     .title(" Scroll Editor "),
             )
-            .wrap(Wrap { trim: false }),
-        chunks[1],
+            .wrap(Wrap { trim: false })
+            .scroll((state.scroll_offset.min(u16::MAX as usize) as u16, 0)),
+        chunks[body_idx],
     );
 
     // ── Status bar ────────────────────────────────────────────────────────────
@@ -1254,6 +1501,16 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
         Span::styled(format!(" {} ", mode_str), mode_style),
         Span::styled("  ", Style::default()),
     ];
+    if state
+        .last_autosaved_at
+        .map(|saved_at| saved_at.elapsed().as_secs() < 4)
+        .unwrap_or(false)
+    {
+        status_spans.push(Span::styled(
+            "✓ Autosaved  ",
+            Style::default().fg(theme.muted),
+        ));
+    }
     if !pending.is_empty() {
         status_spans.push(Span::styled(
             format!(" {pending}_ "),
@@ -1280,7 +1537,7 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
             Span::styled("  Esc", Style::default().fg(accent)),
             Span::styled(esc_label, Style::default().fg(theme.muted)),
         ]);
-    } else {
+    } else if state.editing_project {
         status_spans.extend([
             Span::styled(
                 "Ctrl+S",
@@ -1289,8 +1546,28 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(" Save", Style::default().fg(theme.muted)),
+            Span::styled("  ↑/↓", Style::default().fg(accent)),
+            Span::styled(" Campaign", Style::default().fg(theme.muted)),
+            Span::styled("  Enter", Style::default().fg(accent)),
+            Span::styled(" Editor", Style::default().fg(theme.muted)),
             Span::styled("  Esc", Style::default().fg(accent)),
-            Span::styled(" Cancel", Style::default().fg(theme.muted)),
+            Span::styled(" Title", Style::default().fg(theme.muted)),
+        ]);
+    } else {
+        let (esc_action, esc_label) = match state.mode {
+            EditorMode::Normal => (" Close", "Esc"),
+            EditorMode::Insert | EditorMode::Visual { .. } => (" Normal", "Esc"),
+        };
+        status_spans.extend([
+            Span::styled(
+                "Ctrl+S",
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" Save", Style::default().fg(theme.muted)),
+            Span::styled(format!("  {esc_label}"), Style::default().fg(accent)),
+            Span::styled(esc_action, Style::default().fg(theme.muted)),
             Span::styled("  ?", Style::default().fg(accent)),
             Span::styled(" Help", Style::default().fg(theme.muted)),
             Span::styled(pos_str, Style::default().fg(theme.muted)),
@@ -1304,24 +1581,18 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border)),
         ),
-        chunks[2],
+        chunks[status_idx],
     );
 
-    // ── Terminal cursor ───────────────────────────────────────────────────────
+    // The body already renders an inline cursor in `render_body_line`. Drawing a
+    // second terminal cursor there drifts onto another visual row when long or
+    // pasted text wraps. Only the title uses the terminal cursor.
     if !state.show_help {
         if state.editing_title {
             let col = state.title.chars().count() as u16;
             f.set_cursor(
                 (chunks[0].x + 1 + col).min(chunks[0].x + chunks[0].width.saturating_sub(2)),
                 chunks[0].y + 1,
-            );
-        } else if state.mode == EditorMode::Insert {
-            let line = &state.lines[state.cursor_y];
-            let visual_col = line[..state.cursor_x.min(line.len())].chars().count() as u16;
-            let rel_y = state.cursor_y.saturating_sub(state.scroll_offset) as u16;
-            f.set_cursor(
-                (chunks[1].x + 1 + visual_col).min(chunks[1].x + chunks[1].width.saturating_sub(2)),
-                (chunks[1].y + 1 + rel_y).min(chunks[1].y + chunks[1].height.saturating_sub(2)),
             );
         }
     }
@@ -1330,6 +1601,51 @@ pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
     if state.show_help {
         draw_help_popup(f, size, theme);
     }
+    if state.confirm_close {
+        draw_unsaved_changes_popup(f, size, theme);
+    }
+}
+
+fn draw_unsaved_changes_popup(f: &mut Frame, area: Rect, theme: &Theme) {
+    let popup_w = 58u16.min(area.width);
+    let popup_h = 7u16.min(area.height);
+    let popup_area = Rect {
+        x: area.x + area.width.saturating_sub(popup_w) / 2,
+        y: area.y + area.height.saturating_sub(popup_h) / 2,
+        width: popup_w,
+        height: popup_h,
+    };
+    f.render_widget(Clear, popup_area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "This scroll has unsaved changes.",
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("[S/Enter]", Style::default().fg(theme.success)),
+                Span::raw(" Save & Close   "),
+                Span::styled("[D]", Style::default().fg(theme.warning)),
+                Span::raw(" Discard   "),
+                Span::styled("[Esc]", Style::default().fg(theme.primary)),
+                Span::raw(" Keep Editing"),
+            ]),
+        ])
+        .alignment(ratatui::layout::Alignment::Center)
+        .block(
+            Block::default()
+                .style(Style::default().bg(theme.background))
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .border_style(Style::default().fg(theme.warning))
+                .title(" Unsaved Scroll "),
+        ),
+        popup_area,
+    );
 }
 
 fn draw_help_popup(f: &mut Frame, area: Rect, theme: &Theme) {
@@ -1452,6 +1768,158 @@ mod tests {
         assert_eq!(editor.lines[0], "Hi    Y");
         assert_eq!(editor.cursor_y, 0);
         assert_eq!(editor.cursor_x, 2);
+    }
+
+    #[test]
+    fn bulk_paste_inserts_unicode_paragraphs_in_one_edit() {
+        let project_id = Uuid::new_v4();
+        let mut editor =
+            EditorState::new(project_id, None, String::new(), "Antes después".to_string());
+        editor.editing_title = false;
+        editor.cursor_x = "Antes ".len();
+
+        editor.insert_text("información\r\nPhishing:\nAtaque DoS");
+
+        assert_eq!(
+            editor.lines,
+            vec![
+                "Antes información".to_string(),
+                "Phishing:".to_string(),
+                "Ataque DoSdespués".to_string(),
+            ]
+        );
+        assert_eq!(editor.cursor_y, 2);
+        assert_eq!(editor.cursor_x, "Ataque DoS".len());
+        assert_eq!(editor.undo_history.len(), 1);
+        assert_eq!(editor.mode, EditorMode::Insert);
+    }
+
+    #[test]
+    fn quick_note_uses_active_campaign_and_keeps_all_choices() {
+        let first_id = Uuid::new_v4();
+        let active_id = Uuid::new_v4();
+        let choices = vec![
+            (first_id, "First Campaign".to_string()),
+            (active_id, "Active Campaign".to_string()),
+        ];
+
+        let editor = EditorState::new_quick_note(choices, Some(active_id)).unwrap();
+
+        assert!(editor.quick_note);
+        assert!(editor.editing_title);
+        assert_eq!(editor.project_id, active_id);
+        assert_eq!(editor.project_choice_idx, 1);
+        assert_eq!(editor.selected_project_name(), "Active Campaign");
+    }
+
+    #[test]
+    fn quick_note_requires_an_active_campaign() {
+        assert!(EditorState::new_quick_note(Vec::new(), None).is_none());
+    }
+
+    #[test]
+    fn insert_cursor_is_visible_on_empty_lines_and_between_text() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(project_id, None, String::new(), String::new());
+        editor.editing_title = false;
+        editor.mode = EditorMode::Insert;
+        let theme = Theme::default_theme();
+
+        let empty_cursor = render_body_line("", 0, &editor, &theme);
+        let empty_text: String = empty_cursor
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(empty_text, "│");
+
+        editor.lines[0] = "pasted text".to_string();
+        editor.cursor_x = "pasted ".len();
+        let text_cursor = render_body_line(&editor.lines[0], 0, &editor, &theme);
+        let rendered: String = text_cursor
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(rendered, "pasted text");
+        assert_eq!(text_cursor.spans[1].content.as_ref(), "t");
+        assert_eq!(text_cursor.spans[1].style.bg, Some(theme.success));
+    }
+
+    #[test]
+    fn cursor_visual_row_counts_wrapped_rows_and_newlines() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            None,
+            String::new(),
+            "first\nabcdefghij".to_string(),
+        );
+        editor.editing_title = false;
+        editor.mode = EditorMode::Insert;
+        editor.cursor_y = 1;
+        editor.cursor_x = editor.lines[1].len();
+
+        // "first" occupies row 0. Ten characters plus the insert cursor wrap
+        // across three rows at width 5, placing the cursor on global row 3.
+        assert_eq!(cursor_visual_row(&editor, 5), 3);
+    }
+
+    #[test]
+    fn editor_scrolls_when_wrapped_cursor_reaches_below_the_panel() {
+        let project_id = Uuid::new_v4();
+        let content = "wrapped text ".repeat(40);
+        let mut editor = EditorState::new(project_id, None, String::new(), content.clone());
+        editor.editing_title = false;
+        editor.mode = EditorMode::Insert;
+        editor.cursor_x = content.len();
+        let theme = Theme::default_theme();
+        let backend = ratatui::backend::TestBackend::new(30, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+
+        terminal
+            .draw(|frame| draw(frame, &mut editor, &theme))
+            .unwrap();
+
+        assert!(editor.scroll_offset > 0);
+    }
+
+    #[test]
+    fn unsaved_changes_clear_after_marking_the_note_saved() {
+        let project_id = Uuid::new_v4();
+        let mut editor =
+            EditorState::new(project_id, None, "Draft".to_string(), "Body".to_string());
+        assert!(!editor.has_unsaved_changes());
+
+        editor.title.push_str(" changed");
+        assert!(editor.has_unsaved_changes());
+
+        let note_id = Uuid::new_v4();
+        editor.mark_saved(note_id);
+        assert!(!editor.has_unsaved_changes());
+        assert_eq!(editor.note_id, Some(note_id));
+
+        editor.lines.push("Another line".to_string());
+        assert!(editor.has_unsaved_changes());
+    }
+
+    #[test]
+    fn autosave_runs_only_for_changed_notes_after_the_interval() {
+        let project_id = Uuid::new_v4();
+        let mut editor =
+            EditorState::new(project_id, None, "Draft".to_string(), "Body".to_string());
+        let interval = std::time::Duration::from_secs(5);
+        assert!(!editor.autosave_due(interval));
+
+        editor.title.push('!');
+        assert!(!editor.autosave_due(interval));
+        editor.autosave_timer = std::time::Instant::now() - std::time::Duration::from_secs(6);
+        assert!(editor.autosave_due(interval));
+
+        editor.mark_saved(Uuid::new_v4());
+        editor.record_autosaved();
+        assert!(!editor.autosave_due(interval));
+        assert!(editor.last_autosaved_at.is_some());
     }
 
     #[test]

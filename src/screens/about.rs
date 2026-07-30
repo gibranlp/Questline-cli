@@ -193,6 +193,22 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v1.1.3",
+            "Jul 29, 2026",
+            "The Chronicle Remembers",
+            &[
+                "Legacy sync damage is repaired without deleting quests, steps, or scrolls",
+                "Suspicious cloud events are quarantined without blocking healthy sync records",
+                "Conflict timestamps and revisions protect newer edits across devices",
+                "Manual sync can reseed the complete trusted local state",
+                "Scrolls can move between campaigns and directly into destination codices",
+                "Focus Sanctuary adds a large timer and quiet session progress compass",
+                "Quest Calendar adds month planning and direct due-date creation",
+                "Quick Notes, safer autosave, and improved editor navigation",
+                "macOS notifications, hydration schedules, and local music controls improved",
+            ],
+        ),
+        (
             "v1.1.2",
             "Jul 26, 2026",
             "The Command Center Holds",

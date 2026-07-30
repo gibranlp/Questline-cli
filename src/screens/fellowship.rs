@@ -308,12 +308,21 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
                         // Traemos las reacciones del mensaje — cada DB call aquí, ojo con el performance
                         let reactions = app.db.get_message_reactions(&msg.0).unwrap_or_default();
+                        let selected_fg = if is_selected {
+                            theme.selected_fg()
+                        } else {
+                            Color::Reset
+                        };
 
                         if msg_type == "system" {
                             chat_lines.push(Line::from(vec![Span::styled(
                                 format!(" ── {} ──  ", &msg.4),
                                 Style::default()
-                                    .fg(theme.muted)
+                                    .fg(if is_selected {
+                                        selected_fg
+                                    } else {
+                                        theme.muted
+                                    })
                                     .add_modifier(Modifier::ITALIC)
                                     .bg(sel_bg),
                             )]));
@@ -331,17 +340,29 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                             chat_lines.push(Line::from(vec![
                                 Span::styled(
                                     sel_marker,
-                                    Style::default().fg(accent_color).bg(sel_bg),
+                                    Style::default()
+                                        .fg(if is_selected {
+                                            selected_fg
+                                        } else {
+                                            accent_color
+                                        })
+                                        .bg(sel_bg),
                                 ),
                                 Span::styled(
                                     format!(" {}", formatted_time),
-                                    Style::default().fg(theme.muted).bg(sel_bg),
+                                    Style::default()
+                                        .fg(if is_selected {
+                                            selected_fg
+                                        } else {
+                                            theme.muted
+                                        })
+                                        .bg(sel_bg),
                                 ),
                                 Span::styled("  ", Style::default().bg(sel_bg)),
                                 Span::styled(
                                     format!("{}", &msg.3),
                                     Style::default()
-                                        .fg(name_color)
+                                        .fg(if is_selected { selected_fg } else { name_color })
                                         .add_modifier(Modifier::BOLD)
                                         .bg(sel_bg),
                                 ),
@@ -353,7 +374,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                             let has_url = extract_url(content).is_some();
                             let mut content_spans = vec![Span::styled(
                                 if is_selected { "▌ " } else { "  " },
-                                Style::default().fg(accent_color).bg(sel_bg),
+                                Style::default()
+                                    .fg(if is_selected {
+                                        selected_fg
+                                    } else {
+                                        accent_color
+                                    })
+                                    .bg(sel_bg),
                             )];
                             if has_url {
                                 // Partimos el contenido palabra por palabra para colorear solo las URLs
@@ -369,21 +396,37 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                                         content_spans.push(Span::styled(
                                             format!("{}{} ", prefix, word),
                                             Style::default()
-                                                .fg(Color::Cyan)
+                                                .fg(if is_selected {
+                                                    selected_fg
+                                                } else {
+                                                    Color::Cyan
+                                                })
                                                 .add_modifier(Modifier::UNDERLINED)
                                                 .bg(sel_bg),
                                         ));
                                     } else {
                                         content_spans.push(Span::styled(
                                             format!("{} ", word),
-                                            Style::default().fg(Color::White).bg(sel_bg),
+                                            Style::default()
+                                                .fg(if is_selected {
+                                                    selected_fg
+                                                } else {
+                                                    Color::White
+                                                })
+                                                .bg(sel_bg),
                                         ));
                                     }
                                 }
                             } else {
                                 content_spans.push(Span::styled(
                                     content.as_str(),
-                                    Style::default().fg(Color::White).bg(sel_bg),
+                                    Style::default()
+                                        .fg(if is_selected {
+                                            selected_fg
+                                        } else {
+                                            Color::White
+                                        })
+                                        .bg(sel_bg),
                                 ));
                             }
                             chat_lines.push(Line::from(content_spans));
@@ -395,11 +438,23 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                                 chat_lines.push(Line::from(vec![
                                     Span::styled(
                                         if is_selected { "▌ " } else { "  " },
-                                        Style::default().fg(accent_color).bg(sel_bg),
+                                        Style::default()
+                                            .fg(if is_selected {
+                                                selected_fg
+                                            } else {
+                                                accent_color
+                                            })
+                                            .bg(sel_bg),
                                     ),
                                     Span::styled(
                                         r_list.join("  "),
-                                        Style::default().fg(theme.warning).bg(sel_bg),
+                                        Style::default()
+                                            .fg(if is_selected {
+                                                selected_fg
+                                            } else {
+                                                theme.warning
+                                            })
+                                            .bg(sel_bg),
                                     ),
                                 ]));
                             }

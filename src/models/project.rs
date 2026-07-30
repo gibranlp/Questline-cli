@@ -12,6 +12,8 @@ pub struct Project {
     pub name: String,
     pub description: Option<String>,
     pub created_at: DateTime<Utc>,
+    #[serde(default = "crate::models::default_sync_timestamp")]
+    pub updated_at: DateTime<Utc>,
     pub archived: bool,
     pub completed: bool,
     pub owner_identity: Option<String>,
