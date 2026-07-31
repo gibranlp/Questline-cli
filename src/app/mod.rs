@@ -951,6 +951,7 @@ pub struct App {
     pub library_active_col: usize,
     pub library_item_scroll_offset: usize,
     pub library_scroll_offset: u16,
+    pub library_detail_max_scroll: Cell<u16>,
     pub selected_relic_idx: usize,
     pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End
     pub selected_settings_theme_idx: usize,
@@ -984,6 +985,7 @@ pub struct App {
     pub viewing_step_for_task: Option<Uuid>,
     pub selected_notes_flat_idx: usize,
     pub note_preview_scroll: usize,
+    pub note_preview_max_scroll: Cell<usize>,
     pub note_preview_focused: bool,
 
     // Cachés de performance — se llenan en reload_data() para no golpear la DB en cada frame
@@ -2250,6 +2252,7 @@ impl App {
             library_active_col: 0,
             library_item_scroll_offset: 0,
             library_scroll_offset: 0,
+            library_detail_max_scroll: Cell::new(0),
             selected_relic_idx: 0,
             selected_settings_focus_idx: 0,
             selected_settings_theme_idx: 0,
@@ -2280,6 +2283,7 @@ impl App {
             viewing_step_for_task: None,
             selected_notes_flat_idx: 0,
             note_preview_scroll: 0,
+            note_preview_max_scroll: Cell::new(0),
             note_preview_focused: false,
             all_tasks: Vec::new(),
             all_notes: Vec::new(),
@@ -7829,16 +7833,12 @@ impl App {
                 self.clamp_dashboard_command_selection();
             }
             KeyCode::Tab if self.active_screen == ActiveScreen::Library => {
-                if self.library_active_col < 2 {
-                    self.library_active_col += 1;
-                    self.library_scroll_offset = 0;
-                }
+                self.library_active_col = (self.library_active_col + 1) % 3;
+                self.library_scroll_offset = 0;
             }
             KeyCode::BackTab if self.active_screen == ActiveScreen::Library => {
-                if self.library_active_col > 0 {
-                    self.library_active_col -= 1;
-                    self.library_scroll_offset = 0;
-                }
+                self.library_active_col = (self.library_active_col + 2) % 3;
+                self.library_scroll_offset = 0;
             }
             KeyCode::Tab if self.active_screen == ActiveScreen::Character => {
                 let has_reflections = !self.db.get_reflections().unwrap_or_default().is_empty();
@@ -8167,7 +8167,10 @@ impl App {
                         }
                         self.library_scroll_offset = 0;
                     } else if self.library_active_col == 2 {
-                        self.library_scroll_offset = self.library_scroll_offset.saturating_add(1);
+                        self.library_scroll_offset = self
+                            .library_scroll_offset
+                            .saturating_add(1)
+                            .min(self.library_detail_max_scroll.get());
                     }
                 } else if self.active_screen == ActiveScreen::Legends {
                     let relics = self.db.get_relics().unwrap_or_default();
@@ -9453,7 +9456,10 @@ impl App {
                 self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
             }
             KeyCode::Down if self.note_preview_focused => {
-                self.note_preview_scroll += 1;
+                self.note_preview_scroll = self
+                    .note_preview_scroll
+                    .saturating_add(1)
+                    .min(self.note_preview_max_scroll.get());
             }
             KeyCode::Up => match self.workspace_tab_idx {
                 0 => {
@@ -13444,6 +13450,12 @@ impl App {
                 id: "search_integration",
             },
             CommandAction {
+                name: "Open Quest Codex",
+                description: "View Workspace keybindings and commands",
+                shortcut: "? (Workspace)",
+                id: "open_quest_codex",
+            },
+            CommandAction {
                 name: "Create Quest",
                 description: "Create a new quest, with campaign picker if needed",
                 shortcut: "Ctrl+T",
@@ -13615,6 +13627,15 @@ impl App {
                     selected_idx: 0,
                     results: Vec::new(),
                 };
+            }
+            "open_quest_codex" => {
+                if self.active_screen == ActiveScreen::Workspace {
+                    self.workspace_help_open = true;
+                } else {
+                    self.notifications.push(Notification::info(
+                        "Open a campaign Workspace to view the Quest Codex.",
+                    ));
+                }
             }
             "create_task" => {
                 self.pending_calendar_due_date = None;
@@ -19118,6 +19139,25 @@ mod app_tests {
     }
 
     #[test]
+    fn command_palette_opens_quest_codex_from_workspace() {
+        let db_file = Path::new("test_questline_codex_command.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+
+        let actions = app.get_available_command_actions("codex");
+        assert_eq!(
+            actions.first().map(|action| action.id),
+            Some("open_quest_codex")
+        );
+
+        app.active_screen = ActiveScreen::Workspace;
+        app.execute_command_action("open_quest_codex").unwrap();
+        assert!(app.workspace_help_open);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn test_choose_dynamic_quotes_isolation() {
         let db_file = Path::new("test_questline_quotes.db");
         let _ = std::fs::remove_file(db_file);
@@ -19422,6 +19462,35 @@ mod app_tests {
         assert!(
             matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0)
         );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn library_tab_cycles_panes() {
+        let db_file = Path::new("test_questline_library_tabs.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Library;
+        app.library_active_col = 0;
+        app.library_scroll_offset = 4;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.library_active_col, 1);
+        assert_eq!(app.library_scroll_offset, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.library_active_col, 2);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.library_active_col, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.library_active_col, 2);
 
         let _ = std::fs::remove_file(db_file);
     }
