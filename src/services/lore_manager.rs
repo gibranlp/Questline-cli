@@ -731,18 +731,12 @@ impl LoreManager {
             .join("lore_cache.json")
     }
 
-    // Lee el caché local; devuelve None si está expirado o no existe
-    fn load_cache() -> Option<LoreCache> {
+    // Lee el caché local aunque esté vencido. El lore antiguo sigue siendo una
+    // mejor experiencia de arranque que bloquear la UI esperando la red.
+    fn read_cache() -> Option<LoreCache> {
         let path = Self::cache_path();
         let data = std::fs::read_to_string(&path).ok()?;
-        let cache: LoreCache = serde_json::from_str(&data).ok()?;
-
-        let age = Utc::now().timestamp() - cache.fetched_at;
-        if age > CACHE_TTL_SECS {
-            return None;
-        }
-
-        Some(cache)
+        serde_json::from_str(&data).ok()
     }
 
     // Persiste el caché en disco — falla silenciosamente
@@ -767,27 +761,28 @@ impl LoreManager {
         resp.into_string().context("Failed to read response body")
     }
 
-    // Intenta descargar lore y quests; si falla devuelve los valores del caché o vacío
+    // Carga inmediatamente desde disco (o desde los valores integrados) y
+    // refresca la red en background. El arranque nunca debe depender de Internet.
     pub fn load() -> Self {
-        // Primero intenta usar el caché vigente para no bloquear el arranque
-        if let Some(cache) = Self::load_cache() {
-            // Lanza una descarga en background para refrescar el caché (fire-and-forget)
+        let cache = Self::read_cache();
+        let cache_is_fresh = cache.as_ref().is_some_and(|cache| {
+            Utc::now().timestamp().saturating_sub(cache.fetched_at) <= CACHE_TTL_SECS
+        });
+
+        // A fresh cache does not need an immediate request. Missing, invalid, or
+        // stale data is refreshed without delaying the first rendered frame.
+        if !cache_is_fresh {
             std::thread::spawn(|| {
                 let _ = Self::fetch_and_save();
             });
-            return Self {
-                lore: merge_with_built_in_lore(cache.lore),
-                quests: merge_with_built_in_quests(cache.quests),
-            };
         }
 
-        // Sin caché válido: descarga bloqueante (solo ocurre la primera vez)
-        match Self::fetch_and_save() {
-            Ok((lore, quests)) => Self {
-                lore: merge_with_built_in_lore(lore),
-                quests: merge_with_built_in_quests(quests),
+        match cache {
+            Some(cache) => Self {
+                lore: merge_with_built_in_lore(cache.lore),
+                quests: merge_with_built_in_quests(cache.quests),
             },
-            Err(_) => Self {
+            None => Self {
                 lore: built_in_class_stories(),
                 quests: built_in_class_quests(),
             },

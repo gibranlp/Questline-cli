@@ -9,6 +9,12 @@ use rodio::{OutputStream, Sink, Source};
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
 use std::sync::{Arc, Mutex};
 
+const SOUND_EFFECTS_MAX_GAIN: f32 = 0.20;
+
+fn sound_effects_gain(state: &AudioState) -> f32 {
+    SOUND_EFFECTS_MAX_GAIN * state.sound_effects_volume.clamp(0.0, 1.0)
+}
+
 pub struct AudioPlayer {
     _stream: Option<OutputStream>,
     handle: Option<rodio::OutputStreamHandle>,
@@ -92,8 +98,11 @@ impl AudioPlayer {
             if !state.sound_effects_enabled {
                 return;
             }
-            // Calcula el volumen efectivo de los efectos sin alterar el volumen del soundscape activo.
-            let volume = state.volume * 0.20 * state.sound_effects_volume;
+            // SFX volume is independent from music/soundscape volume.
+            let gain = sound_effects_gain(&state);
+            if gain <= f32::EPSILON {
+                return;
+            }
             std::thread::spawn(move || {
                 let cursor = std::io::Cursor::new(bytes);
                 let source = match rodio::Decoder::new(cursor) {
@@ -122,8 +131,9 @@ impl AudioPlayer {
                     }
                 };
 
-                sink.set_volume(volume);
-                sink.append(source);
+                // Apply gain to the samples themselves. This is reliable for
+                // short-lived sinks and makes 0% SFX unambiguously silent.
+                sink.append(source.amplify(gain));
                 sink.sleep_until_end();
             });
         }
@@ -173,7 +183,10 @@ impl AudioPlayer {
         if !state.sound_effects_enabled {
             return;
         }
-        let volume = state.volume * 0.20 * state.sound_effects_volume;
+        let gain = sound_effects_gain(&state);
+        if gain <= f32::EPSILON {
+            return;
+        }
         let handle = handle.clone();
         std::thread::spawn(move || {
             let cursor =
@@ -186,8 +199,7 @@ impl AudioPlayer {
                 Ok(s) => s,
                 Err(_) => return,
             };
-            sk.set_volume(volume);
-            sk.append(source);
+            sk.append(source.amplify(gain));
             sk.play();
             let mut guard = sink_arc.lock().unwrap();
             *guard = Some(sk);
@@ -921,6 +933,32 @@ fn trigger_local_folder(
 
 #[cfg(test)]
 mod tests {
+    use super::{AudioState, sound_effects_gain};
+
+    #[test]
+    fn sfx_gain_is_independent_from_soundscape_volume() {
+        let mut quiet_soundscape = AudioState::new();
+        quiet_soundscape.volume = 0.0;
+        quiet_soundscape.sound_effects_volume = 0.5;
+
+        let mut loud_soundscape = quiet_soundscape.clone();
+        loud_soundscape.volume = 1.0;
+
+        assert_eq!(
+            sound_effects_gain(&quiet_soundscape),
+            sound_effects_gain(&loud_soundscape)
+        );
+        assert!((sound_effects_gain(&quiet_soundscape) - 0.10).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn zero_sfx_volume_has_zero_gain() {
+        let mut state = AudioState::new();
+        state.sound_effects_volume = 0.0;
+
+        assert_eq!(sound_effects_gain(&state), 0.0);
+    }
+
     #[test]
     fn test_sound_decoding() {
         let cursor1 = std::io::Cursor::new(include_bytes!("../../assets/sounds/TaskCreattion.mp3"));

@@ -81,14 +81,16 @@ pub fn send_system_notification_with_icon(
 
         #[cfg(target_os = "macos")]
         {
-            // AppleScript no permite elegir iconos por notificación; terminal-notifier sí cuando está instalado.
+            // terminal-notifier can attach our per-alert artwork. AppleScript is
+            // only a fallback: invoking both produces two Notification Center alerts.
             let subtitle = if urgent {
                 "Questline - Urgent"
             } else {
                 "Questline"
             };
-            let _ = send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref());
-            send_with_osascript(&title, &message, subtitle);
+            if !send_with_terminal_notifier(&title, &message, subtitle, icon_path.as_ref()) {
+                send_with_osascript(&title, &message, subtitle);
+            }
         }
 
         #[cfg(target_os = "windows")]
@@ -158,7 +160,10 @@ fn send_with_terminal_notifier(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         if let Some(path) = icon_path {
-            cmd.arg("-appIcon").arg(path);
+            // -appIcon is a best-effort hint on older macOS releases. Current
+            // macOS versions may ignore it, while -contentImage still exposes
+            // the alert-specific artwork inside the notification.
+            cmd.arg("-appIcon").arg(path).arg("-contentImage").arg(path);
         }
         let status = cmd.status();
         if status.map(|s| s.success()).unwrap_or(false) {
@@ -337,7 +342,115 @@ fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
     }
     candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(&relative));
 
-    candidates.into_iter().find(|path| path.exists())
+    candidates
+        .into_iter()
+        .find(|path| path.exists())
+        .or_else(|| materialize_embedded_notification_icon(icon))
+}
+
+fn materialize_embedded_notification_icon(icon: NotificationIcon) -> Option<PathBuf> {
+    let directory = std::env::temp_dir()
+        .join("questline")
+        .join("notification-icons")
+        .join(env!("CARGO_PKG_VERSION"));
+    let path = directory.join(icon.file_name());
+
+    if path.is_file() {
+        return Some(path);
+    }
+
+    std::fs::create_dir_all(&directory).ok()?;
+    std::fs::write(&path, embedded_notification_icon(icon)).ok()?;
+    Some(path)
+}
+
+fn embedded_notification_icon(icon: NotificationIcon) -> &'static [u8] {
+    match icon {
+        NotificationIcon::Tasks => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/tasks.png"
+        )),
+        NotificationIcon::TaskDue => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_due.png"
+        )),
+        NotificationIcon::TaskOverdue => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_overdue.png"
+        )),
+        NotificationIcon::TaskCompleted => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_completed.png"
+        )),
+        NotificationIcon::TaskRecurring => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_recurring.png"
+        )),
+        NotificationIcon::TaskHighPriority => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_high_priority.png"
+        )),
+        NotificationIcon::TaskDailySummary => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_daily_summary.png"
+        )),
+        NotificationIcon::TaskIdle => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/task_idle.png"
+        )),
+        NotificationIcon::Fellowship => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/fellowship.png"
+        )),
+        NotificationIcon::NotificationSwarm => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/notification_swarm.png"
+        )),
+        NotificationIcon::LevelUp => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/level_up.png"
+        )),
+        NotificationIcon::Achievement => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/achievement.png"
+        )),
+        NotificationIcon::Hydration => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/hydration.png"
+        )),
+        NotificationIcon::Sync => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/sync.png"
+        )),
+        NotificationIcon::JournalNotes => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/journal_notes.png"
+        )),
+        NotificationIcon::Rewards => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/rewards.png"
+        )),
+        NotificationIcon::DailyAdventure => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/daily_adventure.png"
+        )),
+        NotificationIcon::Evergrowth => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/evergrowth.png"
+        )),
+        NotificationIcon::Info => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/info.png"
+        )),
+        NotificationIcon::Warning => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/warning.png"
+        )),
+        NotificationIcon::Focus => include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/notifications/focus.png"
+        )),
+    }
 }
 
 fn strip_non_ascii(s: &str) -> String {
@@ -363,5 +476,41 @@ fn windows_file_uri(path: &std::path::Path) -> String {
         format!("file:{}", normalized)
     } else {
         format!("file:///{}", normalized)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_notification_icon_has_embedded_png_data() {
+        let icons = [
+            NotificationIcon::Tasks,
+            NotificationIcon::TaskDue,
+            NotificationIcon::TaskOverdue,
+            NotificationIcon::TaskCompleted,
+            NotificationIcon::TaskRecurring,
+            NotificationIcon::TaskHighPriority,
+            NotificationIcon::TaskDailySummary,
+            NotificationIcon::TaskIdle,
+            NotificationIcon::Fellowship,
+            NotificationIcon::NotificationSwarm,
+            NotificationIcon::LevelUp,
+            NotificationIcon::Achievement,
+            NotificationIcon::Hydration,
+            NotificationIcon::Sync,
+            NotificationIcon::JournalNotes,
+            NotificationIcon::Rewards,
+            NotificationIcon::DailyAdventure,
+            NotificationIcon::Evergrowth,
+            NotificationIcon::Info,
+            NotificationIcon::Warning,
+            NotificationIcon::Focus,
+        ];
+
+        for icon in icons {
+            assert_eq!(&embedded_notification_icon(icon)[..8], b"\x89PNG\r\n\x1a\n");
+        }
     }
 }
