@@ -747,6 +747,7 @@ async fn main() -> Result<()> {
                                 app.selected_library_item_idx,
                                 app.library_item_scroll_offset,
                                 app.library_scroll_offset,
+                                &app.library_detail_max_scroll,
                                 &quests,
                                 &lore,
                                 &app.stats_cache.achievements,

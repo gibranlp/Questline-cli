@@ -349,6 +349,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 &project_codices,
                 app.note_preview_focused,
                 app.note_preview_scroll,
+                &app.note_preview_max_scroll,
             );
         }
         2 => draw_journal_tab(
@@ -746,68 +747,95 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         )
     };
     let m = |s: &str| Span::styled(s.to_string(), Style::default().fg(theme.muted));
-
-    let col_w = (area.width.saturating_sub(6)) / 2;
+    let binding = |key: &str, description: &str, enabled: bool| {
+        let key_style = if enabled {
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        let description_style = if enabled {
+            Style::default().fg(theme.text)
+        } else {
+            Style::default().fg(theme.muted)
+        };
+        Line::from(vec![
+            Span::styled(format!("  {:<12}", key), key_style),
+            Span::styled(description.to_string(), description_style),
+        ])
+    };
 
     let left: Vec<Line> = vec![
-        Line::from(vec![h("  QUESTS (Section 1)")]),
-        Line::from(vec![k("  n"), d("          New quest")]),
-        Line::from(vec![k("  Enter / e"), d("    Edit quest")]),
-        Line::from(vec![k("  Space"), d("       Complete / Reopen")]),
-        Line::from(vec![k("  Delete"), d("      Delete quest")]),
-        Line::from(vec![k("  →"), d("           View steps")]),
-        Line::from(vec![k("  +"), d("           Add step to quest")]),
-        Line::from(vec![k("  f"), d("           Cycle filter")]),
-        Line::from(vec![k("  s"), d("           Cycle sort")]),
-        if is_shared {
-            Line::from(vec![k("  a"), d("           Assign member")])
-        } else {
-            Line::from(vec![m("  a"), m("           Assign (shared only)")])
-        },
+        Line::from(vec![h("  1 · QUESTS")]),
+        binding("n", "New quest", true),
+        binding("Enter / e", "Edit quest", true),
+        binding("Space", "Complete / reopen", true),
+        binding("Delete", "Delete quest", true),
+        binding("→", "View steps", true),
+        binding("+", "Add step", true),
+        binding("f", "Cycle filter", true),
+        binding("s", "Cycle sort", true),
+        binding(
+            "a",
+            if is_shared {
+                "Assign member"
+            } else {
+                "Assign (shared only)"
+            },
+            is_shared,
+        ),
         Line::from(vec![]),
         Line::from(vec![h("  STEP VIEW")]),
-        Line::from(vec![k("  n"), d("          New step")]),
-        Line::from(vec![k("  Enter / e"), d("    Edit step")]),
-        Line::from(vec![k("  Space"), d("       Complete / Reopen")]),
-        Line::from(vec![k("  Delete"), d("      Delete step")]),
-        Line::from(vec![k("  ← / ESC"), d("     Back to quests")]),
+        binding("n", "New step", true),
+        binding("Enter / e", "Edit step", true),
+        binding("Space", "Complete / reopen", true),
+        binding("Delete", "Delete step", true),
+        binding("← / Esc", "Back to quests", true),
         Line::from(vec![]),
         Line::from(vec![h("  NAVIGATION")]),
-        Line::from(vec![k("  1 2 3 4"), d("     Switch sections")]),
-        Line::from(vec![k("  Tab"), d("         Cycle panes")]),
-        Line::from(vec![k("  Shift+Tab"), d("   Cycle panes back")]),
-        Line::from(vec![k("  ↑ / ↓"), d("      Navigate items")]),
-        Line::from(vec![k("  C"), d("           Open quest calendar")]),
-        Line::from(vec![k("  /"), d("           Search")]),
-        Line::from(vec![k("  ESC"), d("         Exit workspace")]),
+        binding("1  2  3  4", "Switch sections", true),
+        binding("Tab", "Next pane", true),
+        binding("Shift+Tab", "Previous pane", true),
+        binding("↑ / ↓", "Navigate items", true),
+        binding("C", "Quest calendar", true),
+        binding("/", "Search", true),
+        binding("Esc", "Exit workspace", true),
     ];
 
     let right: Vec<Line> = vec![
-        Line::from(vec![h("  SCROLLS (Section 2)")]),
-        Line::from(vec![k("  n"), d("          New scroll")]),
-        Line::from(vec![k("  Enter / e"), d("    Edit scroll")]),
-        Line::from(vec![k("  d"), d("           New codex")]),
-        Line::from(vec![k("  r"), d("           Move to campaign / codex")]),
-        Line::from(vec![k("  Delete"), d("      Delete scroll")]),
+        Line::from(vec![h("  2 · SCROLLS")]),
+        binding("n", "New scroll", true),
+        binding("Enter / e", "Edit scroll", true),
+        binding("d", "New codex", true),
+        binding("r", "Move scroll / codex", true),
+        binding("Delete", "Delete scroll", true),
         Line::from(vec![]),
-        Line::from(vec![h("  JOURNAL (Section 3)")]),
-        Line::from(vec![k("  j"), d("           New journal log")]),
-        Line::from(vec![k("  v"), d("           Toggle visibility")]),
-        Line::from(vec![k("  Delete"), d("      Delete entry")]),
+        Line::from(vec![h("  3 · CHRONICLES")]),
+        binding("j", "New journal log", true),
+        binding("v", "Toggle visibility", true),
+        binding("Delete", "Delete entry", true),
         Line::from(vec![]),
-        Line::from(vec![h("  OVERVIEW (Section 4)")]),
-        Line::from(vec![k("  m"), d("           New milestone")]),
-        Line::from(vec![k("  Space"), d("       Toggle milestone")]),
-        Line::from(vec![k("  Delete"), d("      Remove milestone")]),
-        Line::from(vec![k("  c"), d("           Conquer campaign")]),
+        Line::from(vec![h("  4 · OVERVIEW")]),
+        binding("m", "New milestone", true),
+        binding("Space", "Toggle milestone", true),
+        binding("Delete", "Remove milestone", true),
+        binding("c", "Conquer campaign", true),
         Line::from(vec![]),
-        Line::from(vec![h("  SORT OPTIONS  "), m("(press s to cycle)")]),
-        Line::from(vec![m("  Created Date → Due Date → Priority → A→Z")]),
+        Line::from(vec![h("  QUEST OPTIONS")]),
+        Line::from(vec![
+            k("  s"),
+            d("  Sort: "),
+            m("Created → Due → Priority → A–Z"),
+        ]),
+        Line::from(vec![
+            k("  f"),
+            d("  Filter: "),
+            m("All → Incomplete → Completed"),
+        ]),
         Line::from(vec![]),
-        Line::from(vec![h("  FILTER OPTIONS  "), m("(press f to cycle)")]),
-        Line::from(vec![m("  All → Incomplete → Completed")]),
-        Line::from(vec![]),
-        Line::from(vec![h("  RECURRENCE  "), m("(L/R/Space in quest modal)")]),
+        Line::from(vec![h("  RECURRENCE")]),
+        Line::from(vec![m("  Use ← / → / Space in the quest modal")]),
         Line::from(vec![m("  None → Daily → Weekly → Monthly → Yearly")]),
     ];
 
@@ -818,15 +846,20 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         height: area.height.saturating_sub(5),
     };
 
+    let col_w = inner.width.saturating_sub(2) / 2;
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(col_w), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(col_w),
+            Constraint::Length(2),
+            Constraint::Min(1),
+        ])
         .split(inner);
 
     let left_p = Paragraph::new(left);
     let right_p = Paragraph::new(right);
     f.render_widget(left_p, cols[0]);
-    f.render_widget(right_p, cols[1]);
+    f.render_widget(right_p, cols[2]);
 
     let close_line = Line::from(vec![
         Span::styled("  Press ", Style::default().fg(theme.muted)),
@@ -1790,7 +1823,9 @@ fn draw_notes_tab(
     codices: &[crate::models::Codex],
     preview_focused: bool,
     preview_scroll: usize,
+    preview_max_scroll: &std::cell::Cell<usize>,
 ) {
+    preview_max_scroll.set(0);
     let accent_color = theme.primary;
     let list_border = if sidebar_focused || preview_focused {
         theme.border
@@ -2007,6 +2042,21 @@ fn draw_notes_tab(
             }
         }
 
+        let preview_width = sub_chunks[1].width.saturating_sub(2) as usize;
+        let preview_height = sub_chunks[1].height.saturating_sub(2) as usize;
+        let visual_rows: usize = lines
+            .iter()
+            .map(|line| {
+                if preview_width == 0 {
+                    1
+                } else {
+                    line.width().max(1).div_ceil(preview_width)
+                }
+            })
+            .sum();
+        let max_scroll = visual_rows.saturating_sub(preview_height);
+        preview_max_scroll.set(max_scroll);
+
         Paragraph::new(lines)
             .block(
                 Block::default()
@@ -2016,7 +2066,10 @@ fn draw_notes_tab(
                     .title(preview_title),
             )
             .wrap(ratatui::widgets::Wrap { trim: false })
-            .scroll((preview_scroll as u16, 0))
+            .scroll((
+                preview_scroll.min(max_scroll).min(u16::MAX as usize) as u16,
+                0,
+            ))
     };
     f.render_widget(preview_widget, sub_chunks[1]);
 }
@@ -2177,7 +2230,6 @@ fn draw_overview_tab(
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .margin(1)
         .constraints(constraints)
         .split(area);
 

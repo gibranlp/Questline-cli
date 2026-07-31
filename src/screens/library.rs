@@ -14,6 +14,7 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState,
     },
 };
+use std::cell::Cell;
 
 // Categorías de la biblioteca — cada una tiene su propio conjunto de entradas
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +220,7 @@ pub fn draw(
     selected_item: usize,
     item_scroll_offset: usize,
     scroll_offset: u16,
+    detail_max_scroll: &Cell<u16>,
     // Quests details: (class_name, unlock_level, name, desc, status, progress, target, reward)
     quests: &[(String, i32, String, String, String, i32, i32, String)],
     // Lore entries: (id, category, title, content, unlocked, unlocked_at)
@@ -237,6 +239,7 @@ pub fn draw(
     theme: &Theme,
     animation_ticks: usize,
 ) {
+    detail_max_scroll.set(0);
     let size = f.size();
     let accent_color = theme.primary;
 
@@ -850,9 +853,18 @@ pub fn draw(
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Min(8), Constraint::Length(3)])
                 .split(detail_inner);
+            let viewport_width = detail_layout[0].width.max(1) as usize;
+            let total_visual_rows: usize = text
+                .iter()
+                .map(|line| line.width().max(1).div_ceil(viewport_width))
+                .sum();
+            let max_scroll = total_visual_rows
+                .saturating_sub(detail_layout[0].height as usize)
+                .min(u16::MAX as usize) as u16;
+            detail_max_scroll.set(max_scroll);
             let p = Paragraph::new(text)
                 .wrap(ratatui::widgets::Wrap { trim: false })
-                .scroll((scroll_offset, 0));
+                .scroll((scroll_offset.min(max_scroll), 0));
             f.render_widget(p, detail_layout[0]);
             let gauge = Gauge::default()
                 .block(
@@ -1036,9 +1048,13 @@ pub fn draw(
                     })
                     .sum();
 
+                let viewport_height = detail_inner.height as usize;
+                let scrollable = total_visual_rows.saturating_sub(viewport_height);
+                let max_scroll = scrollable.min(u16::MAX as usize) as u16;
+                detail_max_scroll.set(max_scroll);
                 let p = Paragraph::new(text)
                     .wrap(ratatui::widgets::Wrap { trim: false })
-                    .scroll((scroll_offset, 0));
+                    .scroll((scroll_offset.min(max_scroll), 0));
                 f.render_widget(p, detail_inner);
 
                 // Scrollbar vertical — renderiza sobre el borde derecho del bloque de detalles
@@ -1054,10 +1070,8 @@ pub fn draw(
                     .thumb_style(Style::default().fg(scrollbar_color))
                     .track_symbol(Some("│"))
                     .track_style(Style::default().fg(theme.muted));
-                let viewport_height = detail_inner.height as usize;
-                let scrollable = total_visual_rows.saturating_sub(viewport_height);
-                let mut scrollbar_state =
-                    ScrollbarState::new(scrollable).position(scroll_offset as usize);
+                let mut scrollbar_state = ScrollbarState::new(scrollable)
+                    .position(scroll_offset.min(max_scroll) as usize);
                 f.render_stateful_widget(scrollbar, col_chunks[2], &mut scrollbar_state);
             }
         }
@@ -1065,11 +1079,11 @@ pub fn draw(
 
     // 3. Footer — las instrucciones cambian según la columna activa
     let inst_text = if active_col == 0 {
-        "Press [Right Arrow] or [Tab] to browse entries | [Esc] back"
+        "[Tab] browse entries | [Shift+Tab] previous pane | [Esc] back"
     } else if active_col == 1 {
-        "Press [Left Arrow] to select categories | [Right Arrow] to read details | [Space] to act on quest"
+        "[Tab] read details | [Shift+Tab] categories | [Space] act on quest"
     } else {
-        "[Up/Down] scroll content | [Left Arrow] return to entries"
+        "[Up/Down] scroll content | [Tab] categories | [Shift+Tab] entries"
     };
     let footer_p = Paragraph::new(Span::styled(
         format!("  Keys: {}  ", inst_text),
