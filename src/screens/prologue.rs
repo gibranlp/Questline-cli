@@ -21,6 +21,7 @@ const ORDER_COLORS: &[Color] = &[
     Color::Rgb(232, 121, 249), // 4 Time Chronomancers
     Color::Rgb(250, 204, 21),  // 5 Arch Accountants
 ];
+const BODY_TEXT_COLOR: Color = Color::Rgb(195, 195, 195);
 
 // todos los "sabores" de línea — cada uno dicta estilo y comportamiento
 #[derive(Clone, Copy)]
@@ -286,17 +287,11 @@ fn style_line(text: String, kind: LineKind, class_color: Color) -> Line<'static>
         ))
         .alignment(Alignment::Center),
 
-        LineKind::Normal => Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Rgb(195, 195, 195)),
-        ))
-        .alignment(Alignment::Center),
+        LineKind::Normal => Line::from(Span::styled(text, Style::default().fg(BODY_TEXT_COLOR)))
+            .alignment(Alignment::Center),
 
-        LineKind::Muted => Line::from(Span::styled(
-            text,
-            Style::default().fg(Color::Rgb(105, 105, 105)),
-        ))
-        .alignment(Alignment::Center),
+        LineKind::Muted => Line::from(Span::styled(text, Style::default().fg(BODY_TEXT_COLOR)))
+            .alignment(Alignment::Center),
 
         LineKind::Dramatic => Line::from(Span::styled(
             text,
