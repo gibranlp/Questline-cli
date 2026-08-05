@@ -33,7 +33,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .unwrap_or_else(|| "Never".to_string());
     let local_sync_seq = app
         .db
-        .get_setting("last_pull_seq")
+        .get_setting("last_pull_seq_v2")
         .unwrap_or(None)
         .unwrap_or_else(|| "0".to_string());
     let cloud_sync_seq = app
@@ -149,7 +149,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )]),
         Line::from(vec![
             Span::styled(
-                "   [c] Copy Share Key       ",
+                "   [c] Copy Companion Key   ",
                 Style::default().fg(theme.text),
             ),
             Span::styled("[b] Backup", Style::default().fg(theme.text)),
@@ -217,13 +217,26 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            "   Public Key (Share Key):",
+            "   Companion Key (public; safe to share):",
             Style::default().fg(theme.muted),
         )]),
         Line::from(vec![Span::styled(
-            format!("   {}", app.identity.public_key),
+            format!(
+                "   {}",
+                crate::services::identity::format_companion_key(&app.identity.public_key)
+            ),
             Style::default().fg(Color::LightCyan),
         )]),
+        Line::from(vec![
+            Span::styled("   Fingerprint: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                crate::services::identity::companion_key_fingerprint(&app.identity.public_key)
+                    .unwrap_or_else(|_| "Unavailable".to_string()),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(vec![
             Span::styled("   Created At: ", Style::default().fg(theme.muted)),
             Span::styled(&app.identity.created_at, Style::default().fg(theme.text)),
@@ -244,6 +257,38 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  [u] edit", Style::default().fg(theme.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("   Encryption: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!(
+                    "Active — sync-v{} / {} / {}",
+                    crate::services::encryption::SYNC_VERSION,
+                    crate::services::encryption::CIPHER_NAME,
+                    crate::services::encryption::KEY_ID,
+                ),
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("   Cloud Sync: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                if app.config.sync_enabled {
+                    "Enabled"
+                } else {
+                    "Disabled — Local Only"
+                },
+                Style::default()
+                    .fg(if app.config.sync_enabled {
+                        theme.success
+                    } else {
+                        theme.warning
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  [s] toggle", Style::default().fg(theme.muted)),
         ]),
         Line::from(vec![
             Span::styled("   Auto Sync:  ", Style::default().fg(theme.muted)),
@@ -371,7 +416,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(34), Constraint::Min(6)])
+        .constraints([Constraint::Length(36), Constraint::Min(6)])
         .split(chunks[0]);
 
     f.render_widget(left_panel, left_chunks[0]);

@@ -7,6 +7,8 @@
 CREATE TABLE IF NOT EXISTS users (
     id VARCHAR(36) PRIMARY KEY,
     public_key VARCHAR(64) UNIQUE NOT NULL,
+    sync_protocol TINYINT UNSIGNED NOT NULL DEFAULT 1,
+    encryption_public_key VARCHAR(64) NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -23,7 +25,7 @@ CREATE TABLE IF NOT EXISTS sync_events (
     id VARCHAR(36) PRIMARY KEY,
     user_id VARCHAR(36) NOT NULL,
     entity_type VARCHAR(50) NOT NULL,
-    entity_id VARCHAR(36) NOT NULL,
+    entity_id VARCHAR(255) NOT NULL,
     operation VARCHAR(20) NOT NULL,
     payload LONGTEXT NOT NULL,
     created_at VARCHAR(50) NOT NULL, -- Client timestamp string for Latest Edit Wins
@@ -52,6 +54,14 @@ CREATE TABLE IF NOT EXISTS project_invitations (
     role VARCHAR(50) NOT NULL,
     status VARCHAR(20) NOT NULL DEFAULT 'Pending', -- Pending, Accepted, Declined
     created_at VARCHAR(50) NOT NULL,
+    routing_id VARCHAR(36) NULL,
+    inviter_encryption_key VARCHAR(64) NULL,
+    key_nonce VARCHAR(32) NULL,
+    key_ciphertext TEXT NULL,
+    project_name_nonce VARCHAR(32) NULL,
+    project_name_ciphertext TEXT NULL,
+    project_id_nonce VARCHAR(32) NULL,
+    project_id_ciphertext TEXT NULL,
     INDEX idx_invitee (invitee_identity)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

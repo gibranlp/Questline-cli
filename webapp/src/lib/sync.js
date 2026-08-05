@@ -9,11 +9,17 @@ import {
   projects, tasks, notes, codices, journalEntries,
   milestones, achievements, rituals, focusSessions,
   loreUnlocks, chronicleMessages, userStats, zenTree, streaks,
+  taskAssignments, notifications, identity,
   dataKey,
 } from './store.js';
-import { encryptPayload, decryptPayload } from './crypto.js';
-import { saveEntity, deleteEntity, loadAllEntities } from './db.js';
+import { encryptPayload, decryptPayload, signEvent, verifyEvent,
+  importProjectKey, projectKeyFromHex } from './crypto.js';
+import { saveEntity, deleteEntity, loadAllEntities,
+  getProjectKeyByRouting, getActiveProjectKeyByProject } from './db.js';
+import { saveProjectOutboxEvent, deleteProjectOutboxEvent, loadProjectOutboxEvents } from './db.js';
 import { ApiClient, QUESTLINE_API_BASE, pullAllFromQuestline } from './api.js';
+import { processKeyEnvelopesAndRevocations } from './fellowship.js';
+import { assignmentNotification } from './collaboration.js';
 
 const SEQ_KEY     = 'questline_sync_seq';  // webapp DB (gibranlp_webappquest) pull cursor
 const CLI_SEQ_KEY = 'questline_cli_seq';   // questlinecli.com pull cursor — different DB, different seq space
@@ -48,6 +54,8 @@ export async function loadLocalCache() {
     ['rituals',        rituals],
     ['focus_sessions', focusSessions],
     ['lore_unlocks',   loreUnlocks],
+    ['task_assignments', taskAssignments],
+    ['notifications', notifications],
   ];
 
   for (const [storeName, svStore] of entityStoreMap) {
@@ -109,23 +117,49 @@ const ENTITY_STORE_NAME = {
   focus_session:     'focus_sessions',
   lore_unlock:       'lore_unlocks',
   chronicle_message: 'chronicle_messages',
+  task_assignment:   'task_assignments',
+  notification:      'notifications',
 };
 
-async function applyAndCacheEvent(event) {
-  const { entity_type, entity_id, operation, content } = event;
-  const key = get(dataKey);
-
-  // Decrypt content when a key is available; fall back to raw if not encrypted
-  let plainContent = content;
-  if (key && content) {
-    plainContent = await decryptPayload(content, key);
+async function applyAndCacheEvent(event, signaturesRequired = false) {
+  const hasSignature = Boolean(event.author_public_key && event.event_signature);
+  if (signaturesRequired && !hasSignature) {
+    throw new Error(`Unsigned sync event ${event.id} received after signature cutover`);
   }
+  if (hasSignature && !(await verifyEvent(event))) {
+    throw new Error(`Invalid durable signature on sync event ${event.id}`);
+  }
+  const { entity_type, entity_id, operation } = event;
+
+  // Encrypted Fellowship events decrypt with the per-project key (looked up by
+  // routing_id) instead of the account data key. If we don't hold that key yet,
+  // skip the event without failing the pull so it can arrive after key delivery.
+  let key;
+  if (event.key_id === 'project-v1' || event.scope === 'project') {
+    const rec = await getProjectKeyByRouting(event.routing_id);
+    if (!rec) return false;
+    key = await importProjectKey(projectKeyFromHex(rec.key_hex));
+  } else {
+    key = get(dataKey);
+  }
+  const plainContent = await decryptPayload(event, key);
 
   // Apply to Svelte stores (store.js handles all entity_type routing)
   applySyncEvent({ ...event, content: plainContent });
 
   // Persist decrypted entity to IndexedDB
   const payload = plainContent ? JSON.parse(plainContent) : null;
+
+  if (entity_type === 'task_assignment' && operation !== 'delete' && payload) {
+    const mine = String(get(identity)?.public_key || '').toLowerCase();
+    if (mine && String(payload.user_identity || '').toLowerCase() === mine) {
+      const title = get(tasks).get(payload.task_id)?.title || 'A quest';
+      const notice = assignmentNotification(event.id, payload, title);
+      if (notice) {
+        try { await saveEntity('notifications', notice); } catch {}
+      }
+    }
+  }
 
   if ((entity_type === 'user' || entity_type === 'user_stats') && payload) {
     try { await saveEntity('user_stats', { id: 'singleton', ...payload }); } catch {}
@@ -164,11 +198,12 @@ export async function pullSync(api, onProgress = null) {
 
   try {
     while (hasMore) {
-      const events = await api.request('POST', 'sync/pull', null, { since_seq: seq });
+      const page = await api.request('POST', 'sync/v2/pull', null, { since_seq: seq, limit: 500, include_meta: 1 });
+      const events = page.events;
       if (!Array.isArray(events) || events.length === 0) { hasMore = false; break; }
 
       for (const event of events) {
-        await applyAndCacheEvent(event);
+        await applyAndCacheEvent(event, Boolean(page.signatures_required));
         if (event.seq > seq) seq = event.seq;
       }
 
@@ -192,7 +227,11 @@ export async function pullSync(api, onProgress = null) {
 // so the CLI picks up webapp changes on its next pull.
 
 export async function pushEvent(api, entityType, entityId, operation, payload) {
-  const key = get(dataKey);
+  // A project we hold a key for is an encrypted Fellowship project: its events are
+  // project-scoped, encrypted under the project key, and routed via questlinecli.com
+  // only (the webapp DB cannot store project scope).
+  const projectId = entityType === 'project' ? entityId : payload?.project_id;
+  const projectKeyRec = projectId ? await getActiveProjectKeyByProject(projectId) : null;
 
   // Optimistic local save
   const storeName = ENTITY_STORE_NAME[entityType];
@@ -206,28 +245,52 @@ export async function pushEvent(api, entityType, entityId, operation, payload) {
     } catch {}
   }
 
-  // Encrypt payload before transmitting
-  let contentString = payload ? JSON.stringify(payload) : null;
-  if (key && contentString) {
-    try {
-      contentString = await encryptPayload(contentString, key);
-    } catch (err) {
-      console.warn('[sync] encryption failed, sending unencrypted:', err);
-    }
-  }
-
   const event = {
+    version:     2,
     id:          crypto.randomUUID(),
     entity_type: entityType,
     entity_id:   entityId,
     operation,
-    content:     contentString,
     timestamp:   new Date().toISOString(),
+    key_id:      'account-v1',
+    scope:       'account',
+    routing_id:  '',
+    device_id:   api.identity.device_id,
   };
+
+  if (projectKeyRec) {
+    event.key_id     = 'project-v1';
+    event.scope      = 'project';
+    event.routing_id = projectKeyRec.routing_id;
+    const projectKey = await importProjectKey(projectKeyFromHex(projectKeyRec.key_hex));
+    const encrypted = await encryptPayload(payload ? JSON.stringify(payload) : 'null', projectKey, event);
+    Object.assign(event, encrypted);
+    await signEvent(event, api.identity);
+    await saveProjectOutboxEvent(event);
+
+    // Project events go to questlinecli.com only; the server fans them out to the
+    // other route members' encrypted accounts.
+    try {
+      const questlineClient = new ApiClient(api.identity, QUESTLINE_API_BASE);
+      await questlineClient.post('sync/v2/push', [event]);
+      await deleteProjectOutboxEvent(event.id);
+      return { queued: false };
+    } catch (err) {
+      console.error('[sync] Fellowship push failed:', err);
+      addToast('Fellowship change queued until the Realm reconnects', 'warning');
+      return { queued: true };
+    }
+  }
+
+  const key = get(dataKey);
+  if (!key) throw new Error('Sync encryption key is unavailable');
+  const encrypted = await encryptPayload(payload ? JSON.stringify(payload) : 'null', key, event);
+  Object.assign(event, encrypted);
+  await signEvent(event, api.identity);
 
   // Push to primary webapp API
   try {
-    await api.post('sync/push', [event]);
+    await api.post('sync/v2/push', [event]);
   } catch (err) {
     console.error('[sync] webapp push failed:', err);
     addToast('Sync failed — changes saved locally', 'warning');
@@ -237,16 +300,74 @@ export async function pushEvent(api, entityType, entityId, operation, payload) {
   // Dual-push to questlinecli.com so the CLI stays in sync
   try {
     const questlineClient = new ApiClient(api.identity, QUESTLINE_API_BASE);
-    await questlineClient.post('sync/push', [event]);
+    await questlineClient.post('sync/v2/push', [event]);
   } catch {
     // Non-fatal — webapp DB is source of truth; CLI will catch up via its own sync
   }
 }
 
+export async function flushProjectOutbox(identityValue) {
+  const queued = await loadProjectOutboxEvents();
+  if (queued.length === 0) return 0;
+  const questlineClient = new ApiClient(identityValue, QUESTLINE_API_BASE);
+  let sent = 0;
+  for (const item of queued) {
+    try {
+      await questlineClient.post('sync/v2/push', [item.event]);
+      await deleteProjectOutboxEvent(item.id);
+      sent += 1;
+    } catch {
+      // Preserve order: a later event may depend on this one.
+      break;
+    }
+  }
+  return sent;
+}
+
+// ── Project pull ───────────────────────────────────────────────────────────────
+// Project events live only on questlinecli.com. We pull them on a dedicated cursor,
+// applying project-scoped events locally (account events arrive via the webapp poll).
+// Rotation keys/revocations are processed first so new-route events can decrypt.
+
+const PROJECT_SEQ_KEY = 'questline_project_seq';
+function getLastProjectSeq() { return parseInt(localStorage.getItem(PROJECT_SEQ_KEY) || '0', 10); }
+function setLastProjectSeq(seq) { localStorage.setItem(PROJECT_SEQ_KEY, String(seq)); }
+
+export async function pullProjectSync(identity) {
+  await processKeyEnvelopesAndRevocations(identity);
+
+  const questlineClient = new ApiClient(identity, QUESTLINE_API_BASE);
+  let seq = getLastProjectSeq();
+  let hasMore = true;
+
+  while (hasMore) {
+    const page = await questlineClient.request('POST', 'sync/v2/pull', null, { since_seq: seq, limit: 500, include_meta: 1 });
+    const events = page.events;
+    if (!Array.isArray(events) || events.length === 0) break;
+
+    for (const event of events) {
+      if (event.scope === 'project' || event.key_id === 'project-v1') {
+        try {
+          await applyAndCacheEvent(event, Boolean(page.signatures_required));
+        } catch (err) {
+          // Do not advance the durable cursor past an event we could not
+          // authenticate or decrypt. Earlier events may replay on retry, but
+          // cache writes are idempotent and the failed event remains recoverable.
+          throw new Error(`Could not apply Fellowship event ${event.id}: ${err.message}`, { cause: err });
+        }
+      }
+      if (event.seq > seq) seq = event.seq;
+    }
+    if (events.length < 500) hasMore = false;
+  }
+
+  setLastProjectSeq(seq);
+}
+
 // ── Import: pull all events from questlinecli.com → store in webapp DB ────────
 //
 // Flow:
-//   1. Pull all sync events from questlinecli.com (seq=0, batches of 500)
+//   1. Pull all encrypted sync-v2 events from questlinecli.com (seq=0, batches of 500)
 //   2. POST each batch to the webapp API (webapp/import) → gibranlp_webappquest
 //   3. Apply events locally (IndexedDB + Svelte stores) for instant UI
 //   4. Register a webhook on questlinecli.com so future CLI pushes propagate here
@@ -265,7 +386,7 @@ export async function importFromQuestline(webappApi, identity, onProgress = null
 
       // Apply locally
       for (const event of batch) {
-        await applyAndCacheEvent(event);
+        await applyAndCacheEvent(event, Boolean(batch.signatures_required));
         if (event.seq > cliCursor) cliCursor = event.seq;
       }
 
@@ -321,12 +442,13 @@ export async function catchupFromQuestline(webappApi, identity, onProgress = nul
     let hasMore = true;
 
     while (hasMore) {
-      const events = await questlineClient.request('POST', 'sync/pull', null, { since_seq: cursor });
+      const page = await questlineClient.request('POST', 'sync/v2/pull', null, { since_seq: cursor, limit: 500, include_meta: 1 });
+      const events = page.events;
       if (!Array.isArray(events) || events.length === 0) break;
 
       await webappApi.post('webapp/import', events);
       for (const event of events) {
-        await applyAndCacheEvent(event);
+        await applyAndCacheEvent(event, Boolean(page.signatures_required));
         if (event.seq > cursor) cursor = event.seq;
       }
 
@@ -357,7 +479,9 @@ export function startBackgroundSync(api) {
   const poll = async () => {
     if (pullInFlight) return;
     pullInFlight = true;
+    try { await flushProjectOutbox(api.identity); } catch { /* retry next tick */ }
     try { await pullSync(api); } catch { /* retry next tick */ }
+    try { await pullProjectSync(api.identity); } catch { /* retry next tick */ }
     finally { pullInFlight = false; }
   };
 

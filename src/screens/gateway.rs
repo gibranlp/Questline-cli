@@ -211,7 +211,9 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
             Span::styled("[ ↑ / ↓ ]", Style::default().fg(ghost)),
             Span::styled("  navigate    ", Style::default().fg(dim)),
             Span::styled("[ Enter ]", Style::default().fg(ghost)),
-            Span::styled("  confirm your fate", Style::default().fg(dim)),
+            Span::styled("  confirm your fate    ", Style::default().fg(dim)),
+            Span::styled("[ q ]", Style::default().fg(ghost)),
+            Span::styled("  quit", Style::default().fg(dim)),
         ]))
         .alignment(Alignment::Center),
         center(layout[7]),

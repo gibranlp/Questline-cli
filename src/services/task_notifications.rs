@@ -132,7 +132,7 @@ fn due_event(
         if now >= threshold && now < due {
             let key = task_key("due_before", task.id, label);
             if mark_once(db, &key)? {
-                return Ok(Some(TaskNotificationEvent {
+                let event = TaskNotificationEvent {
                     title: "Quest approaching".to_string(),
                     message: format!("{} is due in {}.", task.title, label),
                     urgent: task.priority == TaskPriority::High,
@@ -141,7 +141,15 @@ fn due_event(
                     } else {
                         NotificationIcon::TaskDue
                     },
-                }));
+                };
+                db.create_notification_once(
+                    &format!("quest_due:{}:{}", task.id, label),
+                    "due_soon",
+                    &event.title,
+                    &event.message,
+                    Some(&task.id.to_string()),
+                )?;
+                return Ok(Some(event));
             }
         }
     }
@@ -149,7 +157,7 @@ fn due_event(
     if now >= due && now < due + chrono::Duration::minutes(30) {
         let key = task_key("due_now", task.id, "once");
         if mark_once(db, &key)? {
-            return Ok(Some(TaskNotificationEvent {
+            let event = TaskNotificationEvent {
                 title: "Quest due".to_string(),
                 message: format!("{} is due now.", task.title),
                 urgent: task.priority == TaskPriority::High,
@@ -158,7 +166,15 @@ fn due_event(
                 } else {
                     NotificationIcon::TaskDue
                 },
-            }));
+            };
+            db.create_notification_once(
+                &format!("quest_due:{}:now", task.id),
+                "due_soon",
+                &event.title,
+                &event.message,
+                Some(&task.id.to_string()),
+            )?;
+            return Ok(Some(event));
         }
     }
 
@@ -186,12 +202,20 @@ fn overdue_event(
         }
     } else {
         db.set_setting(&first_key, &now.to_rfc3339())?;
-        return Ok(Some(TaskNotificationEvent {
+        let event = TaskNotificationEvent {
             title: "Quest overdue".to_string(),
             message: format!("{} is overdue.", task.title),
             urgent: task.priority == TaskPriority::High,
             icon: NotificationIcon::TaskOverdue,
-        }));
+        };
+        db.create_notification_once(
+            &format!("quest_overdue:{}:first", task.id),
+            "overdue",
+            &event.title,
+            &event.message,
+            Some(&task.id.to_string()),
+        )?;
+        return Ok(Some(event));
     }
 
     let daily_key = task_key(
@@ -200,12 +224,20 @@ fn overdue_event(
         &today.format("%Y-%m-%d").to_string(),
     );
     if mark_once(db, &daily_key)? {
-        return Ok(Some(TaskNotificationEvent {
+        let event = TaskNotificationEvent {
             title: "Overdue quest".to_string(),
             message: format!("{} still needs your attention.", task.title),
             urgent: false,
             icon: NotificationIcon::TaskOverdue,
-        }));
+        };
+        db.create_notification_once(
+            &format!("quest_overdue:{}:{}", task.id, today.format("%Y-%m-%d")),
+            "overdue",
+            &event.title,
+            &event.message,
+            Some(&task.id.to_string()),
+        )?;
+        return Ok(Some(event));
     }
 
     Ok(None)

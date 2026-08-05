@@ -5,6 +5,113 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum QuestStatus {
+    Backlog,
+    Ready,
+    InProgress,
+    Blocked,
+    Review,
+    Done,
+}
+
+impl QuestStatus {
+    pub const ACTIVE: [Self; 5] = [
+        Self::Backlog,
+        Self::Ready,
+        Self::InProgress,
+        Self::Blocked,
+        Self::Review,
+    ];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Backlog => "Backlog",
+            Self::Ready => "Ready",
+            Self::InProgress => "InProgress",
+            Self::Blocked => "Blocked",
+            Self::Review => "Review",
+            Self::Done => "Done",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Backlog => "Awaiting the Council",
+            Self::Ready => "Ready for Adventure",
+            Self::InProgress => "Quest Underway",
+            Self::Blocked => "Path Obstructed",
+            Self::Review => "Awaiting Judgment",
+            Self::Done => "Conquered",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Self {
+        match value {
+            "Ready" => Self::Ready,
+            "InProgress" => Self::InProgress,
+            "Blocked" => Self::Blocked,
+            "Review" => Self::Review,
+            "Done" => Self::Done,
+            _ => Self::Backlog,
+        }
+    }
+
+    pub fn next_active(self) -> Self {
+        let index = Self::ACTIVE
+            .iter()
+            .position(|status| *status == self)
+            .unwrap_or(0);
+        Self::ACTIVE[(index + 1) % Self::ACTIVE.len()]
+    }
+
+    pub fn previous_active(self) -> Self {
+        let index = Self::ACTIVE
+            .iter()
+            .position(|status| *status == self)
+            .unwrap_or(0);
+        Self::ACTIVE[(index + Self::ACTIVE.len() - 1) % Self::ACTIVE.len()]
+    }
+}
+
+#[cfg(test)]
+mod quest_status_tests {
+    use super::QuestStatus;
+
+    #[test]
+    fn quest_stances_cycle_without_claiming_done() {
+        let mut status = QuestStatus::Backlog;
+        let expected = [
+            QuestStatus::Ready,
+            QuestStatus::InProgress,
+            QuestStatus::Blocked,
+            QuestStatus::Review,
+            QuestStatus::Backlog,
+        ];
+        for next in expected {
+            status = status.next_active();
+            assert_eq!(status, next);
+        }
+        assert_ne!(status, QuestStatus::Done);
+    }
+
+    #[test]
+    fn quest_stance_wire_names_are_stable() {
+        assert_eq!(QuestStatus::from_str("InProgress").name(), "InProgress");
+        assert_eq!(QuestStatus::from_str("unknown"), QuestStatus::Backlog);
+        assert_eq!(QuestStatus::Done.display_name(), "Conquered");
+    }
+
+    #[test]
+    fn quest_stances_can_move_backward() {
+        assert_eq!(
+            QuestStatus::Blocked.previous_active(),
+            QuestStatus::InProgress
+        );
+        assert_eq!(QuestStatus::Backlog.previous_active(), QuestStatus::Review);
+    }
+}
+
 // Frecuencia de recurrencia — qué tan seguido se reinicia la tarea al completarse
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecurrenceType {

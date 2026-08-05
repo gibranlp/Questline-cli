@@ -130,7 +130,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             },
         ),
         settings_row(
-            "Quest Burst",
+            "Completion Effect: ",
             App::ambient_effect_label(app.task_completion_ambient_effect).to_string(),
             "",
             4,

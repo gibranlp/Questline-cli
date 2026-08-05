@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import ZenTree from '../components/ZenTree.svelte';
   import TaskItem from '../components/TaskItem.svelte';
-  import { userStats, zenTree, streaks, tasks, dailyQuests, addToast } from '../lib/store.js';
+  import { userStats, zenTree, streaks, tasks, dailyQuests, myAssignedTasks, notifications, addToast } from '../lib/store.js';
+  import { saveEntity } from '../lib/db.js';
   import { pullSync } from '../lib/sync.js';
   import { navigate } from '../lib/router.js';
   import { get } from 'svelte/store';
@@ -36,6 +37,16 @@
   $: nextQuest = scoreAndRank(allTasks.filter(t => !t.completed))[1] ?? null;
   $: todayStr = new Date().toISOString().slice(0, 10);
   $: todayTasks = allTasks.filter(t => !t.completed && t.due_date?.startsWith(todayStr));
+  $: unreadAssignments = [...$notifications.values()]
+    .filter(n => n.notification_type === 'task_assignment' && !n.read)
+    .sort((a, b) => String(b.created_at || '').localeCompare(String(a.created_at || '')));
+
+  async function openAssignmentNotice(notice) {
+    const updated = { ...notice, read: true };
+    notifications.update(map => { const next = new Map(map); next.set(notice.id, updated); return next; });
+    try { await saveEntity('notifications', updated); } catch {}
+    if (notice.project_id) navigate(`/projects/${notice.project_id}`);
+  }
 
   function scoreTask(t) {
     const now = new Date();
@@ -79,6 +90,18 @@
     </div>
   {:else}
     <div class="grid">
+      {#if unreadAssignments.length > 0}
+        <div class="card notice-card">
+          <h2 class="section-label">Fellowship Dispatches</h2>
+          {#each unreadAssignments.slice(0, 5) as notice (notice.id)}
+            <button class="notice-row" on:click={() => openAssignmentNotice(notice)}>
+              <span>⚜</span>
+              <span><strong>{notice.title}</strong><small>{notice.content}</small></span>
+              <span>Open →</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
       <!-- Main Quest -->
       <div class="card main-quest">
         <h2 class="section-label">Main Quest</h2>
@@ -153,6 +176,20 @@
           View all projects →
         </button>
       </div>
+
+      <div class="card tasks-card">
+        <h2 class="section-label">My Quests</h2>
+        {#if $myAssignedTasks.length === 0}
+          <div class="empty">No active quests are assigned to you.</div>
+        {:else}
+          {#each $myAssignedTasks.slice(0, 6) as t (t.id)}
+            <TaskItem task={t} {api} />
+          {/each}
+          {#if $myAssignedTasks.length > 6}
+            <div class="empty">+ {$myAssignedTasks.length - 6} more assigned quests</div>
+          {/if}
+        {/if}
+      </div>
     </div>
   {/if}
 </div>
@@ -193,6 +230,17 @@
     border-radius: 8px;
     padding: 1.25rem;
   }
+
+  .notice-card { grid-column: 1 / -1; border-color: rgba(168,85,247,0.35); }
+  .notice-row {
+    width: 100%; display: grid; grid-template-columns: auto 1fr auto; align-items: center;
+    gap: 0.75rem; background: none; border: 0; border-bottom: 1px solid #171717;
+    color: #a855f7; cursor: pointer; font: inherit; padding: 0.65rem 0; text-align: left;
+  }
+  .notice-row:hover { color: #c084fc; }
+  .notice-row strong, .notice-row small { display: block; }
+  .notice-row strong { color: #d4d4d4; font-size: 0.78rem; }
+  .notice-row small { color: #666; font-size: 0.7rem; margin-top: 0.1rem; }
 
   .section-label {
     font-size: 0.7rem;

@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 use crate::database::Database;
-use crate::models::{Note, Task};
+use crate::models::{Note, QuestStatus, Task};
 use crate::services::Identity;
 
 const PULL_PAGE_SIZE: usize = 1000;
@@ -17,6 +17,8 @@ const MAX_DRAIN_PAGES: usize = 100;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct SyncLogEntry {
+    #[serde(default)]
+    pub version: u8,
     pub id: String,
     pub entity_type: String,
     pub entity_id: String,
@@ -24,7 +26,21 @@ pub struct SyncLogEntry {
     pub timestamp: String,
     pub content: Option<String>,
     #[serde(default)]
+    pub key_id: String,
+    #[serde(default)]
+    pub nonce: String,
+    #[serde(default)]
+    pub ciphertext: String,
+    #[serde(default)]
+    pub scope: String,
+    #[serde(default)]
+    pub routing_id: String,
+    #[serde(default)]
     pub device_id: String,
+    #[serde(default)]
+    pub author_public_key: String,
+    #[serde(default)]
+    pub event_signature: String,
     // seq — cursor incremental del servidor para no descargar toda la historia en cada sync
     #[serde(default)]
     pub seq: i64,
@@ -37,6 +53,7 @@ struct PullPage {
     next_seq: i64,
     has_more: bool,
     metadata_supported: bool,
+    signatures_required: bool,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +65,8 @@ struct PullPageEnvelope {
     next_seq: i64,
     #[serde(default)]
     has_more: bool,
+    #[serde(default)]
+    signatures_required: bool,
 }
 
 fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
@@ -66,6 +85,7 @@ fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
             next_seq,
             has_more: envelope.has_more,
             metadata_supported: true,
+            signatures_required: envelope.signatures_required,
         });
     }
 
@@ -77,12 +97,23 @@ fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
         next_seq,
         events,
         metadata_supported: false,
+        signatures_required: false,
     })
 }
 
 pub trait CloudProvider {
     fn name(&self) -> &str;
+    /// Production transports require sync-v2. Test providers may return decoded fixtures.
+    fn requires_encryption(&self) -> bool {
+        false
+    }
+    fn prepare_pull(&self, _db: &Database, _identity: &Identity) -> Result<()> {
+        Ok(())
+    }
     fn push(&self, public_key: &str, signature: &str, payload: &str) -> Result<()>;
+    fn replace_snapshot(&self, public_key: &str, signature: &str, payload: &str) -> Result<()> {
+        self.push(public_key, signature, payload)
+    }
     fn pull(&self, public_key: &str, signature: &str, since_seq: i64) -> Result<String>;
 }
 
@@ -110,6 +141,10 @@ impl FileCloudProvider {
 impl CloudProvider for FileCloudProvider {
     fn name(&self) -> &str {
         "Cloud Chronicle (File-Simulated)"
+    }
+
+    fn requires_encryption(&self) -> bool {
+        true
     }
 
     // Nada se escribe sin firma criptográfica válida — el servidor de archivos también la exige
@@ -151,6 +186,20 @@ impl CloudProvider for FileCloudProvider {
             Ok("[]".to_string())
         }
     }
+
+    fn replace_snapshot(&self, public_key: &str, signature: &str, payload: &str) -> Result<()> {
+        if !Identity::verify(payload.as_bytes(), public_key, signature)? {
+            return Err(anyhow!(
+                "Security Error: Signature verification failed for snapshot"
+            ));
+        }
+        let entries: Vec<SyncLogEntry> = serde_json::from_str(payload)?;
+        std::fs::write(
+            self.user_log_file(public_key),
+            serde_json::to_string_pretty(&entries)?,
+        )?;
+        Ok(())
+    }
 }
 
 use crate::services::ApiClient;
@@ -162,6 +211,35 @@ fn total_user_progress_xp(user: &crate::models::User) -> i64 {
     completed_levels + user.xp.max(0) as i64
 }
 
+fn project_id_from_sync_content(
+    entity_type: &str,
+    entity_id: &str,
+    content: &str,
+) -> Option<String> {
+    if entity_type == "project_key" {
+        return None;
+    }
+    if entity_type == "project" {
+        return serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|value| value["is_shared"].as_bool().filter(|shared| *shared))
+            .map(|_| entity_id.to_string());
+    }
+    if entity_type == "project_member" {
+        return entity_id
+            .split_once("__")
+            .map(|(project_id, _)| project_id.to_string());
+    }
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| {
+            value["project_id"]
+                .as_str()
+                .or_else(|| value["campaign_id"].as_str())
+                .map(str::to_string)
+        })
+}
+
 pub struct HttpCloudProvider {
     pub client: ApiClient,
 }
@@ -171,8 +249,76 @@ impl CloudProvider for HttpCloudProvider {
         "Cloud Chronicle (HTTPS REST)"
     }
 
+    fn requires_encryption(&self) -> bool {
+        true
+    }
+
+    fn prepare_pull(&self, db: &Database, identity: &Identity) -> Result<()> {
+        let response = self
+            .client
+            .send_request("GET", "project/key-envelopes", "")?;
+        let envelopes: serde_json::Value = serde_json::from_str(&response)?;
+        let Some(envelopes) = envelopes.as_array() else {
+            return Err(anyhow!("invalid project key-envelope response"));
+        };
+        for envelope in envelopes {
+            let old_route = envelope["old_routing_id"].as_str().unwrap_or_default();
+            let new_route = envelope["new_routing_id"].as_str().unwrap_or_default();
+            let sender_key = envelope["sender_encryption_key"]
+                .as_str()
+                .unwrap_or_default();
+            let nonce = envelope["key_nonce"].as_str().unwrap_or_default();
+            let ciphertext = envelope["key_ciphertext"].as_str().unwrap_or_default();
+            if old_route.is_empty() || new_route.is_empty() {
+                return Err(anyhow!("malformed project key rotation envelope"));
+            }
+            if db
+                .get_project_encryption_key_by_routing_id(new_route)?
+                .is_some()
+            {
+                continue;
+            }
+            let (project_id, _) = db
+                .get_project_encryption_key_by_routing_id(old_route)?
+                .ok_or_else(|| anyhow!("missing prior Fellowship key for route {old_route}"))?;
+            let key = crate::services::encryption::unwrap_project_key(
+                identity, sender_key, new_route, nonce, ciphertext,
+            )?;
+            db.save_project_encryption_key(&project_id, new_route, &key)?;
+        }
+
+        let response = self.client.send_request("GET", "project/revocations", "")?;
+        let revocations: serde_json::Value = serde_json::from_str(&response)?;
+        let Some(revocations) = revocations.as_array() else {
+            return Err(anyhow!("invalid project revocation response"));
+        };
+        for revocation in revocations {
+            let old_route = revocation["routing_id"].as_str().unwrap_or_default();
+            let replacement_route = revocation["replacement_routing_id"]
+                .as_str()
+                .unwrap_or_default();
+            if old_route.is_empty() || replacement_route.is_empty() {
+                return Err(anyhow!("malformed project revocation"));
+            }
+            if db.is_project_route_revoked(old_route)? {
+                continue;
+            }
+            if let Some(project_id) =
+                db.apply_project_route_revocation(old_route, replacement_route)?
+            {
+                let _ = db.create_notification(
+                    "fellowship_access_removed",
+                    "Fellowship access removed",
+                    "A shared campaign is now a private local copy. Future changes will not be sent to its former Fellowship.",
+                    Some(&project_id),
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn push(&self, _public_key: &str, _signature: &str, payload: &str) -> Result<()> {
-        self.client.send_request("POST", "sync/push", payload)?;
+        self.client.send_request("POST", "sync/v2/push", payload)?;
         Ok(())
     }
 
@@ -180,11 +326,17 @@ impl CloudProvider for HttpCloudProvider {
         self.client.send_request(
             "POST",
             &format!(
-                "sync/pull?since_seq={}&limit={}&include_meta=1",
+                "sync/v2/pull?since_seq={}&limit={}&include_meta=1",
                 since_seq, PULL_PAGE_SIZE
             ),
             "",
         )
+    }
+
+    fn replace_snapshot(&self, _public_key: &str, _signature: &str, payload: &str) -> Result<()> {
+        self.client
+            .send_request("POST", "sync/v2/snapshot", payload)?;
+        Ok(())
     }
 }
 
@@ -275,6 +427,17 @@ impl<'a> SyncEngine<'a> {
                     }
                 }
             }
+            "ledger_entry" => {
+                if let Ok(id) = Uuid::parse_str(entity_id) {
+                    if let Ok(Some(entry)) =
+                        crate::services::TreasuryService::new(self.db).get_entry(id)
+                    {
+                        if let Ok(content) = serde_json::to_string(&entry) {
+                            let _ = self.db.create_revision("ledger_entry", entity_id, &content);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -305,6 +468,29 @@ impl<'a> SyncEngine<'a> {
             .unwrap_or_else(crate::models::default_sync_timestamp)
     }
 
+    /// Cuando una fila de tesorería no se puede aplicar casi siempre es orden de llegada:
+    /// falta la campaña, la categoría o la tarea a la que apunta la llave foránea. Se
+    /// reporta como conflicto y se rebobina el cursor para reintentar en el próximo sync,
+    /// en lugar de descartar el movimiento en silencio y quedar divergentes para siempre.
+    fn defer_treasury_event(
+        log: &SyncLogEntry,
+        stored: rusqlite::Result<usize>,
+        conflicts: &mut Vec<String>,
+        retry_from_seq: &mut Option<i64>,
+    ) -> bool {
+        let Err(error) = stored else {
+            return false;
+        };
+        conflicts.push(format!(
+            "Treasury {} {} could not be applied yet ({}); it will be retried on the next sync",
+            log.entity_type, log.entity_id, error
+        ));
+        if log.seq > 0 {
+            *retry_from_seq = Some(retry_from_seq.map_or(log.seq, |current| current.min(log.seq)));
+        }
+        true
+    }
+
     fn incoming_entity_is_newer(&self, table: &str, log: &SyncLogEntry) -> bool {
         let incoming = if log.operation == "delete" {
             Self::timestamp_or_epoch(Some(&log.timestamp))
@@ -319,7 +505,13 @@ impl<'a> SyncEngine<'a> {
                     .and_then(|value| value["updated_at"].as_str()),
             )
         };
-        let sql = format!("SELECT updated_at FROM {} WHERE id = ?1", table);
+        let id_column = match table {
+            "campaign_treasury" => "campaign_id",
+            "category_budgets" => "category_id",
+            "task_financials" => "task_id",
+            _ => "id",
+        };
+        let sql = format!("SELECT updated_at FROM {} WHERE {} = ?1", table, id_column);
         match self
             .db
             .conn
@@ -331,16 +523,63 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
+    fn incoming_task_status_is_newer(&self, log: &SyncLogEntry) -> bool {
+        let incoming = if log.operation == "delete" {
+            Self::timestamp_or_epoch(Some(&log.timestamp))
+        } else {
+            let value = log
+                .content
+                .as_ref()
+                .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+            Self::timestamp_or_epoch(
+                value
+                    .as_ref()
+                    .and_then(|value| value["updated_at"].as_str()),
+            )
+        };
+        match self.db.conn.query_row(
+            "SELECT updated_at FROM task_statuses WHERE task_id = ?1",
+            params![log.entity_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(local) => incoming > Self::timestamp_or_epoch(Some(&local)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(_) => false,
+        }
+    }
+
+    fn incoming_notification_state_is_newer(&self, log: &SyncLogEntry) -> bool {
+        let value = log
+            .content
+            .as_ref()
+            .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok());
+        let incoming = Self::timestamp_or_epoch(
+            value
+                .as_ref()
+                .and_then(|value| value["updated_at"].as_str()),
+        );
+        match self.db.conn.query_row(
+            "SELECT updated_at FROM notification_states WHERE notification_id = ?1",
+            params![log.entity_id],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(local) => incoming > Self::timestamp_or_epoch(Some(&local)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => true,
+            Err(_) => false,
+        }
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
+        self.provider.prepare_pull(self.db, self.identity)?;
         // Pull and drain remote history first, then push local changes. This keeps restore and
         // normal sync incremental: a device learns the server head before it publishes anything.
         let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
-            self.sync_once(false, true)?;
+            self.sync_once(false, true, false)?;
         let mut drain_pages = 0usize;
 
         while has_more && drain_pages < MAX_DRAIN_PAGES {
             let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false, true)?;
+                self.sync_once(false, true, false)?;
             pushed += more_pushed;
             pulled += more_pulled;
             downloaded += more_downloaded;
@@ -350,7 +589,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-            self.sync_once(true, true)?;
+            self.sync_once(true, true, false)?;
         pushed += more_pushed;
         pulled += more_pulled;
         downloaded += more_downloaded;
@@ -359,7 +598,7 @@ impl<'a> SyncEngine<'a> {
 
         while has_more && drain_pages < MAX_DRAIN_PAGES {
             let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false, true)?;
+                self.sync_once(false, true, false)?;
             pushed += more_pushed;
             pulled += more_pulled;
             downloaded += more_downloaded;
@@ -379,7 +618,13 @@ impl<'a> SyncEngine<'a> {
     /// Cloud backup/export uses this so a known-good local snapshot can be uploaded even when the
     /// remote event stream still contains older destructive updates that must not be applied.
     pub fn push_pending_only(&self) -> Result<usize> {
-        let (pushed, _, _, _, _) = self.sync_once(true, false)?;
+        let (pushed, _, _, _, _) = self.sync_once(true, false, false)?;
+        Ok(pushed)
+    }
+
+    /// Atomically replaces this account's remote encrypted history with the queued full snapshot.
+    pub fn replace_with_pending_snapshot(&self) -> Result<usize> {
+        let (pushed, _, _, _, _) = self.sync_once(true, false, true)?;
         Ok(pushed)
     }
 
@@ -389,6 +634,7 @@ impl<'a> SyncEngine<'a> {
         &self,
         push_local: bool,
         pull_remote: bool,
+        replace_snapshot: bool,
     ) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
@@ -401,6 +647,9 @@ impl<'a> SyncEngine<'a> {
             Vec::new()
         };
         let mut local_payload = Vec::new();
+        // Rol por campaña resuelto una sola vez — se consulta por cada evento pendiente.
+        let mut observer_routes: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
 
         for (log_id, entity_type, entity_id, operation, timestamp) in pending {
             let uuid = Uuid::parse_str(&entity_id).unwrap_or_default();
@@ -416,6 +665,53 @@ impl<'a> SyncEngine<'a> {
                     .get_task_by_id(uuid)
                     .ok()
                     .and_then(|t| serde_json::to_string(&t).ok()),
+                "campaign_treasury" => crate::services::TreasuryService::new(self.db)
+                    .get_campaign(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::to_string(&value).ok()),
+                "ledger_entry" => crate::services::TreasuryService::new(self.db)
+                    .get_entry(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::to_string(&value).ok()),
+                "task_financials" => crate::services::TreasuryService::new(self.db)
+                    .get_task_financials(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::to_string(&value).ok()),
+                "ledger_category" => self
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT campaign_id FROM ledger_categories WHERE id=?1",
+                        params![entity_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok()
+                    .and_then(|campaign_id| Uuid::parse_str(&campaign_id).ok())
+                    .and_then(|campaign_id| {
+                        crate::services::TreasuryService::new(self.db)
+                            .categories(campaign_id)
+                            .ok()
+                    })
+                    .and_then(|categories| {
+                        categories
+                            .into_iter()
+                            .find(|category| category.id.to_string() == entity_id)
+                    })
+                    .and_then(|category| serde_json::to_string(&category).ok()),
+                "category_budget" => self
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT json_object('category_id', category_id, 'campaign_id', campaign_id,
+                     'amount_minor', amount_minor, 'version', version, 'created_at', created_at,
+                     'updated_at', updated_at) FROM category_budgets WHERE category_id=?1",
+                        params![entity_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .ok(),
                 "note" => self
                     .db
                     .get_note_by_id(uuid)
@@ -637,6 +933,84 @@ impl<'a> SyncEngine<'a> {
                         None
                     }
                 }
+                "task_status" => {
+                    let mut stmt = self.db.conn.prepare(
+                        "SELECT task_id, project_id, status, changed_by_identity, changed_by_username, updated_at
+                         FROM task_statuses WHERE task_id = ?1",
+                    )?;
+                    stmt.query_row(params![entity_id], |row| {
+                        Ok(serde_json::json!({
+                            "task_id": row.get::<_, String>(0)?,
+                            "project_id": row.get::<_, String>(1)?,
+                            "status": row.get::<_, String>(2)?,
+                            "changed_by_identity": row.get::<_, String>(3)?,
+                            "changed_by_username": row.get::<_, String>(4)?,
+                            "updated_at": row.get::<_, String>(5)?,
+                        })
+                        .to_string())
+                    })
+                    .ok()
+                }
+                "task_comment" => {
+                    let mut stmt = self.db.conn.prepare(
+                        "SELECT id, task_id, project_id, author_identity, author_username, content,
+                                mentioned_identities, created_at, updated_at, edited_at, deleted_at
+                         FROM task_comments WHERE id = ?1",
+                    )?;
+                    stmt.query_row(params![entity_id], |row| {
+                        Ok(serde_json::json!({
+                            "id": row.get::<_, String>(0)?,
+                            "task_id": row.get::<_, String>(1)?,
+                            "project_id": row.get::<_, String>(2)?,
+                            "author_identity": row.get::<_, String>(3)?,
+                            "author_username": row.get::<_, String>(4)?,
+                            "content": row.get::<_, String>(5)?,
+                            "mentioned_identities": serde_json::from_str::<serde_json::Value>(&row.get::<_, String>(6)?).unwrap_or_else(|_| serde_json::json!([])),
+                            "created_at": row.get::<_, String>(7)?,
+                            "updated_at": row.get::<_, String>(8)?,
+                            "edited_at": row.get::<_, Option<String>>(9)?,
+                            "deleted_at": row.get::<_, Option<String>>(10)?,
+                        }).to_string())
+                    }).ok()
+                }
+                "task_dependency" => {
+                    let parts: Vec<&str> = entity_id.splitn(2, "__").collect();
+                    if parts.len() != 2 {
+                        None
+                    } else {
+                        let mut stmt = self.db.conn.prepare(
+                            "SELECT task_id, depends_on_task_id, project_id, created_by_identity,
+                                    created_by_username, created_at
+                             FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
+                        )?;
+                        stmt.query_row(params![parts[0], parts[1]], |row| {
+                            Ok(serde_json::json!({
+                                "task_id": row.get::<_, String>(0)?,
+                                "depends_on_task_id": row.get::<_, String>(1)?,
+                                "project_id": row.get::<_, String>(2)?,
+                                "created_by_identity": row.get::<_, String>(3)?,
+                                "created_by_username": row.get::<_, String>(4)?,
+                                "created_at": row.get::<_, String>(5)?,
+                            })
+                            .to_string())
+                        })
+                        .ok()
+                    }
+                }
+                "notification_state" => {
+                    let mut stmt = self.db.conn.prepare(
+                        "SELECT notification_id, read, updated_at FROM notification_states WHERE notification_id = ?1",
+                    )?;
+                    stmt.query_row(params![entity_id], |row| {
+                        Ok(serde_json::json!({
+                            "notification_id": row.get::<_, String>(0)?,
+                            "read": row.get::<_, i32>(1)? != 0,
+                            "updated_at": row.get::<_, String>(2)?,
+                        })
+                        .to_string())
+                    })
+                    .ok()
+                }
                 "project_member" => {
                     // Formato compuesto: "project_id__user_identity"
                     let parts: Vec<&str> = entity_id.splitn(2, "__").collect();
@@ -663,6 +1037,19 @@ impl<'a> SyncEngine<'a> {
                         None
                     }
                 }
+                "project_key" => self
+                    .db
+                    .get_project_encryption_key(&entity_id)
+                    .ok()
+                    .flatten()
+                    .map(|(routing_id, key)| {
+                        serde_json::json!({
+                            "project_id": entity_id,
+                            "routing_id": routing_id,
+                            "key_hex": key.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        })
+                        .to_string()
+                    }),
                 "chronicle_message" => {
                     let mut stmt = self.db.conn.prepare(
                         "SELECT id, project_id, sender_identity, sender_username, content, message_type, timestamp FROM chronicle_messages WHERE id = ?1",
@@ -723,14 +1110,108 @@ impl<'a> SyncEngine<'a> {
                 _ => None,
             };
 
+            // Deletes no longer have a live row. Revisions retain the last complete
+            // value, which lets us recover the Fellowship route for the tombstone.
+            let plaintext = content.unwrap_or_else(|| {
+                self.db
+                    .conn
+                    .query_row(
+                        "SELECT content FROM revisions WHERE entity_type = ?1 AND entity_id = ?2 ORDER BY revision_number DESC LIMIT 1",
+                        params![entity_type, entity_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap_or_else(|_| "null".to_string())
+            });
+            let project_id = project_id_from_sync_content(&entity_type, &entity_id, &plaintext);
+            let project_encryption = project_id.as_deref().and_then(|project_id| {
+                if operation == "delete" {
+                    self.db
+                        .get_project_encryption_key_for_tombstone(project_id)
+                        .ok()
+                        .flatten()
+                } else {
+                    self.db
+                        .get_project_encryption_key(project_id)
+                        .ok()
+                        .flatten()
+                }
+            });
+            // El servidor rechaza con 403 cualquier escritura de un Observer sobre una ruta
+            // compartida, y ese rechazo revierte el lote completo: un solo evento así
+            // dejaría el sync atascado para todo lo demás. Se queda local y pendiente,
+            // por si el rol cambia más adelante.
+            if project_encryption.is_some()
+                && entity_type != "chronicle_message"
+                && project_id
+                    .as_deref()
+                    .and_then(|project_id| {
+                        observer_routes
+                            .entry(project_id.to_string())
+                            .or_insert_with(|| {
+                                self.db
+                                    .get_member_role(project_id, &self.identity.public_key)
+                                    .ok()
+                                    .flatten()
+                                    .as_deref()
+                                    == Some("Observer")
+                            })
+                            .then_some(())
+                    })
+                    .is_some()
+            {
+                continue;
+            }
+            let (key_id, scope, routing_id) = match &project_encryption {
+                Some((routing_id, _)) => ("project-v1", "project", routing_id.clone()),
+                None => (
+                    crate::services::encryption::KEY_ID,
+                    "account",
+                    String::new(),
+                ),
+            };
+            let aad = if scope == "project" {
+                crate::services::encryption::associated_data_for_route(
+                    &log_id,
+                    &entity_type,
+                    &entity_id,
+                    &operation,
+                    &timestamp,
+                    key_id,
+                    scope,
+                    &routing_id,
+                )
+            } else {
+                crate::services::encryption::associated_data_for(
+                    &log_id,
+                    &entity_type,
+                    &entity_id,
+                    &operation,
+                    &timestamp,
+                    key_id,
+                )
+            };
+            let (nonce, ciphertext) = match project_encryption {
+                Some((_, key)) => {
+                    crate::services::encryption::encrypt_with_project_key(&key, &plaintext, &aad)?
+                }
+                None => crate::services::encryption::encrypt(self.identity, &plaintext, &aad)?,
+            };
             local_payload.push(SyncLogEntry {
+                version: crate::services::encryption::SYNC_VERSION,
                 id: log_id,
                 entity_type,
                 entity_id,
                 operation,
                 timestamp,
-                content,
+                content: None,
+                key_id: key_id.to_string(),
+                nonce,
+                ciphertext,
+                scope: scope.to_string(),
+                routing_id,
                 device_id: self.device_id.to_string(),
+                author_public_key: self.identity.public_key.clone(),
+                event_signature: String::new(),
                 seq: 0, // el servidor sobreescribe esto con el seq real al insertar
             });
         }
@@ -756,28 +1237,74 @@ impl<'a> SyncEngine<'a> {
                 "username": username,
             })
             .to_string();
+            let heartbeat_id = format!(
+                "device_heartbeat__{}__{}",
+                self.device_id,
+                Utc::now().format("%Y%m%d_%H%M")
+            );
+            let aad = crate::services::encryption::associated_data(
+                &heartbeat_id,
+                "device",
+                self.device_id,
+                "heartbeat",
+                &now_str,
+            );
+            let (nonce, ciphertext) =
+                crate::services::encryption::encrypt(self.identity, &device_info, &aad)?;
             local_payload.push(SyncLogEntry {
-                id: format!(
-                    "device_heartbeat__{}__{}",
-                    self.device_id,
-                    Utc::now().format("%Y%m%d_%H%M")
-                ),
+                version: crate::services::encryption::SYNC_VERSION,
+                id: heartbeat_id,
                 entity_type: "device".to_string(),
                 entity_id: self.device_id.to_string(),
                 operation: "heartbeat".to_string(),
                 timestamp: now_str,
-                content: Some(device_info),
+                content: None,
+                key_id: crate::services::encryption::KEY_ID.to_string(),
+                nonce,
+                ciphertext,
+                scope: "account".to_string(),
+                routing_id: String::new(),
                 device_id: self.device_id.to_string(),
+                author_public_key: self.identity.public_key.clone(),
+                event_signature: String::new(),
                 seq: 0,
             });
+        }
+
+        for event in &mut local_payload {
+            let version = event.version.to_string();
+            let message = crate::services::encryption::event_signature_message(&[
+                &version,
+                &event.id,
+                &event.entity_type,
+                &event.entity_id,
+                &event.operation,
+                &event.timestamp,
+                &event.key_id,
+                &event.nonce,
+                &event.ciphertext,
+                &event.scope,
+                &event.routing_id,
+                &event.device_id,
+                &event.author_public_key,
+            ]);
+            event.event_signature = self.identity.sign(&message)?;
         }
 
         // Si falla el push, no jalamos nada — así no pisamos cambios que aún no subimos
         let pushed_ids: Vec<String> = if !local_payload.is_empty() {
             let serialized = serde_json::to_string(&local_payload)?;
             let signature = self.identity.sign(serialized.as_bytes())?;
-            self.provider
-                .push(&self.identity.public_key, &signature, &serialized)?;
+            if replace_snapshot {
+                self.provider.replace_snapshot(
+                    &self.identity.public_key,
+                    &signature,
+                    &serialized,
+                )?;
+            } else {
+                self.provider
+                    .push(&self.identity.public_key, &signature, &serialized)?;
+            }
             pushed_count = local_payload.len();
             local_payload.iter().map(|l| l.id.clone()).collect()
         } else {
@@ -795,7 +1322,7 @@ impl<'a> SyncEngine<'a> {
         // El cursor `since_seq` evita descargar toda la historia en cada sync
         let since_seq: i64 = self
             .db
-            .get_setting("last_pull_seq")
+            .get_setting("last_pull_seq_v2")
             .ok()
             .flatten()
             .and_then(|s| s.parse().ok())
@@ -809,7 +1336,96 @@ impl<'a> SyncEngine<'a> {
         let remote_next_seq = pull_page.next_seq;
         let metadata_supported = pull_page.metadata_supported;
         let mut remote_has_more = pull_page.has_more;
-        let remote_logs = pull_page.events;
+        let mut remote_logs = pull_page.events;
+        for log in &mut remote_logs {
+            if !self.provider.requires_encryption() {
+                continue;
+            }
+            if log.version != crate::services::encryption::SYNC_VERSION
+                || !matches!(log.key_id.as_str(), "account-v1" | "project-v1")
+                || log.nonce.is_empty()
+                || log.ciphertext.is_empty()
+            {
+                return Err(anyhow!(
+                    "server returned a non-encrypted or unsupported sync event {}",
+                    log.id
+                ));
+            }
+            let has_signature =
+                log.author_public_key.len() == 64 && log.event_signature.len() == 128;
+            if pull_page.signatures_required && !has_signature {
+                return Err(anyhow!(
+                    "server returned unsigned event {} after signature cutover",
+                    log.id
+                ));
+            }
+            if has_signature {
+                let version = log.version.to_string();
+                let signed = crate::services::encryption::event_signature_message(&[
+                    &version,
+                    &log.id,
+                    &log.entity_type,
+                    &log.entity_id,
+                    &log.operation,
+                    &log.timestamp,
+                    &log.key_id,
+                    &log.nonce,
+                    &log.ciphertext,
+                    &log.scope,
+                    &log.routing_id,
+                    &log.device_id,
+                    &log.author_public_key,
+                ]);
+                if !Identity::verify(&signed, &log.author_public_key, &log.event_signature)? {
+                    return Err(anyhow!(
+                        "invalid durable signature on sync event {}",
+                        log.id
+                    ));
+                }
+            }
+            let aad = if log.scope == "project" {
+                crate::services::encryption::associated_data_for_route(
+                    &log.id,
+                    &log.entity_type,
+                    &log.entity_id,
+                    &log.operation,
+                    &log.timestamp,
+                    &log.key_id,
+                    &log.scope,
+                    &log.routing_id,
+                )
+            } else {
+                crate::services::encryption::associated_data_for(
+                    &log.id,
+                    &log.entity_type,
+                    &log.entity_id,
+                    &log.operation,
+                    &log.timestamp,
+                    &log.key_id,
+                )
+            };
+            log.content = Some(if log.key_id == "project-v1" {
+                let (_, key) = self
+                    .db
+                    .get_project_encryption_key_by_routing_id(&log.routing_id)?
+                    .ok_or_else(|| {
+                        anyhow!("missing Fellowship key for routing id {}", log.routing_id)
+                    })?;
+                crate::services::encryption::decrypt_with_project_key(
+                    &key,
+                    &log.nonce,
+                    &log.ciphertext,
+                    &aad,
+                )?
+            } else {
+                crate::services::encryption::decrypt(
+                    self.identity,
+                    &log.nonce,
+                    &log.ciphertext,
+                    &aad,
+                )?
+            });
+        }
 
         // Dedup por ID — si el servidor no retorna seq reales (todos llegan con seq=0), este set
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
@@ -921,6 +1537,7 @@ impl<'a> SyncEngine<'a> {
 
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
+        let mut retry_from_seq: Option<i64> = None;
         for log in remote_logs {
             if log.seq > max_seq {
                 max_seq = log.seq;
@@ -1108,7 +1725,12 @@ impl<'a> SyncEngine<'a> {
                         == 0
                 }
                 "task_assignment" => true,
+                "task_status" => self.incoming_task_status_is_newer(&log),
+                "task_comment" => self.incoming_entity_is_newer("task_comments", &log),
+                "task_dependency" => true,
+                "notification_state" => self.incoming_notification_state_is_newer(&log),
                 "project_member" => true,
+                "project_key" => true,
                 // Los mensajes de la crónica son inmutables — nunca se editan, solo se insertan
                 "chronicle_message" => {
                     self.db
@@ -1170,6 +1792,11 @@ impl<'a> SyncEngine<'a> {
                     }
                 }
                 "milestone" => self.incoming_entity_is_newer("milestones", &log),
+                "campaign_treasury" => self.incoming_entity_is_newer("campaign_treasury", &log),
+                "ledger_entry" => self.incoming_entity_is_newer("ledger_entries", &log),
+                "ledger_category" => self.incoming_entity_is_newer("ledger_categories", &log),
+                "category_budget" => self.incoming_entity_is_newer("category_budgets", &log),
+                "task_financials" => self.incoming_entity_is_newer("task_financials", &log),
                 // Dispositivos: siempre aplicamos — upsert idempotente
                 "device" => true,
                 _ => false,
@@ -1218,15 +1845,68 @@ impl<'a> SyncEngine<'a> {
                             );
                             pulled_count += 1;
                         }
+                        "ledger_entry" => {
+                            self.save_local_revision_before_delete("ledger_entry", &log.entity_id);
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM ledger_entries WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
                         "task_assignment" => {
                             let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                             if parts.len() == 2 {
+                                let task_title = uuid::Uuid::parse_str(parts[0])
+                                    .ok()
+                                    .and_then(|id| self.db.get_task_by_id(id).ok())
+                                    .map(|task| task.title)
+                                    .unwrap_or_else(|| "A shared Quest".to_string());
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
                                     params![parts[0], parts[1]],
                                 );
+                                if parts[1] == self.identity.public_key.as_str() {
+                                    self.create_task_fellowship_notification(
+                                        &format!("task_unassigned:{}", log.id),
+                                        "task_unassignment",
+                                        "Released from Quest",
+                                        &format!("You are no longer assigned to {}.", task_title),
+                                        parts[0],
+                                    );
+                                }
                                 pulled_count += 1;
                             }
+                        }
+                        "task_status" => {
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM task_statuses WHERE task_id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "task_comment" => {
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM task_comments WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "task_dependency" => {
+                            let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
+                            if parts.len() == 2 {
+                                let _ = self.db.conn.execute(
+                                    "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
+                                    params![parts[0], parts[1]],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        "notification_state" => {
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM notification_states WHERE notification_id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
                         }
                         "project_member" => {
                             let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
@@ -1245,6 +1925,35 @@ impl<'a> SyncEngine<'a> {
                 }
 
                 if let Some(ref content) = log.content {
+                    if log.entity_type == "project_key" {
+                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                            if let (Some(project_id), Some(routing_id), Some(key_hex)) = (
+                                value["project_id"].as_str(),
+                                value["routing_id"].as_str(),
+                                value["key_hex"].as_str(),
+                            ) {
+                                let decoded = (0..key_hex.len())
+                                    .step_by(2)
+                                    .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
+                                    .collect::<std::result::Result<Vec<_>, _>>();
+                                if let Ok(bytes) = decoded {
+                                    if let Ok(key) = <[u8; 32]>::try_from(bytes) {
+                                        if self
+                                            .db
+                                            .save_project_encryption_key_from_sync(
+                                                project_id, routing_id, &key,
+                                            )
+                                            .is_ok()
+                                        {
+                                            pulled_count += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        newly_processed_ids.push(log.id);
+                        continue;
+                    }
                     match log.entity_type.as_str() {
                         "user" => {
                             if let Ok(mut u) = serde_json::from_str::<crate::models::User>(content)
@@ -1360,6 +2069,57 @@ impl<'a> SyncEngine<'a> {
                                     // XP para el usuario local si está asignado y la tarea acaba de completarse
                                     if t.completed && was_incomplete_locally {
                                         let my_key = self.identity.public_key.as_str();
+                                        for dependent_id in self
+                                            .db
+                                            .get_tasks_blocked_by(&t.id.to_string())
+                                            .unwrap_or_default()
+                                        {
+                                            let dependent_assigned_to_me = self
+                                                .db
+                                                .get_task_assignments(&dependent_id)
+                                                .unwrap_or_default()
+                                                .iter()
+                                                .any(|(id, _)| id == my_key);
+                                            if dependent_assigned_to_me {
+                                                let dependent_title =
+                                                    Uuid::parse_str(&dependent_id)
+                                                        .ok()
+                                                        .and_then(|id| {
+                                                            self.db.get_task_by_id(id).ok()
+                                                        })
+                                                        .map(|task| task.title)
+                                                        .unwrap_or_else(|| {
+                                                            "A dependent Quest".to_string()
+                                                        });
+                                                self.create_task_fellowship_notification(
+                                                    &format!(
+                                                        "dependency_resolved:{}:{}",
+                                                        log.id, dependent_id
+                                                    ),
+                                                    "dependency_resolved",
+                                                    "The path has opened",
+                                                    &format!(
+                                                        "{} no longer blocks {}.",
+                                                        t.title, dependent_title
+                                                    ),
+                                                    &dependent_id,
+                                                );
+                                                if let Some(project_id) = t.project_id {
+                                                    let _ = self.db.log_activity(
+                                                        Some(&project_id.to_string()),
+                                                        "quest_dependency_resolved",
+                                                        &format!(
+                                                            "{} opened the path for {}.",
+                                                            t.title, dependent_title
+                                                        ),
+                                                        &log.author_public_key,
+                                                        t.owner_username
+                                                            .as_deref()
+                                                            .unwrap_or("Companion"),
+                                                    );
+                                                }
+                                            }
+                                        }
                                         let assigned = self
                                             .db
                                             .get_task_assignments(&t.id.to_string())
@@ -1503,6 +2263,10 @@ impl<'a> SyncEngine<'a> {
                                         if merged_is_shared { 1 } else { 0 }
                                     ],
                                 );
+                                // A snapshot deliberately sends the account-encrypted project key
+                                // before project-v1 content. On an empty device it is staged in key
+                                // history until this project row satisfies the active-key FK.
+                                let _ = self.db.activate_staged_project_encryption_key(id);
                                 // When a project is shared, ensure owner appears in project_members
                                 if merged_is_shared {
                                     let owner_id_str =
@@ -1515,6 +2279,162 @@ impl<'a> SyncEngine<'a> {
                                             params![id, owner_id_str, owner_name_str],
                                         );
                                     }
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        "campaign_treasury" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::CampaignTreasury>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO campaign_treasury
+                                     (campaign_id, overall_budget_minor, currency_code, large_expense_threshold_minor,
+                                      version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(campaign_id) DO UPDATE SET
+                                      overall_budget_minor=excluded.overall_budget_minor,
+                                      currency_code=excluded.currency_code,
+                                      large_expense_threshold_minor=excluded.large_expense_threshold_minor,
+                                      version=excluded.version, updated_at=excluded.updated_at",
+                                    params![value.campaign_id.to_string(), value.overall_budget_minor,
+                                        value.currency_code, value.large_expense_threshold_minor, value.version,
+                                        value.created_at.to_rfc3339(), value.updated_at.to_rfc3339()],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        "ledger_category" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::LedgerCategory>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO ledger_categories
+                                     (id, campaign_id, name, is_default, version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                                      is_default=excluded.is_default, version=excluded.version,
+                                      updated_at=excluded.updated_at",
+                                    params![value.id.to_string(), value.campaign_id.to_string(), value.name,
+                                        value.is_default as i32, value.version, value.created_at.to_rfc3339(),
+                                        value.updated_at.to_rfc3339()],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        "category_budget" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::CategoryBudget>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO category_budgets
+                                     (category_id, campaign_id, amount_minor, version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                     ON CONFLICT(category_id) DO UPDATE SET amount_minor=excluded.amount_minor,
+                                      version=excluded.version, updated_at=excluded.updated_at",
+                                    params![value.category_id.to_string(), value.campaign_id.to_string(),
+                                        value.amount_minor, value.version, value.created_at.to_rfc3339(),
+                                        value.updated_at.to_rfc3339()],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        "ledger_entry" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::LedgerEntry>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO ledger_entries
+                                     (id, campaign_id, title, description, entry_type, category_id, amount_minor,
+                                      currency_code, status, due_date, payment_date, vendor_source, related_task_id,
+                                      notes, attachment_ref, recurrence, custom_recurrence, version, created_at, updated_at,
+                                      created_by_identity)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                                     ON CONFLICT(id) DO UPDATE SET title=excluded.title,
+                                      description=excluded.description, entry_type=excluded.entry_type,
+                                      category_id=excluded.category_id, amount_minor=excluded.amount_minor,
+                                      currency_code=excluded.currency_code, status=excluded.status,
+                                      due_date=excluded.due_date, payment_date=excluded.payment_date,
+                                      vendor_source=excluded.vendor_source, related_task_id=excluded.related_task_id,
+                                      notes=excluded.notes, attachment_ref=excluded.attachment_ref,
+                                      recurrence=excluded.recurrence, custom_recurrence=excluded.custom_recurrence,
+                                      version=excluded.version, updated_at=excluded.updated_at,
+                                      created_by_identity=COALESCE(excluded.created_by_identity,
+                                                                   ledger_entries.created_by_identity)",
+                                    params![value.id.to_string(), value.campaign_id.to_string(), value.title,
+                                        value.description, value.entry_type.as_str(), value.category_id.to_string(),
+                                        value.amount_minor, value.currency_code, value.status.as_str(),
+                                        value.due_date.map(|date| date.to_rfc3339()),
+                                        value.payment_date.map(|date| date.to_rfc3339()), value.vendor_source,
+                                        value.related_task_id.map(|id| id.to_string()), value.notes,
+                                        value.attachment_ref, value.recurrence.as_str(), value.custom_recurrence,
+                                        value.version, value.created_at.to_rfc3339(), value.updated_at.to_rfc3339(),
+                                        value.created_by_identity],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        "task_financials" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::TaskFinancials>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO task_financials
+                                     (task_id, campaign_id, estimated_cost_minor, actual_cost_minor,
+                                      billable_amount_minor, payment_status, currency_code, version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                                     ON CONFLICT(task_id) DO UPDATE SET
+                                      estimated_cost_minor=excluded.estimated_cost_minor,
+                                      actual_cost_minor=excluded.actual_cost_minor,
+                                      billable_amount_minor=excluded.billable_amount_minor,
+                                      payment_status=excluded.payment_status, currency_code=excluded.currency_code,
+                                      version=excluded.version, updated_at=excluded.updated_at",
+                                    params![value.task_id.to_string(), value.campaign_id.to_string(),
+                                        value.estimated_cost_minor, value.actual_cost_minor,
+                                        value.billable_amount_minor, value.payment_status.map(|status| status.as_str()),
+                                        value.currency_code, value.version, value.created_at.to_rfc3339(),
+                                        value.updated_at.to_rfc3339()],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
                                 }
                                 pulled_count += 1;
                             }
@@ -1744,6 +2664,212 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
+                        "task_status" => {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                                let task_id = value["task_id"].as_str().unwrap_or_default();
+                                let project_id = value["project_id"].as_str().unwrap_or_default();
+                                let status = value["status"].as_str().unwrap_or("Backlog");
+                                let actor_id =
+                                    value["changed_by_identity"].as_str().unwrap_or_default();
+                                let actor_name =
+                                    value["changed_by_username"].as_str().unwrap_or("Companion");
+                                let updated_at = value["updated_at"].as_str().unwrap_or_default();
+                                if !task_id.is_empty() && !project_id.is_empty() {
+                                    let _ = self.db.conn.execute(
+                                        "INSERT INTO task_statuses (task_id, project_id, status, changed_by_identity, changed_by_username, updated_at)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                                         ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id, status=excluded.status,
+                                             changed_by_identity=excluded.changed_by_identity, changed_by_username=excluded.changed_by_username,
+                                             updated_at=excluded.updated_at",
+                                        params![task_id, project_id, status, actor_id, actor_name, updated_at],
+                                    );
+                                    if actor_id != self.identity.public_key.as_str() {
+                                        let quest_title = uuid::Uuid::parse_str(task_id)
+                                            .ok()
+                                            .and_then(|id| self.db.get_task_by_id(id).ok())
+                                            .map(|task| task.title)
+                                            .unwrap_or_else(|| "A shared Quest".to_string());
+                                        let stance = QuestStatus::from_str(status).display_name();
+                                        let description =
+                                            format!("{} entered stance: {}.", quest_title, stance);
+                                        let _ = self.db.log_activity(
+                                            Some(project_id),
+                                            "quest_status_changed",
+                                            &description,
+                                            actor_id,
+                                            actor_name,
+                                        );
+
+                                        let assigned_to_me = self
+                                            .db
+                                            .get_task_assignments(task_id)
+                                            .unwrap_or_default()
+                                            .iter()
+                                            .any(|(identity, _)| {
+                                                identity == self.identity.public_key.as_str()
+                                            });
+                                        if assigned_to_me {
+                                            self.create_task_fellowship_notification(
+                                                &format!("task_status:{}", log.id),
+                                                "quest_status",
+                                                "Council decree",
+                                                &format!("{} is now {}.", quest_title, stance),
+                                                task_id,
+                                            );
+                                        }
+                                    }
+                                    pulled_count += 1;
+                                }
+                            }
+                        }
+                        "task_dependency" => {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                                let task_id = value["task_id"].as_str().unwrap_or_default();
+                                let blocker_id =
+                                    value["depends_on_task_id"].as_str().unwrap_or_default();
+                                let project_id = value["project_id"].as_str().unwrap_or_default();
+                                let actor_id =
+                                    value["created_by_identity"].as_str().unwrap_or_default();
+                                let actor_name =
+                                    value["created_by_username"].as_str().unwrap_or("Companion");
+                                if !task_id.is_empty()
+                                    && !blocker_id.is_empty()
+                                    && task_id != blocker_id
+                                    && !project_id.is_empty()
+                                {
+                                    if actor_id != log.author_public_key {
+                                        conflicts.push(format!(
+                                            "Quest dependency {} rejected: creator does not match its signed Companion Key",
+                                            log.entity_id
+                                        ));
+                                    } else {
+                                        match self.db.add_task_dependency(
+                                            task_id, blocker_id, project_id, actor_id, actor_name,
+                                        ) {
+                                            Ok(()) => {
+                                                let _ = self.db.conn.execute(
+                                                    "UPDATE sync_log SET synced = 1 WHERE entity_type = 'task_dependency' AND entity_id = ?1",
+                                                    params![log.entity_id],
+                                                );
+                                                pulled_count += 1;
+                                            }
+                                            Err(error) => conflicts.push(format!(
+                                                "Quest dependency {} rejected: {}",
+                                                log.entity_id, error
+                                            )),
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        "task_comment" => {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                                let id = value["id"].as_str().unwrap_or_default();
+                                let task_id = value["task_id"].as_str().unwrap_or_default();
+                                let project_id = value["project_id"].as_str().unwrap_or_default();
+                                let author_id =
+                                    value["author_identity"].as_str().unwrap_or_default();
+                                let author_name =
+                                    value["author_username"].as_str().unwrap_or("Companion");
+                                let body = value["content"].as_str().unwrap_or_default();
+                                let mentions = value["mentioned_identities"].to_string();
+                                let created_at = value["created_at"].as_str().unwrap_or_default();
+                                let updated_at = value["updated_at"].as_str().unwrap_or_default();
+                                let edited_at = value["edited_at"].as_str();
+                                let deleted_at = value["deleted_at"].as_str();
+                                if author_id != log.author_public_key {
+                                    conflicts.push(format!(
+                                        "Quest Council message {} rejected: author does not match its signed Companion Key",
+                                        id
+                                    ));
+                                } else if !id.is_empty()
+                                    && !task_id.is_empty()
+                                    && !project_id.is_empty()
+                                {
+                                    let stored = self.db.conn.execute(
+                                        "INSERT INTO task_comments (id, task_id, project_id, author_identity, author_username, content, mentioned_identities, created_at, updated_at, edited_at, deleted_at)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                                         ON CONFLICT(id) DO UPDATE SET content=excluded.content,
+                                             mentioned_identities=excluded.mentioned_identities, updated_at=excluded.updated_at,
+                                             edited_at=excluded.edited_at, deleted_at=excluded.deleted_at",
+                                        params![id, task_id, project_id, author_id, author_name, body, mentions, created_at, updated_at, edited_at, deleted_at],
+                                    );
+                                    if let Err(error) = stored {
+                                        conflicts.push(format!(
+                                            "Quest Council message {} could not be stored: {}",
+                                            id, error
+                                        ));
+                                        if log.seq > 0 {
+                                            retry_from_seq =
+                                                Some(retry_from_seq.map_or(log.seq, |current| {
+                                                    current.min(log.seq)
+                                                }));
+                                        }
+                                        continue;
+                                    }
+                                    if author_id != self.identity.public_key.as_str() {
+                                        let description = if deleted_at.is_some() {
+                                            "withdrew a Quest Council message."
+                                        } else if edited_at.is_some() {
+                                            "revised a Quest Council message."
+                                        } else {
+                                            "convened the Quest Council."
+                                        };
+                                        let _ = self.db.log_activity(
+                                            Some(project_id),
+                                            "quest_comment_added",
+                                            description,
+                                            author_id,
+                                            author_name,
+                                        );
+                                    }
+                                    if deleted_at.is_none()
+                                        && author_id != self.identity.public_key.as_str()
+                                        && value["mentioned_identities"].as_array().is_some_and(
+                                            |ids| {
+                                                ids.iter().any(|identity| {
+                                                    identity.as_str()
+                                                        == Some(self.identity.public_key.as_str())
+                                                })
+                                            },
+                                        )
+                                    {
+                                        self.create_task_fellowship_notification(
+                                            &format!("task_comment_mention:{}", log.id),
+                                            "mention",
+                                            "The Council calls your name",
+                                            &format!(
+                                                "{} mentioned you in a Quest Council.",
+                                                author_name
+                                            ),
+                                            task_id,
+                                        );
+                                    }
+                                    pulled_count += 1;
+                                }
+                            }
+                        }
+                        "notification_state" => {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
+                                let notification_id =
+                                    value["notification_id"].as_str().unwrap_or_default();
+                                let read = value["read"].as_bool().unwrap_or(false);
+                                let updated_at = value["updated_at"].as_str().unwrap_or_default();
+                                if !notification_id.is_empty() {
+                                    let _ = self.db.conn.execute(
+                                        "INSERT INTO notification_states (notification_id, read, updated_at)
+                                         VALUES (?1, ?2, ?3)
+                                         ON CONFLICT(notification_id) DO UPDATE SET read=excluded.read, updated_at=excluded.updated_at",
+                                        params![notification_id, read as i32, updated_at],
+                                    );
+                                    let _ = self.db.conn.execute(
+                                        "UPDATE notifications SET read = ?1 WHERE id = ?2",
+                                        params![read as i32, notification_id],
+                                    );
+                                    pulled_count += 1;
+                                }
+                            }
+                        }
                         "project_member" => {
                             if log.operation == "delete" {
                                 let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
@@ -1782,6 +2908,36 @@ impl<'a> SyncEngine<'a> {
                                     "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                                     params![id, project_id, sender_id, sender_name, msg_content, msg_type, timestamp],
                                 );
+                                let my_username = self
+                                    .db
+                                    .get_user()
+                                    .ok()
+                                    .flatten()
+                                    .map(|user| user.username)
+                                    .unwrap_or_default();
+                                let mentions_me = !my_username.is_empty()
+                                    && msg_content.split_whitespace().any(|word| {
+                                        word.strip_prefix('@').is_some_and(|name| {
+                                            name.trim_matches(|character: char| {
+                                                !character.is_alphanumeric() && character != '_'
+                                            })
+                                            .eq_ignore_ascii_case(&my_username)
+                                        })
+                                    });
+                                if sender_id != self.identity.public_key.as_str() && mentions_me {
+                                    if let Some(project_id) = project_id {
+                                        self.create_task_fellowship_notification(
+                                            &format!("chronicle_mention:{}", log.id),
+                                            "chronicle_mention",
+                                            "Summoned to the Chronicle",
+                                            &format!(
+                                                "{} mentioned you in a Campaign Chronicle.",
+                                                sender_name
+                                            ),
+                                            project_id,
+                                        );
+                                    }
+                                }
                                 pulled_count += 1;
                             }
                         }
@@ -1848,14 +3004,47 @@ impl<'a> SyncEngine<'a> {
                     }
                 }
             }
+            if is_newer
+                && matches!(
+                    log.entity_type.as_str(),
+                    "campaign_treasury"
+                        | "ledger_category"
+                        | "category_budget"
+                        | "ledger_entry"
+                        | "task_financials"
+                )
+            {
+                let snapshot = log.content.as_deref().unwrap_or("null");
+                if let Some(campaign_id) =
+                    project_id_from_sync_content(&log.entity_type, &log.entity_id, snapshot)
+                {
+                    let version = serde_json::from_str::<serde_json::Value>(snapshot)
+                        .ok()
+                        .and_then(|value| value["version"].as_i64())
+                        .unwrap_or(1);
+                    let _ = self.db.conn.execute(
+                        "INSERT INTO treasury_history
+                         (id, campaign_id, entity_type, entity_id, action, snapshot, version, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        params![Uuid::new_v4().to_string(), campaign_id, log.entity_type,
+                            log.entity_id, format!("remote_{}", log.operation), snapshot,
+                            version, log.timestamp],
+                    );
+                }
+            }
             // Marcar como procesado independientemente de si `is_newer` — queremos dedup siempre
             newly_processed_ids.push(log.id);
         }
 
         // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
         max_seq = max_seq.max(remote_next_seq);
+        if let Some(retry_seq) = retry_from_seq {
+            max_seq = max_seq.min(retry_seq.saturating_sub(1));
+        }
         if max_seq > since_seq {
-            let _ = self.db.set_setting("last_pull_seq", &max_seq.to_string());
+            let _ = self
+                .db
+                .set_setting("last_pull_seq_v2", &max_seq.to_string());
         }
         let last_remote_head_seq = remote_head_seq.max(max_seq);
         let _ = self
@@ -1898,14 +3087,14 @@ impl<'a> SyncEngine<'a> {
         content: &str,
         task_id: &str,
     ) {
-        let setting_key = format!("task_notify:fellowship_created:{}", dedup_key);
-        if self.db.get_setting(&setting_key).ok().flatten().is_some() {
-            return;
-        }
-        let _ = self.db.set_setting(&setting_key, "1");
-        let _ = self
-            .db
-            .create_notification(notif_type, title, content, Some(task_id));
+        let notification_id = format!("fellowship:{}", dedup_key);
+        let _ = self.db.create_notification_once(
+            &notification_id,
+            notif_type,
+            title,
+            content,
+            Some(task_id),
+        );
     }
 }
 
@@ -2768,5 +3957,956 @@ mod tests {
 
         drop(db);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn remote_notification_state_updates_matching_local_notice_without_content() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_notification_state_sync.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::new(&db_path).unwrap();
+        let notice_id = "fellowship:task_comment_mention:event-9";
+        db.create_notification_once(
+            notice_id,
+            "mention",
+            "Private local title",
+            "Private decrypted text",
+            Some("task-9"),
+        )
+        .unwrap();
+        let updated_at = (Utc::now() + Duration::minutes(1)).to_rfc3339();
+        let pull_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-notification-read",
+                "entity_type": "notification_state",
+                "entity_id": notice_id,
+                "operation": "upsert",
+                "timestamp": updated_at,
+                "content": serde_json::json!({
+                    "notification_id": notice_id,
+                    "read": true,
+                    "updated_at": updated_at
+                }).to_string(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider { pull_payload }),
+        }
+        .sync()
+        .unwrap();
+        let notices = db.get_notifications().unwrap();
+        assert!(notices[0].5);
+        assert_eq!(notices[0].2, "Private local title");
+        assert_eq!(notices[0].3, "Private decrypted text");
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn remote_council_message_is_stored_and_creates_one_mention_notice() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_remote_council_mention_sync.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::new(&db_path).unwrap();
+        let now = Utc::now();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let local_identity = test_identity();
+        let remote_identity = test_identity();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Shared Council".into(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(remote_identity.public_key.clone()),
+            owner_username: Some("Aria".into()),
+            is_shared: true,
+        })
+        .unwrap();
+        db.insert_task(&Task {
+            id: task_id,
+            project_id: Some(project_id),
+            title: "Review the map".into(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: Some(remote_identity.public_key.clone()),
+            owner_username: Some("Aria".into()),
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        })
+        .unwrap();
+        let comment_id = Uuid::new_v4().to_string();
+        let event_time = (now + Duration::minutes(1)).to_rfc3339();
+        let content = serde_json::json!({
+            "id": comment_id,
+            "task_id": task_id.to_string(),
+            "project_id": project_id.to_string(),
+            "author_identity": remote_identity.public_key.clone(),
+            "author_username": "Aria",
+            "content": "@Ren the map is ready",
+            "mentioned_identities": [local_identity.public_key.clone()],
+            "created_at": event_time,
+            "updated_at": event_time,
+            "edited_at": null,
+            "deleted_at": null
+        });
+        let payload = serde_json::json!({
+            "events": [{
+                "id": "remote-council-event",
+                "entity_type": "task_comment",
+                "entity_id": comment_id,
+                "operation": "create",
+                "timestamp": event_time,
+                "content": content.to_string(),
+                "device_id": "profile-a-device",
+                "author_public_key": content["author_identity"],
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+
+        SyncEngine {
+            db: &db,
+            identity: &local_identity,
+            device_id: "profile-b-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload.clone(),
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_task_comments(&task_id.to_string()).unwrap().len(), 1);
+        let notices = db.get_notifications().unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.1 == "mention")
+                .count(),
+            1
+        );
+
+        SyncEngine {
+            db: &db,
+            identity: &local_identity,
+            device_id: "profile-b-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .unwrap();
+        assert_eq!(db.get_notifications().unwrap().len(), 1);
+        assert_eq!(
+            db.get_activity_log_for_project(&project_id.to_string(), 5)
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn remote_blocker_completion_creates_one_dependency_resolution_notice() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_remote_dependency_resolution.db");
+        let _ = std::fs::remove_file(&db_path);
+        let db = Database::new(&db_path).unwrap();
+        let identity = test_identity();
+        let project_id = Uuid::new_v4();
+        let blocker_id = Uuid::new_v4();
+        let dependent_id = Uuid::new_v4();
+        let now = Utc::now();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Dependency Sync".into(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        })
+        .unwrap();
+        let make_task = |id, title: &str| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.into(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: Some("Remote Companion".into()),
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let blocker = make_task(blocker_id, "Open the gate");
+        let dependent = make_task(dependent_id, "Cross the gate");
+        db.insert_task(&blocker).unwrap();
+        db.insert_task(&dependent).unwrap();
+        db.add_task_dependency(
+            &dependent_id.to_string(),
+            &blocker_id.to_string(),
+            &project_id.to_string(),
+            "remote-author",
+            "Remote Companion",
+        )
+        .unwrap();
+        db.assign_task(
+            &dependent_id.to_string(),
+            &identity.public_key,
+            "Local Hero",
+        )
+        .unwrap();
+        let mut completed = blocker.clone();
+        completed.completed = true;
+        completed.updated_at = now + Duration::minutes(1);
+        let pull_payload = serde_json::json!({
+            "events": [{
+                "id": "remote-blocker-completed",
+                "entity_type": "task",
+                "entity_id": blocker_id.to_string(),
+                "operation": "update",
+                "timestamp": completed.updated_at.to_rfc3339(),
+                "content": serde_json::to_string(&completed).unwrap(),
+                "device_id": "other-device",
+                "seq": 1
+            }],
+            "head_seq": 1,
+            "next_seq": 1,
+            "has_more": false
+        })
+        .to_string();
+        SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider { pull_payload }),
+        }
+        .sync()
+        .unwrap();
+
+        let notices = db.get_notifications().unwrap();
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.1 == "dependency_resolved")
+                .count(),
+            1
+        );
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.3.contains("Cross the gate"))
+        );
+        drop(db);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    /// Servidor de prueba que sí ejerce la ruta cifrada real: guarda los sobres tal
+    /// como los manda el cliente y los devuelve con el mismo formato que sync/v2/pull.
+    #[derive(Clone, Default)]
+    struct SharedEventLog(std::sync::Arc<std::sync::Mutex<Vec<SyncLogEntry>>>);
+
+    struct RecordingProvider {
+        events: SharedEventLog,
+        serve: bool,
+        // El servidor real solo replica eventos de ámbito project a otras cuentas.
+        project_scope_only: bool,
+        // Simula un padre que todavía no llega (paginación, borrado local, evento perdido).
+        withhold: Option<&'static str>,
+    }
+
+    impl CloudProvider for RecordingProvider {
+        fn name(&self) -> &str {
+            "Recording Encrypted Provider"
+        }
+
+        fn requires_encryption(&self) -> bool {
+            true
+        }
+
+        fn push(&self, _public_key: &str, _signature: &str, payload: &str) -> Result<()> {
+            let mut parsed: Vec<SyncLogEntry> = serde_json::from_str(payload)?;
+            let mut events = self.events.0.lock().unwrap();
+            for event in &mut parsed {
+                event.seq = events.len() as i64 + 1;
+                events.push(event.clone());
+            }
+            Ok(())
+        }
+
+        fn pull(&self, _public_key: &str, _signature: &str, since_seq: i64) -> Result<String> {
+            let events = self.events.0.lock().unwrap();
+            let served = if self.serve {
+                events
+                    .iter()
+                    .filter(|event| event.seq > since_seq)
+                    .filter(|event| !self.project_scope_only || event.scope == "project")
+                    .filter(|event| Some(event.entity_type.as_str()) != self.withhold)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let head = events.len() as i64;
+            Ok(serde_json::json!({
+                "events": served,
+                "head_seq": head,
+                "next_seq": head,
+                "has_more": false,
+                "signatures_required": true,
+            })
+            .to_string())
+        }
+    }
+
+    fn treasury_test_db(name: &str) -> (std::path::PathBuf, Database) {
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("{name}.db"));
+        let _ = std::fs::remove_file(&path);
+        let db = Database::new(&path).unwrap();
+        (path, db)
+    }
+
+    fn shared_campaign_project(id: Uuid, owner: &Identity, is_shared: bool) -> Project {
+        let now = Utc::now();
+        Project {
+            id,
+            name: "Ledger Campaign".into(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(owner.public_key.clone()),
+            owner_username: Some("Aria".into()),
+            is_shared,
+        }
+    }
+
+    fn campaign_task(id: Uuid, project_id: Uuid, owner: &Identity) -> Task {
+        let now = Utc::now();
+        Task {
+            id,
+            project_id: Some(project_id),
+            title: "Commission the smith".into(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: Some(owner.public_key.clone()),
+            owner_username: Some("Aria".into()),
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        }
+    }
+
+    /// Siembra tesorería completa: divisa, categoría propia, presupuestos, movimiento y finanzas de tarea.
+    fn seed_treasury(
+        db: &Database,
+        campaign_id: Uuid,
+        task_id: Uuid,
+        author: &str,
+    ) -> (Uuid, Uuid) {
+        let service = crate::services::TreasuryService::new(db);
+        service.ensure_campaign(campaign_id).unwrap();
+        service
+            .set_currency(campaign_id, crate::models::Currency::Mxn)
+            .unwrap();
+        service.set_overall_budget(campaign_id, 5_000_00).unwrap();
+        let category = service.create_category(campaign_id, "Smithing").unwrap();
+        service
+            .set_category_budget(campaign_id, category.id, 1_200_00)
+            .unwrap();
+        let now = Utc::now();
+        let entry = service
+            .create_entry(crate::models::LedgerEntry {
+                id: Uuid::new_v4(),
+                campaign_id,
+                title: "Dwarven anvil".into(),
+                description: "Special order".into(),
+                entry_type: crate::models::LedgerEntryType::Expense,
+                category_id: category.id,
+                amount_minor: 742_55,
+                currency_code: "MXN".into(),
+                status: crate::models::LedgerStatus::Paid,
+                due_date: None,
+                payment_date: Some(now),
+                vendor_source: Some("Erebor Forge".into()),
+                related_task_id: Some(task_id),
+                notes: Some("Paid in pesos".into()),
+                attachment_ref: None,
+                recurrence: crate::models::LedgerRecurrence::None,
+                custom_recurrence: None,
+                version: 0,
+                created_at: now,
+                updated_at: now,
+                created_by_identity: Some(author.to_string()),
+            })
+            .unwrap();
+        service
+            .set_task_financials(&crate::models::TaskFinancials {
+                task_id,
+                campaign_id,
+                estimated_cost_minor: Some(800_00),
+                actual_cost_minor: Some(742_55),
+                billable_amount_minor: Some(900_00),
+                payment_status: Some(crate::models::TaskPaymentStatus::Invoiced),
+                currency_code: "MXN".into(),
+                version: 1,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+        (category.id, entry.id)
+    }
+
+    fn assert_treasury_matches(
+        db: &Database,
+        campaign_id: Uuid,
+        category_id: Uuid,
+        entry_id: Uuid,
+        author: &str,
+    ) {
+        let service = crate::services::TreasuryService::new(db);
+        let treasury = service
+            .get_campaign(campaign_id)
+            .unwrap()
+            .expect("campaign treasury did not sync");
+        assert_eq!(treasury.currency_code, "MXN");
+        assert_eq!(treasury.overall_budget_minor, 5_000_00);
+
+        let categories = service.categories(campaign_id).unwrap();
+        assert!(
+            categories
+                .iter()
+                .any(|item| item.id == category_id && item.name == "Smithing" && !item.is_default),
+            "custom ledger category did not sync"
+        );
+        assert_eq!(
+            categories.len(),
+            crate::services::treasury::DEFAULT_CATEGORIES.len() + 1
+        );
+
+        let budgeted = service
+            .calculate_category_totals(campaign_id)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.category.id == category_id)
+            .expect("category totals missing");
+        assert_eq!(budgeted.budget_minor, Some(1_200_00));
+
+        let entry = service
+            .get_entry(entry_id)
+            .unwrap()
+            .expect("ledger entry did not sync");
+        assert_eq!(entry.title, "Dwarven anvil");
+        assert_eq!(entry.amount_minor, 742_55);
+        assert_eq!(entry.currency_code, "MXN");
+        assert_eq!(entry.vendor_source.as_deref(), Some("Erebor Forge"));
+        assert_eq!(entry.notes.as_deref(), Some("Paid in pesos"));
+        assert_eq!(entry.status, crate::models::LedgerStatus::Paid);
+        assert!(entry.payment_date.is_some());
+        // La autoría viaja: de ella depende que un Companion pueda tocar su movimiento.
+        assert_eq!(entry.created_by_identity.as_deref(), Some(author));
+
+        let financials = service
+            .get_task_financials(entry.related_task_id.unwrap())
+            .unwrap()
+            .expect("task financials did not sync");
+        assert_eq!(financials.estimated_cost_minor, Some(800_00));
+        assert_eq!(financials.actual_cost_minor, Some(742_55));
+        assert_eq!(financials.billable_amount_minor, Some(900_00));
+        assert_eq!(financials.currency_code, "MXN");
+        assert_eq!(
+            financials.payment_status,
+            Some(crate::models::TaskPaymentStatus::Invoiced)
+        );
+    }
+
+    /// Campaña personal: la tesorería viaja cifrada con la llave de cuenta y llega
+    /// completa al segundo dispositivo de la misma identidad.
+    #[test]
+    fn treasury_round_trips_through_account_encrypted_sync() {
+        let identity = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let (path_a, db_a) = treasury_test_db("treasury_sync_account_device_a");
+        let (path_b, db_b) = treasury_test_db("treasury_sync_account_device_b");
+        db_a.insert_project(&shared_campaign_project(campaign_id, &identity, false))
+            .unwrap();
+        db_a.insert_task(&campaign_task(task_id, campaign_id, &identity))
+            .unwrap();
+        let (category_id, entry_id) =
+            seed_treasury(&db_a, campaign_id, task_id, &identity.public_key);
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let treasury_types = [
+            "campaign_treasury",
+            "ledger_category",
+            "category_budget",
+            "ledger_entry",
+            "task_financials",
+        ];
+        let raw = server.0.lock().unwrap().clone();
+        for entity_type in treasury_types {
+            let events = raw
+                .iter()
+                .filter(|event| event.entity_type == entity_type)
+                .collect::<Vec<_>>();
+            assert!(!events.is_empty(), "{entity_type} never reached the server");
+            for event in events {
+                assert_eq!(event.version, crate::services::encryption::SYNC_VERSION);
+                assert_eq!(event.key_id, "account-v1");
+                assert_eq!(event.scope, "account");
+                assert!(event.content.is_none(), "{entity_type} pushed plaintext");
+                assert!(!event.nonce.is_empty() && !event.ciphertext.is_empty());
+                assert_eq!(event.event_signature.len(), 128);
+            }
+        }
+        // Ningún dato sensible de la tesorería puede aparecer legible en el sobre.
+        let wire = serde_json::to_string(&raw).unwrap();
+        for secret in ["Dwarven anvil", "Erebor Forge", "Smithing", "Paid in pesos"] {
+            assert!(
+                !wire.contains(secret),
+                "{secret} leaked in cleartext to the server"
+            );
+        }
+
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        assert_treasury_matches(
+            &db_b,
+            campaign_id,
+            category_id,
+            entry_id,
+            &identity.public_key,
+        );
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Un cambio de divisa aislado —sin ningún otro movimiento después— tiene que
+    /// viajar solo: la campaña y cada fila reetiquetada deben llegar al otro equipo.
+    #[test]
+    fn currency_switch_alone_syncs_to_the_other_device() {
+        let identity = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let (path_a, db_a) = treasury_test_db("treasury_sync_currency_only_a");
+        let (path_b, db_b) = treasury_test_db("treasury_sync_currency_only_b");
+        db_a.insert_project(&shared_campaign_project(campaign_id, &identity, false))
+            .unwrap();
+        db_a.insert_task(&campaign_task(task_id, campaign_id, &identity))
+            .unwrap();
+        let (_, entry_id) = seed_treasury(&db_a, campaign_id, task_id, &identity.public_key);
+
+        let server = SharedEventLog::default();
+        let sync = |db: &Database, device: &str, serve: bool| {
+            SyncEngine {
+                db,
+                identity: &identity,
+                device_id: device,
+                provider: Box::new(RecordingProvider {
+                    events: server.clone(),
+                    serve,
+                    project_scope_only: false,
+                    withhold: None,
+                }),
+            }
+            .sync()
+            .unwrap();
+        };
+
+        sync(&db_a, "device-a", false);
+        sync(&db_b, "device-b", true);
+        let service_b = crate::services::TreasuryService::new(&db_b);
+        assert_eq!(
+            service_b.campaign_currency(campaign_id).unwrap(),
+            crate::models::Currency::Mxn
+        );
+
+        // Único cambio de esta ronda: volver a USD. Nada más toca la tesorería.
+        let before = server.0.lock().unwrap().len();
+        crate::services::TreasuryService::new(&db_a)
+            .set_currency(campaign_id, crate::models::Currency::Usd)
+            .unwrap();
+        sync(&db_a, "device-a", false);
+        let pushed = server.0.lock().unwrap()[before..]
+            .iter()
+            .map(|event| event.entity_type.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            pushed.iter().any(|kind| kind == "campaign_treasury"),
+            "the currency change alone was never pushed: {pushed:?}"
+        );
+        assert!(
+            pushed.iter().any(|kind| kind == "ledger_entry"),
+            "relabeled ledger rows were not pushed: {pushed:?}"
+        );
+        assert!(
+            pushed.iter().any(|kind| kind == "task_financials"),
+            "relabeled task financials were not pushed: {pushed:?}"
+        );
+
+        sync(&db_b, "device-b", true);
+        assert_eq!(
+            service_b.campaign_currency(campaign_id).unwrap(),
+            crate::models::Currency::Usd
+        );
+        let entry = service_b.get_entry(entry_id).unwrap().unwrap();
+        assert_eq!(entry.currency_code, "USD");
+        // Reetiquetado, nunca convertido.
+        assert_eq!(entry.amount_minor, 742_55);
+        assert_eq!(
+            service_b
+                .get_task_financials(task_id)
+                .unwrap()
+                .unwrap()
+                .currency_code,
+            "USD"
+        );
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// El servidor devuelve 403 y revierte el lote entero si un Observer escribe en una
+    /// ruta compartida. Sus eventos de tesorería no deben salir, o el sync se atasca.
+    #[test]
+    fn observer_treasury_edits_never_reach_a_shared_route() {
+        let observer = test_identity();
+        let owner = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let routing_id = Uuid::new_v4().to_string();
+        let (path, db) = treasury_test_db("treasury_sync_observer_guard");
+        db.insert_project(&shared_campaign_project(campaign_id, &owner, true))
+            .unwrap();
+        db.save_project_encryption_key_from_sync(
+            &campaign_id.to_string(),
+            &routing_id,
+            &[13u8; 32],
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO project_members (project_id, user_identity, user_username, role)
+                 VALUES (?1, ?2, 'Watcher', 'Observer')",
+                params![campaign_id.to_string(), observer.public_key],
+            )
+            .unwrap();
+        db.insert_task(&campaign_task(task_id, campaign_id, &owner))
+            .unwrap();
+        seed_treasury(&db, campaign_id, task_id, &observer.public_key);
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db,
+            identity: &observer,
+            device_id: "observer-device",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let leaked = server
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.scope == "project")
+            // El servidor sí acepta mensajes de crónica de un Observer; nada más.
+            .filter(|event| event.entity_type != "chronicle_message")
+            .map(|event| event.entity_type.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            leaked.is_empty(),
+            "an Observer pushed shared-route events and would 403 the whole batch: {leaked:?}"
+        );
+        // Siguen pendientes en local: si el rol cambia a Companion, subirán entonces.
+        assert!(!db.get_pending_sync_logs().unwrap().is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Un movimiento que llega antes que su tarea no se puede insertar por la llave
+    /// foránea. No debe perderse: se reporta y se reintenta cuando la tarea ya existe.
+    #[test]
+    fn treasury_event_that_cannot_apply_yet_is_retried_not_dropped() {
+        let identity = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let (path_a, db_a) = treasury_test_db("treasury_sync_retry_source");
+        let (path_b, db_b) = treasury_test_db("treasury_sync_retry_target");
+        db_a.insert_project(&shared_campaign_project(campaign_id, &identity, false))
+            .unwrap();
+        db_a.insert_task(&campaign_task(task_id, campaign_id, &identity))
+            .unwrap();
+        let (category_id, entry_id) =
+            seed_treasury(&db_a, campaign_id, task_id, &identity.public_key);
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        // El destino ya tiene la campaña, pero su tarea aún no llega: el asiento ligado
+        // a ella y sus finanzas violan la llave foránea en este primer intento.
+        db_b.insert_project(&shared_campaign_project(campaign_id, &identity, false))
+            .unwrap();
+        let pull = |db: &Database, withhold: Option<&'static str>| -> Vec<String> {
+            SyncEngine {
+                db,
+                identity: &identity,
+                device_id: "device-b",
+                provider: Box::new(RecordingProvider {
+                    events: server.clone(),
+                    serve: true,
+                    project_scope_only: false,
+                    withhold,
+                }),
+            }
+            .sync()
+            .unwrap()
+            .2
+        };
+
+        let conflicts = pull(&db_b, Some("task"));
+        let service_b = crate::services::TreasuryService::new(&db_b);
+        assert!(
+            conflicts
+                .iter()
+                .any(|line| line.contains("could not be applied yet")),
+            "a blocked treasury row must be reported, got {conflicts:?}"
+        );
+        assert!(
+            service_b.get_entry(entry_id).unwrap().is_none(),
+            "the entry cannot exist before its task"
+        );
+
+        // Llega la tarea que faltaba: el reintento tiene que completar la tesorería.
+        db_b.insert_task(&campaign_task(task_id, campaign_id, &identity))
+            .unwrap();
+        pull(&db_b, None);
+        assert_treasury_matches(
+            &db_b,
+            campaign_id,
+            category_id,
+            entry_id,
+            &identity.public_key,
+        );
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Campaña compartida: la tesorería se cifra con la llave de la Fellowship y otro
+    /// miembro la reconstruye; sin esa llave el sobre es indescifrable.
+    #[test]
+    fn treasury_round_trips_through_fellowship_project_encryption() {
+        let owner = test_identity();
+        let companion = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let routing_id = Uuid::new_v4().to_string();
+        let project_key = [11u8; 32];
+        let (path_a, db_a) = treasury_test_db("treasury_sync_project_owner");
+        let (path_b, db_b) = treasury_test_db("treasury_sync_project_companion");
+
+        for db in [&db_a, &db_b] {
+            db.insert_project(&shared_campaign_project(campaign_id, &owner, true))
+                .unwrap();
+            db.save_project_encryption_key_from_sync(
+                &campaign_id.to_string(),
+                &routing_id,
+                &project_key,
+            )
+            .unwrap();
+        }
+        db_a.insert_task(&campaign_task(task_id, campaign_id, &owner))
+            .unwrap();
+        db_b.insert_task(&campaign_task(task_id, campaign_id, &owner))
+            .unwrap();
+        let (category_id, entry_id) = seed_treasury(&db_a, campaign_id, task_id, &owner.public_key);
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &owner,
+            device_id: "owner-device",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let raw = server.0.lock().unwrap().clone();
+        let treasury_events = raw
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.entity_type.as_str(),
+                    "campaign_treasury"
+                        | "ledger_category"
+                        | "category_budget"
+                        | "ledger_entry"
+                        | "task_financials"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(!treasury_events.is_empty());
+        for event in &treasury_events {
+            assert_eq!(event.key_id, "project-v1");
+            assert_eq!(event.scope, "project");
+            assert_eq!(event.routing_id, routing_id);
+            assert!(event.content.is_none());
+        }
+
+        // Sin la llave de la Fellowship el sobre no se abre.
+        let sample = treasury_events
+            .iter()
+            .find(|event| event.entity_type == "ledger_entry")
+            .unwrap();
+        let aad = crate::services::encryption::associated_data_for_route(
+            &sample.id,
+            &sample.entity_type,
+            &sample.entity_id,
+            &sample.operation,
+            &sample.timestamp,
+            &sample.key_id,
+            &sample.scope,
+            &sample.routing_id,
+        );
+        assert!(
+            crate::services::encryption::decrypt_with_project_key(
+                &[12u8; 32],
+                &sample.nonce,
+                &sample.ciphertext,
+                &aad,
+            )
+            .is_err(),
+            "a wrong Fellowship key must not open a treasury event"
+        );
+        assert!(
+            crate::services::encryption::decrypt_with_project_key(
+                &project_key,
+                &sample.nonce,
+                &sample.ciphertext,
+                &aad,
+            )
+            .is_ok()
+        );
+
+        SyncEngine {
+            db: &db_b,
+            identity: &companion,
+            device_id: "companion-device",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: true,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        assert_treasury_matches(&db_b, campaign_id, category_id, entry_id, &owner.public_key);
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
     }
 }

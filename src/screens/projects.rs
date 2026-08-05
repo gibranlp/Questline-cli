@@ -2,7 +2,7 @@
 // screens/projects.rs — la lista de reinos (proyectos) del usuario
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::app::ModalType;
+use crate::app::{ModalType, ordered_active_projects};
 use crate::models::{Note, Project, Task};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
@@ -30,10 +30,7 @@ pub fn draw(
     let accent_color = theme.primary;
 
     // filtra archivados aquí mismo — los proyectos archivados tienen su propia pantalla
-    let active_projects: Vec<&Project> = projects
-        .iter()
-        .filter(|p| !p.archived && !p.completed)
-        .collect();
+    let active_projects = ordered_active_projects(projects);
 
     // Screen Layout splits: Main List/Details, Bottom keyboard shortcut guide
     let chunks = Layout::default()
@@ -156,6 +153,17 @@ pub fn draw(
         );
     } else {
         for (i, p) in active_projects.iter().enumerate() {
+            if p.is_shared && (i == 0 || !active_projects[i - 1].is_shared) {
+                list_items.push(
+                    ListItem::new(Line::from(vec![Span::styled(
+                        "  ◇ Shared Campaigns",
+                        Style::default()
+                            .fg(theme.secondary)
+                            .add_modifier(Modifier::BOLD),
+                    )]))
+                    .style(Style::default().bg(theme.panel)),
+                );
+            }
             let open_tasks = all_tasks
                 .iter()
                 .filter(|t| {
@@ -382,6 +390,13 @@ pub fn draw(
         ),
         Span::styled(" New | ", Style::default().fg(theme.muted)),
         Span::styled(
+            "t",
+            Style::default()
+                .fg(accent_color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" Template | ", Style::default().fg(theme.muted)),
+        Span::styled(
             "e",
             Style::default()
                 .fg(accent_color)
@@ -473,8 +488,113 @@ pub fn draw(
                 theme,
             );
         }
+        ModalType::CampaignTemplateSelect { selected_idx } => {
+            draw_campaign_template_select(f, *selected_idx, theme);
+        }
         _ => {}
     }
+}
+
+fn draw_campaign_template_select(f: &mut Frame, selected_idx: usize, theme: &Theme) {
+    let templates = crate::campaign_templates::TEMPLATES;
+    let selected = selected_idx.min(templates.len().saturating_sub(1));
+    let area = centered_rect(72, 72, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        area,
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.primary))
+        .title(Span::styled(
+            " Campaign Templates ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(templates.len() as u16 + 2),
+            Constraint::Min(7),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+
+    let items = templates
+        .iter()
+        .enumerate()
+        .map(|(idx, template)| {
+            let style = if idx == selected {
+                theme.selected_style().add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            ListItem::new(format!(
+                " {} {} · {} Quests",
+                if idx == selected { "▶" } else { " " },
+                template.name,
+                template.quests.len()
+            ))
+            .style(style)
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        List::new(items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary))
+                .title(" Choose a blueprint "),
+        ),
+        chunks[0],
+    );
+
+    if let Some(template) = templates.get(selected) {
+        let mut lines = vec![
+            Line::from(Span::styled(
+                template.description,
+                Style::default().fg(theme.text),
+            )),
+            Line::from(""),
+        ];
+        for quest in template.quests {
+            lines.push(Line::from(vec![
+                Span::styled("  ◆ ", Style::default().fg(theme.primary)),
+                Span::styled(
+                    quest.title,
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {} steps", quest.steps.len()),
+                    Style::default().fg(theme.muted),
+                ),
+            ]));
+        }
+        f.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(theme.border))
+                        .title(" Preview "),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false }),
+            chunks[1],
+        );
+    }
+
+    f.render_widget(
+        Paragraph::new("↑/↓ Select  ·  Enter Create private Campaign  ·  Esc Cancel")
+            .style(Style::default().fg(theme.muted))
+            .alignment(Alignment::Center),
+        chunks[2],
+    );
 }
 
 // Builds the tree view lines for the "All Campaigns" panel

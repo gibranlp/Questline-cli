@@ -10,6 +10,7 @@ pub mod note;
 pub mod project;
 pub mod rpg;
 pub mod task;
+pub mod treasury;
 pub mod user;
 pub mod xp_event;
 
@@ -23,7 +24,13 @@ pub use rpg::{
     Achievement, DailyAdventure, DailyReflection, FocusSession, Milestone, Ritual, Season,
     Statistics, Streak, ZenTree,
 };
-pub use task::{RecurrenceType, Task, TaskPriority};
+pub use task::{QuestStatus, RecurrenceType, Task, TaskPriority};
+pub use treasury::{
+    BudgetUsage, BudgetWarningLevel, CampaignTotals, CampaignTreasury, CategoryBudget,
+    CategoryReport, CategoryTotals, Currency, LedgerCategory, LedgerEntry, LedgerEntryType,
+    LedgerFilter, LedgerRecurrence, LedgerSort, LedgerStatus, MonthlySpending, TaskFinancials,
+    TaskPaymentStatus, TreasuryReport,
+};
 pub use user::{ClassType, User};
 pub use xp_event::XPEvent;
 

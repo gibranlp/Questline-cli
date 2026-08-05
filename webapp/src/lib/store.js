@@ -1,6 +1,7 @@
 // Svelte stores — in-memory state built from sync events
 
-import { writable, derived } from 'svelte/store';
+import { writable, derived, get } from 'svelte/store';
+import { assignmentNotification } from './collaboration.js';
 
 export const identity = writable(null);
 export const apiClient = writable(null);
@@ -19,6 +20,8 @@ export const rituals = writable(new Map());
 export const focusSessions = writable(new Map());
 export const loreUnlocks = writable(new Map()); // keyed by lore entry id → {id, unlocked, unlocked_at}
 export const chronicleMessages = writable(new Map()); // keyed by project_id -> []
+export const taskAssignments = writable(new Map()); // keyed by task_id__user_identity
+export const notifications = writable(new Map()); // keyed by deterministic source/event id
 export const userStats = writable(null);
 export const zenTree = writable(null);
 export const streaks = writable(null);
@@ -33,6 +36,22 @@ export const syncStatus = writable('idle'); // idle | syncing | error
 // Derived: projects sorted by name
 export const sortedProjects = derived(projects, $p =>
   [...$p.values()].sort((a, b) => a.name.localeCompare(b.name))
+);
+
+export const myAssignedTasks = derived(
+  [tasks, taskAssignments, identity],
+  ([$tasks, $assignments, $identity]) => {
+    const mine = String($identity?.public_key || '').toLowerCase();
+    if (!mine) return [];
+    const assignedIds = new Set(
+      [...$assignments.values()]
+        .filter(a => String(a.user_identity || '').toLowerCase() === mine)
+        .map(a => a.task_id),
+    );
+    return [...$tasks.values()]
+      .filter(t => assignedIds.has(t.id) && !t.completed)
+      .sort((a, b) => String(a.due_date || '9999').localeCompare(String(b.due_date || '9999')));
+  },
 );
 
 // Derived: tasks for current project
@@ -81,7 +100,32 @@ export function applySyncEvent(event) {
     achievement: achievements,
     ritual: rituals,
     focus_session: focusSessions,
+    task_assignment: taskAssignments,
+    notification: notifications,
   };
+
+  if (entity_type === 'task_assignment' && entity_id) {
+    taskAssignments.update(map => {
+      const next = new Map(map);
+      if (operation === 'delete') next.delete(entity_id);
+      else if (payload) next.set(entity_id, { ...payload, id: entity_id });
+      return next;
+    });
+
+    const mine = String(get(identity)?.public_key || '').toLowerCase();
+    const assigned = String(payload?.user_identity || '').toLowerCase();
+    if (operation !== 'delete' && payload && mine && assigned === mine && event.id) {
+      const title = get(tasks).get(payload.task_id)?.title || 'A quest';
+      const notice = assignmentNotification(event.id, payload, title);
+      if (notice) notifications.update(map => {
+        if (map.has(notice.id)) return map;
+        const next = new Map(map);
+        next.set(notice.id, notice);
+        return next;
+      });
+    }
+    return;
+  }
 
   // CLI sends entity_type "user" for character data (level, xp, class)
   if ((entity_type === 'user' || entity_type === 'user_stats') && payload) {

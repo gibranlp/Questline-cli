@@ -12,8 +12,11 @@
 )]
 
 pub mod app;
+pub mod archive_game;
 pub mod audio;
 pub mod build_info;
+pub mod calendar_import;
+pub mod campaign_templates;
 pub mod database;
 pub mod milestone_templates;
 pub mod models;

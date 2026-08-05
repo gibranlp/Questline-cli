@@ -29,7 +29,12 @@ impl<'a> XPService<'a> {
                 // Especializaciones enfocadas en tareas — bonus por completar tasks o eventos Hero
                 "Bug Hunter" | "Execution Knight" | "Insight Seeker" | "Process Optimizer"
                 | "Temporal Ward" | "Audit Judge" => {
-                    event_type.contains("Task") || event_type.contains("Hero")
+                    // Task completions are labelled as "Quest"s (e.g. "Complete Quest"),
+                    // so match "Quest" too — otherwise only high-priority ("Hero") tasks
+                    // earned the bonus. Mirrors class_quest_bonus_percent's is_task.
+                    event_type.contains("Task")
+                        || event_type.contains("Hero")
+                        || event_type.contains("Quest")
                 }
                 // Especializaciones enfocadas en notas — bonus por crear scrolls o notes
                 "Automation Mage" | "Momentum Crusader" | "Knowledge Keeper"

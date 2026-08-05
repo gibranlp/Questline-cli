@@ -5,6 +5,17 @@
 const PKCS8_PREFIX = new Uint8Array([48, 46, 2, 1, 0, 48, 5, 6, 3, 43, 101, 112, 4, 34, 4, 32]);
 
 const STORAGE_KEY = 'questline_identity';
+const CURSOR_IDENTITY_KEY = 'questline_cursor_identity';
+
+function bindLocalStateToIdentity(identity) {
+  const previous = localStorage.getItem(CURSOR_IDENTITY_KEY);
+  if (previous && previous !== identity.public_key) {
+    localStorage.removeItem('questline_sync_seq');
+    localStorage.removeItem('questline_cli_seq');
+    localStorage.removeItem('questline_project_seq');
+  }
+  localStorage.setItem(CURSOR_IDENTITY_KEY, identity.public_key);
+}
 
 export function bytesToHex(bytes) {
   return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -55,23 +66,38 @@ export async function generateIdentity() {
     created_at: new Date().toISOString(),
   };
 
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  sessionStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  localStorage.removeItem(STORAGE_KEY);
+  bindLocalStateToIdentity(identity);
   return identity;
 }
 
 export function saveIdentity(identity) {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  sessionStorage.setItem(STORAGE_KEY, JSON.stringify(identity));
+  localStorage.removeItem(STORAGE_KEY);
+  bindLocalStateToIdentity(identity);
 }
 
 export function loadIdentity() {
-  const raw = localStorage.getItem(STORAGE_KEY);
-  return raw ? JSON.parse(raw) : null;
+  let raw = sessionStorage.getItem(STORAGE_KEY);
+  // Migrate secrets written by older builds out of persistent browser storage.
+  if (!raw) {
+    raw = localStorage.getItem(STORAGE_KEY);
+    if (raw) sessionStorage.setItem(STORAGE_KEY, raw);
+  }
+  localStorage.removeItem(STORAGE_KEY);
+  const identity = raw ? JSON.parse(raw) : null;
+  if (identity) bindLocalStateToIdentity(identity);
+  return identity;
 }
 
 export function clearIdentity() {
+  sessionStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem(STORAGE_KEY);
   localStorage.removeItem('questline_sync_seq');
   localStorage.removeItem('questline_cli_seq');
+  localStorage.removeItem('questline_project_seq');
+  localStorage.removeItem(CURSOR_IDENTITY_KEY);
   sessionStorage.removeItem('questline_data_key');
 }
 
@@ -103,4 +129,19 @@ export async function signRequest(secretKeyHex, timestamp, nonce, bodyToSend) {
   const message = new TextEncoder().encode(`${timestamp}.${nonce}.${bodyToSend}`);
   const sig = await crypto.subtle.sign('Ed25519', privKey, message);
   return bytesToHex(new Uint8Array(sig));
+}
+
+export async function signBytes(secretKeyHex, message) {
+  const privKey = await crypto.subtle.importKey(
+    'pkcs8', buildPkcs8(hexToBytes(secretKeyHex)), { name: 'Ed25519' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('Ed25519', privKey, message);
+  return bytesToHex(new Uint8Array(sig));
+}
+
+export async function verifyBytes(publicKeyHex, signatureHex, message) {
+  const publicKey = await crypto.subtle.importKey(
+    'raw', hexToBytes(publicKeyHex), { name: 'Ed25519' }, false, ['verify']
+  );
+  return crypto.subtle.verify('Ed25519', publicKey, hexToBytes(signatureHex), message);
 }

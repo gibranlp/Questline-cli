@@ -69,6 +69,208 @@
       The backlog has not shrunk. But at least it now has a proper domain.
     </p>
 
+    <!-- v2.0.0 -->
+    <div style="margin-top:2.5rem;">
+      <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
+        <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v2.0.0</span>
+        <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— Encrypted Fellowship</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-08-01</span>
+      </div>
+      <div class="term">
+        <pre style="margin-top:0.5rem;line-height:2;">
+<span class="comment"># Chronicle Entry — No Hero Quests Alone</span>
+
+  For a long time, the Fellowship could gather around a Campaign.
+  It could exchange messages, watch the work move, and trust that the cloud
+  would carry the Chronicle from one device to another.
+
+  But trust deserves more than a familiar banner and a hopeful sync button.
+
+  <span class="hi">The Fellowship now carries its own wards.</span>
+
+  Private sync content is sealed on the hero's device with AES-256-GCM before
+  it leaves the CLI or browser. Every encrypted event bears a durable Ed25519
+  signature over its complete envelope, verified before the contents are opened.
+  Rust and WebCrypto now share the same identity-based key ceremony, allowing a
+  trusted new device to recover the same account through its Transfer Code.
+
+  That code is a master recovery secret. It should be guarded accordingly.
+
+  Fellowship Campaigns receive separate keys and opaque routes. Invitations
+  carry encrypted Campaign details, repeated acceptance survives interruption,
+  and removing a Companion closes the old road by rotating both key and route.
+  When the final Companion departs, the Campaign quietly becomes local again.
+
+  The Chronicle learned to distrust echoes as well. Replayed requests, duplicate
+  events, forged identities, substituted ciphertext, retired routes, interrupted
+  rotations, and suspicious remote pages are rejected or quarantined. Signed
+  snapshots replace old backups cleanly, retire unsigned account history at
+  cutover, and make migration, restore, and cursor recovery safer.
+
+  <span class="hi">Then the Fellowship learned how to work as a party.</span>
+
+  Companion Keys remain the Fellowship trust ceremony, now with readable
+  grouping, normalization, and fingerprints for verification.
+
+  Owners and Stewards can assign multiple Quest bearers. My Quests gathers a
+  hero's responsibilities across Campaigns. Six offline-capable Quest Stances
+  move work from the first spark to final judgment, in either the Ledger or a
+  keyboard-driven Kanban board.
+
+  Quests may now name their blockers. Cycles and self-links are refused, and
+  when a completed blocker opens the road, the waiting bearers receive one clear
+  notice. Council Briefing gathers blocked, overdue, due-soon, unassigned, and
+  review work beside Companion workload, presence, and recent activity.
+
+  Each Quest can convene an encrypted Quest Council. Mentions bind to stable
+  Companion identities; authors may revise or withdraw their own words without
+  erasing authorship or sync history. Actionable Council Notices open the exact
+  Quest, and their encrypted read state follows the recipient's trusted devices.
+  Search and the Command Palette now lead directly to Fellowship work, Council
+  messages, Campaign Chronicle messages, queues, and Companion workloads.
+
+  Owners and Stewards administer assignments. Companions work and convene.
+  Observers may witness the Council, but cannot alter its record.
+
+  <span class="hi">Beyond the Council chamber, Campaigns gained new maps.</span>
+
+  Software Release, Content Sprint, and Event Launch starter templates create
+  private Campaign structure through a preview-first flow. That structure can
+  travel as a versioned, identity-free JSON blueprint without carrying members,
+  assignments, history, dates, notes, discussions, sharing state, or keys.
+
+  Local iCalendar files can also become due-dated Quests after an exact preview.
+  Repeated imports are idempotent. Reconciliation changes only event-controlled
+  titles, descriptions, and due times, marks cancellations visibly, and leaves
+  priority, completion, XP, and assignments untouched. IANA timezones and
+  daylight-saving transitions are resolved before any Quest is written.
+
+  Authenticated calendar subscriptions remain outside the gate. A native
+  credential-vault boundary is ready, with no plaintext fallback, but provider
+  login will not ship until OAuth and export-isolation tests prove that secrets
+  cannot escape into SQLite, configuration, logs, backups, or Fellowship sync.
+
+  The web app now guards Markdown previews, browser key storage, account caches,
+  and encrypted envelopes more carefully. Shared cryptographic test vectors lock
+  CLI and browser interoperability. Task-focused specializations now award their
+  intended bonus on every Quest completion, unreachable key-handling paths were
+  removed, and the release suite was repaired so encryption failures cannot hide
+  behind unrelated noise.
+
+  The server still sees the shape of a journey: routing identifiers, devices,
+  event types, timestamps, approximate sizes, and sync frequency. It does not
+  receive plaintext Quest or Council content. This is end-to-end encrypted
+  content, honestly described, rather than a claim of knowing no metadata.
+
+  The legacy road remains open only for unmigrated accounts during the rollback
+  window. The new road has survived the automated gates, cross-platform restore,
+  CLI-to-browser trials, hostile-input checks, retention audits, removal and key
+  rotation, and the final two-device keyboard walkthrough.
+
+  <span class="hi">And then the Fellowship opened its Treasury.</span>
+
+  Every Campaign now keeps a ledger. Budgets for the whole Campaign and for each
+  category. Income and expenses with their vendors, their due dates, the day they
+  were settled. Estimated, actual, and billable coin on individual Quests. The
+  Treasury warns at four fifths, at nine tenths, and at the moment a budget is
+  spent, watches what falls due, and hands the whole record over as CSV or JSON.
+
+  A Campaign also chooses the coin it counts in: dollars or pesos.
+
+  Questline does not convert between them. It keeps no exchange rate and will not
+  invent one. A hero declares the denomination they work in, and the numbers stay
+  exactly as they were entered. Changing the coin relabels the ledger rather than
+  rewriting its amounts, so no total ever quietly mixes two currencies, and the
+  Chronicle notes the day the Campaign changed its reckoning.
+
+  The Treasury travels the same warded road as everything else. In a shared
+  Campaign every ledger entry, category, budget, and Quest cost is sealed with
+  that Fellowship's key and carried through its opaque route; a private Campaign
+  seals them with the hero's own. The server holds ciphertext. It never learns an
+  amount, a vendor, or the name of a single entry. Trials confirm it: no title, no
+  vendor, no category name appears in the clear on the wire, and a wrong
+  Fellowship key opens nothing.
+
+  <span class="hi">Coin, however, demands more than a lock. It demands witnesses.</span>
+
+  Whoever records a cost is not the one who approves it. Companions record their
+  own expenses and may amend them only while the entry is still Planned; once it
+  is approved, paid, or cancelled it passes into the keeping of the Owner and the
+  Stewards. Those two approve, settle, budget, and shape the categories. Only the
+  Owner may change the coin of the whole Campaign. Observers audit the ledger and
+  alter nothing within it.
+
+  Authorship is written as the author's Companion Key the moment an entry is
+  made, and it never changes hands. Editing another hero's record does not make
+  it yours. The status field is no back door either: to write anything other than
+  Planned, a hero must already hold the right to approve or to settle.
+
+  The Fellowship gained a Treasury hall of its own, where a Campaign's totals,
+  the hero who recorded each movement, and the exact reach of one's own rank are
+  all plainly visible. Elsewhere the ledger now offers only the keys a rank can
+  truly press.
+
+  Three flaws were found and closed in the counting house. A ledger row that
+  arrived before the Campaign, category, or Quest it depended upon was being
+  discarded in silence while the sync claimed success; it is now reported and
+  retried. An Observer could queue a treasury change the server would refuse, and
+  because that refusal reverses an entire delivery, a single such edit could halt
+  everything that account was trying to send. And two advertised keys had never
+  once done what they promised: in the Treasury, one paused the music instead of
+  settling a payment, the other silenced it instead of sorting the ledger.
+
+  <span class="hi">The party now shares more than a key. It shares the quest, and the coin.</span>
+
+<span class="comment">// Changes in this version</span>
+<span class="cmd">  ✓  AES-256-GCM private sync-v2 encrypts content before it leaves the CLI or browser</span>
+<span class="cmd">  ✓  Ed25519 signatures authenticate complete encrypted envelopes before decryption</span>
+<span class="cmd">  ✓  Shared Rust and WebCrypto key derivation keeps trusted-device restore interoperable</span>
+<span class="cmd">  ✓  Transfer Codes restore encrypted identities and are treated as master recovery secrets</span>
+<span class="cmd">  ✓  Signed snapshots replace old backups and establish the account's encrypted protocol cutover</span>
+<span class="cmd">  ✓  Restore, migration, cursor recovery, replay defense, and remote-page quarantine are safer</span>
+<span class="cmd">  ✓  Fellowship Campaigns use per-Campaign keys, opaque routes, and encrypted invitations</span>
+<span class="cmd">  ✓  Companion removal rotates keys and routes; the last removal returns a Campaign to local mode</span>
+<span class="cmd">  ✓  Companion Key grouping, normalization, and fingerprints strengthen invitation verification</span>
+<span class="cmd">  ✓  My Quests gathers assigned work across Campaigns and supports multiple Quest bearers</span>
+<span class="cmd">  ✓  Six Quest Stances work offline in the Ledger and keyboard-driven Kanban board</span>
+<span class="cmd">  ✓  Quest dependencies reject self-links and cycles and notify bearers when the path opens</span>
+<span class="cmd">  ✓  Encrypted Quest Councils support stable mentions, author-only revision, and withdrawal</span>
+<span class="cmd">  ✓  Council Notices deep-link to work and synchronize encrypted read state across trusted devices</span>
+<span class="cmd">  ✓  Council Briefing summarizes queues, review duty, workload, presence, and recent activity</span>
+<span class="cmd">  ✓  Fellowship search and Command Palette actions open exact messages, Quests, and workloads</span>
+<span class="cmd">  ✓  Owner and Steward assignment authority is enforced from signed event metadata</span>
+<span class="cmd">  ✓  Observers remain read-only while Companions can work and convene</span>
+<span class="cmd">  ✓  Software Release, Content Sprint, and Event Launch Campaign templates include preview</span>
+<span class="cmd">  ✓  Versioned JSON blueprints exchange Campaign structure without identities, history, or keys</span>
+<span class="cmd">  ✓  Local .ics import previews due-dated Quests, skips repeats, and reconciles only on request</span>
+<span class="cmd">  ✓  Calendar reconciliation preserves priority, completion, XP, assignments, and cancellations</span>
+<span class="cmd">  ✓  IANA timezones and daylight-saving transitions are resolved before calendar import</span>
+<span class="cmd">  ✓  Native credential-vault groundwork has no plaintext fallback</span>
+<span class="cmd">  ✓  Browser Markdown, local key storage, decrypted caches, and encrypted envelopes are hardened</span>
+<span class="cmd">  ✓  Cross-client cryptographic test vectors protect CLI and browser portability</span>
+<span class="cmd">  ✓  Task-focused specialization bonuses now apply to every Quest completion</span>
+<span class="cmd">  ✓  Security, retention, interoperability, restore, rotation, and release gates passed</span>
+<span class="cmd">  ✓  Campaign Treasury adds budgets, ledger entries, Quest costs, warnings, and CSV/JSON export</span>
+<span class="cmd">  ✓  Each Campaign counts in USD or MXN, with symbols and thousands separators on every amount</span>
+<span class="cmd">  ✓  No currency conversion and no exchange rate: switching relabels the ledger, never rewrites it</span>
+<span class="cmd">  ✓  The whole Treasury syncs encrypted under the Fellowship key, or the account key when private</span>
+<span class="cmd">  ✓  Round-trip trials prove no entry title, vendor, or category reaches the wire in cleartext</span>
+<span class="cmd">  ✓  Treasury rights follow Fellowship rank, separating who records a cost from who approves it</span>
+<span class="cmd">  ✓  Companions amend only their own Planned entries; Owner and Stewards approve, settle, and budget</span>
+<span class="cmd">  ✓  Only the Campaign Owner changes its coin; Observers audit the ledger and alter nothing</span>
+<span class="cmd">  ✓  Entry authorship is written as the author's Companion Key and can never change hands</span>
+<span class="cmd">  ✓  Fellowship Treasury shows totals, who recorded each movement, and the reach of your own rank</span>
+<span class="cmd">  ✓  Fixed a treasury row arriving before its Campaign, category, or Quest being dropped in silence</span>
+<span class="cmd">  ✓  Fixed an Observer's refused treasury write halting everything else that account was sending</span>
+<span class="cmd">  ✓  Fixed Treasury keys that paused and silenced the music instead of settling and sorting</span>
+<span class="cmd">  –  Authenticated calendar subscriptions remain sealed until their security gate is complete</span>
+<span class="cmd">  –  The server can still observe routing metadata, but never plaintext Quest or Council content</span>
+<span class="cmd">  –  Questline keeps no exchange rate; converting between currencies remains the hero's own work</span>
+<span class="cmd">  –  Somewhere beyond the mapped paths, the Archive remembers</span>
+        </pre>
+      </div>
+    </div>
+
     <!-- v1.1.3 -->
     <div style="margin-top:2.5rem;">
       <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
