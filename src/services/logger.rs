@@ -83,7 +83,7 @@ fn write_recovery_report(panic_msg: &str, location: &str) {
             "diagnostics": {
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
-                "version": "1.0.1"
+                "version": env!("CARGO_PKG_VERSION")
             }
         });
         if let Ok(json_str) = serde_json::to_string_pretty(&report) {

@@ -149,6 +149,14 @@ pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Them
         )),
     ];
 
+    let version_title = match crate::storage::active_profile() {
+        Some(profile) => format!(
+            " [ {} · TEST PROFILE: {} ] ",
+            build_info::version_label(),
+            profile
+        ),
+        None => format!(" [ {} ] ", build_info::version_label()),
+    };
     let quote_para = Paragraph::new(quote_text)
         .block(
             Block::default()
@@ -156,7 +164,7 @@ pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Them
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(current_color))
                 .title(Span::styled(
-                    format!(" [ {} ] ", build_info::version_label()),
+                    version_title,
                     Style::default()
                         .fg(Color::Rgb(249, 115, 22))
                         .add_modifier(Modifier::BOLD),

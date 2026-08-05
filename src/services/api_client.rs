@@ -39,9 +39,10 @@ impl ApiClient {
                 Err(e) => {
                     let msg = e.to_string();
                     // No reintentes errores de auth (401/403) ni errores del cliente (4xx)
+                    // A rate-limit window is much longer than the sub-second retry
+                    // schedule. Retrying here only consumes more nonces and prolongs it.
                     if msg.contains("429") {
-                        last_err = e;
-                        continue;
+                        return Err(e);
                     }
                     if msg.contains("401")
                         || msg.contains("403")

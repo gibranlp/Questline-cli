@@ -269,12 +269,12 @@ fn draw_today_command_center(
             .unwrap_or((0, ritual.daily_target));
         let done = count >= target;
         let streak = *app.stats_cache.ritual_streaks.get(&ritual.id).unwrap_or(&0);
-        let (rank, rank_color) = sidequest_rank(streak).unwrap_or(("Sidequest", theme.muted));
+        let rank = sidequest_rank(streak);
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
         action_idx += 1;
-        rows.push(ListItem::new(Line::from(vec![
+        let mut spans = vec![
             Span::styled(
                 if done {
                     "[x] "
@@ -291,10 +291,17 @@ fn draw_today_command_center(
                 Style::default().fg(theme.muted),
             ),
             Span::styled(
-                format!("{}d {}", streak, rank),
-                Style::default().fg(rank_color),
+                format!("{}d", streak),
+                Style::default().fg(rank.map_or(theme.muted, |(_, color)| color)),
             ),
-        ])));
+        ];
+        if let Some((rank_name, rank_color)) = rank {
+            spans.push(Span::styled(
+                format!(" {}", rank_name),
+                Style::default().fg(rank_color),
+            ));
+        }
+        rows.push(ListItem::new(Line::from(spans)));
     }
 
     push_separator(&mut rows, "Daily", theme.warning);
@@ -1071,7 +1078,8 @@ fn draw_fellowship_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
         .unwrap_or(None)
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
 
-    // Count unread messages and mentions from chronicle_messages
+    // Chronicle chat predates Council Notices, so combine both sources. Quest
+    // Council mentions are identity-backed notices rather than Chronicle text.
     let mut unread_count = 0;
     let mut mentions = 0;
     if let Ok(mut stmt) = app.db.conn.prepare("SELECT content, sender_identity FROM chronicle_messages WHERE timestamp > ?1 AND sender_identity != ?2") {
@@ -1085,6 +1093,22 @@ fn draw_fellowship_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
             }
         }
     }
+    if let Ok((notice_unread, council_mentions)) = app.db.conn.query_row(
+        "SELECT
+             SUM(CASE WHEN read = 0 AND notification_type != 'chronicle_mention' THEN 1 ELSE 0 END),
+             SUM(CASE WHEN read = 0 AND notification_type = 'mention' THEN 1 ELSE 0 END)
+         FROM notifications",
+        [],
+        |row| {
+            Ok((
+                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
+                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
+            ))
+        },
+    ) {
+        unread_count += notice_unread as usize;
+        mentions += council_mentions as usize;
+    }
 
     let border_color = if mentions > 0 {
         Color::Magenta
@@ -1096,13 +1120,18 @@ fn draw_fellowship_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
         theme.border
     };
 
-    let title = if mentions > 0 {
-        format!(" Fellowship [Mentions: {}] 🔔 ", mentions)
-    } else if unread_count > 0 {
-        format!(" Fellowship [Unread: {}] ✉ ", unread_count)
-    } else {
-        " Fellowship ".to_string()
-    };
+    let title = format!(
+        " Fellowship [Unread: {} · Mentions: {}]{} ",
+        unread_count,
+        mentions,
+        if mentions > 0 {
+            " 🔔"
+        } else if unread_count > 0 {
+            " ✉"
+        } else {
+            ""
+        }
+    );
 
     let lines = vec![
         Line::from(vec![

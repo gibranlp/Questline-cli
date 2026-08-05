@@ -9,7 +9,44 @@
   let preview = false;
   let rendered = '';
 
-  $: rendered = marked.parse(value || '');
+  const ALLOWED_TAGS = new Set([
+    'P', 'BR', 'STRONG', 'EM', 'DEL', 'BLOCKQUOTE', 'PRE', 'CODE',
+    'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'UL', 'OL', 'LI', 'A', 'HR',
+    'TABLE', 'THEAD', 'TBODY', 'TR', 'TH', 'TD',
+  ]);
+
+  function sanitizeMarkdown(html) {
+    if (typeof document === 'undefined') return '';
+    const template = document.createElement('template');
+    template.innerHTML = html;
+    for (const element of [...template.content.querySelectorAll('*')]) {
+      if (!ALLOWED_TAGS.has(element.tagName)) {
+        element.replaceWith(document.createTextNode(element.textContent || ''));
+        continue;
+      }
+      for (const attribute of [...element.attributes]) {
+        if (element.tagName !== 'A' || !['href', 'title'].includes(attribute.name)) {
+          element.removeAttribute(attribute.name);
+        }
+      }
+      if (element.tagName === 'A') {
+        const href = element.getAttribute('href') || '';
+        let safe = href.startsWith('#') || href.startsWith('/');
+        if (!safe) {
+          try {
+            safe = ['http:', 'https:', 'mailto:'].includes(new URL(href, location.origin).protocol);
+          } catch {
+            safe = false;
+          }
+        }
+        if (!safe) element.removeAttribute('href');
+        element.setAttribute('rel', 'noopener noreferrer');
+      }
+    }
+    return template.innerHTML;
+  }
+
+  $: rendered = sanitizeMarkdown(marked.parse(value || ''));
 
   function handleKeydown(e) {
     // Ctrl+S or Cmd+S saves

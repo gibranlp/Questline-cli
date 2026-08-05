@@ -8,6 +8,8 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
+Current stable version: **2.0.0**.
+
 ---
 
 Questline is a terminal productivity app disguised as an RPG. Complete real tasks. Level up a real character. Explore a world that grows with your output.
@@ -90,6 +92,31 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ### Quest System
 Tasks in Questline are quests. They carry priority, due dates, subtasks, and steps. Completing a quest earns XP, waters your Zen Tree, and pushes chapter objectives forward. Fail to complete daily quests and the realm takes notice.
 
+Press `t` from Campaigns to start from a Software Release, Content Sprint, or Event Launch template. Reusable Campaign structure can also be exchanged as an identity-free JSON blueprint:
+
+```sh
+questline campaign-export "Campaign Name" campaign.json
+questline campaign-import campaign.json
+questline campaign-import campaign.json --confirm
+```
+
+Import previews the Campaign before making changes. Blueprint files contain only the Campaign name and description plus Quest titles, descriptions, priorities, and steps; sharing state, identities, assignments, completion history, comments, notes, activity, dates, and encryption keys are excluded.
+
+Local iCalendar files can be previewed and imported as due-dated Quests without connecting a calendar account:
+
+```sh
+questline calendar-import "Campaign Name" events.ics
+questline calendar-import "Campaign Name" events.ics --confirm
+questline calendar-import "Campaign Name" events.ics --reconcile
+```
+
+Repeated imports skip event UIDs already present in that Campaign. Use `--reconcile` explicitly to apply changed event titles, descriptions, and due times and to mark cancellations without deleting or completing Quests. Quest priority, completion, XP, and assignments remain untouched. IANA `TZID` values and daylight-saving transitions are resolved before the UTC due time is shown in preview. Importing into a shared Campaign displays a warning because the resulting Quests will use normal Fellowship sync.
+
+Authenticated calendar subscriptions are not enabled yet. Questline will not
+store calendar tokens or private feed URLs in its SQLite database or ordinary
+configuration files. A native credential-vault boundary is in place, but
+provider authorization and export-isolation checks must pass before login ships.
+
 ### The Main Quest
 
 Every time the Dashboard opens, Questline convenes an emergency session of the Planning Council — a deterministic scoring engine that reviews every incomplete task in your backlog and selects the single most important thing to do right now.
@@ -141,6 +168,102 @@ Collectible items discovered through focus sessions and long-form work. Each rel
 
 ### Progression
 Every action earns XP. XP drives levels. Levels unlock class powers, new titles, and deeper lore. Specializations let you redirect your growth. Achievements mark the moments worth remembering.
+
+### The Treasury
+
+Every Campaign has a Treasury — a full ledger for the money behind the work. Press `4` in a Campaign workspace to open it. You get overall and per-category budgets, income and expense entries with vendors, due dates, payment dates, notes and recurrence, plus estimated, actual, and billable amounts on individual Quests.
+
+The Treasury summarizes Budget, Income, Paid, Committed, and Available at a glance, warns at 80%, 90%, and 100% of any budget, tracks upcoming and overdue payments, and exports the whole ledger to CSV and JSON with `x`.
+
+Choose the currency your Campaign works in — **USD** or **MXN**:
+
+- Press `$` in the Treasury to switch. Amounts display with the currency symbol and thousands separators (`MX$1,234,567.89`).
+- Questline does not convert between currencies. It has no exchange rate and never invents one. You pick the denomination you are working in, and the numbers stay exactly as you entered them.
+- Switching relabels the existing ledger rather than converting it, so totals never silently mix denominations. The Chronicle records the switch.
+
+Currency is per Campaign, so different Campaigns can be kept in different currencies.
+
+Treasury keys: `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter, `s` sort, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
+
+### Encrypted Sync and Fellowship
+
+Questline now has an encrypted sync path for private data. Your tasks, notes,
+projects, journals, and progress are encrypted on your device before they are
+uploaded. The server stores encrypted data and does not receive your account
+decryption key.
+
+Encrypted sync works across the CLI and web app. A Transfer Code can move your
+identity to another trusted computer so it can derive the same encryption key.
+Treat that code like a master password: anyone who gets it can access your
+encrypted data.
+
+Fellowship projects use their own project key. Members receive encrypted key
+envelopes, project routes are opaque, and removing a member rotates the key so
+the old route can no longer receive new edits. A project becomes local again
+when its last companion is removed.
+
+Shared Campaigns now include a keyboard-first teamwork loop:
+
+- Exchange the public **Companion Key** and compare its short fingerprint.
+- Use Fellowship **My Quests** (`y`) to see assigned work across Campaigns.
+- In the Quest Ledger, use `a` to manage Quest bearers, `g` to advance a
+  Quest Stance, `Shift+G` to move it back, and `c` to convene the encrypted
+  **Quest Council**.
+- Quest Council mentions bind to stable Companion Keys. Authors can revise with
+  `Ctrl+E` or withdraw with `Ctrl+D` while retaining a sync tombstone.
+- Fellowship **Council Notices** (`b`) provide deep-links, filters, read/unread
+  controls, and account-encrypted read-state synchronization.
+- Owners and Stewards administer assignments. Companions work and discuss;
+  Observers remain read-only in Quest Councils.
+- Fellowship **Treasury** (`t`) shows a shared Campaign's totals, who recorded
+  each movement, and exactly what your own role may do.
+
+Decrypted notice and discussion content stays on trusted clients. The server
+receives encrypted payloads plus unavoidable routing metadata, never a plaintext
+Quest or Council message.
+
+#### Treasury in a Shared Campaign
+
+The whole Treasury syncs end-to-end encrypted. In a shared Campaign every
+treasury event — the Campaign treasury, ledger categories, category budgets,
+ledger entries, and Quest financials — is sealed with that Fellowship's project
+key and routed through its opaque route. In a private Campaign the same data
+uses your account key. The server stores ciphertext; it never receives an
+amount, a vendor, or an entry title in the clear.
+
+Money deserves separation of duties, so whoever records a cost is not who
+approves or settles it:
+
+| Action | Owner | Steward | Companion | Observer |
+|---|:---:|:---:|:---:|:---:|
+| View Treasury | Yes | Yes | Yes | Yes |
+| Record entry | Yes | Yes | Yes | No |
+| Edit/delete own Planned entry | Yes | Yes | Yes | No |
+| Edit/delete any entry | Yes | Yes | No | No |
+| Approve entry | Yes | Yes | No | No |
+| Settle payment | Yes | Yes | No | No |
+| Set budgets | Yes | Yes | No | No |
+| Manage categories | Yes | Yes | No | No |
+| Switch currency | Yes | No | No | No |
+| Quest estimated/actual cost | Yes | Yes | Yes | No |
+| Quest billable amount and payment status | Yes | Yes | No | No |
+
+A Companion owns an entry only while it is still `Planned`. Once it is approved,
+paid, or cancelled it belongs to the Owner and Stewards. Authorship is recorded
+as the author's Companion Key when the entry is created and never changes, so
+editing someone else's entry does not transfer ownership of it. The status field
+in the entry form is not a shortcut either: saving anything other than `Planned`
+requires the right to approve or settle.
+
+The Treasury footer only advertises the shortcuts your role can actually use,
+and the Quest Codex (`?`) grays out the rest.
+
+You can also turn cloud sync off and use Questline locally. The local-only
+choice also lets you quit without waiting for a sync operation.
+
+The encrypted rollout is additive for now. Older accounts can continue using
+the legacy path while they migrate. The encrypted server database is separate
+from the old database so the migration can be verified and rolled back safely.
 
 ---
 
@@ -238,6 +361,131 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v2.0.0 — Encrypted Fellowship
+*Released 2026-08-01*
+
+- Private sync-v2 encrypts content with AES-256-GCM before it leaves the CLI or
+  browser.
+- Every stored encrypted event carries a durable Ed25519 author signature. The
+  signature covers the complete envelope, including ciphertext, nonce, scope,
+  route, device, and author identity, and is verified before decryption.
+- Rust and WebCrypto use the same identity-based key derivation, so trusted
+  devices can restore the same account data.
+- Encrypted snapshots replace previous backups instead of duplicating the full
+  history on every export.
+- A trusted signed snapshot performs a per-account cutover: old unsigned account
+  history is retired, future unsigned writes are rejected, and clients reject
+  unsigned pulls without rewriting Fellowship authorship.
+- New-device restore, migration, cursor recovery, replay protection, and
+  suspicious remote-page quarantine are safer.
+- Fellowship projects use per-project encryption keys and opaque routing IDs.
+- Invitations contain encrypted project details and are checked before they are
+  accepted; repeated acceptance is safe after a crash.
+- Removing a Fellowship member rotates keys and routes. Removing the last
+  companion returns the project to local mode.
+- Production security checks cover request replay, duplicate event IDs,
+  ciphertext substitution, cross-identity forgery, concurrent invitation
+  acceptance, interrupted rotation rollback, removed-member revocation,
+  retired-route write rejection, and replacement-route delivery isolation.
+- Sync Settings show the active protocol and provide a local-only mode.
+- The webapp now protects Markdown previews, browser key storage, account cache,
+  and encrypted API envelopes more carefully.
+- The existing legacy sync path remains available during migration. It will be
+  removed only after the encrypted rollout and compatibility window are complete.
+- Added Companion Key fingerprints, cross-Campaign My Quests, Quest bearers,
+  six Quest Stances, encrypted Quest Councils with identity-backed mentions,
+  and actionable Council Notices.
+- Council Notice read state synchronizes as a separate account-encrypted opaque
+  entity; decrypted notice text remains local.
+- Owner/Steward assignment administration is enforced from signed event
+  metadata, and Quest Council authorship is checked against the event signer.
+- Production retention checks found no private-field markers in available API,
+  admin, PHP error, or Apache logs; no migrated account retains a legacy backup;
+  and encrypted event storage contains ciphertext rather than JSON plaintext.
+- The server still sees routing metadata such as account, device, event, entity,
+  operation, timestamp, approximate size, and sync frequency. Questline therefore
+  describes this as end-to-end encrypted content, not zero metadata knowledge.
+- Legacy plaintext history remains intentionally available for unmigrated users
+  and rollback. It must not be deleted until migration is complete, the rollback
+  window closes, runtime and migration database credentials are separated, and
+  hosting-provider snapshot retention is confirmed.
+
+**Campaign planning and exploration:**
+
+- Added private Campaign starter templates for Software Release, Content Sprint,
+  and Event Launch workflows, available from the Campaigns screen with a
+  keyboard-first preview and confirmation flow.
+- Campaign structure can be exported and imported as a versioned, identity-free
+  JSON blueprint. Portable templates exclude sharing state, identities,
+  assignments, completion history, comments, notes, activity, dates, and
+  encryption keys.
+- Added preview-first local `.ics` calendar import. Calendar events become
+  due-dated Quests only after explicit confirmation, repeated imports are
+  idempotent, and reconciliation must be requested explicitly.
+- Calendar reconciliation updates event-controlled titles, descriptions, and
+  due times while preserving Quest priority, completion, XP, and assignments.
+  Cancellations remain visible without deleting or completing the Quest.
+- IANA calendar timezones and daylight-saving transitions are resolved before
+  import, with malformed, ambiguous, and nonexistent times rejected safely.
+- Added the native credential-vault foundation required for future authenticated
+  calendar subscriptions. Provider login remains disabled until its OAuth and
+  export-isolation security checks are complete.
+- Somewhere beyond the usual menus, a class-specific terminal Easter egg now
+  waits for heroes who uncover the Forgotten Archive.
+
+**Campaign Treasury:**
+
+- Added the Campaign Treasury: overall and per-category budgets, income and
+  expense entries with vendors, due and payment dates, notes and recurrence,
+  Quest-level estimated, actual, and billable amounts, budget warnings at 80%,
+  90%, and 100%, upcoming and overdue payment tracking, and CSV/JSON export.
+- Each Campaign chooses whether it works in USD or MXN. Questline performs no
+  currency conversion and holds no exchange rate; switching relabels the existing
+  ledger so totals never mix denominations silently, and the Chronicle records
+  the change. Amounts render with the currency symbol and thousands separators.
+- The full Treasury now syncs end-to-end encrypted. Shared Campaigns seal every
+  treasury entity with the Fellowship project key and its opaque route; private
+  Campaigns use the account key. Verified by round-trip tests that assert no
+  entry title, vendor, or category name appears in cleartext on the wire, and
+  that a wrong Fellowship key cannot open a treasury envelope.
+- Treasury permissions now follow Fellowship roles, with separation of duties:
+  Companions record their own entries and may amend them only while `Planned`;
+  Owners and Stewards approve, settle, budget, and manage categories; only the
+  Owner switches the Campaign currency; Observers audit but never alter. Entry
+  authorship is stored as the author's Companion Key, is set at creation, and is
+  immutable, so editing another member's entry never transfers ownership.
+- Fellowship gained a **Treasury** tab (`t`) showing a shared Campaign's totals,
+  who recorded each movement, and the permission matrix with your own role
+  highlighted. The Treasury footer and Quest Codex now hide or gray out the
+  actions your role cannot perform.
+- Fixed a treasury sync defect that could lose data silently: a ledger row whose
+  Campaign, category, or Quest had not arrived yet was dropped permanently while
+  the sync still reported success. Such a row is now reported and retried on the
+  next sync.
+- Fixed an Observer in a shared Campaign being able to queue a treasury write the
+  server rejects. Because that rejection rolls back the entire push batch, one
+  such edit previously stalled that account's whole sync.
+- Fixed `p` in the Treasury pausing audio instead of settling a payment, and `s`
+  stopping audio instead of sorting the ledger. Both shortcuts were shadowed by
+  global audio keys and had never worked.
+
+**Release-hardening pass:**
+
+- The full encryption implementation was audited against the design: private
+  sync-v2, HKDF account keys, AES-256-GCM with fail-closed decryption, the
+  four-layer replay protection, protocol lock, Transfer-Code migration and
+  new-device restore, and Fellowship key rotation/removal were all verified in
+  code.
+- CLI ↔ web cryptographic interoperability is now locked by shared test vectors
+  in the CLI itself: the account key derivation, the Fellowship X25519 public
+  key, and a browser-produced key envelope all decrypt and verify byte-for-byte
+  in the Rust client, so encrypted data stays portable across devices.
+- Fixed a specialization XP bug: task-focused specializations (Bug Hunter,
+  Execution Knight, and their class equivalents) now grant their +10% bonus on
+  every quest and task completion, not only high-priority ones.
+- Removed unreachable key-handling code and repaired the test suite so it runs
+  clean, keeping unrelated failures from masking a real encryption regression.
+
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
 
@@ -261,6 +509,11 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **Better pasting and scrolling:** Large clipboard pastes are inserted at once, paragraphs and accented characters are preserved, wrapped text scrolls inside the editor, and the cursor remains visible without adding spaces inside words.
 - **Clearer campaign totals:** The Campaigns list now labels open quests as `!(n)`, steps as `->(n)`, and scrolls as `#(n)`.
 - **Quest Calendar:** Press `C` from Campaigns or a campaign workspace to view due quests from all campaigns in a full month calendar and create a new quest directly on any selected day. Due dates also anchor daily, weekly, monthly, and yearly recurring quests.
+- **Quest Kanban:** Press `k` in a Campaign's Quest workspace to toggle between the detailed Ledger and a six-column stance board. The board uses the same offline Quest Stances and permissions as the Ledger.
+- **Quest dependencies:** Press `l` on a Quest to link or unlink blockers. Unresolved blockers appear in the Ledger and are marked with `⛓` on Kanban cards; dependency cycles are rejected locally and during encrypted sync.
+- **Council Briefing:** Press `B` in a shared Campaign for an offline team summary of blocked, review, overdue, due-soon, and unassigned Quests, Companion workload and presence, and recent activity. Enter opens the selected queue or Companion workload in the Quest Ledger.
+- **Teamwork search and commands:** Global Search includes active Quest Council messages, Campaign Chronicle messages, and Companions from the local encrypted cache. The command palette can open My Quests, Kanban, Council Briefing, blocked/review queues, and the selected Quest Council.
+- **Workload and review visibility:** Council Briefing labels Companion workload as available, balanced, or overloaded and shows open/high/blocked/overdue counts. Its Awaiting Judgment panel names assignees, flags unassigned reviews, and identifies Owner/Steward review responsibility.
 
 ---
 

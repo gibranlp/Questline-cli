@@ -193,6 +193,21 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v2.0.0",
+            "Aug 1, 2026",
+            "Encrypted Fellowship",
+            &[
+                "Private sync-v2 encrypts content before it leaves the CLI or browser",
+                "Signed encrypted events protect identity, integrity, and authorship",
+                "Trusted devices can restore portable account data across Rust and WebCrypto",
+                "Fellowship projects use encrypted project keys and opaque routing IDs",
+                "Member removal rotates project keys and revokes the retired route",
+                "Migration, replay protection, recovery, and remote quarantine are safer",
+                "Sync Settings show the active protocol and offer a local-only mode",
+                "Markdown previews, browser key storage, and encrypted envelopes are hardened",
+            ],
+        ),
+        (
             "v1.1.3",
             "Jul 29, 2026",
             "The Chronicle Remembers",

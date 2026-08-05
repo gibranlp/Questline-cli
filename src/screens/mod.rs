@@ -21,6 +21,7 @@ pub mod restore;
 pub mod settings;
 pub mod soundscapes;
 pub mod sync;
+pub mod text_wrap;
 
 // Enum defining the active UI screen states in Questline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

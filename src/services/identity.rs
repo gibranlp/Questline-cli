@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::storage;
@@ -124,11 +125,103 @@ fn from_hex(hex_str: &str) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+/// Normalize the public identity exchanged during the Fellowship trust ceremony.
+/// Spaces, dashes, and colons are display separators; all other non-hex input is
+/// rejected rather than silently discarded.
+pub fn normalize_companion_key(input: &str) -> Result<String> {
+    let mut normalized = String::with_capacity(64);
+    for character in input.chars() {
+        if character.is_ascii_hexdigit() {
+            normalized.push(character.to_ascii_lowercase());
+        } else if character.is_whitespace() || matches!(character, '-' | ':') {
+            continue;
+        } else {
+            return Err(anyhow!(
+                "Companion Key contains an invalid character: {character}"
+            ));
+        }
+    }
+    if normalized.len() != 64 {
+        return Err(anyhow!(
+            "Companion Key must contain exactly 64 hexadecimal characters (found {})",
+            normalized.len()
+        ));
+    }
+    // Exact decoding catches malformed pairs and documents the 32-byte contract.
+    if from_hex(&normalized)?.len() != 32 {
+        return Err(anyhow!("Companion Key must decode to 32 bytes"));
+    }
+    Ok(normalized)
+}
+
+/// Format a complete or partial normalized key into readable 8-character groups.
+pub fn format_companion_key(input: &str) -> String {
+    input
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .map(|character| character.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .chunks(8)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A short verification fingerprint. This is deliberately only a comparison aid;
+/// the complete Companion Key remains the actual cryptographic identity.
+pub fn companion_key_fingerprint(input: &str) -> Result<String> {
+    let normalized = normalize_companion_key(input)?;
+    let key_bytes = from_hex(&normalized)?;
+    let digest = Sha256::digest(key_bytes);
+    Ok(digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<String>()
+        .as_bytes()
+        .chunks(4)
+        .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+        .collect::<Vec<_>>()
+        .join("-"))
+}
+
 // Lee el hostname del sistema para identificar el dispositivo en la lista de dispositivos del héroe
 pub fn get_local_device_name() -> String {
     std::fs::read_to_string("/etc/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| std::env::var("HOSTNAME").unwrap_or_else(|_| "Workstation".to_string()))
+}
+
+#[cfg(test)]
+mod companion_key_tests {
+    use super::*;
+
+    #[test]
+    fn companion_key_normalizes_grouped_uppercase_input() {
+        let raw = "AA11BB22-CC33DD44 EE55FF66:00112233 44556677 8899AABB CCDDEEFF 01234567";
+        assert_eq!(
+            normalize_companion_key(raw).unwrap(),
+            "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff01234567"
+        );
+    }
+
+    #[test]
+    fn companion_key_rejects_invalid_characters_and_lengths() {
+        assert!(normalize_companion_key(&"ab".repeat(31)).is_err());
+        assert!(normalize_companion_key(&format!("{}g1", "ab".repeat(31))).is_err());
+    }
+
+    #[test]
+    fn companion_key_format_and_fingerprint_are_stable() {
+        let key = "ab".repeat(32);
+        assert_eq!(
+            format_companion_key(&key),
+            "abababab abababab abababab abababab abababab abababab abababab abababab"
+        );
+        assert_eq!(
+            companion_key_fingerprint(&key).unwrap(),
+            "9A2D-B2E2-3F15-04CD"
+        );
+    }
 }
 
 // Copia texto al portapapeles usando las herramientas nativas de cada plataforma — órale, soporte multiplataforma

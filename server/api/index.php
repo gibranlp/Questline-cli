@@ -155,8 +155,19 @@ try {
     foreach ([
         "ALTER TABLE sync_events ADD COLUMN seq BIGINT NOT NULL AUTO_INCREMENT, ADD KEY idx_seq (seq)",
         "ALTER TABLE sync_events ADD INDEX idx_sync_events_seq (user_id, seq)",
+        "ALTER TABLE sync_events MODIFY COLUMN entity_id VARCHAR(255) NOT NULL",
         "ALTER TABLE users ADD COLUMN supporter TINYINT(1) NOT NULL DEFAULT 0",
         "ALTER TABLE users ADD COLUMN email VARCHAR(255) NULL",
+        "ALTER TABLE users ADD COLUMN sync_protocol TINYINT UNSIGNED NOT NULL DEFAULT 1",
+        "ALTER TABLE users ADD COLUMN encryption_public_key VARCHAR(64) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN routing_id VARCHAR(36) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN inviter_encryption_key VARCHAR(64) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN key_nonce VARCHAR(32) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN key_ciphertext TEXT NULL",
+        "ALTER TABLE project_invitations ADD COLUMN project_name_nonce VARCHAR(32) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN project_name_ciphertext TEXT NULL",
+        "ALTER TABLE project_invitations ADD COLUMN project_id_nonce VARCHAR(32) NULL",
+        "ALTER TABLE project_invitations ADD COLUMN project_id_ciphertext TEXT NULL",
         "ALTER TABLE access_codes ADD COLUMN linked_user_id VARCHAR(36) NULL",
         "ALTER TABLE devices ADD COLUMN public_key VARCHAR(64) NULL",
         "ALTER TABLE webhooks ADD UNIQUE KEY uq_user_url (user_id, url(255))",
@@ -715,7 +726,12 @@ try {
     $stmt = $pdo->prepare("SELECT COUNT(*) FROM nonces WHERE user_id = ? AND created_at > SUBDATE(NOW(), INTERVAL 1 MINUTE)");
     $stmt->execute([$userId]);
     $requestCount = (int)$stmt->fetchColumn();
-    $syncRoutes = ['sync/pull', 'sync/full', 'sync/push', 'sync/head', 'sync/status', 'sync/reset', 'recovery', 'recovery/latest'];
+    $syncRoutes = [
+        'sync/pull', 'sync/full', 'sync/push', 'sync/head', 'sync/status', 'sync/reset',
+        'sync/v2/pull', 'sync/v2/push', 'sync/v2/snapshot',
+        'project/key-envelopes', 'project/revocations',
+        'recovery', 'recovery/latest'
+    ];
     $rateLimit = in_array($route, $syncRoutes, true) ? 1000 : 100;
     if ($requestCount > $rateLimit) {
         log_api_event($pdo, $userId, $deviceId, 'API_ERROR', "Rate limit exceeded on {$route}: {$requestCount}/{$rateLimit}");
@@ -883,7 +899,46 @@ try {
             break;
             
         // ── Sync push/pull — el núcleo de la replicación de datos entre dispositivos ──
+        case 'sync/protocol':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $stmt = $pdo->prepare("SELECT COALESCE(sync_protocol, 1) FROM users WHERE id = ?");
+            $stmt->execute([$userId]);
+            echo json_encode(["protocol" => (int)$stmt->fetchColumn()]);
+            break;
+
+        case 'encryption/register':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $data = json_decode($body, true);
+            $encryptionKey = $data['public_key'] ?? '';
+            if (strlen($encryptionKey) !== 64 || !ctype_xdigit($encryptionKey)) {
+                http_response_code(400);
+                echo json_encode(["error" => "Invalid X25519 public key"]);
+                exit;
+            }
+            $stmt = $pdo->prepare("UPDATE users SET encryption_public_key = ? WHERE id = ?");
+            $stmt->execute([strtolower($encryptionKey), $userId]);
+            echo json_encode(["status" => "success"]);
+            break;
+
+        case 'encryption/key':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $targetIdentity = $_GET['identity'] ?? '';
+            $stmt = $pdo->prepare("SELECT encryption_public_key, username FROM users WHERE public_key = ?");
+            $stmt->execute([$targetIdentity]);
+            $companion = $stmt->fetch();
+            if (!$companion || !$companion['encryption_public_key']) {
+                http_response_code(404);
+                echo json_encode(["error" => "Companion has not upgraded to encrypted Fellowship"]);
+                exit;
+            }
+            echo json_encode([
+                "public_key" => $companion['encryption_public_key'],
+                "username" => $companion['username'] ?: null
+            ]);
+            break;
+
         case 'sync/push':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
@@ -1031,9 +1086,246 @@ try {
                 "examples" => array_slice($invalidEvents, 0, 10)
             ]);
             break;
-            
+
+        case 'sync/v2/push':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $entries = json_decode($body, true);
+            if (!is_array($entries)) {
+                http_response_code(400);
+                echo json_encode(["error" => "Payload must be an array of encrypted events"]);
+                exit;
+            }
+            $encryptedDb = e2ee_database();
+            $security = $encryptedDb->prepare("SELECT signatures_required FROM account_v2_security WHERE account_id = ?");
+            $security->execute([$userId]);
+            $signaturesRequired = (bool)$security->fetchColumn();
+            $stmt = $encryptedDb->prepare("INSERT IGNORE INTO sync_v2_events
+                (id, account_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature)
+                VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+            $memberCheck = $encryptedDb->prepare("SELECT m.role FROM project_v2_members m
+                WHERE m.routing_id = ? AND m.account_id = ?
+                  AND NOT EXISTS (SELECT 1 FROM project_v2_retired_routes r WHERE r.routing_id = m.routing_id)");
+            $routeMembers = $encryptedDb->prepare("SELECT account_id FROM project_v2_members WHERE routing_id = ? AND account_id != ?");
+            $encryptedDb->beginTransaction();
+            $inserted = 0;
+            foreach ($entries as $event) {
+                $required = ['id', 'entity_type', 'entity_id', 'operation', 'timestamp', 'key_id', 'nonce', 'ciphertext'];
+                foreach ($required as $field) {
+                    if (!isset($event[$field]) || !is_string($event[$field]) || $event[$field] === '') {
+                        $encryptedDb->rollBack();
+                        http_response_code(400);
+                        echo json_encode(["error" => "Invalid encrypted event field: $field"]);
+                        exit;
+                    }
+                }
+                if (strlen($event['entity_id']) > 255) {
+                    $encryptedDb->rollBack();
+                    http_response_code(400);
+                    echo json_encode(["error" => "Encrypted event entity ID is too long"]);
+                    exit;
+                }
+                if (($event['version'] ?? null) !== 2 || !in_array($event['key_id'], ['account-v1', 'project-v1'], true)
+                    || (array_key_exists('content', $event) && $event['content'] !== null)
+                    || strlen($event['ciphertext']) > 8 * 1024 * 1024) {
+                    $encryptedDb->rollBack();
+                    http_response_code(400);
+                    echo json_encode(["error" => "Unsupported or malformed sync-v2 envelope"]);
+                    exit;
+                }
+                $decodedNonce = base64_decode($event['nonce'], true);
+                $decodedCiphertext = base64_decode($event['ciphertext'], true);
+                if ($decodedNonce === false || strlen($decodedNonce) !== 12
+                    || $decodedCiphertext === false || strlen($decodedCiphertext) < 16) {
+                    $encryptedDb->rollBack();
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid encrypted event encoding"]);
+                    exit;
+                }
+                $scope = $event['scope'] ?? 'account';
+                $routingId = $event['routing_id'] ?? null;
+                if (!in_array($scope, ['account', 'project'], true)
+                    || ($scope === 'account' && ($event['key_id'] !== 'account-v1' || !empty($routingId)))) {
+                    $encryptedDb->rollBack();
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid account event key"]);
+                    exit;
+                }
+                if ($scope === 'project') {
+                    if ($event['key_id'] !== 'project-v1' || !$routingId) {
+                        $encryptedDb->rollBack();
+                        http_response_code(400);
+                        echo json_encode(["error" => "Invalid encrypted project event"]);
+                        exit;
+                    }
+                    $memberCheck->execute([$routingId, $userId]);
+                    $memberRole = $memberCheck->fetchColumn();
+                    $administrativeEntity = in_array($event['entity_type'], ['task_assignment', 'project_member'], true);
+                    $canWrite = in_array($memberRole, ['Owner', 'Steward'], true)
+                        || ($memberRole === 'Companion' && !$administrativeEntity)
+                        || ($memberRole === 'Observer' && $event['entity_type'] === 'chronicle_message');
+                    if (!$canWrite) {
+                        $encryptedDb->rollBack();
+                        http_response_code(403);
+                        echo json_encode(["error" => "Not a member of encrypted project route"]);
+                        exit;
+                    }
+                }
+                $hasSignature = isset($event['author_public_key'], $event['event_signature']);
+                if (($signaturesRequired && !$hasSignature) || ($hasSignature
+                    && ($event['author_public_key'] !== $identity || !verify_sync_v2_event_signature($event)))) {
+                    $encryptedDb->rollBack();
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid durable sync event signature"]);
+                    exit;
+                }
+                $stmt->execute([$event['id'], $userId, $event['entity_type'], $event['entity_id'],
+                    $event['operation'], $event['timestamp'], $event['key_id'], $event['nonce'],
+                    $event['ciphertext'], $scope, $routingId, $event['device_id'] ?? $deviceId ?? '', $event['author_public_key'] ?? null, $event['event_signature'] ?? null]);
+                $inserted += $stmt->rowCount();
+                if ($scope === 'project') {
+                    $routeMembers->execute([$routingId, $userId]);
+                    foreach ($routeMembers->fetchAll(PDO::FETCH_COLUMN) as $targetAccountId) {
+                        $stmt->execute([$event['id'], $targetAccountId, $event['entity_type'], $event['entity_id'],
+                            $event['operation'], $event['timestamp'], $event['key_id'], $event['nonce'],
+                            $event['ciphertext'], $scope, $routingId, $event['device_id'] ?? $deviceId ?? '', $event['author_public_key'] ?? null, $event['event_signature'] ?? null]);
+                    }
+                }
+            }
+            $encryptedDb->commit();
+            echo json_encode(["status" => "success", "pushed" => $inserted, "protocol" => 2]);
+            break;
+
+        case 'sync/v2/pull':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $encryptedDb = e2ee_database();
+            $security = $encryptedDb->prepare("SELECT signatures_required FROM account_v2_security WHERE account_id = ?");
+            $security->execute([$userId]);
+            $signaturesRequired = (bool)$security->fetchColumn();
+            $sinceSeq = isset($_GET['since_seq']) ? max(0, (int)$_GET['since_seq']) : 0;
+            $limit = max(1, min(isset($_GET['limit']) ? (int)$_GET['limit'] : 500, 1000));
+            $stmt = $encryptedDb->prepare("SELECT id, 2 AS version, entity_type, entity_id, operation,
+                event_timestamp AS timestamp, key_id, nonce, ciphertext, scope, COALESCE(routing_id, '') AS routing_id, device_id, author_public_key, event_signature, seq
+                FROM sync_v2_events WHERE account_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT {$limit}");
+            $stmt->execute([$userId, $deviceId ?? '', $sinceSeq]);
+            $events = $stmt->fetchAll();
+            $head = $encryptedDb->prepare("SELECT COALESCE(MAX(seq), 0) FROM sync_v2_events WHERE account_id = ? AND device_id != ?");
+            $head->execute([$userId, $deviceId ?? '']);
+            $headSeq = (int)$head->fetchColumn();
+            $nextSeq = $sinceSeq;
+            foreach ($events as $event) $nextSeq = max($nextSeq, (int)$event['seq']);
+            echo json_encode(["events" => $events, "head_seq" => $headSeq,
+                "next_seq" => $nextSeq, "has_more" => $nextSeq < $headSeq,
+                "signatures_required" => $signaturesRequired]);
+            break;
+
+        case 'sync/v2/snapshot':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $entries = json_decode($body, true);
+            if (!is_array($entries) || count($entries) === 0 || count($entries) > 100000) {
+                http_response_code(400);
+                echo json_encode(["error" => "Encrypted snapshot must contain 1..100000 events"]);
+                exit;
+            }
+            foreach ($entries as $event) {
+                $required = ['id', 'entity_type', 'entity_id', 'operation', 'timestamp', 'key_id', 'nonce', 'ciphertext', 'author_public_key', 'event_signature'];
+                foreach ($required as $field) {
+                    if (!isset($event[$field]) || !is_string($event[$field]) || $event[$field] === '') {
+                        http_response_code(400);
+                        echo json_encode(["error" => "Invalid encrypted snapshot field: $field"]);
+                        exit;
+                    }
+                }
+                if (strlen($event['entity_id']) > 255) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Encrypted snapshot entity ID is too long"]);
+                    exit;
+                }
+                if (($event['version'] ?? null) !== 2 || !in_array($event['key_id'], ['account-v1', 'project-v1'], true)
+                    || (array_key_exists('content', $event) && $event['content'] !== null)
+                    || strlen($event['ciphertext']) > 8 * 1024 * 1024) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Unsupported or malformed sync-v2 snapshot"]);
+                    exit;
+                }
+                $decodedNonce = base64_decode($event['nonce'], true);
+                $decodedCiphertext = base64_decode($event['ciphertext'], true);
+                if ($decodedNonce === false || strlen($decodedNonce) !== 12
+                    || $decodedCiphertext === false || strlen($decodedCiphertext) < 16) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid encrypted snapshot encoding"]);
+                    exit;
+                }
+                if ($event['author_public_key'] !== $identity || !verify_sync_v2_event_signature($event)) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid durable snapshot event signature"]);
+                    exit;
+                }
+            }
+            $encryptedDb = e2ee_database();
+            $encryptedDb->beginTransaction();
+            try {
+                $delete = $encryptedDb->prepare("DELETE FROM sync_v2_events WHERE account_id = ?");
+                $delete->execute([$userId]);
+                $stmt = $encryptedDb->prepare("INSERT INTO sync_v2_events
+                    (id, account_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature)
+                    VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $fanout = $encryptedDb->prepare("INSERT IGNORE INTO sync_v2_events
+                    (id, account_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature)
+                    VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+                $memberCheck = $encryptedDb->prepare("SELECT m.role FROM project_v2_members m
+                    WHERE m.routing_id = ? AND m.account_id = ?
+                      AND NOT EXISTS (SELECT 1 FROM project_v2_retired_routes r WHERE r.routing_id = m.routing_id)");
+                $routeMembers = $encryptedDb->prepare("SELECT account_id FROM project_v2_members WHERE routing_id = ? AND account_id != ?");
+                foreach ($entries as $event) {
+                    $scope = $event['scope'] ?? 'account';
+                    $routingId = $event['routing_id'] ?? null;
+                    if (!in_array($scope, ['account', 'project'], true)
+                        || ($scope === 'account' && ($event['key_id'] !== 'account-v1' || !empty($routingId)))) {
+                        throw new RuntimeException('Invalid account snapshot key');
+                    }
+                    if ($scope === 'project') {
+                        if ($event['key_id'] !== 'project-v1' || !$routingId) throw new RuntimeException('Invalid encrypted project snapshot event');
+                        $memberCheck->execute([$routingId, $userId]);
+                        $memberRole = $memberCheck->fetchColumn();
+                        if (!in_array($memberRole, ['Owner', 'Steward', 'Companion'], true)) {
+                            throw new RuntimeException('Not permitted to publish encrypted project snapshot');
+                        }
+                    }
+                    $stmt->execute([$event['id'], $userId, $event['entity_type'], $event['entity_id'],
+                        $event['operation'], $event['timestamp'], $event['key_id'], $event['nonce'],
+                        $event['ciphertext'], $scope, $routingId, $event['device_id'] ?? $deviceId ?? '', $event['author_public_key'], $event['event_signature']]);
+                    // Acceptance and the inviter's first snapshot may race. If membership
+                    // already exists, fan out the encrypted project snapshot here; if the
+                    // snapshot won the race, the accept route backfills it instead.
+                    if ($scope === 'project') {
+                        $routeMembers->execute([$routingId, $userId]);
+                        foreach ($routeMembers->fetchAll(PDO::FETCH_COLUMN) as $targetAccountId) {
+                            $fanout->execute([$event['id'], $targetAccountId, $event['entity_type'], $event['entity_id'],
+                                $event['operation'], $event['timestamp'], $event['key_id'], $event['nonce'],
+                                $event['ciphertext'], $scope, $routingId, $event['device_id'] ?? $deviceId ?? '', $event['author_public_key'], $event['event_signature']]);
+                        }
+                    }
+                }
+                $cutover = $encryptedDb->prepare("INSERT INTO account_v2_security (account_id, signatures_required, cutover_at)
+                    VALUES (?, 1, CURRENT_TIMESTAMP) ON DUPLICATE KEY UPDATE signatures_required=1, cutover_at=CURRENT_TIMESTAMP");
+                $cutover->execute([$userId]);
+                $encryptedDb->commit();
+                $legacyBackupDeleted = mark_sync_v2_account($pdo, $userId);
+            } catch (Throwable $error) {
+                if ($encryptedDb->inTransaction()) $encryptedDb->rollBack();
+                throw $error;
+            }
+            echo json_encode([
+                "status" => "success",
+                "replaced" => count($entries),
+                "protocol" => 2,
+                "legacy_backup_deleted" => $legacyBackupDeleted,
+            ]);
+            break;
+
         case 'sync/pull':
         case 'sync/full':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
@@ -1115,6 +1407,174 @@ try {
             ]);
             break;
             
+        case 'project/rotation-members':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $routingId = $_GET['routing_id'] ?? '';
+            $encryptedDb = e2ee_database();
+            $owner = $encryptedDb->prepare("SELECT m.role FROM project_v2_members m
+                WHERE m.routing_id = ? AND m.account_id = ?
+                  AND NOT EXISTS (SELECT 1 FROM project_v2_retired_routes r WHERE r.routing_id = m.routing_id)");
+            $owner->execute([$routingId, $userId]);
+            if ($owner->fetchColumn() !== 'Owner') {
+                http_response_code(403);
+                echo json_encode(["error" => "Only the encrypted project owner may rotate membership"]);
+                break;
+            }
+            $members = $encryptedDb->prepare("SELECT account_id, role FROM project_v2_members WHERE routing_id = ? ORDER BY account_id");
+            $members->execute([$routingId]);
+            $result = [];
+            $identityStmt = $pdo->prepare("SELECT public_key, encryption_public_key, username FROM users WHERE id = ?");
+            foreach ($members->fetchAll() as $member) {
+                $identityStmt->execute([$member['account_id']]);
+                $keys = $identityStmt->fetch();
+                if ($keys) $result[] = [
+                    "identity" => $keys['public_key'],
+                    "encryption_public_key" => $keys['encryption_public_key'],
+                    "username" => $keys['username'] ?: null,
+                    "role" => $member['role'],
+                ];
+            }
+            echo json_encode($result);
+            break;
+
+        case 'project/key-envelopes':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $encryptedDb = e2ee_database();
+            $stmt = $encryptedDb->prepare("SELECT id, old_routing_id, new_routing_id,
+                sender_encryption_key, key_nonce, key_ciphertext, created_at
+                FROM project_v2_key_envelopes WHERE recipient_account_id = ? ORDER BY created_at ASC");
+            $stmt->execute([$userId]);
+            echo json_encode($stmt->fetchAll());
+            break;
+
+        case 'project/revocations':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $encryptedDb = e2ee_database();
+            $stmt = $encryptedDb->prepare("SELECT r.routing_id, r.replacement_routing_id, r.retired_at
+                FROM project_v2_retired_routes r
+                INNER JOIN project_v2_members old_member
+                    ON old_member.routing_id = r.routing_id AND old_member.account_id = ?
+                LEFT JOIN project_v2_members replacement_member
+                    ON replacement_member.routing_id = r.replacement_routing_id
+                   AND replacement_member.account_id = old_member.account_id
+                WHERE replacement_member.account_id IS NULL
+                ORDER BY r.retired_at ASC");
+            $stmt->execute([$userId]);
+            echo json_encode($stmt->fetchAll());
+            break;
+
+        case 'project/remove-member':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $data = json_decode($body, true);
+            $oldRoute = $data['old_routing_id'] ?? '';
+            $newRoute = $data['new_routing_id'] ?? '';
+            $removedIdentity = $data['removed_identity'] ?? '';
+            $envelopes = $data['envelopes'] ?? null;
+            if (!is_uuid_string($oldRoute)
+                || !is_uuid_string($newRoute)
+                || hash_equals(strtolower($oldRoute), strtolower($newRoute))
+                || strlen($removedIdentity) !== 64 || !ctype_xdigit($removedIdentity)
+                || !is_array($envelopes)) {
+                http_response_code(400);
+                echo json_encode(["error" => "Malformed encrypted membership rotation"]);
+                break;
+            }
+            $encryptedDb = e2ee_database();
+            $membersStmt = $encryptedDb->prepare("SELECT account_id, role FROM project_v2_members WHERE routing_id = ?");
+            $membersStmt->execute([$oldRoute]);
+            $members = $membersStmt->fetchAll();
+            $roles = [];
+            foreach ($members as $member) $roles[$member['account_id']] = $member['role'];
+            if (($roles[$userId] ?? null) !== 'Owner') {
+                http_response_code(403);
+                echo json_encode(["error" => "Only the encrypted project owner may remove members"]);
+                break;
+            }
+            $retired = $encryptedDb->prepare("SELECT 1 FROM project_v2_retired_routes WHERE routing_id = ?");
+            $retired->execute([$oldRoute]);
+            if ($retired->fetchColumn()) {
+                http_response_code(409);
+                echo json_encode(["error" => "Project route is already retired"]);
+                break;
+            }
+            $removedStmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
+            $removedStmt->execute([$removedIdentity]);
+            $removedAccountId = $removedStmt->fetchColumn();
+            if (!$removedAccountId || !isset($roles[$removedAccountId]) || $removedAccountId === $userId) {
+                http_response_code(400);
+                echo json_encode(["error" => "Invalid member removal target"]);
+                break;
+            }
+            $envelopeByAccount = [];
+            $accountStmt = $pdo->prepare("SELECT id, encryption_public_key FROM users WHERE public_key = ?");
+            foreach ($envelopes as $envelope) {
+                $recipientIdentity = $envelope['recipient_identity'] ?? '';
+                $accountStmt->execute([$recipientIdentity]);
+                $recipient = $accountStmt->fetch();
+                if (!$recipient || empty($recipient['encryption_public_key'])
+                    || !isset($roles[$recipient['id']])
+                    || !valid_encrypted_field($envelope['key_nonce'] ?? '', 12, 12)
+                    || !valid_encrypted_field($envelope['key_ciphertext'] ?? '', 48, 48)) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invalid replacement key envelope"]);
+                    break 2;
+                }
+                if ($recipient['id'] === $removedAccountId) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Removed member must not receive the replacement key"]);
+                    break 2;
+                }
+                $envelopeByAccount[$recipient['id']] = $envelope;
+            }
+            foreach ($roles as $accountId => $role) {
+                if ($accountId !== $removedAccountId && !isset($envelopeByAccount[$accountId])) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Every remaining member requires a replacement key envelope"]);
+                    break 2;
+                }
+            }
+            $senderKey = $data['sender_encryption_key'] ?? '';
+            if (strlen($senderKey) !== 64 || !ctype_xdigit($senderKey)) {
+                http_response_code(400);
+                echo json_encode(["error" => "Invalid rotation sender key"]);
+                break;
+            }
+            $senderStmt = $pdo->prepare("SELECT encryption_public_key FROM users WHERE id = ?");
+            $senderStmt->execute([$userId]);
+            if (!hash_equals((string)$senderStmt->fetchColumn(), strtolower($senderKey))) {
+                http_response_code(400);
+                echo json_encode(["error" => "Rotation sender key does not match the owner"]);
+                break;
+            }
+            $encryptedDb->beginTransaction();
+            try {
+                $insertMember = $encryptedDb->prepare("INSERT INTO project_v2_members (routing_id, account_id, role) VALUES (?, ?, ?)");
+                foreach ($roles as $accountId => $role) {
+                    if ($accountId !== $removedAccountId) $insertMember->execute([$newRoute, $accountId, $role]);
+                }
+                $insertEnvelope = $encryptedDb->prepare("INSERT INTO project_v2_key_envelopes
+                    (id, old_routing_id, new_routing_id, recipient_account_id, sender_encryption_key, key_nonce, key_ciphertext)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)");
+                foreach ($envelopeByAccount as $accountId => $envelope) {
+                    $insertEnvelope->execute([bin2hex(random_bytes(16)), $oldRoute, $newRoute, $accountId,
+                        $senderKey, $envelope['key_nonce'], $envelope['key_ciphertext']]);
+                }
+                $retire = $encryptedDb->prepare("INSERT INTO project_v2_retired_routes (routing_id, replacement_routing_id) VALUES (?, ?)");
+                $retire->execute([$oldRoute, $newRoute]);
+                $encryptedDb->commit();
+            } catch (Throwable $error) {
+                if ($encryptedDb->inTransaction()) $encryptedDb->rollBack();
+                throw $error;
+            }
+            // Presence/member names are metadata only; the encrypted DB above is the authority.
+            $pdo->prepare("INSERT IGNORE INTO project_members (project_id, user_identity, user_username, role)
+                SELECT ?, user_identity, user_username, role FROM project_members
+                WHERE project_id = ? AND user_identity != ?")
+                ->execute([$newRoute, $oldRoute, $removedIdentity]);
+            $pdo->prepare("DELETE FROM project_members WHERE project_id = ?")->execute([$oldRoute]);
+            echo json_encode(["status" => "success", "routing_id" => $newRoute]);
+            break;
+
         // ── Invitaciones a proyectos compartidos ──────────────────────────────────
         case 'invite':
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
@@ -1125,6 +1585,14 @@ try {
             $projName = $data['project_name'] ?? null;
             $inviteeIdentity = $data['invitee_identity'] ?? null;
             $role = $data['role'] ?? 'Companion';
+            $routingId = $data['routing_id'] ?? null;
+            $inviterEncryptionKey = $data['inviter_encryption_key'] ?? null;
+            $keyNonce = $data['key_nonce'] ?? null;
+            $keyCiphertext = $data['key_ciphertext'] ?? null;
+            $projectNameNonce = $data['project_name_nonce'] ?? null;
+            $projectNameCiphertext = $data['project_name_ciphertext'] ?? null;
+            $projectIdNonce = $data['project_id_nonce'] ?? null;
+            $projectIdCiphertext = $data['project_id_ciphertext'] ?? null;
             
             if (!$projId || !$projName || !$inviteeIdentity) {
                 http_response_code(400);
@@ -1136,6 +1604,45 @@ try {
                 echo json_encode(["error" => "Invalid invitee identity"]);
                 exit;
             }
+            if (!in_array($role, ['Companion', 'Steward', 'Observer'], true)) {
+                http_response_code(400);
+                echo json_encode(["error" => "Invalid Fellowship role"]);
+                exit;
+            }
+            $protocolStmt = $pdo->prepare("SELECT COALESCE(sync_protocol, 1) FROM users WHERE id = ?");
+            $protocolStmt->execute([$userId]);
+            if ((int)$protocolStmt->fetchColumn() >= 2) {
+                if (!is_uuid_string($routingId)
+                    || strlen((string)$inviterEncryptionKey) !== 64 || !ctype_xdigit((string)$inviterEncryptionKey)
+                    || !valid_encrypted_field($keyNonce, 12, 12)
+                    || !valid_encrypted_field($keyCiphertext, 48, 48)
+                    || !valid_encrypted_field($projectNameNonce, 12, 12)
+                    || !valid_encrypted_field($projectNameCiphertext, 16, 4096)
+                    || !valid_encrypted_field($projectIdNonce, 12, 12)
+                    || !valid_encrypted_field($projectIdCiphertext, 16, 512)) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Encrypted Fellowship key envelope is required"]);
+                    exit;
+                }
+                $senderKeyStmt = $pdo->prepare("SELECT encryption_public_key FROM users WHERE id = ?");
+                $senderKeyStmt->execute([$userId]);
+                $registeredSenderKey = strtolower((string)$senderKeyStmt->fetchColumn());
+                if ($registeredSenderKey === ''
+                    || !hash_equals($registeredSenderKey, strtolower($inviterEncryptionKey))) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Invitation sender key does not match the inviter"]);
+                    exit;
+                }
+                $inviteeKeyStmt = $pdo->prepare("SELECT encryption_public_key FROM users WHERE public_key = ?");
+                $inviteeKeyStmt->execute([strtolower($inviteeIdentity)]);
+                if (!$inviteeKeyStmt->fetchColumn()) {
+                    http_response_code(409);
+                    echo json_encode(["error" => "Companion has not enabled encrypted Fellowship"]);
+                    exit;
+                }
+                $projName = '[encrypted]';
+                $projId = $routingId;
+            }
             
             // Buscar el nombre del que invita — si no tiene device name, 'Fellow Companion' pues
             $stmt = $pdo->prepare("SELECT device_name FROM devices WHERE id = ?");
@@ -1143,7 +1650,11 @@ try {
             $inviterName = $stmt->fetchColumn() ?: 'Fellow Companion';
             
             $inviteId = bin2hex(random_bytes(16));
-            $stmt = $pdo->prepare("INSERT INTO project_invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?)");
+            $stmt = $pdo->prepare("INSERT INTO project_invitations
+                (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at,
+                 routing_id, inviter_encryption_key, key_nonce, key_ciphertext, project_name_nonce, project_name_ciphertext,
+                 project_id_nonce, project_id_ciphertext)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)");
             $stmt->execute([
                 $inviteId,
                 $projId,
@@ -1152,8 +1663,15 @@ try {
                 $inviterName,
                 $inviteeIdentity,
                 $role,
-                date(DATE_RFC3339)
+                date(DATE_RFC3339), $routingId, $inviterEncryptionKey, $keyNonce, $keyCiphertext,
+                $projectNameNonce, $projectNameCiphertext, $projectIdNonce, $projectIdCiphertext
             ]);
+            if ($routingId) {
+                $encryptedDb = e2ee_database();
+                $member = $encryptedDb->prepare("INSERT INTO project_v2_members (routing_id, account_id, role)
+                    VALUES (?, ?, 'Owner') ON DUPLICATE KEY UPDATE role='Owner'");
+                $member->execute([$routingId, $userId]);
+            }
             
             log_api_event($pdo, $userId, $deviceId, 'INVITATION', "Invited user $inviteeIdentity to join project $projName");
             echo json_encode(["status" => "success", "invite_id" => $inviteId]);
@@ -1171,20 +1689,28 @@ try {
                 exit;
             }
             
-            // Buscar la invitación pendiente — solo acepta si sigue en estado Pending
-            $stmt = $pdo->prepare("SELECT * FROM project_invitations WHERE id = ? AND status = 'Pending'");
-            $stmt->execute([$inviteId]);
+            // Accepted is deliberately idempotent: if the client crashed after this
+            // request but before saving the project key, it may safely retry.
+            $stmt = $pdo->prepare("SELECT * FROM project_invitations WHERE id = ? AND invitee_identity = ?");
+            $stmt->execute([$inviteId, $identity]);
             $invite = $stmt->fetch();
             
             if (!$invite) {
                 http_response_code(404);
-                echo json_encode(["error" => "Pending invitation not found"]);
+                echo json_encode(["error" => "Invitation not found"]);
                 exit;
             }
+            if ($invite['status'] !== 'Pending' && $invite['status'] !== 'Accepted') {
+                http_response_code(409);
+                echo json_encode(["error" => "Invitation is no longer acceptable"]);
+                exit;
+            }
+            $wasPending = $invite['status'] === 'Pending';
             
             // Marcar la invitación como aceptada
-            $stmt = $pdo->prepare("UPDATE project_invitations SET status = 'Accepted' WHERE id = ?");
+            $stmt = $pdo->prepare("UPDATE project_invitations SET status = 'Accepted' WHERE id = ? AND status = 'Pending'");
             $stmt->execute([$inviteId]);
+            $wasPending = $wasPending && $stmt->rowCount() === 1;
             
             // Registrar ambos en project_members — el que invitó y el que aceptó
             $stmt = $pdo->prepare("INSERT INTO project_members (project_id, user_identity, user_username, role) VALUES (?, ?, ?, ?) ON DUPLICATE KEY UPDATE user_username = ?, role = ?");
@@ -1199,33 +1725,43 @@ try {
             }
             $stmt->execute([$invite['project_id'], $identity, $inviteeUsername, $invite['role'], $inviteeUsername, $invite['role']]);
 
+            if (!empty($invite['routing_id'])) {
+                $encryptedDb = e2ee_database();
+                $member = $encryptedDb->prepare("INSERT INTO project_v2_members (routing_id, account_id, role)
+                    VALUES (?, ?, ?) ON DUPLICATE KEY UPDATE role=VALUES(role)");
+                $member->execute([$invite['routing_id'], $userId, $invite['role']]);
+            }
+
             // El compañero nuevo necesita el historial del proyecto, no solo un placeholder local.
             $stmt = $pdo->prepare("SELECT id FROM users WHERE public_key = ?");
             $stmt->execute([$invite['inviter_identity']]);
             $inviterUserId = $stmt->fetchColumn();
-            if ($inviterUserId) {
+            if ($wasPending && $inviterUserId && empty($invite['routing_id'])) {
                 backfill_project_sync_events($pdo, $inviterUserId, $userId, $invite['project_id']);
             }
+            if ($inviterUserId && !empty($invite['routing_id'])) {
+                $encryptedDb = $encryptedDb ?? e2ee_database();
+                $backfill = $encryptedDb->prepare("INSERT IGNORE INTO sync_v2_events
+                    (id, account_id, version, entity_type, entity_id, operation, event_timestamp,
+                     key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature)
+                    SELECT id, ?, version, entity_type, entity_id, operation, event_timestamp,
+                           key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature
+                    FROM sync_v2_events
+                    WHERE account_id = ? AND routing_id = ? AND scope = 'project'");
+                $backfill->execute([$userId, $inviterUserId, $invite['routing_id']]);
+            }
 
-            insert_project_member_sync_event(
-                $pdo,
-                $userId,
-                $invite['project_id'],
-                $invite['inviter_identity'],
-                $invite['inviter_username'],
-                'Owner',
-                $deviceId
-            );
-            insert_project_member_sync_event(
-                $pdo,
-                $userId,
-                $invite['project_id'],
-                $identity,
-                $inviteeUsername,
-                $invite['role'],
-                $deviceId
-            );
-            if ($inviterUserId) {
+            if ($wasPending && empty($invite['routing_id'])) {
+                insert_project_member_sync_event(
+                    $pdo, $userId, $invite['project_id'], $invite['inviter_identity'],
+                    $invite['inviter_username'], 'Owner', $deviceId
+                );
+                insert_project_member_sync_event(
+                    $pdo, $userId, $invite['project_id'], $identity,
+                    $inviteeUsername, $invite['role'], $deviceId
+                );
+            }
+            if ($wasPending && $inviterUserId && empty($invite['routing_id'])) {
                 insert_project_member_sync_event(
                     $pdo,
                     $inviterUserId,
@@ -1246,21 +1782,29 @@ try {
                 );
             }
             
-            // Mensaje de bienvenida automático en el chronicle — para que se vea chido
-            $msgId = bin2hex(random_bytes(16));
-            $stmt = $pdo->prepare("INSERT INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)");
-            $stmt->execute([
-                $msgId,
-                $invite['project_id'],
-                'system',
-                'System',
-                "Fellowship companion joined project: " . $invite['project_name'],
-                'system',
-                date(DATE_RFC3339)
-            ]);
+            // Encrypted Fellowships generate readable welcome messages on clients.
+            // The server must not synthesize private project content.
+            if ($wasPending && empty($invite['routing_id'])) {
+                $msgId = bin2hex(random_bytes(16));
+                $stmt = $pdo->prepare("INSERT INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)");
+                $stmt->execute([$msgId, $invite['project_id'], 'system', 'System',
+                    "Fellowship companion joined project: " . $invite['project_name'], 'system', date(DATE_RFC3339)]);
+            }
             
             log_api_event($pdo, $userId, $deviceId, 'INVITATION', "Accepted invitation to project ID " . $invite['project_id']);
-            echo json_encode(["status" => "success", "project_id" => $invite['project_id'], "project_name" => $invite['project_name']]);
+            echo json_encode([
+                "status" => "success",
+                "project_id" => $invite['project_id'],
+                "project_name" => $invite['project_name'],
+                "routing_id" => $invite['routing_id'] ?? null,
+                "inviter_encryption_key" => $invite['inviter_encryption_key'] ?? null,
+                "key_nonce" => $invite['key_nonce'] ?? null,
+                "key_ciphertext" => $invite['key_ciphertext'] ?? null,
+                "project_name_nonce" => $invite['project_name_nonce'] ?? null,
+                "project_name_ciphertext" => $invite['project_name_ciphertext'] ?? null,
+                "project_id_nonce" => $invite['project_id_nonce'] ?? null,
+                "project_id_ciphertext" => $invite['project_id_ciphertext'] ?? null,
+            ]);
             break;
             
         case 'decline':
@@ -1275,8 +1819,8 @@ try {
                 exit;
             }
             
-            $stmt = $pdo->prepare("UPDATE project_invitations SET status = 'Declined' WHERE id = ? AND status = 'Pending'");
-            $stmt->execute([$inviteId]);
+            $stmt = $pdo->prepare("UPDATE project_invitations SET status = 'Declined' WHERE id = ? AND invitee_identity = ? AND status = 'Pending'");
+            $stmt->execute([$inviteId, $identity]);
             
             echo json_encode(["status" => "success"]);
             break;
@@ -1286,7 +1830,10 @@ try {
                 send_method_not_allowed();
             }
             // Jalar invitaciones pendientes para esta identity — las que están esperando respuesta
-            $stmt = $pdo->prepare("SELECT id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at FROM project_invitations WHERE invitee_identity = ? AND status = 'Pending' ORDER BY created_at DESC");
+            $stmt = $pdo->prepare("SELECT id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at,
+                routing_id, inviter_encryption_key, key_nonce, key_ciphertext, project_name_nonce, project_name_ciphertext
+                , project_id_nonce, project_id_ciphertext
+                FROM project_invitations WHERE invitee_identity = ? AND status = 'Pending' ORDER BY created_at DESC");
             $stmt->execute([$identity]);
             $invites = $stmt->fetchAll();
             echo json_encode($invites);
@@ -1328,11 +1875,18 @@ try {
                 break;
             }
             $username = null;
-            // project_members es la fuente más confiable — fallback a chronicle, luego a invitaciones
-            $stmt = $pdo->prepare("SELECT user_username FROM project_members WHERE user_identity = ? LIMIT 1");
+            // A fresh profile has not joined a project yet, so account metadata
+            // must be checked before the legacy collaboration fallbacks.
+            $stmt = $pdo->prepare("SELECT username FROM users WHERE public_key = ? LIMIT 1");
             $stmt->execute([$targetKey]);
             $row = $stmt->fetch();
-            if ($row) { $username = $row['user_username']; }
+            if ($row) { $username = $row['username']; }
+            if (!$username) {
+                $stmt = $pdo->prepare("SELECT user_username FROM project_members WHERE user_identity = ? LIMIT 1");
+                $stmt->execute([$targetKey]);
+                $row = $stmt->fetch();
+                if ($row) { $username = $row['user_username']; }
+            }
             // fall back to chronicle messages
             if (!$username) {
                 $stmt = $pdo->prepare("SELECT sender_username FROM chronicle_messages WHERE sender_identity = ? LIMIT 1");
@@ -1357,6 +1911,7 @@ try {
 
         // ── Chronicle: mensajes, presencia y reacciones ───────────────────────────
         case 'chronicle/message':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
@@ -1411,6 +1966,7 @@ try {
             break;
             
         case 'chronicle/messages':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
                 send_method_not_allowed();
             }
@@ -1528,6 +2084,7 @@ try {
         // ── Backup/Recovery — la base de datos del héroe, hasta 50 MB ────────────
         case 'backup':
         case 'recovery':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
                 send_method_not_allowed();
             }
@@ -1551,6 +2108,7 @@ try {
             
         case 'backup/latest':
         case 'recovery/latest':
+            require_legacy_sync_account($pdo, $userId);
             if ($_SERVER['REQUEST_METHOD'] !== 'GET') {
                 send_method_not_allowed();
             }
@@ -1923,6 +2481,44 @@ function verify_ed25519_signature($publicKeyHex, $signatureHex, $message) {
     }
 }
 
+function is_uuid_string($value) {
+    return is_string($value)
+        && preg_match('/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i', $value) === 1;
+}
+
+function valid_encrypted_field($value, $minBytes, $maxBytes) {
+    if (!is_string($value) || $value === '' || strlen($value) > (int)ceil($maxBytes * 4 / 3) + 4) {
+        return false;
+    }
+    $decoded = base64_decode($value, true);
+    if ($decoded === false) return false;
+    $length = strlen($decoded);
+    return $length >= $minBytes && $length <= $maxBytes;
+}
+
+function sync_v2_signature_message($event) {
+    $fields = [
+        (string)($event['version'] ?? ''), (string)($event['id'] ?? ''),
+        (string)($event['entity_type'] ?? ''), (string)($event['entity_id'] ?? ''),
+        (string)($event['operation'] ?? ''), (string)($event['timestamp'] ?? ''),
+        (string)($event['key_id'] ?? ''), (string)($event['nonce'] ?? ''),
+        (string)($event['ciphertext'] ?? ''), (string)($event['scope'] ?? 'account'),
+        (string)($event['routing_id'] ?? ''), (string)($event['device_id'] ?? ''),
+        (string)($event['author_public_key'] ?? '')
+    ];
+    $message = "questline-sync-event-v1\n";
+    foreach ($fields as $field) $message .= strlen($field) . ':' . $field;
+    return $message;
+}
+
+function verify_sync_v2_event_signature($event) {
+    $author = $event['author_public_key'] ?? '';
+    $signature = $event['event_signature'] ?? '';
+    return is_string($author) && strlen($author) === 64 && ctype_xdigit($author)
+        && is_string($signature) && strlen($signature) === 128 && ctype_xdigit($signature)
+        && verify_ed25519_signature($author, $signature, sync_v2_signature_message($event));
+}
+
 function is_project_scoped_sync_type($entityType) {
     return in_array($entityType, [
         'task',
@@ -1932,9 +2528,60 @@ function is_project_scoped_sync_type($entityType) {
         'focus_session',
         'codex',
         'task_assignment',
+        'task_status',
+        'task_comment',
+        'task_dependency',
         'project_member',
         'chronicle_message'
     ], true);
+}
+
+function e2ee_database() {
+    static $connection = null;
+    if ($connection instanceof PDO) return $connection;
+
+    $host = getenv('E2EE_DB_HOST') ?: (getenv('DB_HOST') ?: 'localhost');
+    $name = getenv('E2EE_DB_NAME') ?: 'gibranlp_QuestlineE';
+    $user = getenv('E2EE_DB_USER') ?: 'gibranlp_QuestlineE';
+    $password = getenv('E2EE_DB_PASSWORD');
+    if ($password === false || $password === '') {
+        throw new RuntimeException('E2EE_DB_PASSWORD is not configured');
+    }
+    $connection = new PDO("mysql:host=$host;dbname=$name;charset=utf8mb4", $user, $password, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES => false,
+    ]);
+    return $connection;
+}
+
+function mark_sync_v2_account($pdo, $userId) {
+    $pdo->beginTransaction();
+    try {
+        $stmt = $pdo->prepare("UPDATE users SET sync_protocol = 2 WHERE id = ?");
+        $stmt->execute([$userId]);
+        $delete = $pdo->prepare("DELETE FROM backups WHERE user_id = ?");
+        $delete->execute([$userId]);
+        $deleted = $delete->rowCount() > 0;
+        $pdo->commit();
+        return $deleted;
+    } catch (Throwable $error) {
+        if ($pdo->inTransaction()) $pdo->rollBack();
+        throw $error;
+    }
+}
+
+function require_legacy_sync_account($pdo, $userId) {
+    $stmt = $pdo->prepare("SELECT COALESCE(sync_protocol, 1) FROM users WHERE id = ?");
+    $stmt->execute([$userId]);
+    if ((int)$stmt->fetchColumn() >= 2) {
+        http_response_code(409);
+        echo json_encode([
+            "error" => "This account has migrated to encrypted sync-v2",
+            "required_protocol" => 2,
+        ]);
+        exit;
+    }
 }
 
 function extract_project_id_from_payload($payload) {
@@ -2296,6 +2943,8 @@ function setup_tables($pdo) {
     CREATE TABLE IF NOT EXISTS users (
         id VARCHAR(36) PRIMARY KEY,
         public_key VARCHAR(64) UNIQUE NOT NULL,
+        sync_protocol TINYINT UNSIGNED NOT NULL DEFAULT 1,
+        encryption_public_key VARCHAR(64) NULL,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -2312,7 +2961,7 @@ function setup_tables($pdo) {
         id VARCHAR(36) PRIMARY KEY,
         user_id VARCHAR(36) NOT NULL,
         entity_type VARCHAR(50) NOT NULL,
-        entity_id VARCHAR(36) NOT NULL,
+        entity_id VARCHAR(255) NOT NULL,
         operation VARCHAR(20) NOT NULL,
         payload LONGTEXT NOT NULL,
         created_at VARCHAR(50) NOT NULL,
@@ -2337,6 +2986,14 @@ function setup_tables($pdo) {
         role VARCHAR(50) NOT NULL,
         status VARCHAR(20) NOT NULL DEFAULT 'Pending',
         created_at VARCHAR(50) NOT NULL,
+        routing_id VARCHAR(36) NULL,
+        inviter_encryption_key VARCHAR(64) NULL,
+        key_nonce VARCHAR(32) NULL,
+        key_ciphertext TEXT NULL,
+        project_name_nonce VARCHAR(32) NULL,
+        project_name_ciphertext TEXT NULL,
+        project_id_nonce VARCHAR(32) NULL,
+        project_id_ciphertext TEXT NULL,
         INDEX idx_invitee (invitee_identity)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 

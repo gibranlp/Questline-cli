@@ -20,6 +20,50 @@ pub struct Database {
     pub conn: Connection,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CalendarReconcileResult {
+    pub inserted: usize,
+    pub updated: usize,
+    pub cancelled: usize,
+    pub unchanged: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskComment {
+    pub id: String,
+    pub task_id: String,
+    pub project_id: String,
+    pub author_identity: String,
+    pub author_username: String,
+    pub content: String,
+    pub mentioned_identities: Vec<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub edited_at: Option<String>,
+    pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EncryptedInvitationRecord {
+    pub id: String,
+    pub project_id: String,
+    pub project_name: String,
+    pub inviter_identity: String,
+    pub inviter_username: String,
+    pub invitee_identity: String,
+    pub role: String,
+    pub status: String,
+    pub created_at: String,
+    pub routing_id: String,
+    pub inviter_encryption_key: String,
+    pub key_nonce: String,
+    pub key_ciphertext: String,
+    pub project_name_nonce: String,
+    pub project_name_ciphertext: String,
+    pub project_id_nonce: String,
+    pub project_id_ciphertext: String,
+}
+
 fn ensure_updated_at_column(conn: &Connection, table: &str) -> Result<()> {
     let has_column: bool = conn.query_row(
         &format!(
@@ -328,6 +372,67 @@ impl Database {
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
+
+        // Encrypted invitation envelopes were added after the original local schema.
+        // SQLite has no portable ADD COLUMN IF NOT EXISTS, so inspect the schema first
+        // and keep genuine migration failures fatal.
+        for (column, migration) in [
+            (
+                "routing_id",
+                "ALTER TABLE invitations ADD COLUMN routing_id TEXT",
+            ),
+            (
+                "inviter_encryption_key",
+                "ALTER TABLE invitations ADD COLUMN inviter_encryption_key TEXT",
+            ),
+            (
+                "key_nonce",
+                "ALTER TABLE invitations ADD COLUMN key_nonce TEXT",
+            ),
+            (
+                "key_ciphertext",
+                "ALTER TABLE invitations ADD COLUMN key_ciphertext TEXT",
+            ),
+            (
+                "project_name_nonce",
+                "ALTER TABLE invitations ADD COLUMN project_name_nonce TEXT",
+            ),
+            (
+                "project_name_ciphertext",
+                "ALTER TABLE invitations ADD COLUMN project_name_ciphertext TEXT",
+            ),
+            (
+                "project_id_nonce",
+                "ALTER TABLE invitations ADD COLUMN project_id_nonce TEXT",
+            ),
+            (
+                "project_id_ciphertext",
+                "ALTER TABLE invitations ADD COLUMN project_id_ciphertext TEXT",
+            ),
+        ] {
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('invitations') WHERE name = ?1)",
+                params![column],
+                |row| row.get::<_, i32>(0),
+            )? != 0;
+            if !exists {
+                conn.execute(migration, [])?;
+            }
+        }
+
+        // La autoría del movimiento llegó con los permisos de tesorería por rol: las
+        // filas viejas quedan sin autor y solo un Owner/Steward puede tocarlas.
+        let has_ledger_author = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ledger_entries') WHERE name = 'created_by_identity')",
+            [],
+            |row| row.get::<_, i32>(0),
+        )? != 0;
+        if !has_ledger_author {
+            conn.execute(
+                "ALTER TABLE ledger_entries ADD COLUMN created_by_identity TEXT",
+                [],
+            )?;
+        }
 
         // Migraciones por columna — ALTER TABLE si el campo no existe todavía (upgrades de versiones viejas)
         let has_lore_unlock_type: bool = conn.query_row(
@@ -1139,7 +1244,13 @@ impl Database {
 
     pub fn insert_project(&self, project: &Project) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        Self::insert_project_on(&tx, project)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn insert_project_on(conn: &Connection, project: &Project) -> Result<()> {
+        conn.execute(
             "INSERT INTO projects (id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 project.id.to_string(),
@@ -1154,7 +1265,40 @@ impl Database {
                 if project.is_shared { 1 } else { 0 }
             ],
         )?;
-        Self::log_change_on(&tx, "project", &project.id.to_string(), "create")?;
+        Self::log_change_on(conn, "project", &project.id.to_string(), "create")?;
+        Ok(())
+    }
+
+    /// Creates a Campaign and every Quest/step from a validated blueprint as
+    /// one transaction, preventing partially imported templates.
+    pub fn insert_campaign_template(
+        &self,
+        project: &Project,
+        task_trees: &[(Task, Vec<Task>)],
+    ) -> Result<()> {
+        for (parent, steps) in task_trees {
+            if parent.project_id != Some(project.id) || parent.parent_task_id.is_some() {
+                return Err(anyhow::anyhow!(
+                    "Every template Quest must be a parent in the new Campaign"
+                ));
+            }
+            if steps.iter().any(|step| {
+                step.project_id != Some(project.id) || step.parent_task_id != Some(parent.id)
+            }) {
+                return Err(anyhow::anyhow!(
+                    "Every template step must belong to its Quest and Campaign"
+                ));
+            }
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        Self::insert_project_on(&tx, project)?;
+        for (parent, steps) in task_trees {
+            Self::insert_task_on(&tx, parent)?;
+            for step in steps {
+                Self::insert_task_on(&tx, step)?;
+            }
+        }
         tx.commit()?;
         Ok(())
     }
@@ -1271,6 +1415,153 @@ impl Database {
         }
         tx.commit()?;
         Ok(())
+    }
+
+    /// Atomically inserts imported calendar events that are not already present.
+    /// Stable event-derived task IDs make repeated imports idempotent.
+    pub fn insert_calendar_tasks_if_missing(
+        &self,
+        project_id: Uuid,
+        tasks: &[Task],
+    ) -> Result<usize> {
+        if tasks
+            .iter()
+            .any(|task| task.project_id != Some(project_id) || task.parent_task_id.is_some())
+        {
+            return Err(anyhow::anyhow!(
+                "Calendar imports must create parent Quests in the selected Campaign"
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        if tasks.iter().any(|task| !seen.insert(task.id)) {
+            return Err(anyhow::anyhow!(
+                "Calendar import contains duplicate event identifiers"
+            ));
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        let mut inserted = 0usize;
+        for task in tasks {
+            let exists = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+                params![task.id.to_string()],
+                |row| row.get::<_, i32>(0),
+            )? != 0;
+            if !exists {
+                Self::insert_task_on(&tx, task)?;
+                inserted += 1;
+            }
+        }
+        tx.commit()?;
+        Ok(inserted)
+    }
+
+    /// Explicit reconciliation updates calendar-owned fields on matching stable
+    /// IDs and marks cancellations visibly without deleting or completing Quests.
+    pub fn reconcile_calendar_tasks(
+        &self,
+        project_id: Uuid,
+        tasks: &[Task],
+        cancelled_task_ids: &[Uuid],
+    ) -> Result<CalendarReconcileResult> {
+        if tasks
+            .iter()
+            .any(|task| task.project_id != Some(project_id) || task.parent_task_id.is_some())
+        {
+            return Err(anyhow::anyhow!(
+                "Calendar reconciliation must target parent Quests in one Campaign"
+            ));
+        }
+        let active_ids = tasks
+            .iter()
+            .map(|task| task.id)
+            .collect::<std::collections::HashSet<_>>();
+        let cancelled_ids = cancelled_task_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        if active_ids.len() != tasks.len()
+            || cancelled_ids.len() != cancelled_task_ids.len()
+            || cancelled_task_ids.iter().any(|id| active_ids.contains(id))
+        {
+            return Err(anyhow::anyhow!(
+                "Calendar reconciliation contains duplicate event identifiers"
+            ));
+        }
+
+        let mut result = CalendarReconcileResult::default();
+        let mut updates = Vec::<Task>::new();
+        let mut inserts = Vec::<Task>::new();
+        for imported in tasks {
+            match self.find_task_by_id(imported.id)? {
+                Some(mut existing) => {
+                    let changed = existing.title != imported.title
+                        || existing.description != imported.description
+                        || existing.due_date != imported.due_date;
+                    if changed {
+                        existing.title = imported.title.clone();
+                        existing.description = imported.description.clone();
+                        existing.due_date = imported.due_date;
+                        existing.set_date = None;
+                        updates.push(existing);
+                        result.updated += 1;
+                    } else {
+                        result.unchanged += 1;
+                    }
+                }
+                None => {
+                    inserts.push(imported.clone());
+                    result.inserted += 1;
+                }
+            }
+        }
+        for task_id in cancelled_task_ids {
+            let Some(mut existing) = self.find_task_by_id(*task_id)? else {
+                result.unchanged += 1;
+                continue;
+            };
+            if existing.project_id != Some(project_id) || existing.title.starts_with("[Cancelled] ")
+            {
+                result.unchanged += 1;
+                continue;
+            }
+            existing.title = format!("[Cancelled] {}", existing.title);
+            let cancellation_note = "Cancelled in the source calendar.";
+            existing.description = Some(match existing.description.as_deref() {
+                Some(description) if !description.trim().is_empty() => {
+                    format!("{}\n\n{}", description, cancellation_note)
+                }
+                _ => cancellation_note.to_string(),
+            });
+            updates.push(existing);
+            result.cancelled += 1;
+        }
+
+        let tx = self.conn.unchecked_transaction()?;
+        for task in &inserts {
+            Self::insert_task_on(&tx, task)?;
+        }
+        for task in &updates {
+            Self::update_task_on(&tx, task, task.completed)?;
+        }
+        tx.commit()?;
+        Ok(result)
+    }
+
+    /// Checks existence separately because the legacy row decoder uses
+    /// `QueryReturnedNoRows` for malformed stored values as well as absence.
+    /// Once existence is established, decoding errors must be propagated.
+    fn find_task_by_id(&self, id: Uuid) -> Result<Option<Task>> {
+        let exists = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM tasks WHERE id = ?1)",
+            params![id.to_string()],
+            |row| row.get::<_, i32>(0),
+        )? != 0;
+        if exists {
+            Ok(Some(self.get_task_by_id(id)?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn insert_task_on(conn: &Connection, task: &Task) -> Result<()> {
@@ -1470,10 +1761,16 @@ impl Database {
         let old_task = self.get_task_by_id(task.id).ok();
         let was_completed = old_task.map(|t| t.completed).unwrap_or(false);
 
+        let tx = self.conn.unchecked_transaction()?;
+        Self::update_task_on(&tx, task, was_completed)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn update_task_on(conn: &Connection, task: &Task, was_completed: bool) -> Result<()> {
         let due_date = task.due_date.or(task.set_date);
         let now = Utc::now().to_rfc3339();
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        conn.execute(
             "UPDATE tasks SET project_id = ?1, title = ?2, description = ?3, due_date = ?4, set_date = ?5, completed = ?6, priority = ?7, updated_at = ?8, owner_identity = ?9, owner_username = ?10, parent_task_id = ?11, xp_awarded = ?12, recurrence = ?13 WHERE id = ?14",
             params![
                 task.project_id.map(|id| id.to_string()),
@@ -1499,11 +1796,10 @@ impl Database {
         } else {
             "update"
         };
-        Self::log_change_on(&tx, "task", &task.id.to_string(), op)?;
+        Self::log_change_on(conn, "task", &task.id.to_string(), op)?;
         if let Ok(content_json) = serde_json::to_string(task) {
-            Self::create_revision_on(&tx, "task", &task.id.to_string(), &content_json)?;
+            Self::create_revision_on(conn, "task", &task.id.to_string(), &content_json)?;
         }
-        tx.commit()?;
         Ok(())
     }
 
@@ -2564,6 +2860,14 @@ impl Database {
         let Some(mut expected) = schedule.anchor_day(today) else {
             return Ok(0);
         };
+        // A streak remains active during the current counted day, before today's ritual is
+        // completed. In that case, display the run ending on the previous counted day.
+        if expected == today && !dates.contains(&today) {
+            let Some(previous) = schedule.previous_counted_day(today) else {
+                return Ok(0);
+            };
+            expected = previous;
+        }
         let mut streak = 0i32;
         loop {
             if dates.contains(&expected) {
@@ -2623,6 +2927,14 @@ impl Database {
                 out.insert(id, 0);
                 continue;
             };
+            // Keep yesterday's consecutive run visible until today's sidequest is completed.
+            if expected == today && !dates.contains(&today) {
+                let Some(previous) = schedule.previous_counted_day(today) else {
+                    out.insert(id, 0);
+                    continue;
+                };
+                expected = previous;
+            }
             let mut streak = 0i32;
             loop {
                 if dates.contains(&expected) {
@@ -3557,6 +3869,20 @@ impl Database {
             queued += 1;
         }
 
+        // Account-encrypted project keys must precede project-v1 events so a fresh
+        // device can decrypt even when a snapshot spans multiple pull pages.
+        let mut key_stmt = self
+            .conn
+            .prepare("SELECT project_id FROM project_encryption_keys")?;
+        let key_project_ids = key_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in key_project_ids {
+            self.log_change("project_key", &id, "upsert")?;
+            queued += 1;
+        }
+
         let simple_tables = [
             ("project", "projects", "id"),
             ("codex", "codices", "id"),
@@ -3568,6 +3894,12 @@ impl Database {
             ("ritual", "rituals", "id"),
             ("focus_session", "focus_sessions", "id"),
             ("chronicle_message", "chronicle_messages", "id"),
+            ("task_comment", "task_comments", "id"),
+            ("campaign_treasury", "campaign_treasury", "campaign_id"),
+            ("ledger_category", "ledger_categories", "id"),
+            ("category_budget", "category_budgets", "category_id"),
+            ("ledger_entry", "ledger_entries", "id"),
+            ("task_financials", "task_financials", "task_id"),
         ];
 
         for (entity_type, table, id_col) in simple_tables {
@@ -3619,6 +3951,18 @@ impl Database {
             }
         }
 
+        let mut notification_state_stmt = self
+            .conn
+            .prepare("SELECT notification_id FROM notification_states")?;
+        let notification_state_ids = notification_state_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in notification_state_ids {
+            self.log_change("notification_state", &id, "upsert")?;
+            queued += 1;
+        }
+
         let mut assignment_stmt = self
             .conn
             .prepare("SELECT task_id, user_identity FROM task_assignments")?;
@@ -3632,6 +3976,34 @@ impl Database {
             .collect::<Vec<_>>();
         for id in assignment_ids {
             self.log_change("task_assignment", &id, "assign")?;
+            queued += 1;
+        }
+
+        let mut status_stmt = self.conn.prepare("SELECT task_id FROM task_statuses")?;
+        let status_ids = status_stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in status_ids {
+            self.log_change("task_status", &id, "upsert")?;
+            queued += 1;
+        }
+
+        let mut dependency_stmt = self
+            .conn
+            .prepare("SELECT task_id, depends_on_task_id FROM task_dependencies")?;
+        let dependency_ids = dependency_stmt
+            .query_map([], |row| {
+                Ok(format!(
+                    "{}__{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?
+                ))
+            })?
+            .filter_map(|row| row.ok())
+            .collect::<Vec<_>>();
+        for id in dependency_ids {
+            self.log_change("task_dependency", &id, "upsert")?;
             queued += 1;
         }
 
@@ -4198,6 +4570,242 @@ impl Database {
         Ok(())
     }
 
+    pub fn get_project_encryption_key(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(String, [u8; 32])>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT routing_id, key_hex FROM project_encryption_keys WHERE project_id = ?1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(routing_id, key_hex)| {
+            let bytes = (0..key_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;
+            Ok((routing_id, key))
+        })
+        .transpose()
+    }
+
+    pub fn get_project_encryption_key_by_routing_id(
+        &self,
+        routing_id: &str,
+    ) -> Result<Option<(String, [u8; 32])>> {
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT project_id, key_hex FROM project_encryption_keys WHERE routing_id = ?1",
+                params![routing_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?
+            .or_else(|| {
+                self.conn
+                    .query_row(
+                        "SELECT project_id, key_hex FROM project_encryption_key_history WHERE routing_id = ?1",
+                        params![routing_id],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .optional()
+                    .ok()
+                    .flatten()
+            });
+        row.map(|(project_id, key_hex)| {
+            let bytes = (0..key_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;
+            Ok((project_id, key))
+        })
+        .transpose()
+    }
+
+    pub fn get_project_encryption_key_for_tombstone(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<(String, [u8; 32])>> {
+        if let Some(active) = self.get_project_encryption_key(project_id)? {
+            return Ok(Some(active));
+        }
+        let row: Option<(String, String)> = self
+            .conn
+            .query_row(
+                "SELECT h.routing_id, h.key_hex FROM project_encryption_key_history h
+                 WHERE h.project_id = ?1
+                   AND NOT EXISTS (SELECT 1 FROM revoked_project_routes r WHERE r.routing_id = h.routing_id)
+                 ORDER BY h.created_at DESC LIMIT 1",
+                params![project_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(routing_id, key_hex)| {
+            let bytes = (0..key_hex.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let key: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;
+            Ok((routing_id, key))
+        })
+        .transpose()
+    }
+
+    pub fn apply_project_route_revocation(
+        &self,
+        old_routing_id: &str,
+        replacement_routing_id: &str,
+    ) -> Result<Option<String>> {
+        let Some((project_id, _)) =
+            self.get_project_encryption_key_by_routing_id(old_routing_id)?
+        else {
+            return Ok(None);
+        };
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO revoked_project_routes (routing_id, replacement_routing_id, project_id, revoked_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![old_routing_id, replacement_routing_id, project_id, Utc::now().to_rfc3339()],
+        )?;
+        tx.execute(
+            "DELETE FROM project_encryption_keys WHERE project_id = ?1 AND routing_id = ?2",
+            params![project_id, old_routing_id],
+        )?;
+        tx.execute(
+            "UPDATE projects SET is_shared = 0, updated_at = ?2 WHERE id = ?1",
+            params![project_id, Utc::now().to_rfc3339()],
+        )?;
+        tx.execute(
+            "DELETE FROM project_members WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM sync_log WHERE synced = 0 AND (
+                (entity_type = 'project' AND entity_id = ?1)
+                OR (entity_type = 'project_member' AND entity_id LIKE ?2)
+                OR (entity_type = 'task' AND entity_id IN (SELECT id FROM tasks WHERE project_id = ?1))
+                OR (entity_type = 'task_status' AND entity_id IN (SELECT task_id FROM task_statuses WHERE project_id = ?1))
+                OR (entity_type = 'task_comment' AND entity_id IN (SELECT id FROM task_comments WHERE project_id = ?1))
+                OR (entity_type = 'task_dependency' AND entity_id IN (
+                    SELECT task_id || '__' || depends_on_task_id FROM task_dependencies WHERE project_id = ?1
+                ))
+                OR (entity_type = 'note' AND entity_id IN (SELECT id FROM notes WHERE project_id = ?1))
+                OR (entity_type = 'codex' AND entity_id IN (SELECT id FROM codices WHERE project_id = ?1))
+                OR (entity_type = 'journal_entry' AND entity_id IN (SELECT id FROM journal_entries WHERE project_id = ?1))
+                OR (entity_type = 'milestone' AND entity_id IN (SELECT id FROM milestones WHERE project_id = ?1))
+                OR (entity_type = 'focus_session' AND entity_id IN (SELECT id FROM focus_sessions WHERE project_id = ?1))
+                OR (entity_type = 'chronicle_message' AND entity_id IN (SELECT id FROM chronicle_messages WHERE project_id = ?1))
+                OR (entity_type = 'campaign_treasury' AND entity_id = ?1)
+                OR (entity_type = 'ledger_category' AND entity_id IN (SELECT id FROM ledger_categories WHERE campaign_id = ?1))
+                OR (entity_type = 'category_budget' AND entity_id IN (SELECT category_id FROM category_budgets WHERE campaign_id = ?1))
+                OR (entity_type = 'ledger_entry' AND entity_id IN (SELECT id FROM ledger_entries WHERE campaign_id = ?1))
+                OR (entity_type = 'task_financials' AND entity_id IN (SELECT task_id FROM task_financials WHERE campaign_id = ?1))
+                OR (entity_type = 'project_key' AND entity_id = ?1)
+            )",
+            params![project_id, format!("{}__%", project_id)],
+        )?;
+        tx.commit()?;
+        Ok(Some(project_id))
+    }
+
+    pub fn is_project_route_revoked(&self, routing_id: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM revoked_project_routes WHERE routing_id = ?1)",
+            params![routing_id],
+            |row| row.get::<_, i32>(0),
+        )? != 0)
+    }
+
+    pub fn save_project_encryption_key(
+        &self,
+        project_id: &str,
+        routing_id: &str,
+        key: &[u8; 32],
+    ) -> Result<()> {
+        self.save_project_encryption_key_inner(project_id, routing_id, key)?;
+        self.log_change("project_key", project_id, "upsert")?;
+        Ok(())
+    }
+
+    pub fn save_project_encryption_key_from_sync(
+        &self,
+        project_id: &str,
+        routing_id: &str,
+        key: &[u8; 32],
+    ) -> Result<()> {
+        self.save_project_encryption_key_inner(project_id, routing_id, key)
+    }
+
+    /// Promotes a key that arrived before its project during a fresh encrypted restore.
+    /// The history table intentionally has no project foreign key so it can stage that
+    /// key; once the project row exists, it must become the active collaboration key.
+    pub fn activate_staged_project_encryption_key(&self, project_id: &str) -> Result<bool> {
+        let changed = self.conn.execute(
+            "INSERT INTO project_encryption_keys
+             (project_id, routing_id, key_hex, key_version, created_at)
+             SELECT h.project_id, h.routing_id, h.key_hex, h.key_version, h.created_at
+             FROM project_encryption_key_history h
+             WHERE h.project_id = ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM revoked_project_routes r WHERE r.routing_id = h.routing_id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM project_encryption_keys active WHERE active.project_id = ?1
+               )
+             ORDER BY h.created_at DESC
+             LIMIT 1",
+            params![project_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    fn save_project_encryption_key_inner(
+        &self,
+        project_id: &str,
+        routing_id: &str,
+        key: &[u8; 32],
+    ) -> Result<()> {
+        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        self.conn.execute(
+            "INSERT INTO project_encryption_keys (project_id, routing_id, key_hex, key_version, created_at)
+             SELECT ?1, ?2, ?3, 1, ?4
+             WHERE EXISTS (SELECT 1 FROM projects WHERE id = ?1)
+               AND NOT EXISTS (SELECT 1 FROM revoked_project_routes WHERE routing_id = ?2)
+             ON CONFLICT(project_id) DO UPDATE SET routing_id=excluded.routing_id, key_hex=excluded.key_hex",
+            params![project_id, routing_id, key_hex, Utc::now().to_rfc3339()],
+        )?;
+        self.conn.execute(
+            "INSERT INTO project_encryption_key_history (routing_id, project_id, key_hex, key_version, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(routing_id) DO UPDATE SET project_id=excluded.project_id, key_hex=excluded.key_hex",
+            params![routing_id, project_id, key_hex, Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    pub fn ensure_project_encryption_key(&self, project_id: &str) -> Result<(String, [u8; 32])> {
+        if let Some(existing) = self.get_project_encryption_key(project_id)? {
+            return Ok(existing);
+        }
+        use rand::RngCore;
+        let mut key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut key);
+        let routing_id = Uuid::new_v4().to_string();
+        self.save_project_encryption_key(project_id, &routing_id, &key)?;
+        Ok((routing_id, key))
+    }
+
     /// Retorna todos los miembros de un proyecto con su estado de presencia actual.
     /// El campo `is_online` se deriva: online=1 y last_seen dentro de los últimos 10 minutos.
     pub fn get_presence_for_project(
@@ -4281,6 +4889,11 @@ impl Database {
     }
 
     pub fn remove_project_member(&self, project_id: &str, identity: &str) -> Result<()> {
+        if self.get_project_encryption_key(project_id)?.is_some() {
+            return Err(anyhow::anyhow!(
+                "Encrypted Fellowship member removal requires atomic project-key rotation"
+            ));
+        }
         let tx = self.conn.unchecked_transaction()?;
         let changed = tx.execute(
             "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
@@ -4290,6 +4903,42 @@ impl Database {
             let compound_id = format!("{}__{}", project_id, identity);
             Self::log_change_on(&tx, "project_member", &compound_id, "delete")?;
         }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn commit_project_key_rotation_and_member_removal(
+        &self,
+        project_id: &str,
+        removed_identity: &str,
+        new_routing_id: &str,
+        new_key: &[u8; 32],
+    ) -> Result<()> {
+        let key_hex: String = new_key.iter().map(|b| format!("{b:02x}")).collect();
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO project_encryption_keys (project_id, routing_id, key_hex, key_version, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT(project_id) DO UPDATE SET routing_id=excluded.routing_id, key_hex=excluded.key_hex, created_at=excluded.created_at",
+            params![project_id, new_routing_id, key_hex, now],
+        )?;
+        tx.execute(
+            "INSERT INTO project_encryption_key_history (routing_id, project_id, key_hex, key_version, created_at)
+             VALUES (?1, ?2, ?3, 1, ?4)",
+            params![new_routing_id, project_id, key_hex, now],
+        )?;
+        tx.execute(
+            "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
+            params![project_id, removed_identity],
+        )?;
+        Self::log_change_on(&tx, "project_key", project_id, "upsert")?;
+        Self::log_change_on(
+            &tx,
+            "project_member",
+            &format!("{}__{}", project_id, removed_identity),
+            "delete",
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -4345,6 +4994,87 @@ impl Database {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    pub fn upsert_encrypted_invitation(&self, invite: &EncryptedInvitationRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO invitations
+             (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity,
+              role, status, created_at, routing_id, inviter_encryption_key, key_nonce,
+              key_ciphertext, project_name_nonce, project_name_ciphertext,
+              project_id_nonce, project_id_ciphertext)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)
+             ON CONFLICT(id) DO UPDATE SET
+              project_id=excluded.project_id, project_name=excluded.project_name,
+              inviter_identity=excluded.inviter_identity, inviter_username=excluded.inviter_username,
+              invitee_identity=excluded.invitee_identity, role=excluded.role,
+              status=excluded.status, created_at=excluded.created_at,
+              routing_id=excluded.routing_id, inviter_encryption_key=excluded.inviter_encryption_key,
+              key_nonce=excluded.key_nonce, key_ciphertext=excluded.key_ciphertext,
+              project_name_nonce=excluded.project_name_nonce,
+              project_name_ciphertext=excluded.project_name_ciphertext,
+              project_id_nonce=excluded.project_id_nonce,
+              project_id_ciphertext=excluded.project_id_ciphertext",
+            params![
+                invite.id,
+                invite.project_id,
+                invite.project_name,
+                invite.inviter_identity,
+                invite.inviter_username,
+                invite.invitee_identity,
+                invite.role,
+                invite.status,
+                invite.created_at,
+                invite.routing_id,
+                invite.inviter_encryption_key,
+                invite.key_nonce,
+                invite.key_ciphertext,
+                invite.project_name_nonce,
+                invite.project_name_ciphertext,
+                invite.project_id_nonce,
+                invite.project_id_ciphertext,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_encrypted_invitation(
+        &self,
+        invite_id: &str,
+    ) -> Result<Option<EncryptedInvitationRecord>> {
+        self.conn
+            .query_row(
+                "SELECT id, project_id, project_name, inviter_identity, inviter_username,
+                 invitee_identity, role, status, created_at, COALESCE(routing_id, ''),
+                 COALESCE(inviter_encryption_key, ''), COALESCE(key_nonce, ''),
+                 COALESCE(key_ciphertext, ''), COALESCE(project_name_nonce, ''),
+                 COALESCE(project_name_ciphertext, ''), COALESCE(project_id_nonce, ''),
+                 COALESCE(project_id_ciphertext, '') FROM invitations WHERE id = ?1",
+                params![invite_id],
+                |row| {
+                    Ok(EncryptedInvitationRecord {
+                        id: row.get(0)?,
+                        project_id: row.get(1)?,
+                        project_name: row.get(2)?,
+                        inviter_identity: row.get(3)?,
+                        inviter_username: row.get(4)?,
+                        invitee_identity: row.get(5)?,
+                        role: row.get(6)?,
+                        status: row.get(7)?,
+                        created_at: row.get(8)?,
+                        routing_id: row.get(9)?,
+                        inviter_encryption_key: row.get(10)?,
+                        key_nonce: row.get(11)?,
+                        key_ciphertext: row.get(12)?,
+                        project_name_nonce: row.get(13)?,
+                        project_name_ciphertext: row.get(14)?,
+                        project_id_nonce: row.get(15)?,
+                        project_id_ciphertext: row.get(16)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn update_invitation_status(&self, invite_id: &str, status: &str) -> Result<()> {
@@ -4561,6 +5291,23 @@ impl Database {
         Ok(())
     }
 
+    pub fn create_notification_once(
+        &self,
+        id: &str,
+        notif_type: &str,
+        title: &str,
+        content: &str,
+        target_id: Option<&str>,
+    ) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR IGNORE INTO notifications (id, notification_type, title, content, target_id, read, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, COALESCE((SELECT read FROM notification_states WHERE notification_id = ?1), 0), ?6)",
+            params![id, notif_type, title, content, target_id, now],
+        )?;
+        Ok(())
+    }
+
     pub fn get_notifications(
         &self,
     ) -> Result<Vec<(String, String, String, String, Option<String>, bool, String)>> {
@@ -4585,15 +5332,39 @@ impl Database {
     }
 
     pub fn mark_notification_read(&self, id: &str) -> Result<()> {
-        self.conn.execute(
-            "UPDATE notifications SET read = 1 WHERE id = ?1",
-            params![id],
+        self.set_notification_read_state(id, true)
+    }
+
+    pub fn mark_notification_unread(&self, id: &str) -> Result<()> {
+        self.set_notification_read_state(id, false)
+    }
+
+    fn set_notification_read_state(&self, id: &str, read: bool) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE notifications SET read = ?1 WHERE id = ?2",
+            params![read as i32, id],
         )?;
+        tx.execute(
+            "INSERT INTO notification_states (notification_id, read, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(notification_id) DO UPDATE SET read=excluded.read, updated_at=excluded.updated_at",
+            params![id, read as i32, now],
+        )?;
+        Self::log_change_on(&tx, "notification_state", id, "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn mark_all_notifications_read(&self) -> Result<()> {
-        self.conn.execute("UPDATE notifications SET read = 1", [])?;
+        let ids = self
+            .get_notifications()?
+            .into_iter()
+            .map(|notice| notice.0)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.set_notification_read_state(&id, true)?;
+        }
         Ok(())
     }
 
@@ -4635,6 +5406,318 @@ impl Database {
             list.push(r?);
         }
         Ok(list)
+    }
+
+    pub fn get_task_ids_assigned_to(&self, user_identity: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT ta.task_id
+             FROM task_assignments ta
+             JOIN tasks t ON t.id = ta.task_id
+             WHERE ta.user_identity = ?1
+             ORDER BY t.completed ASC,
+                      CASE t.priority WHEN 'High' THEN 0 WHEN 'Medium' THEN 1 ELSE 2 END,
+                      COALESCE(t.due_date, '9999-12-31') ASC",
+        )?;
+        let rows = stmt.query_map(params![user_identity], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_quest_status(
+        &self,
+        task_id: &str,
+        completed: bool,
+    ) -> Result<crate::models::QuestStatus> {
+        if completed {
+            return Ok(crate::models::QuestStatus::Done);
+        }
+        let stored = self
+            .conn
+            .query_row(
+                "SELECT status FROM task_statuses WHERE task_id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let stored_status = stored
+            .as_deref()
+            .map(crate::models::QuestStatus::from_str)
+            .unwrap_or(crate::models::QuestStatus::Backlog);
+        // Dependencies temporarily obstruct a Quest without overwriting its chosen
+        // stance. Once every blocker is resolved, the Quest returns to that stance;
+        // a manually selected Path Obstructed stance remains blocked on its own.
+        if stored_status != crate::models::QuestStatus::Blocked
+            && self.has_unresolved_task_dependencies(task_id)?
+        {
+            Ok(crate::models::QuestStatus::Blocked)
+        } else {
+            Ok(stored_status)
+        }
+    }
+
+    pub fn set_quest_status(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        status: crate::models::QuestStatus,
+        actor_identity: &str,
+        actor_username: &str,
+    ) -> Result<()> {
+        if status == crate::models::QuestStatus::Done {
+            return Err(anyhow::anyhow!("Use quest completion to mark a quest Done"));
+        }
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO task_statuses (task_id, project_id, status, changed_by_identity, changed_by_username, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id, status=excluded.status,
+                 changed_by_identity=excluded.changed_by_identity, changed_by_username=excluded.changed_by_username,
+                 updated_at=excluded.updated_at",
+            params![task_id, project_id, status.name(), actor_identity, actor_username, now],
+        )?;
+        Self::log_change_on(&tx, "task_status", task_id, "upsert")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn add_task_dependency(
+        &self,
+        task_id: &str,
+        depends_on_task_id: &str,
+        project_id: &str,
+        actor_identity: &str,
+        actor_username: &str,
+    ) -> Result<()> {
+        if task_id == depends_on_task_id {
+            return Err(anyhow::anyhow!("A Quest cannot depend on itself"));
+        }
+        let task_project: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1 AND parent_task_id IS NULL",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        let blocker_project: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT project_id FROM tasks WHERE id = ?1 AND parent_task_id IS NULL",
+                params![depends_on_task_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if task_project.as_deref() != Some(project_id)
+            || blocker_project.as_deref() != Some(project_id)
+        {
+            return Err(anyhow::anyhow!(
+                "Quest dependencies must connect two Quests in the same Campaign"
+            ));
+        }
+
+        let mut frontier = vec![depends_on_task_id.to_string()];
+        let mut visited = std::collections::HashSet::new();
+        while let Some(candidate) = frontier.pop() {
+            if candidate == task_id {
+                return Err(anyhow::anyhow!("That dependency would create a cycle"));
+            }
+            if !visited.insert(candidate.clone()) {
+                continue;
+            }
+            let mut stmt = self
+                .conn
+                .prepare("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1")?;
+            frontier.extend(
+                stmt.query_map(params![candidate], |row| row.get::<_, String>(0))?
+                    .filter_map(|row| row.ok()),
+            );
+        }
+
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO task_dependencies
+             (task_id, depends_on_task_id, project_id, created_by_identity, created_by_username, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![task_id, depends_on_task_id, project_id, actor_identity, actor_username, now],
+        )?;
+        if tx.changes() > 0 {
+            Self::log_change_on(
+                &tx,
+                "task_dependency",
+                &format!("{}__{}", task_id, depends_on_task_id),
+                "upsert",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn remove_task_dependency(&self, task_id: &str, depends_on_task_id: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
+            params![task_id, depends_on_task_id],
+        )?;
+        if tx.changes() > 0 {
+            Self::log_change_on(
+                &tx,
+                "task_dependency",
+                &format!("{}__{}", task_id, depends_on_task_id),
+                "delete",
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn get_task_dependencies(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn has_unresolved_task_dependencies(&self, task_id: &str) -> Result<bool> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM task_dependencies d
+                JOIN tasks blocker ON blocker.id = d.depends_on_task_id
+                WHERE d.task_id = ?1 AND blocker.completed = 0
+             )",
+                params![task_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    pub fn get_unresolved_task_dependency_titles(&self, task_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT blocker.title
+             FROM task_dependencies d
+             JOIN tasks blocker ON blocker.id = d.depends_on_task_id
+             WHERE d.task_id = ?1 AND blocker.completed = 0
+             ORDER BY d.created_at, blocker.title",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn get_tasks_blocked_by(&self, blocker_task_id: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_id FROM task_dependencies WHERE depends_on_task_id = ?1 ORDER BY created_at",
+        )?;
+        let rows = stmt.query_map(params![blocker_task_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn add_task_comment(
+        &self,
+        task_id: &str,
+        project_id: &str,
+        author_identity: &str,
+        author_username: &str,
+        content: &str,
+        mentioned_identities: &[String],
+    ) -> Result<String> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(anyhow::anyhow!("A Council message cannot be empty"));
+        }
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        let mentions = serde_json::to_string(mentioned_identities)?;
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO task_comments (id, task_id, project_id, author_identity, author_username, content, mentioned_identities, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![id, task_id, project_id, author_identity, author_username, content, mentions, now],
+        )?;
+        Self::log_change_on(&tx, "task_comment", &id, "create")?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn get_task_comments(&self, task_id: &str) -> Result<Vec<TaskComment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, task_id, project_id, author_identity, author_username, content,
+                    mentioned_identities, created_at, updated_at, edited_at, deleted_at
+             FROM task_comments WHERE task_id = ?1 ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map(params![task_id], |row| {
+            let mentions: String = row.get(6)?;
+            Ok(TaskComment {
+                id: row.get(0)?,
+                task_id: row.get(1)?,
+                project_id: row.get(2)?,
+                author_identity: row.get(3)?,
+                author_username: row.get(4)?,
+                content: row.get(5)?,
+                mentioned_identities: serde_json::from_str(&mentions).unwrap_or_default(),
+                created_at: row.get(7)?,
+                updated_at: row.get(8)?,
+                edited_at: row.get(9)?,
+                deleted_at: row.get(10)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn edit_task_comment(
+        &self,
+        comment_id: &str,
+        author_identity: &str,
+        content: &str,
+        mentioned_identities: &[String],
+    ) -> Result<()> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Err(anyhow::anyhow!("A Council message cannot be empty"));
+        }
+        let now = Utc::now().to_rfc3339();
+        let mentions = serde_json::to_string(mentioned_identities)?;
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE task_comments SET content = ?1, mentioned_identities = ?2,
+                    updated_at = ?3, edited_at = ?3
+             WHERE id = ?4 AND author_identity = ?5 AND deleted_at IS NULL",
+            params![content, mentions, now, comment_id, author_identity],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "Only the author may edit this Council message"
+            ));
+        }
+        Self::log_change_on(&tx, "task_comment", comment_id, "upsert")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn withdraw_task_comment(&self, comment_id: &str, author_identity: &str) -> Result<()> {
+        let now = Utc::now().to_rfc3339();
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE task_comments SET content = '', updated_at = ?1, deleted_at = ?1
+             WHERE id = ?2 AND author_identity = ?3 AND deleted_at IS NULL",
+            params![now, comment_id, author_identity],
+        )?;
+        if changed != 1 {
+            return Err(anyhow::anyhow!(
+                "Only the author may withdraw this Council message"
+            ));
+        }
+        Self::log_change_on(&tx, "task_comment", comment_id, "upsert")?;
+        tx.commit()?;
+        Ok(())
     }
 
     pub fn clear_task_assignments(&self, task_id: &str) -> Result<()> {
@@ -5471,6 +6554,54 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn ritual_streak_stays_visible_until_todays_completion() {
+        let db_file = Path::new("test_questline_active_ritual_streak.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let now = Utc::now();
+        let ritual = Ritual {
+            id: "active-streak".to_string(),
+            name: "Workout".to_string(),
+            description: None,
+            frequency: "Daily".to_string(),
+            reward_xp: 40,
+            daily_target: 1,
+            created_at: now,
+            updated_at: now,
+        };
+        db.insert_ritual(&ritual).unwrap();
+
+        let today = Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let two_days_ago = yesterday.pred_opt().unwrap();
+        for date in [two_days_ago, yesterday] {
+            db.conn
+                .execute(
+                    "INSERT INTO ritual_history
+                        (ritual_id, completed_date, completion_count)
+                     VALUES (?1, ?2, 1)",
+                    params![ritual.id, date.to_string()],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(db.get_ritual_streak(&ritual.id).unwrap(), 2);
+        assert_eq!(
+            db.get_all_ritual_streaks()
+                .unwrap()
+                .get(&ritual.id)
+                .copied(),
+            Some(2)
+        );
+
+        db.complete_ritual(&ritual.id, today, Local::now()).unwrap();
+        assert_eq!(db.get_ritual_streak(&ritual.id).unwrap(), 3);
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn legacy_relationship_repair_recovers_steps_and_projectless_scrolls() {
         let db_file = Path::new("test_questline_legacy_relationship_repair.db");
         let _ = std::fs::remove_file(db_file);
@@ -5895,6 +7026,512 @@ mod tests {
         let unchanged = db.get_note_by_id(note_id).unwrap();
         assert_eq!(unchanged.project_id, Some(destination_project_id));
         assert_eq!(unchanged.codex_id, Some(destination_codex_id));
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn encrypted_fellowship_member_cannot_be_removed_without_key_rotation() {
+        let db_file = Path::new("test_questline_encrypted_member_removal.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Encrypted Fellowship".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some("owner".to_string()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        })
+        .unwrap();
+        db.add_project_member(
+            &project_id.to_string(),
+            "companion",
+            "Companion",
+            "Companion",
+        )
+        .unwrap();
+        db.save_project_encryption_key(
+            &project_id.to_string(),
+            &Uuid::new_v4().to_string(),
+            &[7u8; 32],
+        )
+        .unwrap();
+
+        let error = db
+            .remove_project_member(&project_id.to_string(), "companion")
+            .unwrap_err();
+        assert!(error.to_string().contains("project-key rotation"));
+        assert!(
+            db.get_project_members(&project_id.to_string())
+                .unwrap()
+                .iter()
+                .any(|member| member.0 == "companion")
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn revoked_fellowship_route_becomes_a_private_project_copy() {
+        let db_file = Path::new("test_questline_revoked_project_route.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let route = Uuid::new_v4().to_string();
+        let replacement = Uuid::new_v4().to_string();
+        let now = Utc::now();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Former Fellowship".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some("other-owner".to_string()),
+            owner_username: Some("Other Owner".to_string()),
+            is_shared: true,
+        })
+        .unwrap();
+        db.add_project_member(
+            &project_id.to_string(),
+            "removed-user",
+            "Removed User",
+            "Companion",
+        )
+        .unwrap();
+        db.save_project_encryption_key(&project_id.to_string(), &route, &[9u8; 32])
+            .unwrap();
+
+        assert_eq!(
+            db.apply_project_route_revocation(&route, &replacement)
+                .unwrap(),
+            Some(project_id.to_string())
+        );
+        assert!(db.is_project_route_revoked(&route).unwrap());
+        assert!(
+            db.get_project_encryption_key(&project_id.to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_project_encryption_key_by_routing_id(&route)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            !db.get_projects()
+                .unwrap()
+                .into_iter()
+                .find(|project| project.id == project_id)
+                .unwrap()
+                .is_shared
+        );
+        assert!(
+            db.get_project_members(&project_id.to_string())
+                .unwrap()
+                .is_empty()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn staged_fellowship_key_becomes_active_after_project_restore() {
+        let db_file = Path::new("test_questline_staged_project_key.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let route = Uuid::new_v4().to_string();
+        let key = [31u8; 32];
+
+        db.save_project_encryption_key_from_sync(&project_id.to_string(), &route, &key)
+            .unwrap();
+        assert!(
+            db.get_project_encryption_key(&project_id.to_string())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            db.get_project_encryption_key_by_routing_id(&route)
+                .unwrap()
+                .is_some()
+        );
+
+        let now = Utc::now();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Restored Fellowship".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some("owner".to_string()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        })
+        .unwrap();
+        assert!(
+            db.activate_staged_project_encryption_key(&project_id.to_string())
+                .unwrap()
+        );
+        assert_eq!(
+            db.get_project_encryption_key(&project_id.to_string())
+                .unwrap(),
+            Some((route, key))
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn task_comments_preserve_stable_mention_identities() {
+        let db_file = Path::new("test_questline_task_comments.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4().to_string();
+        let task_id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        db.conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?1, 'Council Test', ?2, ?2)",
+            params![project_id, now],
+        ).unwrap();
+        db.conn.execute(
+            "INSERT INTO tasks (id, project_id, title, completed, priority, created_at, updated_at) VALUES (?1, ?2, 'Discuss launch', 0, 'Medium', ?3, ?3)",
+            params![task_id, project_id, now],
+        ).unwrap();
+        let mentioned = vec!["companion-key-123".to_string()];
+        let comment_id = db
+            .add_task_comment(
+                &task_id,
+                &project_id,
+                "author-key",
+                "Aria",
+                "@Ren review this",
+                &mentioned,
+            )
+            .unwrap();
+        let comments = db.get_task_comments(&task_id).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].mentioned_identities, mentioned);
+        assert_eq!(comments[0].content, "@Ren review this");
+        assert!(
+            db.edit_task_comment(&comment_id, "other-key", "tampered", &[])
+                .is_err()
+        );
+        db.edit_task_comment(&comment_id, "author-key", "@Ren revised this", &mentioned)
+            .unwrap();
+        let revised = db.get_task_comments(&task_id).unwrap();
+        assert_eq!(revised[0].content, "@Ren revised this");
+        assert!(revised[0].edited_at.is_some());
+        assert!(db.withdraw_task_comment(&comment_id, "other-key").is_err());
+        db.withdraw_task_comment(&comment_id, "author-key").unwrap();
+        let withdrawn = db.get_task_comments(&task_id).unwrap();
+        assert!(withdrawn[0].deleted_at.is_some());
+        assert!(withdrawn[0].content.is_empty());
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn deterministic_notice_state_is_deduplicated_and_syncable() {
+        let db_file = Path::new("test_questline_notification_state.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let notice_id = "fellowship:task_assignment:event-42";
+        db.create_notification_once(
+            notice_id,
+            "task_assignment",
+            "Quest entrusted",
+            "Take the bridge.",
+            Some("task-42"),
+        )
+        .unwrap();
+        db.create_notification_once(
+            notice_id,
+            "task_assignment",
+            "Duplicate",
+            "Duplicate",
+            Some("task-42"),
+        )
+        .unwrap();
+        assert_eq!(db.get_notifications().unwrap().len(), 1);
+
+        db.mark_notification_read(notice_id).unwrap();
+        let notices = db.get_notifications().unwrap();
+        assert!(notices[0].5);
+        let state: (i32, String) = db
+            .conn
+            .query_row(
+                "SELECT read, updated_at FROM notification_states WHERE notification_id = ?1",
+                params![notice_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, 1);
+        assert!(!state.1.is_empty());
+        let queued: i32 = db.conn.query_row(
+            "SELECT COUNT(*) FROM sync_log WHERE entity_type = 'notification_state' AND entity_id = ?1 AND synced = 0",
+            params![notice_id],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(queued, 1);
+
+        db.mark_notification_unread(notice_id).unwrap();
+        assert!(!db.get_notifications().unwrap()[0].5);
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn task_dependencies_reject_cycles_and_track_unresolved_blockers() {
+        let db_file = Path::new("test_questline_task_dependencies.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4().to_string();
+        let task_a = Uuid::new_v4().to_string();
+        let task_b = Uuid::new_v4().to_string();
+        let task_c = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        db.conn.execute(
+            "INSERT INTO projects (id, name, created_at, updated_at) VALUES (?1, 'Dependency Test', ?2, ?2)",
+            params![project_id, now],
+        ).unwrap();
+        for (id, title) in [(&task_a, "A"), (&task_b, "B"), (&task_c, "C")] {
+            db.conn.execute(
+                "INSERT INTO tasks (id, project_id, title, completed, priority, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, 'Medium', ?4, ?4)",
+                params![id, project_id, title, now],
+            ).unwrap();
+        }
+
+        db.add_task_dependency(&task_a, &task_b, &project_id, "owner", "Owner")
+            .unwrap();
+        db.add_task_dependency(&task_b, &task_c, &project_id, "owner", "Owner")
+            .unwrap();
+        assert!(db.has_unresolved_task_dependencies(&task_a).unwrap());
+        assert_eq!(
+            db.get_quest_status(&task_a, false).unwrap(),
+            crate::models::QuestStatus::Blocked
+        );
+        assert_eq!(
+            db.get_unresolved_task_dependency_titles(&task_a).unwrap(),
+            vec!["B".to_string()]
+        );
+        assert_eq!(
+            db.get_tasks_blocked_by(&task_b).unwrap(),
+            vec![task_a.clone()]
+        );
+        assert!(
+            db.add_task_dependency(&task_c, &task_a, &project_id, "owner", "Owner")
+                .is_err()
+        );
+        assert!(
+            db.add_task_dependency(&task_a, &task_a, &project_id, "owner", "Owner")
+                .is_err()
+        );
+
+        db.conn
+            .execute(
+                "UPDATE tasks SET completed = 1 WHERE id = ?1",
+                params![task_b],
+            )
+            .unwrap();
+        assert!(!db.has_unresolved_task_dependencies(&task_a).unwrap());
+        assert_eq!(
+            db.get_quest_status(&task_a, false).unwrap(),
+            crate::models::QuestStatus::Backlog
+        );
+        assert!(
+            db.get_unresolved_task_dependency_titles(&task_a)
+                .unwrap()
+                .is_empty()
+        );
+        db.remove_task_dependency(&task_a, &task_b).unwrap();
+        assert!(db.get_task_dependencies(&task_a).unwrap().is_empty());
+
+        let queued: i32 = db.conn.query_row(
+            "SELECT COUNT(*) FROM sync_log WHERE entity_type = 'task_dependency' AND synced = 0",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(queued, 3);
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn invalid_campaign_template_leaves_no_partial_campaign() {
+        let db_file = Path::new("test_questline_campaign_template_atomicity.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Atomic Blueprint".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        let make_task = |id, title: &str, parent_task_id, task_project_id| Task {
+            id,
+            project_id: task_project_id,
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Parent", None, Some(project_id));
+        let invalid_step = make_task(
+            Uuid::new_v4(),
+            "Wrong Campaign",
+            Some(parent_id),
+            Some(Uuid::new_v4()),
+        );
+
+        assert!(
+            db.insert_campaign_template(&project, &[(parent, vec![invalid_step])])
+                .is_err()
+        );
+        assert!(db.get_projects().unwrap().is_empty());
+        assert!(db.get_tasks().unwrap().is_empty());
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn calendar_import_is_idempotent_and_queues_one_task_event() {
+        let db_file = Path::new("test_questline_calendar_import.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        db.insert_project(&Project {
+            id: project_id,
+            name: "Calendar Destination".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        })
+        .unwrap();
+        let events = vec![crate::calendar_import::CalendarEvent {
+            uid: "stable-event@example.test".to_string(),
+            summary: "Planning session".to_string(),
+            description: Some("Prepare the next iteration".to_string()),
+            due_at: now,
+        }];
+        let tasks =
+            crate::calendar_import::materialize_events(project_id, &events, "owner-key", "Owner");
+
+        assert_eq!(
+            db.insert_calendar_tasks_if_missing(project_id, &tasks)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            db.insert_calendar_tasks_if_missing(project_id, &tasks)
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.get_tasks_for_project(project_id).unwrap().len(), 1);
+        let queued: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_log WHERE entity_type = 'task' AND entity_id = ?1",
+                params![tasks[0].id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1);
+
+        let mut local = db.get_task_by_id(tasks[0].id).unwrap();
+        local.priority = TaskPriority::High;
+        local.completed = true;
+        db.update_task(&local).unwrap();
+        let updated_events = vec![crate::calendar_import::CalendarEvent {
+            uid: "stable-event@example.test".to_string(),
+            summary: "Rescheduled planning session".to_string(),
+            description: Some("New calendar description".to_string()),
+            due_at: now + chrono::Duration::hours(2),
+        }];
+        let updated_tasks = crate::calendar_import::materialize_events(
+            project_id,
+            &updated_events,
+            "owner-key",
+            "Owner",
+        );
+        let reconciled = db
+            .reconcile_calendar_tasks(project_id, &updated_tasks, &[])
+            .unwrap();
+        assert_eq!(reconciled.updated, 1);
+        let updated = db.get_task_by_id(tasks[0].id).unwrap();
+        assert_eq!(updated.title, "Rescheduled planning session");
+        assert_eq!(updated.priority, TaskPriority::High);
+        assert!(updated.completed);
+
+        let cancelled = db
+            .reconcile_calendar_tasks(project_id, &[], &[tasks[0].id])
+            .unwrap();
+        assert_eq!(cancelled.cancelled, 1);
+        let cancelled_task = db.get_task_by_id(tasks[0].id).unwrap();
+        assert!(cancelled_task.title.starts_with("[Cancelled] "));
+        assert!(cancelled_task.completed);
+        assert!(
+            cancelled_task
+                .description
+                .as_deref()
+                .unwrap_or_default()
+                .contains("Cancelled in the source calendar")
+        );
+
+        assert!(
+            db.reconcile_calendar_tasks(project_id, &[], &[tasks[0].id, tasks[0].id])
+                .is_err()
+        );
+        db.conn
+            .execute(
+                "UPDATE tasks SET due_date = 'not-a-date' WHERE id = ?1",
+                params![tasks[0].id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            db.reconcile_calendar_tasks(project_id, &updated_tasks, &[])
+                .is_err()
+        );
 
         drop(db);
         let _ = std::fs::remove_file(db_file);

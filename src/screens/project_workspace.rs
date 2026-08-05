@@ -1,10 +1,10 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // project_workspace.rs — el workspace donde ocurre todo: tareas, notas, journal y milestones
 // ─────────────────────────────────────────────────────────────────────────────
-use crate::app::{App, DueDateType, JOURNAL_ENTRY_CHAR_LIMIT, ModalType};
+use crate::app::{App, DueDateType, JOURNAL_ENTRY_CHAR_LIMIT, ModalType, council_mention_query};
 use crate::milestone_templates::{self, ProjectStats, Tier};
 use crate::models::RecurrenceType;
-use crate::models::{JournalEntry, Milestone, Note, Project, Task, TaskPriority};
+use crate::models::{JournalEntry, Milestone, Note, Project, QuestStatus, Task, TaskPriority};
 use crate::screens::editor::{EditorMode, EditorState, render_body_line};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
@@ -14,7 +14,10 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph},
+    widgets::{
+        Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
+        Table,
+    },
 };
 
 // El jefe máximo de renderizado — desde aquí se coordina todo el workspace
@@ -57,6 +60,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         1 => app.selected_notes_flat_idx,
         2 => app.selected_journal_idx,
         3 => app.selected_milestone_idx,
+        4 => app.selected_treasury_idx,
         _ => 0,
     };
 
@@ -98,6 +102,45 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             .filter(|t| match task_filter.as_str() {
                 "Incomplete" => !t.completed,
                 "Completed" => t.completed,
+                "MyQuests" => app
+                    .db
+                    .get_task_assignments(&t.id.to_string())
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(identity, _)| identity == &app.identity.public_key),
+                filter if filter.starts_with("Assignee:") => app
+                    .db
+                    .get_task_assignments(&t.id.to_string())
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(identity, _)| identity == filter.trim_start_matches("Assignee:")),
+                "Unassigned" => app
+                    .db
+                    .get_task_assignments(&t.id.to_string())
+                    .unwrap_or_default()
+                    .is_empty(),
+                "Blocked" => {
+                    app.db
+                        .get_quest_status(&t.id.to_string(), t.completed)
+                        .is_ok_and(|status| status == crate::models::QuestStatus::Blocked)
+                        || app
+                            .db
+                            .has_unresolved_task_dependencies(&t.id.to_string())
+                            .unwrap_or(false)
+                }
+                "Review" => app
+                    .db
+                    .get_quest_status(&t.id.to_string(), t.completed)
+                    .is_ok_and(|status| status == crate::models::QuestStatus::Review),
+                "Overdue" => !t.completed && t.due_date.is_some_and(|due| due < Utc::now()),
+                "HighPriority" => t.priority == TaskPriority::High,
+                "DueSoon" => {
+                    !t.completed
+                        && t.due_date.is_some_and(|due| {
+                            due >= chrono::Utc::now()
+                                && due <= chrono::Utc::now() + chrono::Duration::days(7)
+                        })
+                }
                 _ => true,
             })
             .filter(|t| {
@@ -171,6 +214,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             }
         }
         flat
+    };
+
+    let sorted_tasks: Vec<&Task> = if app.quest_board_open && app.viewing_step_for_task.is_none() {
+        sorted_tasks
+            .into_iter()
+            .filter(|task| task.parent_task_id.is_none())
+            .collect()
+    } else {
+        sorted_tasks
     };
 
     let filtered_notes: Vec<&Note> = notes
@@ -263,16 +315,17 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     // 2a. Left tab options list
     let menu_items = [
-        "  1 Quests",
-        "  2 Scrolls",
-        "  3 Chronicles",
-        "  4 Overview",
+        ("  1 Overview", 3),
+        ("  2 Tasks", 0),
+        ("  3 Scrolls", 1),
+        ("  4 Treasury", 4),
+        ("  5 Chronicle", 2),
     ];
     let list_items: Vec<ListItem> = menu_items
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            let style = if i == active_tab {
+        .map(|(_, (item, tab))| {
+            let style = if *tab == active_tab {
                 Style::default()
                     .fg(Color::Black)
                     .bg(theme.selection)
@@ -293,7 +346,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(sidebar_border_style)
-            .title(" Workspace "),
+            .title(if app.workspace_sidebar_focused {
+                " Workspace [FOCUS] "
+            } else {
+                " Workspace "
+            }),
     );
     f.render_widget(menu_list, body_chunks[0]);
 
@@ -306,6 +363,31 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     } else {
         vec![]
     };
+    let selected_quest_status = sorted_tasks
+        .get(selected_item_idx)
+        .and_then(|task| {
+            app.db
+                .get_quest_status(&task.id.to_string(), task.completed)
+                .ok()
+        })
+        .unwrap_or(crate::models::QuestStatus::Backlog);
+    let selected_task_comments = sorted_tasks
+        .get(selected_item_idx)
+        .and_then(|task| app.db.get_task_comments(&task.id.to_string()).ok())
+        .unwrap_or_default();
+    let selected_task_dependencies = sorted_tasks
+        .get(selected_item_idx)
+        .map(|task| {
+            app.db
+                .get_task_dependencies(&task.id.to_string())
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|id| uuid::Uuid::parse_str(&id).ok())
+                .filter_map(|id| tasks.iter().find(|task| task.id == id))
+                .map(|task| (task.title.clone(), task.completed))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
     let sidebar_focused = app.workspace_sidebar_focused;
     let viewing_step_for_task = app.viewing_step_for_task;
     // Título del padre para el breadcrumb cuando estamos viendo steps
@@ -316,6 +398,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             .map(|t| t.title.clone())
     });
     match active_tab {
+        0 if app.quest_board_open && app.viewing_step_for_task.is_none() => draw_quest_board(
+            f,
+            body_chunks[1],
+            &sorted_tasks,
+            selected_item_idx,
+            app,
+            theme,
+            sidebar_focused,
+        ),
         0 => draw_tasks_tab(
             f,
             body_chunks[1],
@@ -324,6 +415,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             task_filter,
             task_sort,
             &task_assignees,
+            selected_quest_status,
+            &selected_task_comments,
+            &selected_task_dependencies,
             theme,
             sidebar_focused,
             &tasks,
@@ -331,6 +425,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             parent_quest_title.as_deref(),
             is_shared,
             &app.identity.public_key,
+            &app.db,
         ),
         1 => {
             let project_codices: Vec<crate::models::Codex> = app
@@ -352,15 +447,29 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 &app.note_preview_max_scroll,
             );
         }
-        2 => draw_journal_tab(
-            f,
-            body_chunks[1],
-            &filtered_journals,
-            selected_item_idx,
-            theme,
-            sidebar_focused,
-            is_shared,
-        ),
+        2 => {
+            let treasury_events = app
+                .db
+                .get_chronicle_messages(&p_id.to_string())
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|message| message.5 == "treasury_event")
+                .rev()
+                .take(8)
+                .map(|message| format!("{}  {}", &message.6[..10.min(message.6.len())], message.4))
+                .collect::<Vec<_>>();
+            draw_journal_tab(
+                f,
+                body_chunks[1],
+                &filtered_journals,
+                &treasury_events,
+                selected_item_idx,
+                theme,
+                sidebar_focused,
+                is_shared,
+            )
+        }
+        4 => draw_treasury_tab(f, body_chunks[1], app, project.id, theme, sidebar_focused),
         _ => {
             let (overview_members, overview_activity) = if is_shared {
                 (
@@ -450,6 +559,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             sep(),
             key("s"),
             txt(" Sort"),
+            sep(),
+            key("$"),
+            txt(" Finance"),
         ],
         1 => vec![
             txt(" Scrolls  "),
@@ -479,6 +591,41 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             key("v"),
             txt(" Visibility"),
         ],
+        // Los atajos que el rol actual no puede ejercer no se anuncian.
+        4 => {
+            use crate::services::treasury_policy::{TreasuryAction, allows};
+            let role = app.treasury_role(project.id);
+            let mut spans = vec![txt(" Treasury  ")];
+            let push = |spans: &mut Vec<Span>, shortcut, label| {
+                if spans.len() > 1 {
+                    spans.push(sep());
+                }
+                spans.push(key(shortcut));
+                spans.push(txt(label));
+            };
+            if allows(role, TreasuryAction::RecordEntry) {
+                push(&mut spans, "n", " New");
+            }
+            if allows(role, TreasuryAction::ApproveEntry) {
+                push(&mut spans, "a", " Approve");
+            }
+            if allows(role, TreasuryAction::MarkPaid) {
+                push(&mut spans, "p", " Paid");
+            }
+            push(&mut spans, "f", " Filter");
+            push(&mut spans, "s", " Sort");
+            push(&mut spans, "x", " Export");
+            if allows(role, TreasuryAction::SetOverallBudget) {
+                push(&mut spans, "B", " Budget");
+            }
+            if allows(role, TreasuryAction::ManageCategories) {
+                push(&mut spans, "c", " Category");
+            }
+            if allows(role, TreasuryAction::SwitchCurrency) {
+                push(&mut spans, "$", " Currency");
+            }
+            spans
+        }
         _ => vec![
             txt(" Overview  "),
             key("m"),
@@ -500,7 +647,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         key("Tab"),
         txt(" Panes"),
         sep(),
-        key("1-4"),
+        key("1-5"),
         txt(" Sections"),
         sep(),
         key("/"),
@@ -550,6 +697,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 f,
                 modal_title,
                 title,
+                if app.task_title_editing {
+                    app.task_title_cursor
+                } else {
+                    title.len()
+                },
                 desc,
                 *desc_cursor,
                 *priority,
@@ -593,6 +745,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 f,
                 " Edit Quest ",
                 title,
+                if app.task_title_editing {
+                    app.task_title_cursor
+                } else {
+                    title.len()
+                },
                 desc,
                 *desc_cursor,
                 *priority,
@@ -612,6 +769,54 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         ModalType::NewJournalEntry { content } => {
             draw_journal_modal(f, content, theme);
         }
+        ModalType::TreasuryEntry {
+            entry_id: _,
+            title,
+            amount,
+            entry_type_idx,
+            status_idx,
+            category_idx,
+            focus_idx,
+        } => draw_treasury_entry_modal(
+            f,
+            app,
+            title,
+            amount,
+            *entry_type_idx,
+            *status_idx,
+            *category_idx,
+            *focus_idx,
+            theme,
+        ),
+        ModalType::TaskExpenseCompletion { selected_idx, .. } => {
+            draw_task_expense_completion_modal(f, *selected_idx, theme)
+        }
+        ModalType::TreasuryBudget {
+            amount,
+            target_idx,
+            focus_idx,
+        } => draw_treasury_budget_modal(f, app, amount, *target_idx, *focus_idx, theme),
+        ModalType::TaskFinancials {
+            estimated,
+            actual,
+            billable,
+            payment_status_idx,
+            focus_idx,
+            ..
+        } => draw_task_financials_modal(
+            f,
+            app,
+            estimated,
+            actual,
+            billable,
+            *payment_status_idx,
+            *focus_idx,
+            theme,
+        ),
+        ModalType::TreasuryCategory { name } => draw_treasury_category_modal(f, name, theme),
+        ModalType::TreasuryCurrency { selected_idx } => {
+            draw_treasury_currency_modal(f, app, *selected_idx, theme)
+        }
         ModalType::MilestoneTierSelect { selected_idx, .. } => {
             draw_tier_select_modal(f, *selected_idx, theme);
         }
@@ -625,6 +830,31 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             ..
         } => {
             draw_assign_task_modal(f, app, *selected_member_idx, theme);
+        }
+        ModalType::QuestDependencies {
+            task_id,
+            selected_quest_idx,
+        } => draw_quest_dependencies_modal(f, app, *task_id, *selected_quest_idx, theme),
+        ModalType::CouncilBriefing {
+            selected_section_idx,
+        } => draw_council_briefing(f, app, *selected_section_idx, theme),
+        ModalType::QuestCouncil {
+            task_id,
+            content,
+            selected_comment_idx,
+            selected_member_idx,
+            editing_comment_id,
+        } => {
+            draw_quest_council_modal(
+                f,
+                app,
+                *task_id,
+                content,
+                *selected_comment_idx,
+                *selected_member_idx,
+                editing_comment_id.as_deref(),
+                theme,
+            );
         }
         ModalType::ShareNote { permission_idx, .. } => {
             draw_share_note_modal(f, *permission_idx, theme);
@@ -686,6 +916,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             f,
             modal_title,
             title,
+            if app.task_title_editing {
+                app.task_title_cursor
+            } else {
+                title.len()
+            },
             desc,
             *desc_cursor,
             *priority,
@@ -705,11 +940,665 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
 
     // 7. Codex de atajos — se abre con [?] y cubre todo
     if app.workspace_help_open {
-        draw_workspace_help(f, theme, is_shared);
+        draw_workspace_help(f, app, theme, is_shared);
     }
 }
 
-fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
+fn draw_treasury_tab(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    campaign_id: uuid::Uuid,
+    theme: &Theme,
+    sidebar_focused: bool,
+) {
+    let service = crate::services::TreasuryService::new(&app.db);
+    let treasury = service.ensure_campaign(campaign_id).ok();
+    let totals = service
+        .calculate_campaign_totals(campaign_id)
+        .unwrap_or_default();
+    let mut filter = app.treasury_filter.clone();
+    if app.searching && !app.search_query.is_empty() {
+        filter.text = Some(app.search_query.clone());
+    }
+    let entries = service
+        .entries(campaign_id, &filter, app.treasury_sort)
+        .unwrap_or_default();
+    let categories = service
+        .calculate_category_totals(campaign_id)
+        .unwrap_or_default();
+    let upcoming = service
+        .upcoming_payments(campaign_id, Utc::now(), 30)
+        .unwrap_or_default();
+    let overdue = service
+        .overdue_payments(campaign_id, Utc::now())
+        .unwrap_or_default();
+    let currency = treasury
+        .as_ref()
+        .map(|value| crate::models::Currency::from_code_or_default(&value.currency_code))
+        .unwrap_or_default();
+    let border = if sidebar_focused {
+        theme.border
+    } else {
+        theme.primary
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(5),
+            Constraint::Min(9),
+            Constraint::Length(8),
+        ])
+        .split(area);
+
+    let summary = [
+        ("Budget", totals.budget_minor),
+        ("Income", totals.income_minor),
+        ("Paid", totals.paid_minor),
+        ("Committed", totals.committed_minor),
+        ("Available", totals.available_minor),
+    ];
+    let summary_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(1, 5); 5])
+        .split(sections[0]);
+    for (index, (label, amount)) in summary.into_iter().enumerate() {
+        let color = if label == "Available" && amount < 0 {
+            theme.danger
+        } else {
+            theme.text
+        };
+        f.render_widget(
+            Paragraph::new(vec![
+                Line::from(Span::styled(label, Style::default().fg(theme.muted))),
+                Line::from(Span::styled(
+                    crate::services::treasury::format_money(amount, currency),
+                    Style::default().fg(color).add_modifier(Modifier::BOLD),
+                )),
+            ])
+            .alignment(Alignment::Center)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(border)),
+            ),
+            summary_chunks[index],
+        );
+    }
+
+    let role = app.treasury_role(campaign_id);
+    let members = app
+        .db
+        .get_project_members(&campaign_id.to_string())
+        .unwrap_or_default();
+    let recorded_by = |entry: &crate::models::LedgerEntry| -> String {
+        match entry.created_by_identity.as_deref() {
+            Some(identity) if identity == app.identity.public_key => "You".to_string(),
+            Some(identity) => members
+                .iter()
+                .find(|(member, _, _)| member == identity)
+                .map(|(_, username, _)| username.clone())
+                .unwrap_or_else(|| format!("{}…", &identity[..identity.len().min(6)])),
+            None => "—".to_string(),
+        }
+    };
+    let transaction_rows = entries.iter().enumerate().map(|(index, entry)| {
+        let style = if index == app.selected_treasury_idx {
+            Style::default().fg(Color::Black).bg(theme.selection)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        Row::new(vec![
+            Cell::from(entry.created_at.format("%Y-%m-%d").to_string()),
+            Cell::from(entry.title.clone()),
+            Cell::from(entry.entry_type.as_str()),
+            Cell::from(entry.status.as_str()),
+            Cell::from(crate::services::treasury::format_money(
+                entry.amount_minor,
+                crate::models::Currency::from_code_or_default(&entry.currency_code),
+            )),
+            Cell::from(recorded_by(entry)),
+            Cell::from(
+                entry
+                    .due_date
+                    .map(|date| date.format("%Y-%m-%d").to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+        ])
+        .style(style)
+    });
+    let title = format!(
+        " Recent Transactions · {:?} · {} items · {} · {} ",
+        app.treasury_sort,
+        entries.len(),
+        currency.code(),
+        role.label()
+    );
+    let table = Table::new(
+        transaction_rows,
+        [
+            Constraint::Length(11),
+            Constraint::Min(16),
+            Constraint::Length(10),
+            Constraint::Length(10),
+            Constraint::Length(16),
+            Constraint::Length(12),
+            Constraint::Length(11),
+        ],
+    )
+    .header(
+        Row::new([
+            "Date",
+            "Title",
+            "Type",
+            "Status",
+            "Amount",
+            "Recorded by",
+            "Due",
+        ])
+        .style(
+            Style::default()
+                .fg(theme.primary)
+                .add_modifier(Modifier::BOLD),
+        ),
+    )
+    .column_spacing(1)
+    .block(
+        Block::default()
+            .title(title)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border)),
+    );
+    f.render_widget(table, sections[1]);
+
+    let lower = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
+        .split(sections[2]);
+    let category_lines = categories
+        .into_iter()
+        .take(5)
+        .map(|item| {
+            let usage = item.budget_minor.map(|budget| {
+                crate::services::TreasuryService::budget_usage(budget, item.spending_minor)
+            });
+            let marker = usage
+                .map(|usage| match usage.warning {
+                    crate::models::BudgetWarningLevel::Healthy => "",
+                    crate::models::BudgetWarningLevel::EightyPercent => "  ! 80%",
+                    crate::models::BudgetWarningLevel::NinetyPercent => "  !! 90%",
+                    crate::models::BudgetWarningLevel::Exhausted => "  !!! 100%",
+                    crate::models::BudgetWarningLevel::Exceeded => "  !!! EXCEEDED",
+                })
+                .unwrap_or("");
+            let bar = usage
+                .map(|usage| {
+                    let filled = (usage.ratio.clamp(0.0, 1.0) * 10.0).round() as usize;
+                    format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled))
+                })
+                .unwrap_or_else(|| "[no budget]".to_string());
+            Line::from(format!(
+                "{} {}  {} spent  {} remaining{}",
+                item.category.name,
+                bar,
+                crate::services::treasury::format_money(item.spending_minor, currency),
+                item.remaining_minor
+                    .map(|value| crate::services::treasury::format_money(value, currency))
+                    .unwrap_or_else(|| "—".to_string()),
+                marker
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_widget(
+        Paragraph::new(category_lines).block(
+            Block::default()
+                .title(" Category Breakdown ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border)),
+        ),
+        lower[0],
+    );
+    let due_lines = vec![
+        Line::from(vec![
+            Span::styled("Upcoming (30d): ", Style::default().fg(theme.muted)),
+            Span::styled(
+                upcoming.len().to_string(),
+                Style::default().fg(theme.warning),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Overdue: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                overdue.len().to_string(),
+                Style::default().fg(if overdue.is_empty() {
+                    theme.text
+                } else {
+                    theme.danger
+                }),
+            ),
+        ]),
+    ];
+    f.render_widget(
+        Paragraph::new(due_lines).block(
+            Block::default()
+                .title(" Due Dates ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.border)),
+        ),
+        lower[1],
+    );
+}
+
+fn draw_treasury_entry_modal(
+    f: &mut Frame,
+    app: &App,
+    title: &str,
+    amount: &str,
+    entry_type_idx: usize,
+    status_idx: usize,
+    category_idx: usize,
+    focus_idx: usize,
+    theme: &Theme,
+) {
+    let area = centered_rect(62, 48, f.size());
+    f.render_widget(Clear, area);
+    let categories = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .categories(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let currency = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .campaign_currency(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let entry_types = ["Income", "Expense", "Transfer", "Adjustment"];
+    let statuses = ["Planned", "Approved", "Paid", "Cancelled"];
+    let category = categories
+        .get(category_idx)
+        .map(|value| value.name.as_str())
+        .unwrap_or("Other");
+    let field = |index: usize, label: &str, value: String| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label:<12}"),
+                Style::default().fg(if focus_idx == index {
+                    theme.primary
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                value,
+                Style::default()
+                    .fg(theme.text)
+                    .add_modifier(if focus_idx == index {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+        ])
+    };
+    let lines = vec![
+        field(
+            0,
+            "Title",
+            format!("{}{}", title, if focus_idx == 0 { "_" } else { "" }),
+        ),
+        Line::from(""),
+        field(
+            1,
+            &format!("Amount ({})", currency.code()),
+            format!("{}{}", amount, if focus_idx == 1 { "_" } else { "" }),
+        ),
+        Line::from(""),
+        field(
+            2,
+            "Type",
+            format!("◀ {} ▶", entry_types[entry_type_idx.min(3)]),
+        ),
+        field(3, "Status", format!("◀ {} ▶", statuses[status_idx.min(3)])),
+        field(4, "Category", format!("◀ {} ▶", category)),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab/↑↓ field · ←→ choice · Enter continue/save · Esc cancel",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" New Treasury Entry ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_task_expense_completion_modal(f: &mut Frame, selected_idx: usize, theme: &Theme) {
+    let area = centered_rect(58, 38, f.size());
+    f.render_widget(Clear, area);
+    let options = [
+        "Record Actual Expense",
+        "Keep Estimate Only",
+        "Complete Without Expense",
+    ];
+    let items = options
+        .into_iter()
+        .enumerate()
+        .map(|(index, option)| {
+            let style = if index == selected_idx {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(theme.selection)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            ListItem::new(format!("  {option}")).style(style)
+        })
+        .collect::<Vec<_>>();
+    let block = Block::default()
+        .title(" Complete Task · Financial Choice ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    f.render_widget(Paragraph::new("This task has an estimated cost. Completion never creates an expense without your choice.")
+        .wrap(ratatui::widgets::Wrap { trim: true }), chunks[0]);
+    f.render_widget(List::new(items), chunks[1]);
+    f.render_widget(
+        Paragraph::new("↑↓ choose · Enter confirm · Esc cancel")
+            .style(Style::default().fg(theme.muted)),
+        chunks[2],
+    );
+}
+
+fn draw_treasury_budget_modal(
+    f: &mut Frame,
+    app: &App,
+    amount: &str,
+    target_idx: usize,
+    focus_idx: usize,
+    theme: &Theme,
+) {
+    let area = centered_rect(56, 34, f.size());
+    f.render_widget(Clear, area);
+    let categories = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .categories(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let target = if target_idx == 0 {
+        "Overall Campaign"
+    } else {
+        categories
+            .get(target_idx - 1)
+            .map(|category| category.name.as_str())
+            .unwrap_or("Overall Campaign")
+    };
+    let currency = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .campaign_currency(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("Amount ({})  ", currency.code()),
+                Style::default().fg(if focus_idx == 0 {
+                    theme.primary
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                format!("{}{}", amount, if focus_idx == 0 { "_" } else { "" }),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Target  ",
+                Style::default().fg(if focus_idx == 1 {
+                    theme.primary
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(format!("◀ {target} ▶"), Style::default().fg(theme.text)),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Tab field · ←→ target · Enter save · Esc cancel",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Budget Management ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_task_financials_modal(
+    f: &mut Frame,
+    app: &App,
+    estimated: &str,
+    actual: &str,
+    billable: &str,
+    payment_status_idx: usize,
+    focus_idx: usize,
+    theme: &Theme,
+) {
+    let area = centered_rect(58, 42, f.size());
+    f.render_widget(Clear, area);
+    let currency = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .campaign_currency(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let statuses = ["Not Billable", "Unbilled", "Invoiced", "Paid"];
+    let field = |index: usize, label: &str, value: &str| {
+        Line::from(vec![
+            Span::styled(
+                format!("{label:<17}"),
+                Style::default().fg(if focus_idx == index {
+                    theme.primary
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                format!("{}{}", value, if focus_idx == index { "_" } else { "" }),
+                Style::default().fg(theme.text),
+            ),
+        ])
+    };
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("Amounts in {}", currency.label()),
+            Style::default().fg(theme.muted),
+        )),
+        Line::from(""),
+        field(0, "Estimated Cost", estimated),
+        Line::from(""),
+        field(1, "Actual Cost", actual),
+        Line::from(""),
+        field(2, "Billable Amount", billable),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "Payment Status   ",
+                Style::default().fg(if focus_idx == 3 {
+                    theme.primary
+                } else {
+                    theme.muted
+                }),
+            ),
+            Span::styled(
+                format!("◀ {} ▶", statuses[payment_status_idx.min(3)]),
+                Style::default().fg(theme.text),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Blank amounts remain unset · Tab field · Enter save",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Task Financial Details ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_treasury_category_modal(f: &mut Frame, name: &str, theme: &Theme) {
+    let area = centered_rect(52, 24, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("Create a campaign-specific ledger category."),
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("Name  {name}_"),
+                Style::default().fg(theme.text),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter save · Esc cancel",
+                Style::default().fg(theme.muted),
+            )),
+        ])
+        .block(
+            Block::default()
+                .title(" Custom Treasury Category ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_treasury_currency_modal(f: &mut Frame, app: &App, selected_idx: usize, theme: &Theme) {
+    let area = centered_rect(58, 34, f.size());
+    f.render_widget(Clear, area);
+    let active = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .campaign_currency(id)
+                .ok()
+        })
+        .unwrap_or_default();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "Pick the currency this campaign works in.",
+            Style::default().fg(theme.text),
+        )),
+        Line::from(""),
+    ];
+    for (index, currency) in crate::models::Currency::ALL.into_iter().enumerate() {
+        let selected = index == selected_idx.min(crate::models::Currency::ALL.len() - 1);
+        let marker = if currency == active { " (current)" } else { "" };
+        lines.push(Line::from(Span::styled(
+            format!(
+                "{} {}{}",
+                if selected { "▸" } else { " " },
+                currency.label(),
+                marker
+            ),
+            if selected {
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.muted)
+            },
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Amounts are relabeled, never converted.",
+        Style::default().fg(theme.warning),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "↑↓ select · Enter save · Esc cancel",
+        Style::default().fg(theme.muted),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(" Campaign Currency ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool) {
+    let role = if is_shared {
+        app.active_project_id
+            .and_then(|project_id| {
+                app.db
+                    .get_member_role(&project_id.to_string(), &app.identity.public_key)
+                    .ok()
+                    .flatten()
+            })
+            .unwrap_or_else(|| "Companion".to_string())
+    } else {
+        "Solo Adventurer".to_string()
+    };
+    let can_edit = !is_shared || role != "Observer";
+    let can_assign = !is_shared || matches!(role.as_str(), "Owner" | "Steward");
+    let can_judge_all = !is_shared || matches!(role.as_str(), "Owner" | "Steward");
     let area = centered_rect(78, 88, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -722,7 +1611,11 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         .border_type(BorderType::Double)
         .border_style(Style::default().fg(theme.primary))
         .title(Span::styled(
-            " ✦ Quest Codex: Keybindings ✦ ",
+            if is_shared {
+                format!(" ✦ Fellowship Quest Guide · {} ✦ ", role)
+            } else {
+                " ✦ Quest Codex: Keybindings ✦ ".to_string()
+            },
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),
@@ -768,29 +1661,57 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
 
     let left: Vec<Line> = vec![
         Line::from(vec![h("  1 · QUESTS")]),
-        binding("n", "New quest", true),
-        binding("Enter / e", "Edit quest", true),
-        binding("Space", "Complete / reopen", true),
-        binding("Delete", "Delete quest", true),
+        binding("n", "New quest", can_edit),
+        binding(
+            "Enter",
+            if app.quest_board_open {
+                "Open quest steps"
+            } else {
+                "Edit quest"
+            },
+            true,
+        ),
+        binding("e", "Edit quest", can_edit),
+        binding("Space", "Complete / reopen", can_edit),
+        binding("Delete", "Delete quest", can_edit),
         binding("→", "View steps", true),
-        binding("+", "Add step", true),
+        binding("+", "Add step", can_edit),
+        binding(
+            "g / Shift+g",
+            if can_judge_all {
+                "Move quest stance forward / back"
+            } else if can_edit {
+                "Move assigned stance forward / back"
+            } else {
+                "View quest stance"
+            },
+            can_edit,
+        ),
+        if is_shared {
+            binding("c", "Open Quest Council", can_edit)
+        } else {
+            Line::from("")
+        },
         binding("f", "Cycle filter", true),
         binding("s", "Cycle sort", true),
         binding(
             "a",
-            if is_shared {
-                "Assign member"
+            if can_assign {
+                "Assign quest / step"
+            } else if is_shared {
+                "Assignment (Owner / Steward)"
             } else {
                 "Assign (shared only)"
             },
-            is_shared,
+            is_shared && can_assign,
         ),
         Line::from(vec![]),
         Line::from(vec![h("  STEP VIEW")]),
-        binding("n", "New step", true),
-        binding("Enter / e", "Edit step", true),
-        binding("Space", "Complete / reopen", true),
-        binding("Delete", "Delete step", true),
+        binding("n", "New step", can_edit),
+        binding("Enter / e", "Edit step", can_edit),
+        binding("Space", "Resolve / reopen step", can_edit),
+        binding("a", "Assign selected step", is_shared && can_assign),
+        binding("Delete", "Delete step", can_edit),
         binding("← / Esc", "Back to quests", true),
         Line::from(vec![]),
         Line::from(vec![h("  NAVIGATION")]),
@@ -799,28 +1720,61 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         binding("Shift+Tab", "Previous pane", true),
         binding("↑ / ↓", "Navigate items", true),
         binding("C", "Quest calendar", true),
+        binding("B", "Council Briefing", is_shared),
+        binding("K", "Toggle Ledger / Kanban", true),
+        binding("L", "Link Quest blockers", can_edit),
         binding("/", "Search", true),
         binding("Esc", "Exit workspace", true),
     ];
 
-    let right: Vec<Line> = vec![
+    let mut right: Vec<Line> = Vec::new();
+    if is_shared {
+        right.extend([
+            Line::from(vec![h("  FELLOWSHIP WORKFLOW")]),
+            Line::from(vec![m(if can_assign {
+                "  Assign: select quest/step → [a] → member → Enter"
+            } else {
+                "  Assignment: only Owners and Stewards may assign"
+            })]),
+            Line::from(vec![m(if can_judge_all {
+                "  Judge: [g] advances and [Shift+g] reverses the selected stance"
+            } else if can_edit {
+                "  Judge: [g/Shift+g] moves stances only on quests assigned to you"
+            } else {
+                "  Judgment: observe stances and Council decisions"
+            })]),
+            Line::from(vec![m(if can_edit {
+                "  Council: select a parent quest → [c] → write → Enter"
+            } else {
+                "  Council: you may read messages but cannot issue them"
+            })]),
+            Line::from(vec![m(
+                "  Steps inherit parent stance; [Space] resolves each step",
+            )]),
+            Line::from(vec![m(
+                "  Kanban shows parent quests; use Ledger to manage steps",
+            )]),
+            Line::from(vec![]),
+        ]);
+    }
+    right.extend(vec![
         Line::from(vec![h("  2 · SCROLLS")]),
-        binding("n", "New scroll", true),
-        binding("Enter / e", "Edit scroll", true),
-        binding("d", "New codex", true),
-        binding("r", "Move scroll / codex", true),
-        binding("Delete", "Delete scroll", true),
+        binding("n", "New scroll", can_edit),
+        binding("Enter / e", "Edit scroll", can_edit),
+        binding("d", "New codex", can_edit),
+        binding("r", "Move scroll / codex", can_edit),
+        binding("Delete", "Delete scroll", can_edit),
         Line::from(vec![]),
         Line::from(vec![h("  3 · CHRONICLES")]),
-        binding("j", "New journal log", true),
-        binding("v", "Toggle visibility", true),
-        binding("Delete", "Delete entry", true),
+        binding("n", "New journal log", can_edit),
+        binding("v", "Toggle visibility", can_edit),
+        binding("Delete", "Delete entry", can_edit),
         Line::from(vec![]),
         Line::from(vec![h("  4 · OVERVIEW")]),
-        binding("m", "New milestone", true),
-        binding("Space", "Toggle milestone", true),
-        binding("Delete", "Remove milestone", true),
-        binding("c", "Conquer campaign", true),
+        binding("m", "New milestone", can_edit),
+        binding("Space", "Toggle milestone", can_edit),
+        binding("Delete", "Remove milestone", can_edit),
+        binding("c", "Conquer campaign", can_edit),
         Line::from(vec![]),
         Line::from(vec![h("  QUEST OPTIONS")]),
         Line::from(vec![
@@ -837,7 +1791,68 @@ fn draw_workspace_help(f: &mut Frame, theme: &Theme, is_shared: bool) {
         Line::from(vec![h("  RECURRENCE")]),
         Line::from(vec![m("  Use ← / → / Space in the quest modal")]),
         Line::from(vec![m("  None → Daily → Weekly → Monthly → Yearly")]),
-    ];
+        Line::from(vec![]),
+        Line::from(vec![h("  5 · TREASURY")]),
+    ]);
+    // Cada atajo se muestra activo o apagado según lo que el rol permite de verdad.
+    {
+        use crate::services::treasury_policy::{TreasuryAction, allows};
+        let treasury_role = app
+            .active_project_id
+            .map(|project_id| app.treasury_role(project_id))
+            .unwrap_or(crate::services::treasury_policy::TreasuryRole::Solo);
+        right.push(binding(
+            "n",
+            "Record entry",
+            allows(treasury_role, TreasuryAction::RecordEntry),
+        ));
+        right.push(binding(
+            "e / d",
+            "Edit / delete entry",
+            allows(
+                treasury_role,
+                TreasuryAction::EditEntry {
+                    mine: true,
+                    status: crate::models::LedgerStatus::Planned,
+                },
+            ),
+        ));
+        right.push(binding(
+            "a",
+            "Approve entry",
+            allows(treasury_role, TreasuryAction::ApproveEntry),
+        ));
+        right.push(binding(
+            "p",
+            "Settle payment",
+            allows(treasury_role, TreasuryAction::MarkPaid),
+        ));
+        right.push(binding(
+            "B",
+            "Set budgets",
+            allows(treasury_role, TreasuryAction::SetOverallBudget),
+        ));
+        right.push(binding(
+            "c",
+            "Manage categories",
+            allows(treasury_role, TreasuryAction::ManageCategories),
+        ));
+        right.push(binding(
+            "$",
+            "Switch currency",
+            allows(treasury_role, TreasuryAction::SwitchCurrency),
+        ));
+        right.push(binding("x", "Export ledger", true));
+        if is_shared {
+            right.push(Line::from(vec![]));
+            right.push(Line::from(vec![m(
+                "  Companions record their own entries;",
+            )]));
+            right.push(Line::from(vec![m(
+                "  Owner and Stewards approve and settle.",
+            )]));
+        }
+    }
 
     let inner = Rect {
         x: area.x + 2,
@@ -1123,6 +2138,9 @@ fn draw_tasks_tab(
     filter: &str,
     sort: &str,
     assignees: &[(String, String)],
+    selected_quest_status: crate::models::QuestStatus,
+    comments: &[crate::database::TaskComment],
+    dependencies: &[(String, bool)],
     theme: &Theme,
     sidebar_focused: bool,
     all_tasks: &[Task],
@@ -1130,6 +2148,7 @@ fn draw_tasks_tab(
     parent_quest_title: Option<&str>,
     is_shared: bool,
     my_identity: &str,
+    db: &crate::database::Database,
 ) {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused {
@@ -1191,6 +2210,22 @@ fn draw_tasks_tab(
                         Span::styled(&t.title, title_style),
                     ]))
                 } else {
+                    let quest_status = db
+                        .get_quest_status(&t.id.to_string(), t.completed)
+                        .unwrap_or(QuestStatus::Backlog);
+                    let has_unresolved_dependencies = db
+                        .has_unresolved_task_dependencies(&t.id.to_string())
+                        .unwrap_or(false);
+                    let blocks_other_quests = !t.completed
+                        && db
+                            .get_tasks_blocked_by(&t.id.to_string())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .any(|dependent_id| {
+                                all_tasks.iter().any(|candidate| {
+                                    candidate.id.to_string() == dependent_id && !candidate.completed
+                                })
+                            });
                     // Fila de tarea padre — coloreamos según prioridad, chido
                     let prio_style = match t.priority {
                         TaskPriority::High => Style::default()
@@ -1292,11 +2327,49 @@ fn draw_tasks_tab(
                         }
                         ListItem::new(Line::from(spans))
                     } else {
+                        let quest_style = if is_sel {
+                            select_style
+                        } else if quest_status == QuestStatus::Blocked
+                            || has_unresolved_dependencies
+                        {
+                            Style::default()
+                                .fg(theme.danger)
+                                .add_modifier(Modifier::BOLD)
+                        } else if blocks_other_quests {
+                            Style::default()
+                                .fg(Color::Magenta)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            select_style
+                        };
                         let mut spans = vec![
-                            Span::styled(format!(" {} ", status), select_style),
+                            Span::styled(format!(" {} ", status), quest_style),
                             Span::styled(format!("({}) ", t.priority.name()), prio_style),
-                            Span::styled(&t.title, select_style),
+                            Span::styled(&t.title, quest_style),
                         ];
+                        if quest_status == QuestStatus::Blocked || has_unresolved_dependencies {
+                            spans.push(Span::styled(
+                                " [BLOCKED]",
+                                if is_sel {
+                                    theme.selected_style()
+                                } else {
+                                    Style::default()
+                                        .fg(theme.danger)
+                                        .add_modifier(Modifier::BOLD)
+                                },
+                            ));
+                        } else if blocks_other_quests {
+                            spans.push(Span::styled(
+                                " [BLOCKER]",
+                                if is_sel {
+                                    theme.selected_style()
+                                } else {
+                                    Style::default()
+                                        .fg(Color::Magenta)
+                                        .add_modifier(Modifier::BOLD)
+                                },
+                            ));
+                        }
                         if !step_badge.is_empty() {
                             spans.push(Span::styled(step_badge, Style::default().fg(theme.muted)));
                         }
@@ -1337,6 +2410,11 @@ fn draw_tasks_tab(
     let list_title = if let Some(parent_title) = parent_quest_title {
         format!(" Steps for: {} ", parent_title)
     } else {
+        let filter_label = if filter.starts_with("Assignee:") {
+            "Companion"
+        } else {
+            filter
+        };
         let sort_label = match sort {
             "DueDate" => "Due Date",
             "Priority" => "Priority",
@@ -1344,8 +2422,8 @@ fn draw_tasks_tab(
             _ => "Created Date",
         };
         format!(
-            " Quests [Filter: {}] [Sort: {} — open first] ",
-            filter, sort_label
+            " Quests [Filter: {}] [Sort: {} — open first]  [g/G] stance ± ",
+            filter_label, sort_label
         )
     };
 
@@ -1412,13 +2490,11 @@ fn draw_tasks_tab(
             Line::from(vec![
                 Span::styled("  Status:      ", Style::default().fg(theme.muted)),
                 Span::styled(
-                    if t.completed {
-                        "Completed Quest"
-                    } else {
-                        "Active Adventure"
-                    },
-                    if t.completed {
+                    selected_quest_status.display_name(),
+                    if selected_quest_status == crate::models::QuestStatus::Done {
                         Style::default().fg(theme.success)
+                    } else if selected_quest_status == crate::models::QuestStatus::Blocked {
+                        Style::default().fg(theme.danger)
                     } else {
                         Style::default().fg(theme.warning)
                     },
@@ -1427,6 +2503,23 @@ fn draw_tasks_tab(
             Line::from(""),
             Line::from("  Description:"),
         ];
+        if !dependencies.is_empty() {
+            text.push(Line::from(""));
+            text.push(Line::from(Span::styled(
+                "  Blocked by:",
+                Style::default().fg(theme.muted),
+            )));
+            for (title, completed) in dependencies {
+                text.push(Line::from(Span::styled(
+                    format!("  {} {}", if *completed { "[x]" } else { "[!]" }, title),
+                    Style::default().fg(if *completed {
+                        theme.muted
+                    } else {
+                        theme.danger
+                    }),
+                )));
+            }
+        }
         for line in desc.lines() {
             text.push(md_line(line, theme));
         }
@@ -1478,6 +2571,43 @@ fn draw_tasks_tab(
             ]));
         }
 
+        if is_shared {
+            text.push(Line::from(""));
+            text.push(Line::from(vec![
+                Span::styled("  Quest Council: ", Style::default().fg(theme.muted)),
+                Span::styled(
+                    format!(
+                        "{} message{}",
+                        comments.len(),
+                        if comments.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(Color::Magenta),
+                ),
+                Span::styled("  [c] convene", Style::default().fg(theme.warning)),
+            ]));
+            for comment in comments.iter().rev().take(3).rev() {
+                let body = if comment.deleted_at.is_some() {
+                    "[message withdrawn]".to_string()
+                } else {
+                    comment.content.clone()
+                };
+                let body = if comment.edited_at.is_some() {
+                    format!("{} (Edited)", body)
+                } else {
+                    body
+                };
+                text.push(Line::from(vec![
+                    Span::styled(
+                        format!("  @{}: ", comment.author_username),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(body, Style::default().fg(theme.text)),
+                ]));
+            }
+        }
+
         Paragraph::new(text)
             .block(
                 Block::default()
@@ -1489,6 +2619,662 @@ fn draw_tasks_tab(
             .wrap(ratatui::widgets::Wrap { trim: true })
     };
     f.render_widget(details_widget, sub_chunks[1]);
+}
+
+fn draw_quest_dependencies_modal(
+    f: &mut Frame,
+    app: &App,
+    task_id: uuid::Uuid,
+    selected_idx: usize,
+    theme: &Theme,
+) {
+    let Some(task) = app.all_tasks.iter().find(|task| task.id == task_id) else {
+        return;
+    };
+    let candidates = app
+        .all_tasks
+        .iter()
+        .filter(|candidate| {
+            candidate.project_id == task.project_id
+                && candidate.parent_task_id.is_none()
+                && candidate.id != task_id
+        })
+        .collect::<Vec<_>>();
+    let linked = app
+        .db
+        .get_task_dependencies(&task_id.to_string())
+        .unwrap_or_default();
+    let items = candidates
+        .iter()
+        .enumerate()
+        .map(|(idx, candidate)| {
+            let is_linked = linked.iter().any(|id| id == &candidate.id.to_string());
+            let check = if is_linked { "[x]" } else { "[ ]" };
+            let state = if candidate.completed {
+                "resolved"
+            } else {
+                "unresolved"
+            };
+            ListItem::new(format!(" {} {} · {}", check, candidate.title, state)).style(
+                if idx == selected_idx {
+                    theme.selected_style()
+                } else if candidate.completed {
+                    Style::default().fg(theme.muted)
+                } else {
+                    Style::default().fg(theme.text)
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let area = centered_rect(68, 64, f.size());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.primary))
+        .title(format!(" Blockers for {} ", task.title));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(2), Constraint::Length(2)])
+        .split(inner);
+    f.render_widget(List::new(items), chunks[0]);
+    f.render_widget(
+        Paragraph::new(" ↑↓ select · Space link/unlink · Enter/Esc close")
+            .style(Style::default().fg(theme.warning)),
+        chunks[1],
+    );
+}
+
+fn draw_council_briefing(f: &mut Frame, app: &App, selected_idx: usize, theme: &Theme) {
+    let Some(project_id) = app.active_project_id else {
+        return;
+    };
+    let quests = app
+        .all_tasks
+        .iter()
+        .filter(|task| task.project_id == Some(project_id) && task.parent_task_id.is_none())
+        .collect::<Vec<_>>();
+    let now = Utc::now();
+    let blocked = quests
+        .iter()
+        .filter(|task| {
+            app.db
+                .get_quest_status(&task.id.to_string(), task.completed)
+                .is_ok_and(|status| status == QuestStatus::Blocked)
+                || app
+                    .db
+                    .has_unresolved_task_dependencies(&task.id.to_string())
+                    .unwrap_or(false)
+        })
+        .count();
+    let review = quests
+        .iter()
+        .filter(|task| {
+            app.db
+                .get_quest_status(&task.id.to_string(), task.completed)
+                .is_ok_and(|status| status == QuestStatus::Review)
+        })
+        .count();
+    let overdue = quests
+        .iter()
+        .filter(|task| !task.completed && task.due_date.is_some_and(|due| due < now))
+        .count();
+    let due_soon = quests
+        .iter()
+        .filter(|task| {
+            !task.completed
+                && task
+                    .due_date
+                    .is_some_and(|due| due >= now && due <= now + Duration::days(7))
+        })
+        .count();
+    let unassigned = quests
+        .iter()
+        .filter(|task| {
+            app.db
+                .get_task_assignments(&task.id.to_string())
+                .unwrap_or_default()
+                .is_empty()
+        })
+        .count();
+    let sections = [
+        ("Blocked paths", blocked),
+        ("Awaiting judgment", review),
+        ("Overdue", overdue),
+        ("Due within seven days", due_soon),
+        ("Unassigned", unassigned),
+    ];
+    let section_items = sections
+        .iter()
+        .enumerate()
+        .map(|(idx, (label, count))| {
+            ListItem::new(format!("  {:<24} {}", label, count)).style(if idx == selected_idx {
+                theme.selected_style()
+            } else {
+                Style::default().fg(theme.text)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let members = app
+        .db
+        .get_presence_for_project(&project_id.to_string())
+        .unwrap_or_default();
+    let mut workload = members
+        .iter()
+        .enumerate()
+        .map(
+            |(idx, (identity, username, role, online, last_seen, current_project))| {
+                let count = quests
+                    .iter()
+                    .filter(|task| !task.completed)
+                    .filter(|task| {
+                        app.db
+                            .get_task_assignments(&task.id.to_string())
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|(assigned, _)| assigned == identity)
+                    })
+                    .count();
+                let assigned_open = quests
+                    .iter()
+                    .filter(|task| !task.completed)
+                    .filter(|task| {
+                        app.db
+                            .get_task_assignments(&task.id.to_string())
+                            .unwrap_or_default()
+                            .iter()
+                            .any(|(assigned, _)| assigned == identity)
+                    })
+                    .collect::<Vec<_>>();
+                let high = assigned_open
+                    .iter()
+                    .filter(|task| task.priority == TaskPriority::High)
+                    .count();
+                let overdue_for_member = assigned_open
+                    .iter()
+                    .filter(|task| task.due_date.is_some_and(|due| due < now))
+                    .count();
+                let blocked_for_member = assigned_open
+                    .iter()
+                    .filter(|task| {
+                        app.db
+                            .get_quest_status(&task.id.to_string(), task.completed)
+                            .is_ok_and(|status| status == QuestStatus::Blocked)
+                            || app
+                                .db
+                                .has_unresolved_task_dependencies(&task.id.to_string())
+                                .unwrap_or(false)
+                    })
+                    .count();
+                let band = workload_band(count, high, blocked_for_member, overdue_for_member);
+                let presence = if *online
+                    && current_project.as_deref() == Some(project_id.to_string().as_str())
+                {
+                    "here now".to_string()
+                } else if *online {
+                    "online".to_string()
+                } else if let Ok(seen) = DateTime::parse_from_rfc3339(last_seen) {
+                    let minutes = now
+                        .signed_duration_since(seen.with_timezone(&Utc))
+                        .num_minutes()
+                        .max(0);
+                    if minutes < 60 {
+                        format!("seen {}m ago", minutes)
+                    } else if minutes < 1440 {
+                        format!("seen {}h ago", minutes / 60)
+                    } else {
+                        format!("seen {}d ago", minutes / 1440)
+                    }
+                } else {
+                    "presence unknown".to_string()
+                };
+                ListItem::new(format!(
+                    "  @{} · {} · {} · {} open · H{} B{} O{} · {}",
+                    username,
+                    role,
+                    band,
+                    count,
+                    high,
+                    blocked_for_member,
+                    overdue_for_member,
+                    presence
+                ))
+                .style(if selected_idx == idx + 5 {
+                    theme.selected_style()
+                } else if *online {
+                    Style::default().fg(theme.success)
+                } else {
+                    Style::default().fg(theme.text)
+                })
+            },
+        )
+        .collect::<Vec<_>>();
+    if workload.is_empty() {
+        workload.push(ListItem::new("  No Fellowship members are cached yet."));
+    }
+    let mut review_items = quests
+        .iter()
+        .filter(|task| {
+            app.db
+                .get_quest_status(&task.id.to_string(), task.completed)
+                .is_ok_and(|status| status == QuestStatus::Review)
+        })
+        .map(|task| {
+            let assignees = app
+                .db
+                .get_task_assignments(&task.id.to_string())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(_, username)| format!("@{}", username))
+                .collect::<Vec<_>>();
+            let assignment = if assignees.is_empty() {
+                "UNASSIGNED".to_string()
+            } else {
+                assignees.join(", ")
+            };
+            ListItem::new(format!(
+                "  {} · {} · reviewers: Owner/Steward",
+                task.title, assignment
+            ))
+            .style(Style::default().fg(if assignees.is_empty() {
+                theme.danger
+            } else {
+                theme.text
+            }))
+        })
+        .collect::<Vec<_>>();
+    if review_items.is_empty() {
+        review_items.push(ListItem::new("  No Quests are awaiting judgment."));
+    }
+    let mut activity = app
+        .db
+        .get_activity_log_for_project(&project_id.to_string(), 5)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|event| ListItem::new(format!("  @{} {}", event.5, event.3)))
+        .collect::<Vec<_>>();
+    if activity.is_empty() {
+        activity.push(ListItem::new("  No recent shared activity yet."));
+    }
+
+    let area = centered_rect(82, 82, f.size());
+    f.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(theme.warning))
+        .title(" Council Briefing ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(7),
+            Constraint::Percentage(27),
+            Constraint::Percentage(23),
+            Constraint::Min(4),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    f.render_widget(
+        List::new(section_items).block(Block::default().borders(Borders::ALL).title(" Attention ")),
+        chunks[0],
+    );
+    f.render_widget(
+        List::new(workload).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Fellowship workload "),
+        ),
+        chunks[1],
+    );
+    f.render_widget(
+        List::new(review_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Awaiting Judgment · Enter queue "),
+        ),
+        chunks[2],
+    );
+    f.render_widget(
+        List::new(activity).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Recent activity "),
+        ),
+        chunks[3],
+    );
+    f.render_widget(
+        Paragraph::new(" ↑↓ choose queue/Companion · Enter open assigned Ledger · B/Esc close")
+            .style(Style::default().fg(theme.warning)),
+        chunks[4],
+    );
+}
+
+fn workload_band(open: usize, high: usize, blocked: usize, overdue: usize) -> &'static str {
+    if open >= 8 || high >= 5 || blocked >= 3 || overdue >= 2 {
+        "OVERLOADED"
+    } else if open <= 2 && high == 0 && blocked == 0 && overdue == 0 {
+        "AVAILABLE"
+    } else {
+        "BALANCED"
+    }
+}
+
+fn draw_quest_board(
+    f: &mut Frame,
+    area: Rect,
+    tasks: &[&Task],
+    selected_idx: usize,
+    app: &App,
+    theme: &Theme,
+    sidebar_focused: bool,
+) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let statuses = [
+        QuestStatus::Backlog,
+        QuestStatus::Ready,
+        QuestStatus::InProgress,
+        QuestStatus::Blocked,
+        QuestStatus::Review,
+        QuestStatus::Done,
+    ];
+
+    for (row_idx, row) in rows.iter().enumerate() {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(34),
+                Constraint::Percentage(33),
+                Constraint::Percentage(33),
+            ])
+            .split(*row);
+        for (column_idx, column) in columns.iter().enumerate() {
+            let status = statuses[row_idx * 3 + column_idx];
+            let cards: Vec<ListItem> = tasks
+                .iter()
+                .enumerate()
+                .filter(|(_, task)| task.parent_task_id.is_none())
+                .filter_map(|(task_idx, task)| {
+                    let task_status = app
+                        .db
+                        .get_quest_status(&task.id.to_string(), task.completed)
+                        .ok()?;
+                    if task_status != status {
+                        return None;
+                    }
+                    let marker = if task_idx == selected_idx {
+                        "▶ "
+                    } else {
+                        "  "
+                    };
+                    let priority = match task.priority {
+                        TaskPriority::High => " !",
+                        TaskPriority::Medium => " ·",
+                        TaskPriority::Low => "",
+                    };
+                    let is_blocked = task_status == QuestStatus::Blocked
+                        || app
+                            .db
+                            .has_unresolved_task_dependencies(&task.id.to_string())
+                            .unwrap_or(false);
+                    let is_blocker = !task.completed
+                        && app
+                            .db
+                            .get_tasks_blocked_by(&task.id.to_string())
+                            .unwrap_or_default()
+                            .into_iter()
+                            .any(|dependent_id| {
+                                app.all_tasks.iter().any(|candidate| {
+                                    candidate.id.to_string() == dependent_id && !candidate.completed
+                                })
+                            });
+                    let blocker = if is_blocked {
+                        " [BLOCKED]"
+                    } else if is_blocker {
+                        " [BLOCKER]"
+                    } else {
+                        ""
+                    };
+                    let step_count = app
+                        .all_tasks
+                        .iter()
+                        .filter(|step| step.parent_task_id == Some(task.id))
+                        .count();
+                    let completed_step_count = app
+                        .all_tasks
+                        .iter()
+                        .filter(|step| step.parent_task_id == Some(task.id) && step.completed)
+                        .count();
+                    let steps = if step_count > 0 {
+                        let steps_left = step_count.saturating_sub(completed_step_count);
+                        format!(
+                            " · {} step{} ({} left)",
+                            step_count,
+                            if step_count == 1 { "" } else { "s" },
+                            steps_left
+                        )
+                    } else {
+                        String::new()
+                    };
+                    let style = if task_idx == selected_idx {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(theme.selection)
+                            .add_modifier(Modifier::BOLD)
+                    } else if task.completed {
+                        Style::default().fg(theme.muted)
+                    } else if is_blocked {
+                        Style::default()
+                            .fg(theme.danger)
+                            .add_modifier(Modifier::BOLD)
+                    } else if is_blocker {
+                        Style::default()
+                            .fg(Color::Magenta)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(theme.text)
+                    };
+                    Some(
+                        ListItem::new(format!(
+                            "{}{}{}{}{}",
+                            marker, task.title, priority, blocker, steps
+                        ))
+                        .style(style),
+                    )
+                })
+                .collect();
+            let count = cards.len();
+            let selected_in_column = tasks.get(selected_idx).and_then(|task| {
+                app.db
+                    .get_quest_status(&task.id.to_string(), task.completed)
+                    .ok()
+            }) == Some(status);
+            let content_focused = !sidebar_focused && selected_in_column;
+            let border = if content_focused {
+                theme.primary
+            } else {
+                theme.border
+            };
+            let title = format!(
+                " {} ({}){} ",
+                status.display_name(),
+                count,
+                if content_focused { " [FOCUS]" } else { "" }
+            );
+            f.render_widget(
+                List::new(cards).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .border_style(Style::default().fg(border))
+                        .title(title),
+                ),
+                *column,
+            );
+        }
+    }
+}
+
+fn draw_quest_council_modal(
+    f: &mut Frame,
+    app: &App,
+    task_id: uuid::Uuid,
+    content: &str,
+    selected_comment_idx: usize,
+    selected_member_idx: usize,
+    editing_comment_id: Option<&str>,
+    theme: &Theme,
+) {
+    let area = centered_rect(70, 66, f.size());
+    f.render_widget(Clear, area);
+    let quest = app
+        .all_tasks
+        .iter()
+        .find(|task| task.id == task_id)
+        .map(|task| task.title.as_str())
+        .unwrap_or("Quest");
+    let members = app
+        .active_project_id
+        .and_then(|id| app.db.get_project_members(&id.to_string()).ok())
+        .unwrap_or_default();
+    let comments = app
+        .db
+        .get_task_comments(&task_id.to_string())
+        .unwrap_or_default();
+    let mention_query = council_mention_query(content);
+    let mention_candidates = mention_query
+        .map(|query| {
+            let query = query.to_lowercase();
+            members
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, username, _))| username.to_lowercase().contains(&query))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mention_height = if mention_query.is_some() {
+        mention_candidates.len().clamp(1, 4) as u16 + 2
+    } else {
+        2
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .border_style(Style::default().fg(Color::Magenta))
+        .title(format!(" Quest Council · {} ", quest));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(5),
+            Constraint::Length(mention_height),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let history = if comments.is_empty() {
+        vec![ListItem::new("  No Council messages yet.")]
+    } else {
+        comments
+            .iter()
+            .enumerate()
+            .map(|(idx, comment)| {
+                let selected = idx == selected_comment_idx;
+                let body = if comment.deleted_at.is_some() {
+                    "[message withdrawn]".to_string()
+                } else {
+                    comment.content.clone()
+                };
+                let body = if comment.edited_at.is_some() {
+                    format!("{} (Edited)", body)
+                } else {
+                    body
+                };
+                ListItem::new(format!("  @{}\n    {}", comment.author_username, body)).style(
+                    if selected {
+                        theme.selected_style()
+                    } else {
+                        Style::default().fg(theme.text)
+                    },
+                )
+            })
+            .collect()
+    };
+    let mut history_state = ListState::default();
+    history_state.select(
+        (!comments.is_empty())
+            .then_some(selected_comment_idx.min(comments.len().saturating_sub(1))),
+    );
+    f.render_stateful_widget(
+        List::new(history).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Council history · ↑↓ select "),
+        ),
+        chunks[0],
+        &mut history_state,
+    );
+    f.render_widget(
+        Paragraph::new(content)
+            .style(Style::default().fg(theme.text))
+            .wrap(ratatui::widgets::Wrap { trim: false })
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(if editing_comment_id.is_some() {
+                        " Revising message "
+                    } else {
+                        " New Council message "
+                    }),
+            ),
+        chunks[1],
+    );
+    if mention_query.is_some() {
+        let items = if mention_candidates.is_empty() {
+            vec![ListItem::new("  No matching Companions").style(Style::default().fg(theme.muted))]
+        } else {
+            mention_candidates
+                .iter()
+                .map(|(_, (_, username, role))| {
+                    ListItem::new(format!("  @{} · {}", username, role))
+                })
+                .collect()
+        };
+        let selected = mention_candidates
+            .iter()
+            .position(|(index, _)| *index == selected_member_idx)
+            .or((!mention_candidates.is_empty()).then_some(0));
+        let mut state = ListState::default();
+        state.select(selected);
+        f.render_stateful_widget(
+            List::new(items).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Mention Companion · type to filter · ↑↓ choose · Enter insert "),
+            ),
+            chunks[2],
+            &mut state,
+        );
+    } else {
+        f.render_widget(
+            Paragraph::new(" Type @ to mention a Companion")
+                .style(Style::default().fg(Color::Cyan)),
+            chunks[2],
+        );
+    }
+    f.render_widget(
+        Paragraph::new(" Enter send · Ctrl+E revise · Ctrl+D withdraw · Esc close")
+            .style(Style::default().fg(theme.warning)),
+        chunks[3],
+    );
 }
 
 // ── Markdown preview helpers ─────────────────────────────────────────────────
@@ -2079,6 +3865,7 @@ fn draw_journal_tab(
     f: &mut Frame,
     area: Rect,
     journals: &[&JournalEntry],
+    treasury_events: &[String],
     selected_idx: usize,
     theme: &Theme,
     sidebar_focused: bool,
@@ -2091,9 +3878,39 @@ fn draw_journal_tab(
         accent_color
     };
 
+    let journal_area = if treasury_events.is_empty() {
+        area
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(6), Constraint::Min(5)])
+            .split(area);
+        let lines = treasury_events
+            .iter()
+            .take(4)
+            .map(|event| {
+                Line::from(Span::styled(
+                    event.clone(),
+                    Style::default().fg(theme.warning),
+                ))
+            })
+            .collect::<Vec<_>>();
+        f.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .title(" Treasury Events ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(content_border)),
+            ),
+            chunks[0],
+        );
+        chunks[1]
+    };
+
     let items: Vec<ListItem> = if journals.is_empty() {
         vec![ListItem::new(
-            "  No daily logs recorded. Press [j] to write chronicle.",
+            "  No daily logs recorded. Press [n] to write chronicle.",
         )]
     } else {
         journals
@@ -2142,7 +3959,7 @@ fn draw_journal_tab(
             .border_style(Style::default().fg(content_border))
             .title(" Campaign Chronicles"),
     );
-    f.render_widget(list_widget, area);
+    f.render_widget(list_widget, journal_area);
 }
 
 // El tab de overview — métricas del proyecto, barra de progreso y lista de milestones con su avance
@@ -2536,6 +4353,7 @@ fn draw_task_modal(
     f: &mut Frame,
     title: &str,
     task_title: &str,
+    title_cursor: usize,
     task_desc: &str,
     desc_cursor: usize,
     priority: TaskPriority,
@@ -2573,16 +4391,23 @@ fn draw_task_modal(
 
     const DESC_BOX_HEIGHT: u16 = 12;
     const DESC_VISIBLE_LINES: usize = DESC_BOX_HEIGHT as usize - 2;
-    const STEPS_BOX_HEIGHT: u16 = 8;
-
-    let base_height: u16 = match (hide_desc, show_steps) {
-        (false, true) => 78,
-        (false, false) => 58,
-        (true, true) => 64,
-        (true, false) => 42,
+    // Two hint rows when empty; otherwise show at most six steps and scroll.
+    let steps_content_height = steps.len().clamp(2, 6) as u16;
+    let steps_box_height = steps_content_height + 2;
+    let content_height = 3
+        + if hide_desc { 0 } else { DESC_BOX_HEIGHT }
+        + 3
+        + if show_recurrence { 3 } else { 0 }
+        + if show_steps { steps_box_height } else { 0 }
+        + 2;
+    let modal_height = (content_height + 2).min(f.size().height);
+    let full_width = centered_rect(65, 100, f.size());
+    let area = Rect {
+        x: full_width.x,
+        y: f.size().y + f.size().height.saturating_sub(modal_height) / 2,
+        width: full_width.width,
+        height: modal_height,
     };
-    let modal_height = base_height + if show_recurrence { 4 } else { 0 };
-    let area = centered_rect(65, modal_height, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
         Block::default().style(Style::default().bg(theme.background)),
@@ -2600,15 +4425,22 @@ fn draw_task_modal(
         constraints.push(Constraint::Length(3)); // Recurrence
     }
     if show_steps {
-        constraints.push(Constraint::Length(STEPS_BOX_HEIGHT)); // Steps
+        constraints.push(Constraint::Length(steps_box_height)); // Steps
     }
     constraints.push(Constraint::Length(2)); // Help
 
+    // Keep only horizontal breathing room. Vertically, the border should end
+    // immediately after the shortcut line rather than leaving a large void.
+    let inner = Rect {
+        x: area.x.saturating_add(2),
+        y: area.y.saturating_add(1),
+        width: area.width.saturating_sub(4),
+        height: area.height.saturating_sub(2),
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .margin(2)
         .constraints(constraints)
-        .split(area);
+        .split(inner);
 
     let main_block = Block::default()
         .borders(Borders::ALL)
@@ -2630,14 +4462,35 @@ fn draw_task_modal(
     } else {
         Style::default().fg(theme.border)
     };
-    let title_owned;
-    let title_text = if task_title.is_empty() {
-        if focus_idx == 0 { "_" } else { "" }
-    } else if focus_idx == 0 {
-        title_owned = format!("{}_", task_title);
-        &title_owned
+    let title_text = if focus_idx == 0 {
+        let mut cursor = title_cursor.min(task_title.len());
+        while cursor > 0 && !task_title.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let before = &task_title[..cursor];
+        let (current, after) = if cursor < task_title.len() {
+            let next = task_title[cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| cursor + offset)
+                .unwrap_or(task_title.len());
+            (&task_title[cursor..next], &task_title[next..])
+        } else {
+            ("_", "")
+        };
+        Line::from(vec![
+            Span::raw(before),
+            Span::styled(
+                current,
+                Style::default()
+                    .fg(theme.background)
+                    .bg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(after),
+        ])
     } else {
-        task_title
+        Line::from(task_title)
     };
     let title_p = Paragraph::new(title_text).block(
         Block::default()
@@ -2667,82 +4520,86 @@ fn draw_task_modal(
 
         let desc_lines: Vec<Line> = if vim_desc {
             let editor = desc_editor.unwrap();
-            let scroll_top = if editor.cursor_y >= visible_lines {
-                editor.cursor_y + 1 - visible_lines
+            // Cada línea lógica se envuelve al ancho de la caja antes de recortar, y el
+            // scroll cuenta filas visuales: así el cursor sigue a la vista aunque una
+            // sola línea ocupe media caja.
+            let text_width = chunks[1].width.saturating_sub(2) as usize;
+            let mut rows: Vec<Line> = Vec::new();
+            let mut cursor_row = 0usize;
+            for (index, line) in editor.lines.iter().enumerate() {
+                if index == editor.cursor_y {
+                    let within = crate::screens::text_wrap::wrap_with_cursor(
+                        line,
+                        editor.cursor_x,
+                        text_width,
+                    );
+                    cursor_row = rows.len() + within.cursor_row;
+                }
+                let styled = render_body_line(line, index, editor, theme);
+                rows.extend(crate::screens::text_wrap::split_styled_line(
+                    &styled, text_width,
+                ));
+            }
+            let scroll_top = if cursor_row >= visible_lines {
+                cursor_row + 1 - visible_lines
             } else {
                 0
             };
-            editor
-                .lines
-                .iter()
-                .enumerate()
-                .skip(scroll_top)
-                .take(visible_lines)
-                .map(|(i, line)| render_body_line(line, i, editor, theme))
-                .collect()
+            rows.into_iter().skip(scroll_top).take(visible_lines).collect()
         } else if task_desc.is_empty() && focus_idx == 1 {
             vec![Line::from(Span::styled(
                 "_",
                 Style::default().fg(accent_color),
             ))]
         } else {
-            // Split desc into lines and locate cursor line/col
-            let lines: Vec<&str> = task_desc.split('\n').collect();
-            let cursor = desc_cursor.min(task_desc.len());
-            let (cursor_line, cursor_col) = {
-                let mut pos = 0usize;
-                let mut cl = 0usize;
-                let mut cc = 0usize;
-                for (i, line) in lines.iter().enumerate() {
-                    let end = pos + line.len();
-                    if cursor <= end || i + 1 == lines.len() {
-                        cl = i;
-                        cc = cursor - pos;
-                        break;
-                    }
-                    pos = end + 1; // +1 for '\n'
-                }
-                (cl, cc)
-            };
-
-            // Scroll para mantener el cursor visible — se ajusta automáticamente al escribir
-            let scroll_top = if cursor_line >= visible_lines {
-                cursor_line + 1 - visible_lines
+            // El texto se envuelve al ancho de la caja y el scroll se hace sobre las filas
+            // visuales, no sobre las líneas lógicas: si no, una línea larga se recortaba a
+            // la derecha y lo que se seguía escribiendo dejaba de verse.
+            let text_width = chunks[1].width.saturating_sub(2) as usize;
+            let wrapped =
+                crate::screens::text_wrap::wrap_with_cursor(task_desc, desc_cursor, text_width);
+            let scroll_top = if wrapped.cursor_row >= visible_lines {
+                wrapped.cursor_row + 1 - visible_lines
             } else {
                 0
             };
 
-            lines
+            wrapped
+                .rows
                 .iter()
                 .enumerate()
                 .skip(scroll_top)
                 .take(visible_lines)
-                .map(|(i, line)| {
-                    if focus_idx == 1 && i == cursor_line {
-                        // Render cursor highlight at cursor_col
-                        let col = cursor_col.min(line.len());
-                        let before = &line[..col];
-                        let (cur_char, after) = if col < line.len() {
-                            let next = line[col..]
-                                .char_indices()
-                                .nth(1)
-                                .map(|(j, _)| col + j)
-                                .unwrap_or(line.len());
-                            (&line[col..next], &line[next..])
-                        } else {
-                            ("_", "")
-                        };
-                        Line::from(vec![
-                            Span::raw(before),
-                            Span::styled(
-                                cur_char,
-                                Style::default().fg(Color::Black).bg(theme.selection),
-                            ),
-                            Span::raw(after),
-                        ])
-                    } else {
-                        Line::from(*line)
+                .map(|(index, &(start, end))| {
+                    let row = &task_desc[start..end];
+                    if focus_idx != 1 || index != wrapped.cursor_row {
+                        return Line::from(row);
                     }
+                    // El cursor se resalta sobre el carácter exacto de esta fila.
+                    let col = row
+                        .char_indices()
+                        .nth(wrapped.cursor_col)
+                        .map(|(offset, _)| offset)
+                        .unwrap_or(row.len());
+                    let before = &row[..col];
+                    let (cur_char, after) = if col < row.len() {
+                        let next = row[col..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(offset, _)| col + offset)
+                            .unwrap_or(row.len());
+                        (&row[col..next], &row[next..])
+                    } else {
+                        ("_", "")
+                    };
+                    Line::from(vec![
+                        Span::raw(before),
+                        Span::styled(
+                            cur_char,
+                            Style::default().fg(Color::Black).bg(theme.selection),
+                        ),
+                        Span::raw(after),
+                    ])
                 })
                 .collect()
         };
@@ -3792,6 +5649,169 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn workload_bands_include_urgent_work_not_only_raw_count() {
+        assert_eq!(workload_band(2, 0, 0, 0), "AVAILABLE");
+        assert_eq!(workload_band(4, 1, 0, 0), "BALANCED");
+        assert_eq!(workload_band(3, 0, 0, 2), "OVERLOADED");
+        assert_eq!(workload_band(8, 0, 0, 0), "OVERLOADED");
+    }
+
+    #[test]
+    fn teamwork_views_render_in_a_narrow_terminal() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_narrow_teamwork_views.db");
+        let _ = std::fs::remove_file(&db_path);
+        let mut app = App::new(&db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Narrow Fellowship Campaign".into(),
+                description: None,
+                archived: false,
+                completed: false,
+                created_at: now,
+                updated_at: now,
+                owner_identity: Some(app.identity.public_key.clone()),
+                owner_username: Some("Narrow Hero".into()),
+                is_shared: true,
+            })
+            .unwrap();
+        app.db
+            .insert_task(&Task {
+                id: uuid::Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "A deliberately long quest title for narrow terminals".into(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: TaskPriority::High,
+                created_at: now,
+                updated_at: now,
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Narrow Hero",
+                "Owner",
+            )
+            .unwrap();
+        app.reload_data().unwrap();
+        app.active_project_id = Some(project_id);
+        let theme = Theme::default_theme();
+        let backend = TestBackend::new(52, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let tasks = app.all_tasks.iter().collect::<Vec<_>>();
+        terminal
+            .draw(|frame| draw_quest_board(frame, frame.size(), &tasks, 0, &app, &theme, false))
+            .unwrap();
+        terminal
+            .draw(|frame| draw_council_briefing(frame, &app, 0, &theme))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Council Briefing"));
+        assert!(rendered.contains("Attention"));
+        drop(terminal);
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn private_campaign_hides_quest_council_shortcuts() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_private_campaign_council_ui.db");
+        let _ = std::fs::remove_file(&db_path);
+        let mut app = App::new(&db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Private Campaign".into(),
+                description: None,
+                archived: false,
+                completed: false,
+                created_at: now,
+                updated_at: now,
+                owner_identity: Some(app.identity.public_key.clone()),
+                owner_username: Some("Solo Hero".into()),
+                is_shared: false,
+            })
+            .unwrap();
+        app.db
+            .insert_task(&Task {
+                id: uuid::Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "A private quest".into(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: TaskPriority::Medium,
+                created_at: now,
+                updated_at: now,
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .unwrap();
+        app.projects = app.db.get_projects().unwrap();
+        app.all_tasks = app.db.get_tasks().unwrap();
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+
+        let theme = Theme::default_theme();
+        let backend = TestBackend::new(120, 44);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let ledger = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!ledger.contains("[c] convene"));
+
+        app.workspace_help_open = true;
+        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        let help = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!help.contains("Open Quest Council"));
+
+        drop(terminal);
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
+    }
 
     #[test]
     fn calendar_grid_renders_due_quests_inside_day_cells() {

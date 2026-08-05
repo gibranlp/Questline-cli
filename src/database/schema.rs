@@ -224,6 +224,32 @@ CREATE TABLE IF NOT EXISTS project_members (
     FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS project_encryption_keys (
+    project_id TEXT PRIMARY KEY,
+    routing_id TEXT UNIQUE NOT NULL,
+    key_hex TEXT NOT NULL,
+    key_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+-- Kept independently of projects so encrypted tombstones can still be routed after
+-- the local entity (or the whole project) has been deleted.
+CREATE TABLE IF NOT EXISTS project_encryption_key_history (
+    routing_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    key_hex TEXT NOT NULL,
+    key_version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS revoked_project_routes (
+    routing_id TEXT PRIMARY KEY,
+    replacement_routing_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    revoked_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS invitations (
     id TEXT PRIMARY KEY,
     project_id TEXT,
@@ -233,7 +259,15 @@ CREATE TABLE IF NOT EXISTS invitations (
     invitee_identity TEXT NOT NULL,
     role TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Pending',
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    routing_id TEXT,
+    inviter_encryption_key TEXT,
+    key_nonce TEXT,
+    key_ciphertext TEXT,
+    project_name_nonce TEXT,
+    project_name_ciphertext TEXT,
+    project_id_nonce TEXT,
+    project_id_ciphertext TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chronicle_messages (
@@ -275,12 +309,56 @@ CREATE TABLE IF NOT EXISTS notifications (
     created_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS notification_states (
+    notification_id TEXT PRIMARY KEY,
+    read INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_assignments (
     task_id TEXT,
     user_identity TEXT,
     user_username TEXT NOT NULL,
     PRIMARY KEY (task_id, user_identity),
     FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_statuses (
+    task_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'Backlog',
+    changed_by_identity TEXT NOT NULL,
+    changed_by_username TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_comments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    author_identity TEXT NOT NULL,
+    author_username TEXT NOT NULL,
+    content TEXT NOT NULL,
+    mentioned_identities TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    edited_at TEXT,
+    deleted_at TEXT,
+    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS task_dependencies (
+    task_id TEXT NOT NULL,
+    depends_on_task_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    created_by_identity TEXT NOT NULL,
+    created_by_username TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (task_id, depends_on_task_id),
+    CHECK (task_id != depends_on_task_id),
+    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(depends_on_task_id) REFERENCES tasks(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS presence (
@@ -375,6 +453,96 @@ CREATE TABLE IF NOT EXISTS hydration_log (
     last_drink_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS campaign_treasury (
+    campaign_id TEXT PRIMARY KEY,
+    overall_budget_minor INTEGER NOT NULL DEFAULT 0 CHECK(overall_budget_minor >= 0),
+    currency_code TEXT NOT NULL DEFAULT 'USD',
+    large_expense_threshold_minor INTEGER NOT NULL DEFAULT 100000,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ledger_categories (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
+    is_default INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, name),
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS category_budgets (
+    category_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL DEFAULT 0 CHECK(amount_minor >= 0),
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(category_id) REFERENCES ledger_categories(id) ON DELETE CASCADE,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS ledger_entries (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    entry_type TEXT NOT NULL CHECK(entry_type IN ('Income', 'Expense', 'Transfer', 'Adjustment')),
+    category_id TEXT NOT NULL,
+    amount_minor INTEGER NOT NULL CHECK(amount_minor >= 0),
+    currency_code TEXT NOT NULL DEFAULT 'USD',
+    status TEXT NOT NULL CHECK(status IN ('Planned', 'Approved', 'Paid', 'Cancelled')),
+    due_date TEXT,
+    payment_date TEXT,
+    vendor_source TEXT,
+    related_task_id TEXT,
+    notes TEXT,
+    attachment_ref TEXT,
+    recurrence TEXT NOT NULL DEFAULT 'None',
+    custom_recurrence TEXT,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    -- Companion Key de quien registró el movimiento: los Companions solo pueden
+    -- editar o borrar los suyos, y la Fellowship necesita saber quién lo asentó.
+    created_by_identity TEXT,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(category_id) REFERENCES ledger_categories(id) ON DELETE RESTRICT,
+    FOREIGN KEY(related_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_financials (
+    task_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    estimated_cost_minor INTEGER,
+    actual_cost_minor INTEGER,
+    billable_amount_minor INTEGER,
+    payment_status TEXT,
+    currency_code TEXT NOT NULL DEFAULT 'USD',
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS treasury_history (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    action TEXT NOT NULL,
+    snapshot TEXT NOT NULL,
+    version INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
 -- índices base — presentes desde el inicio
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks(project_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
@@ -398,7 +566,27 @@ CREATE INDEX IF NOT EXISTS idx_chronicle_messages_timestamp ON chronicle_message
 CREATE INDEX IF NOT EXISTS idx_activity_log_project ON activity_log(project_id);
 CREATE INDEX IF NOT EXISTS idx_activity_log_timestamp ON activity_log(timestamp);
 CREATE INDEX IF NOT EXISTS idx_notifications_read ON notifications(read);
+CREATE INDEX IF NOT EXISTS idx_task_statuses_project ON task_statuses(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_comments_task ON task_comments(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_task_comments_project ON task_comments(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_project ON task_dependencies(project_id);
+CREATE INDEX IF NOT EXISTS idx_task_dependencies_blocker ON task_dependencies(depends_on_task_id);
 CREATE INDEX IF NOT EXISTS idx_global_chronicle_timestamp ON global_chronicle(timestamp);
 CREATE INDEX IF NOT EXISTS idx_notes_updated_at ON notes(updated_at);
 CREATE INDEX IF NOT EXISTS idx_focus_sessions_completed_at ON focus_sessions(completed_at);
+CREATE INDEX IF NOT EXISTS idx_treasury_campaign ON campaign_treasury(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_campaign_created ON ledger_entries(campaign_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_ledger_campaign_due ON ledger_entries(campaign_id, due_date);
+CREATE INDEX IF NOT EXISTS idx_ledger_campaign_payment ON ledger_entries(campaign_id, payment_date);
+CREATE INDEX IF NOT EXISTS idx_ledger_campaign_status ON ledger_entries(campaign_id, status);
+CREATE INDEX IF NOT EXISTS idx_ledger_campaign_category ON ledger_entries(campaign_id, category_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_task ON ledger_entries(related_task_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_vendor ON ledger_entries(campaign_id, vendor_source);
+CREATE INDEX IF NOT EXISTS idx_ledger_amount ON ledger_entries(campaign_id, amount_minor);
+CREATE INDEX IF NOT EXISTS idx_ledger_search ON ledger_entries(campaign_id, title, vendor_source);
+CREATE INDEX IF NOT EXISTS idx_categories_campaign ON ledger_categories(campaign_id, name);
+CREATE INDEX IF NOT EXISTS idx_category_budgets_campaign ON category_budgets(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_task_financials_campaign ON task_financials(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_treasury_history_entity ON treasury_history(entity_type, entity_id, version);
+CREATE INDEX IF NOT EXISTS idx_treasury_history_campaign ON treasury_history(campaign_id, created_at DESC);
 ";

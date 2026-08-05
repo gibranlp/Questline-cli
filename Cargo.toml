@@ -1,6 +1,6 @@
 [package]
 name = "questline"
-version = "1.1.3"
+version = "2.0.0"
 edition = "2024"
 license = "MIT"
 
@@ -13,6 +13,8 @@ serde_json = "1.0.115"
 anyhow = "1.0.82"
 uuid = { version = "1.8.0", features = ["v4", "serde"] }
 chrono = { version = "0.4.38", features = ["serde"] }
+chrono-tz = "0.10.4"
+keyring = { version = "4.1.6", features = ["v1"] }
 directories = "5.0.1"
 rusqlite = { version = "0.31.0", features = ["bundled"] }
 rand = "0.8.5"
@@ -21,6 +23,10 @@ ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 ureq = { version = "2.9.7", features = ["json"] }
 toml = "0.8.12"
 base64 = "0.22.1"
+aes-gcm = "0.10.3"
+hkdf = "0.12.4"
+sha2 = "0.10.8"
+x25519-dalek = { version = "2.0.1", features = ["static_secrets"] }
 souvlaki = "0.7.0"
 rustfft = "6"
 
