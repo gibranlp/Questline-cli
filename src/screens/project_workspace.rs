@@ -770,21 +770,24 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             draw_journal_modal(f, content, theme);
         }
         ModalType::TreasuryEntry {
-            entry_id: _,
+            entry_id,
             title,
             amount,
             entry_type_idx,
             status_idx,
             category_idx,
+            date_val,
             focus_idx,
         } => draw_treasury_entry_modal(
             f,
             app,
+            entry_id.is_some(),
             title,
             amount,
             *entry_type_idx,
             *status_idx,
             *category_idx,
+            date_val,
             *focus_idx,
             theme,
         ),
@@ -887,6 +890,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
                 .map(|c| c.name.as_str())
                 .unwrap_or("");
             draw_refile_codex_modal(f, &app.codices, &targets, *selected_idx, codex_name, theme);
+        }
+        ModalType::RefileTask {
+            task_id,
+            selected_idx,
+        } => {
+            let targets = app.refile_task_targets(*task_id);
+            let task_title = app
+                .all_tasks
+                .iter()
+                .find(|t| t.id == *task_id)
+                .map(|t| t.title.as_str())
+                .unwrap_or("");
+            draw_refile_task_modal(f, &app.all_tasks, &targets, *selected_idx, task_title, theme);
         }
         _ => {}
     }
@@ -1196,11 +1212,13 @@ fn draw_treasury_tab(
 fn draw_treasury_entry_modal(
     f: &mut Frame,
     app: &App,
+    is_editing: bool,
     title: &str,
     amount: &str,
     entry_type_idx: usize,
     status_idx: usize,
     category_idx: usize,
+    date_val: &str,
     focus_idx: usize,
     theme: &Theme,
 ) {
@@ -1250,7 +1268,7 @@ fn draw_treasury_entry_modal(
             ),
         ])
     };
-    let lines = vec![
+    let mut lines = vec![
         field(
             0,
             "Title",
@@ -1270,16 +1288,33 @@ fn draw_treasury_entry_modal(
         ),
         field(3, "Status", format!("◀ {} ▶", statuses[status_idx.min(3)])),
         field(4, "Category", format!("◀ {} ▶", category)),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Tab/↑↓ field · ←→ choice · Enter continue/save · Esc cancel",
-            Style::default().fg(theme.muted),
-        )),
     ];
+    if is_editing {
+        lines.push(Line::from(""));
+        lines.push(field(
+            5,
+            "Date",
+            format!("{}{}", date_val, if focus_idx == 5 { "_" } else { "" }),
+        ));
+        lines.push(Line::from(Span::styled(
+            "  (Owner/Steward only — YYYY-MM-DD, \"today\", \"in 3 days\")",
+            Style::default().fg(theme.muted),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Tab/↑↓ field · ←→ choice · Enter continue/save · Esc cancel",
+        Style::default().fg(theme.muted),
+    )));
+    let modal_title = if is_editing {
+        " Edit Treasury Entry "
+    } else {
+        " New Treasury Entry "
+    };
     f.render_widget(
         Paragraph::new(lines).block(
             Block::default()
-                .title(" New Treasury Entry ")
+                .title(modal_title)
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.primary)),
@@ -1676,6 +1711,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         binding("Delete", "Delete quest", can_edit),
         binding("→", "View steps", true),
         binding("+", "Add step", can_edit),
+        binding("m", "Move to top level / into another quest", can_edit),
         binding(
             "g / Shift+g",
             if can_judge_all {
@@ -1711,6 +1747,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         binding("Enter / e", "Edit step", can_edit),
         binding("Space", "Resolve / reopen step", can_edit),
         binding("a", "Assign selected step", is_shared && can_assign),
+        binding("m", "Move to top level / into another quest", can_edit),
         binding("Delete", "Delete step", can_edit),
         binding("← / Esc", "Back to quests", true),
         Line::from(vec![]),
@@ -2126,6 +2163,86 @@ fn draw_refile_codex_modal(
         .split(inner);
 
     f.render_widget(List::new(items), chunks[0]);
+    f.render_widget(hint, chunks[1]);
+}
+
+// Modal para mover una tarea a top-level o convertirla en step de otra tarea top-level
+fn draw_refile_task_modal(
+    f: &mut Frame,
+    all_tasks: &[Task],
+    targets: &[uuid::Uuid],
+    selected_idx: usize,
+    task_title: &str,
+    theme: &Theme,
+) {
+    let size = f.size();
+    let item_count = (targets.len() + 1) as u16; // +1 for Top-level
+    let height = (item_count + 4).min(size.height.saturating_sub(4));
+    let width = (size.width / 2).clamp(48, 68);
+    let area = ratatui::layout::Rect {
+        x: (size.width.saturating_sub(width)) / 2,
+        y: (size.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default().style(Style::default().bg(theme.background)),
+        area,
+    );
+    let title = format!(" Move Quest: {} ", task_title);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(title);
+    f.render_widget(block, area);
+
+    use ratatui::layout::Margin;
+    let inner = area.inner(&Margin {
+        vertical: 1,
+        horizontal: 1,
+    });
+
+    let mut items: Vec<ListItem> = Vec::new();
+    let top_level_style = if selected_idx == 0 {
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(theme.primary)
+            .add_modifier(Modifier::BOLD)
+    };
+    items.push(ListItem::new("  ── Top Level (no parent quest) ──").style(top_level_style));
+
+    for (i, &target_id) in targets.iter().enumerate() {
+        let style = if selected_idx == i + 1 {
+            Style::default()
+                .fg(Color::Black)
+                .bg(theme.selection)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        if let Some(task) = all_tasks.iter().find(|t| t.id == target_id) {
+            items.push(ListItem::new(format!("  ▸ {}", task.title)).style(style));
+        }
+    }
+
+    let hint = Paragraph::new("↑↓ navigate · Enter move · Esc cancel")
+        .style(Style::default().fg(theme.muted))
+        .alignment(Alignment::Center);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut list_state = ListState::default();
+    list_state.select(Some(selected_idx));
+    f.render_stateful_widget(List::new(items), chunks[0], &mut list_state);
     f.render_widget(hint, chunks[1]);
 }
 

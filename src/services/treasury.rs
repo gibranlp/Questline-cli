@@ -331,8 +331,8 @@ impl<'a> TreasuryService<'a> {
                  title=?1, description=?2, entry_type=?3, category_id=?4, amount_minor=?5,
                  currency_code=?6, status=?7, due_date=?8, payment_date=?9, vendor_source=?10,
                  related_task_id=?11, notes=?12, attachment_ref=?13, recurrence=?14,
-                 custom_recurrence=?15, version=?16, updated_at=?17
-             WHERE id=?18 AND version=?19",
+                 custom_recurrence=?15, version=?16, updated_at=?17, created_at=?18
+             WHERE id=?19 AND version=?20",
             params![
                 entry.title,
                 entry.description,
@@ -351,6 +351,7 @@ impl<'a> TreasuryService<'a> {
                 entry.custom_recurrence,
                 entry.version,
                 entry.updated_at.to_rfc3339(),
+                entry.created_at.to_rfc3339(),
                 entry.id.to_string(),
                 expected_version,
             ],

@@ -260,6 +260,18 @@ pub const SYNCED_STREAK_SETTING_KEYS: [&str; 3] = [
     STREAK_ACTIVE_TO_KEY,
 ];
 
+const QUEST_VISIBILITY_HORIZON_KEY: &str = "quest_visibility_horizon_days";
+pub const SYNCED_QUEST_SETTING_KEYS: [&str; 1] = [QUEST_VISIBILITY_HORIZON_KEY];
+// 15 días — el mismo horizonte que antes vivía hardcodeado en el Planning Council.
+pub const DEFAULT_QUEST_VISIBILITY_HORIZON_DAYS: i64 = 15;
+
+/// True si esta clave de `settings` viaja a la nube — todo lo demás en esa tabla es
+/// puramente local (tema, sonidos, hidratación...). Una sola función para no repetir
+/// el `.contains()` en cada punto del sync engine que decide qué settings sincronizar.
+pub fn is_synced_setting_key(key: &str) -> bool {
+    SYNCED_STREAK_SETTING_KEYS.contains(&key) || SYNCED_QUEST_SETTING_KEYS.contains(&key)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct StreakSchedule {
     pub workday_mask: u8,
@@ -3944,7 +3956,10 @@ impl Database {
             queued += 1;
         }
 
-        for key in SYNCED_STREAK_SETTING_KEYS {
+        for key in SYNCED_STREAK_SETTING_KEYS
+            .iter()
+            .chain(SYNCED_QUEST_SETTING_KEYS.iter())
+        {
             if self.get_setting(key)?.is_some() {
                 self.log_change("setting", key, "upsert")?;
                 queued += 1;
@@ -4176,6 +4191,37 @@ impl Database {
     pub fn queue_streak_schedule_sync(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for key in SYNCED_STREAK_SETTING_KEYS {
+            tx.execute(
+                "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
+                params![key],
+            )?;
+            Self::log_change_on(&tx, "setting", key, "upsert")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    // None = "All" (sin límite). Se guarda como "-1" para distinguirlo de un horizonte
+    // real de 0 días ("Today").
+    pub fn get_quest_visibility_horizon_days(&self) -> Option<i64> {
+        match self.get_setting(QUEST_VISIBILITY_HORIZON_KEY).ok().flatten() {
+            Some(raw) => match raw.parse::<i64>() {
+                Ok(-1) => None,
+                Ok(days) if days >= 0 => Some(days),
+                _ => Some(DEFAULT_QUEST_VISIBILITY_HORIZON_DAYS),
+            },
+            None => Some(DEFAULT_QUEST_VISIBILITY_HORIZON_DAYS),
+        }
+    }
+
+    pub fn set_quest_visibility_horizon_days(&self, days: Option<i64>) -> Result<()> {
+        let raw = days.map(|d| d.to_string()).unwrap_or_else(|| "-1".to_string());
+        self.set_setting(QUEST_VISIBILITY_HORIZON_KEY, &raw)
+    }
+
+    pub fn queue_quest_visibility_horizon_sync(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for key in SYNCED_QUEST_SETTING_KEYS {
             tx.execute(
                 "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
                 params![key],
@@ -7532,6 +7578,68 @@ mod tests {
             db.reconcile_calendar_tasks(project_id, &updated_tasks, &[])
                 .is_err()
         );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quest_visibility_horizon_round_trips_and_defaults_to_fifteen_days() {
+        let db_file = Path::new("test_questline_quest_visibility_horizon.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+
+        // Sin nada guardado, cae al mismo horizonte que antes vivía hardcodeado.
+        assert_eq!(
+            db.get_quest_visibility_horizon_days(),
+            Some(DEFAULT_QUEST_VISIBILITY_HORIZON_DAYS)
+        );
+
+        db.set_quest_visibility_horizon_days(Some(30)).unwrap();
+        assert_eq!(db.get_quest_visibility_horizon_days(), Some(30));
+
+        // "All" se guarda con el centinela -1, no confundirlo con un horizonte real.
+        db.set_quest_visibility_horizon_days(None).unwrap();
+        assert_eq!(db.get_quest_visibility_horizon_days(), None);
+
+        db.set_quest_visibility_horizon_days(Some(0)).unwrap();
+        assert_eq!(
+            db.get_quest_visibility_horizon_days(),
+            Some(0),
+            "Today (0 days) must not be confused with unset/default"
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quest_visibility_horizon_key_is_recognized_as_synced() {
+        assert!(is_synced_setting_key(QUEST_VISIBILITY_HORIZON_KEY));
+        assert!(is_synced_setting_key(STREAK_ACTIVE_FROM_KEY));
+        assert!(!is_synced_setting_key("theme"));
+        assert!(!is_synced_setting_key("sound_effects_volume"));
+    }
+
+    #[test]
+    fn queue_quest_visibility_horizon_sync_logs_a_pending_change() {
+        let db_file = Path::new("test_questline_quest_visibility_horizon_sync.db");
+        let _ = std::fs::remove_file(db_file);
+        let db = Database::new(db_file).unwrap();
+
+        db.set_quest_visibility_horizon_days(Some(7)).unwrap();
+        db.queue_quest_visibility_horizon_sync().unwrap();
+
+        let pending: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_log
+                 WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
+                params![QUEST_VISIBILITY_HORIZON_KEY],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 1, "changing the horizon must queue exactly one pending sync row");
 
         drop(db);
         let _ = std::fs::remove_file(db_file);

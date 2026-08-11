@@ -237,7 +237,9 @@ fn send_with_notify_send(
     let urgency = if urgent { "critical" } else { "normal" };
     let mut cmd = std::process::Command::new("notify-send");
     cmd.arg("--app-name=Questline")
-        .arg(format!("--urgency={}", urgency));
+        .arg(format!("--urgency={}", urgency))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     if let Some(path) = icon_path {
         cmd.arg("--icon").arg(path);
     }
@@ -256,7 +258,9 @@ fn send_with_dunstify(
     cmd.arg("--appname")
         .arg("Questline")
         .arg("--urgency")
-        .arg(urgency);
+        .arg(urgency)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     if let Some(path) = icon_path {
         cmd.arg("--icon").arg(path);
     }
@@ -288,7 +292,9 @@ fn send_with_gdbus(title: &str, message: &str, urgent: bool, icon_path: Option<&
             .arg(message)
             .arg("[]")
             .arg(hints)
-            .arg(timeout_ms),
+            .arg(timeout_ms)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
     )
 }
 
@@ -300,7 +306,9 @@ fn send_with_kdialog(title: &str, message: &str) -> bool {
             .arg(title)
             .arg("--passivepopup")
             .arg(message)
-            .arg("6"),
+            .arg("6")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null()),
     )
 }
 
@@ -311,7 +319,9 @@ fn send_with_zenity(title: &str, message: &str, icon_path: Option<&PathBuf>) -> 
         .arg("--title")
         .arg(title)
         .arg("--text")
-        .arg(message);
+        .arg(message)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     if let Some(path) = icon_path {
         cmd.arg("--window-icon").arg(path);
     }
