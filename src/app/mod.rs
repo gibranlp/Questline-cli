@@ -243,6 +243,17 @@ fn delete_last_word(input: &mut String) {
     delete_word_before_cursor(input, cursor);
 }
 
+// Mueve la fecha de un movimiento de Treasury un día a la vez (←/→ en el modal).
+// Si el valor guardado no se puede leer como YYYY-MM-DD (no debería pasar, nunca se
+// teclea a mano), se cae de vuelta a hoy en lugar de trabar el campo.
+fn step_date_val(date_val: &str, delta_days: i64) -> String {
+    let base = NaiveDate::parse_from_str(date_val.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| Local::now().date_naive());
+    (base + chrono::Duration::days(delta_days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 fn is_ctrl_backspace(key: KeyEvent) -> bool {
     let ctrl_word_delete = key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
@@ -452,12 +463,14 @@ pub enum ModalType {
     TreasuryEntry {
         entry_id: Option<Uuid>,
         title: String,
+        title_cursor: usize,
         amount: String,
+        amount_cursor: usize,
         entry_type_idx: usize,
         status_idx: usize,
         category_idx: usize,
-        // Texto libre para la fecha del movimiento — "today", "in 3 days", "2026-08-10"...
-        // se reutiliza el mismo parser que la fecha de vencimiento de las Quests.
+        // Siempre "YYYY-MM-DD" — se mueve un día a la vez con ←/→, nunca se teclea a mano.
+        // Al crear nace en "hoy"; al editar nace en la fecha ya guardada del movimiento.
         date_val: String,
         focus_idx: usize,
     },
@@ -6755,7 +6768,7 @@ impl App {
             username: String::new(),
             role_idx: 1,
             project_idx: default_proj_idx,
-            focus_idx: 1,
+            focus_idx: 0,
         };
     }
 
@@ -11762,10 +11775,16 @@ impl App {
                     ) {
                         return Ok(());
                     }
+                    let default_amount = crate::services::treasury::format_minor(0);
                     self.modal_state = ModalType::TreasuryEntry {
                         entry_id: None,
                         title: String::new(),
-                        amount: String::new(),
+                        title_cursor: 0,
+                        // "0.00" es un relleno, no un valor tecleado — el cursor nace sobre
+                        // el primer "0" para que escribir el monto lo reemplace de inmediato,
+                        // en vez de aterrizar después del ".00" donde no hay nada que borrar.
+                        amount_cursor: 0,
+                        amount: default_amount,
                         entry_type_idx: 1,
                         status_idx: 0,
                         category_idx: 0,
@@ -11868,10 +11887,13 @@ impl App {
                         }
                         let categories =
                             crate::services::TreasuryService::new(&self.db).categories(p_id)?;
+                        let amount = crate::services::treasury::format_minor(entry.amount_minor);
                         self.modal_state = ModalType::TreasuryEntry {
                             entry_id: Some(entry.id),
+                            title_cursor: entry.title.len(),
                             title: entry.title.clone(),
-                            amount: crate::services::treasury::format_minor(entry.amount_minor),
+                            amount_cursor: amount.len(),
+                            amount,
                             entry_type_idx: match entry.entry_type {
                                 crate::models::LedgerEntryType::Income => 0,
                                 crate::models::LedgerEntryType::Expense => 1,
@@ -12397,7 +12419,9 @@ impl App {
             ModalType::TreasuryEntry {
                 entry_id,
                 ref title,
+                title_cursor,
                 ref amount,
+                amount_cursor,
                 entry_type_idx,
                 status_idx,
                 category_idx,
@@ -12409,7 +12433,9 @@ impl App {
                     project_id,
                     entry_id,
                     title.clone(),
+                    title_cursor,
                     amount.clone(),
+                    amount_cursor,
                     entry_type_idx,
                     status_idx,
                     category_idx,
@@ -14017,7 +14043,9 @@ impl App {
         project_id: Uuid,
         entry_id: Option<Uuid>,
         mut title: String,
+        mut title_cursor: usize,
         mut amount: String,
+        mut amount_cursor: usize,
         mut entry_type_idx: usize,
         mut status_idx: usize,
         mut category_idx: usize,
@@ -14025,10 +14053,12 @@ impl App {
         mut focus_idx: usize,
     ) -> Result<()> {
         let categories = crate::services::TreasuryService::new(&self.db).categories(project_id)?;
-        // La fecha solo se puede tocar al editar un movimiento existente — un movimiento
-        // nuevo siempre nace "hoy" (create_entry lo fuerza), así que no tiene sentido
-        // ofrecer el campo ahí. Editar en cambio sí respeta la fecha elegida.
-        let field_count = if entry_id.is_some() { 6 } else { 5 };
+        title_cursor = title_cursor.min(title.len());
+        amount_cursor = amount_cursor.min(amount.len());
+        // El campo Date siempre está disponible — al crear nace en "hoy", al editar en la
+        // fecha ya guardada. Se mueve un día a la vez con ←/→ (step_date_val); reasentar el
+        // día de un movimiento existente sigue exigiendo permiso de Owner/Steward al guardar.
+        let field_count = 6;
         match key.code {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
@@ -14048,27 +14078,73 @@ impl App {
             KeyCode::Right if focus_idx == 4 && !categories.is_empty() => {
                 category_idx = (category_idx + 1) % categories.len();
             }
+            KeyCode::Left if focus_idx == 5 => date_val = step_date_val(&date_val, -1),
+            KeyCode::Right if focus_idx == 5 => date_val = step_date_val(&date_val, 1),
+            KeyCode::Left if focus_idx == 0 => {
+                if title_cursor > 0 {
+                    title_cursor -= 1;
+                    while title_cursor > 0 && !title.is_char_boundary(title_cursor) {
+                        title_cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Right if focus_idx == 0 => {
+                if title_cursor < title.len() {
+                    title_cursor += 1;
+                    while title_cursor < title.len() && !title.is_char_boundary(title_cursor) {
+                        title_cursor += 1;
+                    }
+                }
+            }
+            KeyCode::Home if focus_idx == 0 => title_cursor = 0,
+            KeyCode::End if focus_idx == 0 => title_cursor = title.len(),
+            // Amount solo contiene ASCII (dígitos y un punto), así que no hace falta
+            // cuidar fronteras de UTF-8 como en Title.
+            KeyCode::Left if focus_idx == 1 => amount_cursor = amount_cursor.saturating_sub(1),
+            KeyCode::Right if focus_idx == 1 => {
+                amount_cursor = (amount_cursor + 1).min(amount.len())
+            }
+            KeyCode::Home if focus_idx == 1 => amount_cursor = 0,
+            KeyCode::End if focus_idx == 1 => amount_cursor = amount.len(),
             KeyCode::Backspace if focus_idx == 0 => {
-                title.pop();
+                if is_ctrl_backspace(key) {
+                    title_cursor = delete_word_before_cursor(&mut title, title_cursor);
+                } else if title_cursor > 0 {
+                    let mut prev = title_cursor - 1;
+                    while prev > 0 && !title.is_char_boundary(prev) {
+                        prev -= 1;
+                    }
+                    title.remove(prev);
+                    title_cursor = prev;
+                }
             }
             KeyCode::Backspace if focus_idx == 1 => {
-                amount.pop();
+                if amount_cursor > 0 {
+                    amount.remove(amount_cursor - 1);
+                    amount_cursor -= 1;
+                }
             }
-            KeyCode::Backspace if focus_idx == 5 => {
-                date_val.pop();
+            KeyCode::Delete if focus_idx == 0 => {
+                if title_cursor < title.len() {
+                    title.remove(title_cursor);
+                }
+            }
+            KeyCode::Delete if focus_idx == 1 => {
+                if amount_cursor < amount.len() {
+                    amount.remove(amount_cursor);
+                }
             }
             KeyCode::Char(character) if focus_idx == 0 && title.chars().count() < 100 => {
-                title.push(character)
+                title.insert(title_cursor, character);
+                title_cursor += character.len_utf8();
             }
             KeyCode::Char(character)
                 if focus_idx == 1
                     && (character.is_ascii_digit() || character == '.')
                     && amount.len() < 16 =>
             {
-                amount.push(character)
-            }
-            KeyCode::Char(character) if focus_idx == 5 && date_val.chars().count() < 20 => {
-                date_val.push(character)
+                amount.insert(amount_cursor, character);
+                amount_cursor += 1;
             }
             KeyCode::Enter if focus_idx < field_count - 1 => focus_idx += 1,
             KeyCode::Enter if !title.trim().is_empty() && !categories.is_empty() => {
@@ -14080,7 +14156,9 @@ impl App {
                         self.modal_state = ModalType::TreasuryEntry {
                             entry_id,
                             title,
+                            title_cursor,
                             amount,
+                            amount_cursor,
                             entry_type_idx,
                             status_idx,
                             category_idx,
@@ -14115,7 +14193,9 @@ impl App {
                         self.modal_state = ModalType::TreasuryEntry {
                             entry_id,
                             title,
+                            title_cursor,
                             amount,
+                            amount_cursor,
                             entry_type_idx,
                             status_idx: 0,
                             category_idx,
@@ -14159,7 +14239,9 @@ impl App {
                                         self.modal_state = ModalType::TreasuryEntry {
                                             entry_id: Some(entry_id),
                                             title,
+                                            title_cursor,
                                             amount,
+                                            amount_cursor,
                                             entry_type_idx,
                                             status_idx,
                                             category_idx,
@@ -14183,7 +14265,9 @@ impl App {
                                 self.modal_state = ModalType::TreasuryEntry {
                                     entry_id: Some(entry_id),
                                     title,
+                                    title_cursor,
                                     amount,
+                                    amount_cursor,
                                     entry_type_idx,
                                     status_idx,
                                     category_idx,
@@ -14196,6 +14280,10 @@ impl App {
                     }
                     crate::services::TreasuryService::new(&self.db).update_entry(entry)?;
                 } else {
+                    // Un movimiento nuevo respeta la fecha elegida en el campo Date (que ya
+                    // nace en "hoy" y solo se mueve con ←/→, nunca se teclea) — no hace falta
+                    // permiso especial porque no hay una fecha previa que se esté reescribiendo.
+                    let created_at = self.parse_due_date_input(&date_val).unwrap_or(now);
                     service.create_entry(crate::models::LedgerEntry {
                         id: Uuid::new_v4(),
                         campaign_id: project_id,
@@ -14215,7 +14303,7 @@ impl App {
                         recurrence: crate::models::LedgerRecurrence::None,
                         custom_recurrence: None,
                         version: 0,
-                        created_at: now,
+                        created_at,
                         updated_at: now,
                         created_by_identity: Some(self.identity.public_key.clone()),
                     })?;
@@ -14231,7 +14319,9 @@ impl App {
         self.modal_state = ModalType::TreasuryEntry {
             entry_id,
             title,
+            title_cursor,
             amount,
+            amount_cursor,
             entry_type_idx,
             status_idx,
             category_idx,
@@ -17187,14 +17277,19 @@ impl App {
         }
 
         let burst_active = self.ambient_particles_ticks_remaining > 0;
+        // Once a burst's spawn window closes, its particles are still mid-flight —
+        // let them keep falling/drifting off-screen on their own instead of wiping
+        // the whole canvas mid-animation, which read as the effect cutting off abruptly.
+        let winding_down = !burst_active
+            && self.active_ambient_effect == 0
+            && !self.ambient_particles.is_empty();
         let effect = if burst_active && self.ambient_burst_overrides_active {
             self.ambient_burst_effect.max(1)
         } else if self.active_ambient_effect > 0 {
             self.active_ambient_effect
-        } else if burst_active {
+        } else if burst_active || winding_down {
             self.ambient_burst_effect.max(1)
         } else {
-            self.ambient_particles.clear();
             self.ambient_burst_effect = 0;
             self.ambient_burst_overrides_active = false;
             return;
@@ -17204,9 +17299,6 @@ impl App {
             self.ambient_particles_ticks_remaining -= 1;
             if self.ambient_particles_ticks_remaining == 0 {
                 self.ambient_burst_overrides_active = false;
-                if self.active_ambient_effect == 0 {
-                    self.ambient_burst_effect = 0;
-                }
             }
         }
 
@@ -17229,7 +17321,9 @@ impl App {
             max_particles
         };
 
-        let spawn_prob = if burst_active {
+        let spawn_prob = if winding_down {
+            0.0
+        } else if burst_active {
             1.0
         } else {
             match effect {
@@ -17238,7 +17332,9 @@ impl App {
             }
         };
 
-        let spawn_count = if burst_active && effect == 7 {
+        let spawn_count = if winding_down {
+            0
+        } else if burst_active && effect == 7 {
             7
         } else if burst_active {
             3
@@ -23376,14 +23472,16 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.modal_state, ModalType::None);
 
-        // v/V are the dedicated Fellowship sharing shortcuts.
+        // v/V are the dedicated Fellowship sharing shortcuts. Focus starts on the
+        // project selector so a companion is invited into the right campaign before
+        // anyone pastes a key.
         app.handle_key_event(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
             .unwrap();
         assert!(matches!(
             app.modal_state,
             ModalType::InviteMember {
                 project_idx: 0,
-                focus_idx: 1,
+                focus_idx: 0,
                 ..
             }
         ));
@@ -23393,7 +23491,7 @@ mod app_tests {
             .unwrap();
         assert!(matches!(
             app.modal_state,
-            ModalType::InviteMember { focus_idx: 1, .. }
+            ModalType::InviteMember { focus_idx: 0, .. }
         ));
 
         app.modal_state = ModalType::InviteMember {
@@ -23608,6 +23706,84 @@ mod app_tests {
     }
 
     #[test]
+    fn new_treasury_entry_defaults_to_today_and_a_formatted_zero_amount() {
+        let db_file = Path::new("test_questline_treasury_new_entry_defaults.db");
+        let (mut app, _, _) = treasury_role_app(db_file, "Companion");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        match app.modal_state {
+            ModalType::TreasuryEntry {
+                ref amount,
+                ref date_val,
+                ..
+            } => {
+                assert_eq!(amount, "0.00", "the amount field should start pre-formatted");
+                assert_eq!(
+                    date_val,
+                    &Local::now().date_naive().format("%Y-%m-%d").to_string(),
+                    "a brand-new entry's date field must default to today"
+                );
+            }
+            ref other => panic!("expected the entry modal to open, got {other:?}"),
+        }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn creating_an_entry_respects_the_arrow_stepped_date() {
+        // Even a Companion — who can never backdate an *existing* entry — may freely
+        // choose the date while creating a new one: there is no prior date being
+        // rewritten, so ChangeEntryDate doesn't apply here.
+        let db_file = Path::new("test_questline_treasury_new_entry_stepped_date.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        let category_idx = 0;
+
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: "Backdated supplies".to_string(),
+            title_cursor: 18,
+            amount: "9.50".to_string(),
+            amount_cursor: 4,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx,
+            date_val: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            focus_idx: 5,
+        };
+        // Dos días atrás.
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid new entry must save");
+        let entries = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter::default(),
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap();
+        let created = entries
+            .iter()
+            .find(|entry| entry.title == "Backdated supplies")
+            .expect("the new entry must have been recorded");
+        assert_eq!(
+            created.created_at.with_timezone(&Local).date_naive(),
+            Local::now().date_naive() - chrono::Duration::days(2),
+            "the entry must be dated two days back, as stepped in the modal"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn companion_cannot_edit_or_delete_an_entry_recorded_by_someone_else() {
         let db_file = Path::new("test_questline_treasury_foreign_entry.db");
         let (mut app, _, entry_id) = treasury_role_app(db_file, "Companion");
@@ -23642,12 +23818,14 @@ mod app_tests {
         app.modal_state = ModalType::TreasuryEntry {
             entry_id: None,
             title: "My own expense".to_string(),
+            title_cursor: 15,
             amount: "12.00".to_string(),
+            amount_cursor: 5,
             entry_type_idx: 1,
             status_idx: 2, // Paid
             category_idx: 0,
             date_val: String::new(),
-            focus_idx: 4,
+            focus_idx: 5, // Date is now the last field — Enter here attempts the save.
         };
 
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -23728,7 +23906,9 @@ mod app_tests {
 
         app.modal_state = ModalType::TreasuryEntry {
             entry_id: Some(entry_id),
+            title_cursor: original.title.len(),
             title: original.title.clone(),
+            amount_cursor: 0,
             amount: crate::services::treasury::format_minor(original.amount_minor),
             entry_type_idx: 1,
             status_idx: 0,
@@ -23796,7 +23976,9 @@ mod app_tests {
         // Un Companion sigue pudiendo editar su propio movimiento en Planned...
         app.modal_state = ModalType::TreasuryEntry {
             entry_id: Some(mine.id),
+            title_cursor: mine.title.len(),
             title: mine.title.clone(),
+            amount_cursor: 0,
             amount: crate::services::treasury::format_minor(mine.amount_minor),
             entry_type_idx: 1,
             status_idx: 0,
