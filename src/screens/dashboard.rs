@@ -675,11 +675,6 @@ fn draw_hero_panel(f: &mut Frame, theme: &Theme, area: ratatui::layout::Rect, us
         .find(|(lvl, _, _)| *lvl <= user.level)
         .map(|(_, name, _)| *name)
         .unwrap_or("");
-    let next_power = powers
-        .iter()
-        .find(|(lvl, _, _)| *lvl > user.level)
-        .map(|(lvl, name, _)| (*lvl, *name));
-
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -693,7 +688,7 @@ fn draw_hero_panel(f: &mut Frame, theme: &Theme, area: ratatui::layout::Rect, us
         .constraints([Constraint::Min(3), Constraint::Length(1)])
         .split(inner);
 
-    let mut progression_spans = vec![
+    let progression_spans = vec![
         Span::styled("→ ", Style::default().fg(theme.muted)),
         Span::styled(
             current_power,
@@ -702,12 +697,6 @@ fn draw_hero_panel(f: &mut Frame, theme: &Theme, area: ratatui::layout::Rect, us
                 .add_modifier(Modifier::BOLD),
         ),
     ];
-    if let Some((next_lvl, next_name)) = next_power {
-        progression_spans.push(Span::styled(
-            format!("  ⟶  {} ({})", next_name, next_lvl),
-            Style::default().fg(theme.muted),
-        ));
-    }
 
     let info = Paragraph::new(vec![
         Line::from(vec![
@@ -1676,87 +1665,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
                 content[5],
             );
         }
-        ModalType::HydrationReminder => {
-            let modal_area = centered_rect(40, 35, area);
-            let hydration_bg = Color::Rgb(7, 25, 48);
-            let hydration_border = Color::Rgb(56, 189, 248);
-            let hydration_title = Color::Rgb(224, 242, 254);
-            let hydration_text = Color::Rgb(186, 230, 253);
-            let hydration_muted = Color::Rgb(125, 211, 252);
-            f.render_widget(Clear, modal_area);
-            f.render_widget(
-                Block::default().style(Style::default().bg(hydration_bg)),
-                modal_area,
-            );
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Double)
-                .border_style(Style::default().fg(hydration_border).bg(hydration_bg))
-                .title(Span::styled(
-                    " Hydration Reminder ",
-                    Style::default()
-                        .fg(hydration_title)
-                        .bg(hydration_bg)
-                        .add_modifier(Modifier::BOLD),
-                ));
-            let inner = block.inner(modal_area);
-            f.render_widget(block, modal_area);
-            let content = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(2),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                    Constraint::Min(1),
-                    Constraint::Length(1),
-                ])
-                .split(inner);
-            f.render_widget(Paragraph::new(""), content[0]);
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    "  Time to drink some water!",
-                    Style::default()
-                        .fg(hydration_title)
-                        .bg(hydration_bg)
-                        .add_modifier(Modifier::BOLD),
-                )),
-                content[1],
-            );
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    format!(
-                        "  Today: {}/{} glasses",
-                        app.hydration_glasses, app.hydration_target
-                    ),
-                    Style::default().fg(hydration_text).bg(hydration_bg),
-                )),
-                content[2],
-            );
-            let bar_w = inner.width.saturating_sub(4) as usize;
-            let filled = if app.hydration_target > 0 {
-                (app.hydration_glasses * bar_w as i32 / app.hydration_target).min(bar_w as i32)
-                    as usize
-            } else {
-                0
-            };
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    format!("  [{}]", render_progress_bar(filled, bar_w, bar_w)),
-                    Style::default().fg(hydration_border).bg(hydration_bg),
-                )),
-                content[3],
-            );
-            f.render_widget(Paragraph::new(""), content[4]);
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    " [d] Drink  [s] Snooze 15m  [x] Dismiss ",
-                    Style::default().fg(hydration_muted).bg(hydration_bg),
-                ))
-                .alignment(Alignment::Center),
-                content[5],
-            );
-        }
+        // HydrationReminder ya no se dibuja aquí — main.rs lo pinta como overlay global
+        // (independiente de active_screen) porque el recordatorio debe interrumpir
+        // cualquier pantalla, no solo el Dashboard. Tenerlo duplicado aquí hacía que,
+        // estando en el Dashboard, se dibujaran dos cajas "Hydration Reminder" a la vez.
         ModalType::HydrationSettings {
             interval_idx,
             from_hour,

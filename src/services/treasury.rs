@@ -14,7 +14,7 @@ use crate::models::{
     TaskPaymentStatus, TreasuryReport,
 };
 
-pub const DEFAULT_CATEGORIES: [&str; 10] = [
+pub const DEFAULT_CATEGORIES: [&str; 11] = [
     "Development",
     "Infrastructure",
     "Design",
@@ -24,6 +24,7 @@ pub const DEFAULT_CATEGORIES: [&str; 10] = [
     "Contractors",
     "Travel",
     "Administrative",
+    "Food",
     "Other",
 ];
 
@@ -284,9 +285,10 @@ impl<'a> TreasuryService<'a> {
         if entry.id.is_nil() {
             entry.id = Uuid::new_v4();
         }
-        let now = Utc::now();
-        entry.created_at = now;
-        entry.updated_at = now;
+        // A diferencia de updated_at, created_at ya no se pisa aquí: la fecha del movimiento
+        // se elige al crearlo (ver el modal de Treasury) tal como update_entry ya respeta la
+        // fecha elegida al editar. El caller decide; por defecto nace "hoy" de todos modos.
+        entry.updated_at = Utc::now();
         entry.version = 1;
         self.db.conn.execute(
             "INSERT INTO ledger_entries

@@ -7,6 +7,7 @@ use crate::audio::streams::build_source;
 use rodio::{OutputStream, Sink, Source};
 #[cfg(not(target_os = "windows"))]
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 const SOUND_EFFECTS_MAX_GAIN: f32 = 0.20;
@@ -22,6 +23,25 @@ pub struct AudioPlayer {
     state: Arc<Mutex<AudioState>>,
     cinematic_sink: Arc<Mutex<Option<Sink>>>,
     spectrum: crate::audio::spectrum::SpectrumData,
+    // Qué efectos (identificados por su clave, p. ej. "task_complete") están sonando
+    // ahora mismo — evita que completar varias tareas de golpe amontone el mismo sonido
+    // encima de sí mismo; efectos distintos siguen sonando en paralelo sin problema.
+    playing_effects: Arc<Mutex<HashSet<&'static str>>>,
+}
+
+// RAII: saca la clave del set de "sonando" en cuanto el hilo del efecto termina,
+// sin importar por qué salió (éxito, falla al decodificar, falla al crear el sink).
+struct PlayingEffectGuard {
+    playing: Arc<Mutex<HashSet<&'static str>>>,
+    key: &'static str,
+}
+
+impl Drop for PlayingEffectGuard {
+    fn drop(&mut self) {
+        if let Ok(mut playing) = self.playing.lock() {
+            playing.remove(self.key);
+        }
+    }
 }
 
 impl Default for AudioPlayer {
@@ -82,6 +102,7 @@ impl AudioPlayer {
             state,
             cinematic_sink: Arc::new(Mutex::new(None)),
             spectrum: crate::audio::spectrum::new_spectrum_data(),
+            playing_effects: Arc::new(Mutex::new(HashSet::new())),
         };
         #[cfg(not(target_os = "windows"))]
         player.init_mpris();
@@ -90,8 +111,12 @@ impl AudioPlayer {
         player
     }
 
-    // reproduce efectos de sonido en su propio sink para no interrumpir el soundscape principal
-    pub fn play_effect_bytes(&self, bytes: &'static [u8]) {
+    // reproduce efectos de sonido en su propio sink para no interrumpir el soundscape principal.
+    // `key` identifica el efecto (p. ej. "task_complete"): si ese mismo efecto ya está
+    // sonando, esta llamada se descarta en silencio en vez de amontonarse encima —
+    // terminar varias tareas de golpe ya no dispara el mismo sonido pisándose a sí mismo.
+    // Efectos con clave distinta no se ven afectados y siguen sonando en paralelo.
+    pub fn play_effect_bytes(&self, key: &'static str, bytes: &'static [u8]) {
         if let Some(ref handle) = self.handle {
             let handle = handle.clone();
             let state = self.get_state();
@@ -103,7 +128,19 @@ impl AudioPlayer {
             if gain <= f32::EPSILON {
                 return;
             }
+            {
+                let mut playing = self.playing_effects.lock().unwrap();
+                if !playing.insert(key) {
+                    // Ya hay una instancia de este mismo efecto sonando — se ignora.
+                    return;
+                }
+            }
+            let playing_effects = self.playing_effects.clone();
             std::thread::spawn(move || {
+                let _guard = PlayingEffectGuard {
+                    playing: playing_effects,
+                    key,
+                };
                 let cursor = std::io::Cursor::new(bytes);
                 let source = match rodio::Decoder::new(cursor) {
                     Ok(s) => s,
@@ -135,42 +172,62 @@ impl AudioPlayer {
                 // short-lived sinks and makes 0% SFX unambiguously silent.
                 sink.append(source.amplify(gain));
                 sink.sleep_until_end();
+                // _guard sale de scope aquí y libera la clave, sin importar la salida.
             });
         }
     }
 
     pub fn play_task_creation(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/TaskCreattion.mp3"));
+        self.play_effect_bytes(
+            "task_creation",
+            include_bytes!("../../assets/sounds/TaskCreattion.mp3"),
+        );
     }
 
     pub fn play_task_complete(&self) {
-        self.play_effect_bytes(include_bytes!(
-            "../../assets/sounds/focus-task-complete.ogg"
-        ));
+        self.play_effect_bytes(
+            "task_complete",
+            include_bytes!("../../assets/sounds/focus-task-complete.ogg"),
+        );
     }
 
     pub fn play_delete(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/Delete.mp3"));
+        self.play_effect_bytes("delete", include_bytes!("../../assets/sounds/Delete.mp3"));
     }
 
     pub fn play_notification_swarm(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/NotificationSwarm.mp3"));
+        self.play_effect_bytes(
+            "notification_swarm",
+            include_bytes!("../../assets/sounds/NotificationSwarm.mp3"),
+        );
     }
 
     pub fn play_notification(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/notification.mp3"));
+        self.play_effect_bytes(
+            "notification",
+            include_bytes!("../../assets/sounds/notification.mp3"),
+        );
     }
 
     pub fn play_water_alert(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/water-alert.mp3"));
+        self.play_effect_bytes(
+            "water_alert",
+            include_bytes!("../../assets/sounds/water-alert.mp3"),
+        );
     }
 
     pub fn play_focus_end(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/focus-end.mp3"));
+        self.play_effect_bytes(
+            "focus_end",
+            include_bytes!("../../assets/sounds/focus-end.mp3"),
+        );
     }
 
     pub fn play_open_tasks(&self) {
-        self.play_effect_bytes(include_bytes!("../../assets/sounds/OpenTasks.mp3"));
+        self.play_effect_bytes(
+            "open_tasks",
+            include_bytes!("../../assets/sounds/OpenTasks.mp3"),
+        );
     }
 
     // dispara el audio cinemático en su propio sink para que suene encima del soundscape

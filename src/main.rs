@@ -1512,7 +1512,9 @@ async fn main() -> Result<()> {
                 && app.active_screen != ActiveScreen::Onboarding
                 && app.active_screen != ActiveScreen::Editor
                 && app.ambient_effects_enabled
-                && (app.active_ambient_effect > 0 || app.ambient_particles_ticks_remaining > 0)
+                && (app.active_ambient_effect > 0
+                    || app.ambient_particles_ticks_remaining > 0
+                    || !app.ambient_particles.is_empty())
             {
                 for p in &app.ambient_particles {
                     let px = p.x;
@@ -2440,8 +2442,15 @@ async fn main() -> Result<()> {
                 );
                 f.render_widget(perm_p, inner_layout[4]);
 
-                let help_p = Paragraph::new("  Paste/type Companion Key  |  [Tab] navigate  |  [←/→] choose  |  [Enter] invite  |  [Esc] cancel")
-                    .style(Style::default().fg(theme.muted));
+                let first_hint = match focus_idx {
+                    0 => "[←/→] choose project",
+                    3 => "[←/→] choose role",
+                    _ => "Paste/type Companion Key",
+                };
+                let help_p = Paragraph::new(format!(
+                    "  {first_hint}  |  [Tab] navigate  |  [Enter] invite  |  [Esc] cancel"
+                ))
+                .style(Style::default().fg(theme.muted));
                 f.render_widget(help_p, inner_layout[5]);
             }
 

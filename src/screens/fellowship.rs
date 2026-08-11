@@ -11,6 +11,29 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
+use uuid::Uuid;
+
+// Recordatorios de vencimiento ("due_soon"/"overdue") son personales — solo
+// pertenecen a las vistas de Fellowship si la tarea vive en una campaña
+// que de verdad está compartida. Todo lo demás (menciones, invitaciones,
+// asignaciones...) ya nace del contexto de Fellowship, así que pasa directo.
+fn notice_belongs_in_fellowship(app: &App, kind: &str, target_id: &Option<String>) -> bool {
+    if kind != "due_soon" && kind != "overdue" {
+        return true;
+    }
+    let Some(task_id) = target_id
+        .as_deref()
+        .and_then(|s| Uuid::parse_str(s).ok())
+    else {
+        return false;
+    };
+    app.all_tasks
+        .iter()
+        .find(|t| t.id == task_id)
+        .and_then(|t| t.project_id)
+        .map(|pid| app.projects.iter().any(|p| p.id == pid && p.is_shared))
+        .unwrap_or(false)
+}
 
 // La función principal — pinta toda la pantalla de fellowship, tabs y modales incluidos
 // Órale, aquí vive todo: proyectos compartidos, chat, compañeros y búsqueda
@@ -168,7 +191,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                         .style(Style::default().fg(theme.text));
                 f.render_widget(desc_p, sub_chunks[0]);
 
-                let notifications = app.db.get_notifications().unwrap_or_default();
+                let notifications: Vec<_> = app
+                    .db
+                    .get_notifications()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|n| notice_belongs_in_fellowship(app, &n.1, &n.4))
+                    .collect();
                 let mut notif_lines = vec![Line::from("")];
 
                 if notifications.is_empty() {
@@ -1001,6 +1030,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .get_notifications()
                 .unwrap_or_default()
                 .into_iter()
+                .filter(|notice| notice_belongs_in_fellowship(app, &notice.1, &notice.4))
                 .filter(|notice| match app.council_notice_filter.as_str() {
                     "Unread" => !notice.5,
                     "Mentions" => notice.1 == "mention",

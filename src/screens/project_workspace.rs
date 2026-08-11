@@ -772,7 +772,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         ModalType::TreasuryEntry {
             entry_id,
             title,
+            title_cursor,
             amount,
+            amount_cursor,
             entry_type_idx,
             status_idx,
             category_idx,
@@ -783,7 +785,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             app,
             entry_id.is_some(),
             title,
+            *title_cursor,
             amount,
+            *amount_cursor,
             *entry_type_idx,
             *status_idx,
             *category_idx,
@@ -1214,7 +1218,9 @@ fn draw_treasury_entry_modal(
     app: &App,
     is_editing: bool,
     title: &str,
+    title_cursor: usize,
     amount: &str,
+    amount_cursor: usize,
     entry_type_idx: usize,
     status_idx: usize,
     category_idx: usize,
@@ -1246,16 +1252,21 @@ fn draw_treasury_entry_modal(
         .get(category_idx)
         .map(|value| value.name.as_str())
         .unwrap_or("Other");
+    let label_span = |index: usize, label: &str| {
+        Span::styled(
+            // El espacio extra tras el ancho fijo garantiza un hueco visible antes del
+            // valor aun cuando la etiqueta (p. ej. "Amount (MXN)") ya mide 12 caracteres.
+            format!("{label:<12} "),
+            Style::default().fg(if focus_idx == index {
+                theme.primary
+            } else {
+                theme.muted
+            }),
+        )
+    };
     let field = |index: usize, label: &str, value: String| {
         Line::from(vec![
-            Span::styled(
-                format!("{label:<12}"),
-                Style::default().fg(if focus_idx == index {
-                    theme.primary
-                } else {
-                    theme.muted
-                }),
-            ),
+            label_span(index, label),
             Span::styled(
                 value,
                 Style::default()
@@ -1268,17 +1279,59 @@ fn draw_treasury_entry_modal(
             ),
         ])
     };
+    // Title/Amount llevan cursor real: se resalta el carácter sobre el que se está parado
+    // en vez de solo poder teclear al final y borrar desde ahí.
+    let text_field = |index: usize, label: &str, value: &str, cursor: usize, prefix: &str| {
+        if focus_idx != index {
+            return field(index, label, format!("{prefix}{value}"));
+        }
+        let mut cursor = cursor.min(value.len());
+        while cursor > 0 && !value.is_char_boundary(cursor) {
+            cursor -= 1;
+        }
+        let before = &value[..cursor];
+        let (current, after) = if cursor < value.len() {
+            let next = value[cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| cursor + offset)
+                .unwrap_or(value.len());
+            (&value[cursor..next], &value[next..])
+        } else {
+            ("_", "")
+        };
+        Line::from(vec![
+            label_span(index, label),
+            Span::styled(
+                prefix.to_string(),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                before.to_string(),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                current.to_string(),
+                Style::default()
+                    .fg(theme.background)
+                    .bg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                after.to_string(),
+                Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
     let mut lines = vec![
-        field(
-            0,
-            "Title",
-            format!("{}{}", title, if focus_idx == 0 { "_" } else { "" }),
-        ),
+        text_field(0, "Title", title, title_cursor, ""),
         Line::from(""),
-        field(
+        text_field(
             1,
             &format!("Amount ({})", currency.code()),
-            format!("{}{}", amount, if focus_idx == 1 { "_" } else { "" }),
+            amount,
+            amount_cursor,
+            currency.symbol(),
         ),
         Line::from(""),
         field(
@@ -1288,22 +1341,18 @@ fn draw_treasury_entry_modal(
         ),
         field(3, "Status", format!("◀ {} ▶", statuses[status_idx.min(3)])),
         field(4, "Category", format!("◀ {} ▶", category)),
+        Line::from(""),
+        field(5, "Date", format!("◀ {} ▶", date_val)),
     ];
     if is_editing {
-        lines.push(Line::from(""));
-        lines.push(field(
-            5,
-            "Date",
-            format!("{}{}", date_val, if focus_idx == 5 { "_" } else { "" }),
-        ));
         lines.push(Line::from(Span::styled(
-            "  (Owner/Steward only — YYYY-MM-DD, \"today\", \"in 3 days\")",
+            "  (Owner/Steward only)",
             Style::default().fg(theme.muted),
         )));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Tab/↑↓ field · ←→ choice · Enter continue/save · Esc cancel",
+        "Tab/↑↓ field · ←→ choice/day/cursor · Enter continue/save · Esc cancel",
         Style::default().fg(theme.muted),
     )));
     let modal_title = if is_editing {
