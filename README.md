@@ -92,6 +92,8 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ### Quest System
 Tasks in Questline are quests. They carry priority, due dates, subtasks, and steps. Completing a quest earns XP, waters your Zen Tree, and pushes chapter objectives forward. Fail to complete daily quests and the realm takes notice.
 
+Press `m` on a quest or step in a Campaign's War Room to move it — send it back to the top level, or file it as a step under any other top-level quest in that Campaign. A quest that still holds its own steps can't be moved into another quest until those steps are cleared or moved first, since a step cannot itself hold steps.
+
 Press `t` from Campaigns to start from a Software Release, Content Sprint, or Event Launch template. Reusable Campaign structure can also be exchanged as an identity-free JSON blueprint:
 
 ```sh
@@ -121,24 +123,36 @@ provider authorization and export-isolation checks must pass before login ships.
 
 Every time the Dashboard opens, Questline convenes an emergency session of the Planning Council — a deterministic scoring engine that reviews every incomplete task in your backlog and selects the single most important thing to do right now.
 
-The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points.
+The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points — but it weighs time far more heavily than it used to, because a task due six weeks from now has no business winning the title of "most important thing to do today."
 
-| Condition | Points |
+| Due date | Points |
 |---|---|
-| Overdue | +100 |
-| Due today | +60 |
-| Due tomorrow | +40 |
-| Due within three days | +25 |
-| Due within seven days | +10 |
-| High priority | +30 |
-| Medium priority | +10 |
+| Overdue | +105 |
+| Due today | +90 |
+| Due tomorrow | +75 |
+| Due within three days | +60 |
+| Due within seven days | +45 |
+| Due within two weeks | +30 |
+| Due within thirty days | +15 |
+| Due beyond thirty days, or no due date | +0 |
+
+| Priority | Points |
+|---|---|
+| High priority | +14 |
+| Medium priority | +5 |
 | Low priority | +0 |
 
-The scores stack. A High priority task due today scores 90. An overdue task of any priority scores at least 100 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
+The due-date ladder climbs in steps of 15, and priority tops out at 14 — one point short of a full step. That gap is deliberate: no amount of priority can ever lift a task over a nearer deadline. A High priority task with no due date, or one due nine months from now, scores 14. A Low priority task due within the month already scores 15, and beats it. Time sets the ceiling; priority only breaks ties between tasks that are already similarly urgent.
+
+The scores still stack within a tier. A High priority task due today scores 104. An overdue task of any priority scores at least 105 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
 
 The Council does not consider how long the task will take, how much you dread it, how many times you have quietly moved it to tomorrow, or whether finishing it would actually matter. Those are judgment calls. The Council only counts points.
 
 The second-highest scoring task is displayed as the Recommended Next Quest — a polite suggestion from an entity that has never experienced a Tuesday afternoon.
+
+The Council only lets tasks compete for Main Quest, Recommended Next Quest, Quick Wins, or Upcoming Threats if they are overdue, undated, or due within your configured planning horizon — 15 days by default. A task due a month out still scores exactly as the table says, but it cannot be crowned "the single most important thing to do right now" until it's actually close, so the Command Center reflects what deserves your attention today rather than everything eventually on the calendar.
+
+Set that horizon yourself from `[9] Settings` → Oath Calendar → **Show up to**, with `Left`/`Right`. Choose Today, Tomorrow, 1 week, 15 days, 1 month, 6 months, 1 year, or All (no limit). The setting syncs across your devices like the rest of the Oath Calendar.
 
 Press `o` from the Dashboard to open the current Main Quest directly in its workspace.
 
@@ -242,6 +256,7 @@ approves or settles it:
 | Edit/delete any entry | Yes | Yes | No | No |
 | Approve entry | Yes | Yes | No | No |
 | Settle payment | Yes | Yes | No | No |
+| Change entry date | Yes | Yes | No | No |
 | Set budgets | Yes | Yes | No | No |
 | Manage categories | Yes | Yes | No | No |
 | Switch currency | Yes | No | No | No |
@@ -253,7 +268,11 @@ paid, or cancelled it belongs to the Owner and Stewards. Authorship is recorded
 as the author's Companion Key when the entry is created and never changes, so
 editing someone else's entry does not transfer ownership of it. The status field
 in the entry form is not a shortcut either: saving anything other than `Planned`
-requires the right to approve or settle.
+requires the right to approve or settle. The same goes for the entry's date —
+editing an entry shows a Date field (`YYYY-MM-DD`, `today`, `tomorrow`, or
+`in N days`) so an Owner or a Steward can correct or backdate when a movement
+actually occurred; a Companion can still edit their own Planned entry, but the
+date itself is Owner/Steward-only and reverts if they try to change it.
 
 The Treasury footer only advertises the shortcuts your role can actually use,
 and the Quest Codex (`?`) grays out the rest.

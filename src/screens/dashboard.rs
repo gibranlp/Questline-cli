@@ -2,7 +2,7 @@
 // dashboard.rs — el centro de comando del héroe: campaña de hoy y estado del reino
 // ─────────────────────────────────────────────────────────────────────────────
 
-use crate::app::{App, ModalType};
+use crate::app::{App, DashboardCommandTarget, ModalType};
 use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
@@ -227,6 +227,30 @@ fn draw_today_command_center(
         ])));
     }
 
+    if let Some(next) = plan.next_quest.as_ref() {
+        let (prio_label, prio_color) = priority_label(next.task.priority);
+        if action_idx == app.selected_dashboard_task_idx {
+            selected_visual_idx = Some(rows.len());
+        }
+        action_idx += 1;
+        rows.push(ListItem::new(Line::from(vec![
+            Span::styled("NEXT  ", Style::default().fg(theme.focus_timer)),
+            Span::styled(
+                format!("{} ", short_text(&next.project_name, 14)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!("[{}] ", prio_label),
+                Style::default().fg(prio_color),
+            ),
+            Span::styled(next.task.title.as_str(), Style::default().fg(theme.text)),
+            Span::styled(
+                format!("  {}", format_duration(next.est_minutes)),
+                Style::default().fg(theme.muted),
+            ),
+        ])));
+    }
+
     push_separator(&mut rows, "Quick Wins", theme.primary);
     for task in &plan.quick_wins {
         let (prio_label, prio_color) = priority_label(task.priority);
@@ -378,15 +402,111 @@ fn draw_campaign_intel(
 ) {
     let mut lines = Vec::new();
 
+    // Vista rápida de la quest seleccionada en el Command Center — el cursor manda,
+    // no solo la Main Quest, para que moverse por la lista muestre sus detalles.
+    if let Some(DashboardCommandTarget::Task(task)) = app.selected_dashboard_command_target() {
+        let (prio_label, prio_color) = priority_label(task.priority);
+        let project_name = app
+            .projects
+            .iter()
+            .find(|p| Some(p.id) == task.project_id)
+            .map(|p| p.name.as_str())
+            .unwrap_or("General");
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Selected: ",
+                Style::default()
+                    .fg(theme.focus_timer)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("[{}] ", prio_label),
+                Style::default().fg(prio_color),
+            ),
+            Span::styled(
+                short_text(&task.title, 22),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", short_text(project_name, 10)),
+                Style::default().fg(theme.muted),
+            ),
+        ]));
+        let due_label = task
+            .due_date
+            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| "None".to_string());
+        lines.push(Line::from(vec![
+            Span::styled("  Due Date: ", Style::default().fg(theme.muted)),
+            Span::styled(due_label, Style::default().fg(theme.text)),
+        ]));
+        let description = task
+            .description
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| short_text(d.trim(), 34))
+            .unwrap_or_else(|| "No description.".to_string());
+        lines.push(Line::from(vec![
+            Span::styled("  Description: ", Style::default().fg(theme.muted)),
+            Span::styled(description, Style::default().fg(theme.text)),
+        ]));
+        let steps: Vec<&Task> = all_tasks
+            .iter()
+            .filter(|t| t.parent_task_id == Some(task.id))
+            .collect();
+        if steps.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "  Steps: none",
+                Style::default().fg(theme.muted),
+            )));
+        } else {
+            let completed = steps.iter().filter(|s| s.completed).count();
+            lines.push(Line::from(Span::styled(
+                format!("  Steps: {}/{}", completed, steps.len()),
+                Style::default().fg(theme.muted),
+            )));
+            for step in steps.iter().take(6) {
+                let marker = if step.completed { "[x]" } else { "[ ]" };
+                let color = if step.completed {
+                    theme.success
+                } else {
+                    theme.text
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("    {} ", marker), Style::default().fg(color)),
+                    Span::styled(step.title.as_str(), Style::default().fg(color)),
+                ]));
+            }
+            if steps.len() > 6 {
+                lines.push(Line::from(Span::styled(
+                    format!("    +{} more", steps.len() - 6),
+                    Style::default().fg(theme.muted),
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+    }
+
     lines.push(Line::from(Span::styled(
         "Upcoming Threats",
         Style::default()
             .fg(theme.warning)
             .add_modifier(Modifier::BOLD),
     )));
+    let horizon_days = app.quest_visibility_horizon_days();
     let mut threats: Vec<&Task> = all_tasks
         .iter()
-        .filter(|t| !t.completed && t.parent_task_id.is_none() && t.due_date.is_some())
+        .filter(|t| {
+            !t.completed
+                && t.parent_task_id.is_none()
+                && t.due_date.is_some_and(|due| {
+                    horizon_days
+                        .map(|limit| (due.with_timezone(&Local).date_naive() - today).num_days() <= limit)
+                        .unwrap_or(true)
+                })
+        })
         .collect();
     threats.sort_by(|a, b| a.due_date.cmp(&b.due_date));
     if threats.is_empty() {
@@ -1324,6 +1444,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         zen_tree.health,
         daily_completed,
         daily_total,
+        app.quest_visibility_horizon_days(),
     );
 
     let reflected_today = app

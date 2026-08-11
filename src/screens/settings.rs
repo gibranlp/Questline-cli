@@ -1,4 +1,4 @@
-use crate::app::App;
+use crate::app::{App, QUEST_VISIBILITY_HORIZON_PRESETS};
 use crate::theme::{Theme, ThemeChoice};
 use ratatui::{
     Frame,
@@ -257,6 +257,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             theme,
             theme.secondary,
         ),
+        settings_row(
+            "Show up to",
+            QUEST_VISIBILITY_HORIZON_PRESETS[app
+                .quest_visibility_horizon_idx
+                .min(QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1)]
+            .0
+            .to_string(),
+            "Left/Right",
+            15,
+            app,
+            theme,
+            theme.secondary,
+        ),
         Line::from(""),
         Line::from(Span::styled(
             "The flame honors only the sworn days and watch hours.",
@@ -270,7 +283,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(
-                    if (6..=14).contains(&app.selected_settings_focus_idx) {
+                    if (6..=15).contains(&app.selected_settings_focus_idx) {
                         theme.primary
                     } else {
                         theme.border

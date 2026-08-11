@@ -26,6 +26,38 @@ use crate::theme::ThemeChoice;
 pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
 const TASK_TITLE_CHAR_LIMIT: usize = 100;
 
+// Presets del Oath Calendar para "Show quests up to" — cuántos días adelante puede
+// competir una quest por Main Quest / Next Quest / Quick Win / Upcoming Threats.
+// None = All (sin límite).
+pub const QUEST_VISIBILITY_HORIZON_PRESETS: [(&str, Option<i64>); 8] = [
+    ("Today", Some(0)),
+    ("Tomorrow", Some(1)),
+    ("1 week", Some(7)),
+    ("15 days", Some(15)),
+    ("1 month", Some(30)),
+    ("6 months", Some(180)),
+    ("1 year", Some(365)),
+    ("All", None),
+];
+
+// Convierte los días guardados en DB al índice de preset más cercano — por si un valor
+// sincronizado desde otra versión no calza exacto con ninguno de los presets actuales.
+fn quest_visibility_horizon_idx_from_days(days: Option<i64>) -> usize {
+    QUEST_VISIBILITY_HORIZON_PRESETS
+        .iter()
+        .position(|(_, preset)| *preset == days)
+        .unwrap_or_else(|| match days {
+            None => QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1,
+            Some(target) => QUEST_VISIBILITY_HORIZON_PRESETS
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, (_, preset))| preset.map(|d| (idx, (d - target).abs())))
+                .min_by_key(|(_, diff)| *diff)
+                .map(|(idx, _)| idx)
+                .unwrap_or(3),
+        })
+}
+
 pub(crate) fn council_mention_query(content: &str) -> Option<&str> {
     if content.is_empty() || content.ends_with(char::is_whitespace) {
         return None;
@@ -394,6 +426,11 @@ pub enum ModalType {
         codex_id: Uuid,
         selected_idx: usize,
     },
+    // Mueve una tarea/step para que sea top-level o step de otra tarea top-level del mismo proyecto
+    RefileTask {
+        task_id: Uuid,
+        selected_idx: usize,
+    },
     EditTask {
         id: Uuid,
         title: String,
@@ -419,6 +456,9 @@ pub enum ModalType {
         entry_type_idx: usize,
         status_idx: usize,
         category_idx: usize,
+        // Texto libre para la fecha del movimiento — "today", "in 3 days", "2026-08-10"...
+        // se reutiliza el mismo parser que la fecha de vencimiento de las Quests.
+        date_val: String,
         focus_idx: usize,
     },
     TaskExpenseCompletion {
@@ -1082,13 +1122,16 @@ pub struct App {
     pub library_scroll_offset: u16,
     pub library_detail_max_scroll: Cell<u16>,
     pub selected_relic_idx: usize,
-    pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End
+    pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End, 15 = Quest Horizon
     pub selected_settings_theme_idx: usize,
     pub sound_effects_enabled: bool,
     pub sound_effects_volume: f32,
     pub streak_workday_mask: u8,
     pub streak_active_from: u32,
     pub streak_active_to: u32,
+    // Índice en QUEST_VISIBILITY_HORIZON_PRESETS — cuántos días adelante puede competir
+    // una quest por Main Quest / Next Quest / Quick Win / Upcoming Threats.
+    pub quest_visibility_horizon_idx: usize,
     pub ambient_effects_enabled: bool,
     pub active_ambient_effect: usize,
     pub ambient_particles: Vec<Particle>,
@@ -1215,7 +1258,7 @@ pub fn open_url(url: &str) {
 }
 
 #[derive(Debug, Clone)]
-enum DashboardCommandTarget {
+pub(crate) enum DashboardCommandTarget {
     Task(Task),
     Ritual(String),
     DailyAdventure(String),
@@ -1469,7 +1512,7 @@ impl App {
         match focus_idx {
             0 => 1,
             1..=5 => 6,
-            6..=14 => 0,
+            6..=15 => 0,
             _ => 0,
         }
     }
@@ -1478,7 +1521,7 @@ impl App {
         match focus_idx {
             0 => 6,
             1..=5 => 0,
-            6..=14 => 1,
+            6..=15 => 1,
             _ => 0,
         }
     }
@@ -1487,8 +1530,8 @@ impl App {
         match focus_idx {
             1 => 5,
             2..=5 => focus_idx - 1,
-            6 => 14,
-            7..=14 => focus_idx - 1,
+            6 => 15,
+            7..=15 => focus_idx - 1,
             _ => focus_idx,
         }
     }
@@ -1497,13 +1540,13 @@ impl App {
         match focus_idx {
             1..=4 => focus_idx + 1,
             5 => 1,
-            6..=13 => focus_idx + 1,
-            14 => 6,
+            6..=14 => focus_idx + 1,
+            15 => 6,
             _ => focus_idx,
         }
     }
 
-    fn dashboard_command_targets(&self) -> Vec<DashboardCommandTarget> {
+    pub(crate) fn dashboard_command_targets(&self) -> Vec<DashboardCommandTarget> {
         let all_tasks = self.db.get_tasks().unwrap_or_default();
         let today = Local::now().date_naive();
         let overdue_count = all_tasks
@@ -1525,11 +1568,16 @@ impl App {
             self.stats_cache.zen_tree.health,
             self.stats_cache.todays_daily_adventures_completed,
             self.stats_cache.todays_daily_adventures_total,
+            self.quest_visibility_horizon_days(),
         );
         let mut targets = Vec::new();
 
         if let Some(main) = plan.main_quest {
             targets.push(DashboardCommandTarget::Task(main.task));
+        }
+
+        if let Some(next) = plan.next_quest {
+            targets.push(DashboardCommandTarget::Task(next.task));
         }
 
         for task in plan.quick_wins {
@@ -1549,7 +1597,7 @@ impl App {
         targets
     }
 
-    fn selected_dashboard_command_target(&self) -> Option<DashboardCommandTarget> {
+    pub(crate) fn selected_dashboard_command_target(&self) -> Option<DashboardCommandTarget> {
         let targets = self.dashboard_command_targets();
         let idx = self
             .selected_dashboard_task_idx
@@ -2278,6 +2326,8 @@ impl App {
             .map(|v| v.min(7))
             .unwrap_or(7);
         let streak_schedule = db.get_streak_schedule();
+        let quest_visibility_horizon_idx =
+            quest_visibility_horizon_idx_from_days(db.get_quest_visibility_horizon_days());
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -2475,6 +2525,7 @@ impl App {
             streak_workday_mask: streak_schedule.workday_mask,
             streak_active_from: streak_schedule.active_from,
             streak_active_to: streak_schedule.active_to,
+            quest_visibility_horizon_idx,
             ambient_effects_enabled: true,
             active_ambient_effect: 0,
             ambient_particles: Vec::new(),
@@ -2881,6 +2932,10 @@ impl App {
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|v| v.min(7))
                 .unwrap_or(7);
+            // Recargar tras un pull remoto — así un cambio de horizonte hecho en otro
+            // dispositivo se refleja aquí sin esperar a reiniciar la app.
+            self.quest_visibility_horizon_idx =
+                quest_visibility_horizon_idx_from_days(self.db.get_quest_visibility_horizon_days());
 
             self.projects = self.db.get_projects()?;
             self.projects
@@ -3160,9 +3215,9 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
-                    // 'm' en Workspace milestones y Fellowship ya está tomado — no cambiar pantalla
+                    // 'm' en Workspace quests/milestones y Fellowship ya está tomado — no cambiar pantalla
                     if !(self.active_screen == ActiveScreen::Workspace
-                        && self.workspace_tab_idx == 3)
+                        && (self.workspace_tab_idx == 0 || self.workspace_tab_idx == 3))
                         && self.active_screen != ActiveScreen::Fellowship
                     {
                         self.active_screen = ActiveScreen::Soundscapes;
@@ -3958,6 +4013,61 @@ impl App {
                         self.mark_dirty();
                         self.selected_notes_flat_idx = 0;
                         self.reload_data()?;
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::RefileTask {
+                task_id,
+                selected_idx,
+            } => {
+                let tid = task_id;
+                let mut sel = selected_idx;
+                let targets = self.refile_task_targets(tid);
+                let total = targets.len() + 1; // 0 = Top-level (no parent)
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = if sel > 0 { sel - 1 } else { total - 1 };
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: tid,
+                            selected_idx: sel,
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1) % total;
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: tid,
+                            selected_idx: sel,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let new_parent = if sel == 0 {
+                            None
+                        } else {
+                            targets.get(sel - 1).copied()
+                        };
+                        if let Some(orig) = self.all_tasks.iter().find(|t| t.id == tid) {
+                            let mut t = orig.clone();
+                            t.parent_task_id = new_parent;
+                            self.db.update_task(&t)?;
+                            self.mark_dirty();
+                            self.selected_task_idx = 0;
+                            self.reload_data()?;
+                            let message = match new_parent.and_then(|pid| {
+                                self.all_tasks.iter().find(|p| p.id == pid)
+                            }) {
+                                Some(parent) => {
+                                    format!("Quest is now a step of \"{}\".", parent.title)
+                                }
+                                None => "Quest returned to the top level.".to_string(),
+                            };
+                            self.notifications.push(Notification::info(message));
+                        }
                         self.modal_state = ModalType::None;
                     }
                     _ => {}
@@ -8461,9 +8571,11 @@ impl App {
                 if self.active_screen == ActiveScreen::Dashboard =>
             {
                 let today = chrono::Local::now().date_naive();
-                if let Some(task) =
-                    crate::services::planner::find_main_quest(&self.all_tasks, today)
-                {
+                if let Some(task) = crate::services::planner::find_main_quest(
+                    &self.all_tasks,
+                    today,
+                    self.quest_visibility_horizon_days(),
+                ) {
                     if let Some(p_id) = task.project_id {
                         self.active_project_id = Some(p_id);
                         self.refresh_stats_cache();
@@ -8521,6 +8633,7 @@ impl App {
                         5 => self.adjust_sound_effects_volume(-0.05)?,
                         13 => self.adjust_streak_active_from(-1)?,
                         14 => self.adjust_streak_active_to(-1)?,
+                        15 => self.adjust_quest_visibility_horizon(-1)?,
                         _ => {}
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -8548,6 +8661,7 @@ impl App {
                         5 => self.adjust_sound_effects_volume(0.05)?,
                         13 => self.adjust_streak_active_from(1)?,
                         14 => self.adjust_streak_active_to(1)?,
+                        15 => self.adjust_quest_visibility_horizon(1)?,
                         _ => {}
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -8742,6 +8856,7 @@ impl App {
                     5 => self.adjust_sound_effects_volume(0.05)?,
                     13 => self.adjust_streak_active_from(1)?,
                     14 => self.adjust_streak_active_to(1)?,
+                    15 => self.adjust_quest_visibility_horizon(1)?,
                     _ => {}
                 }
             }
@@ -8750,6 +8865,7 @@ impl App {
                     5 => self.adjust_sound_effects_volume(-0.05)?,
                     13 => self.adjust_streak_active_from(-1)?,
                     14 => self.adjust_streak_active_to(-1)?,
+                    15 => self.adjust_quest_visibility_horizon(-1)?,
                     _ => {}
                 }
             }
@@ -10331,6 +10447,32 @@ impl App {
             .collect()
     }
 
+    // True cuando la tarea tiene steps propios — no se le permite volverse step de otra
+    // tarea porque este tablero solo soporta un nivel de anidamiento (steps no tienen steps)
+    pub fn task_has_children(&self, task_id: Uuid) -> bool {
+        self.all_tasks
+            .iter()
+            .any(|t| t.parent_task_id == Some(task_id))
+    }
+
+    // Destinos elegibles para "mover" una tarea: otras tareas top-level del mismo proyecto,
+    // sin completar y sin steps propios. No incluye la tarea en sí.
+    pub fn refile_task_targets(&self, task_id: Uuid) -> Vec<Uuid> {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return Vec::new();
+        };
+        self.all_tasks
+            .iter()
+            .filter(|t| {
+                t.id != task_id
+                    && t.project_id == task.project_id
+                    && t.parent_task_id.is_none()
+                    && !t.completed
+            })
+            .map(|t| t.id)
+            .collect()
+    }
+
     pub fn build_scroll_destinations(
         projects: &[Project],
         codices: &[crate::models::Codex],
@@ -11119,6 +11261,28 @@ impl App {
                     self.cycle_quest_stance(&task, p_id, true)?;
                 }
             }
+            KeyCode::Char('m') if self.workspace_tab_idx == 0 => {
+                if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
+                    let task = proj_tasks[self.selected_task_idx].clone();
+                    if self.task_has_children(task.id) {
+                        self.notifications.push(Notification::warning(
+                            "This quest still holds its own steps. Clear or move them first."
+                                .to_string(),
+                        ));
+                    } else {
+                        let targets = self.refile_task_targets(task.id);
+                        let default_idx = task
+                            .parent_task_id
+                            .and_then(|pid| targets.iter().position(|t| *t == pid))
+                            .map(|pos| pos + 1)
+                            .unwrap_or(0);
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: task.id,
+                            selected_idx: default_idx,
+                        };
+                    }
+                }
+            }
             KeyCode::Char('c') if self.workspace_tab_idx == 0 => {
                 if !self.project_is_shared(p_id) {
                     return Ok(());
@@ -11605,6 +11769,7 @@ impl App {
                         entry_type_idx: 1,
                         status_idx: 0,
                         category_idx: 0,
+                        date_val: Local::now().date_naive().format("%Y-%m-%d").to_string(),
                         focus_idx: 0,
                     };
                 }
@@ -11723,6 +11888,11 @@ impl App {
                                 .iter()
                                 .position(|category| category.id == entry.category_id)
                                 .unwrap_or(0),
+                            date_val: entry
+                                .created_at
+                                .with_timezone(&Local)
+                                .format("%Y-%m-%d")
+                                .to_string(),
                             focus_idx: 0,
                         };
                     }
@@ -12231,6 +12401,7 @@ impl App {
                 entry_type_idx,
                 status_idx,
                 category_idx,
+                ref date_val,
                 focus_idx,
             } => {
                 self.handle_treasury_entry_modal_key(
@@ -12242,6 +12413,7 @@ impl App {
                     entry_type_idx,
                     status_idx,
                     category_idx,
+                    date_val.clone(),
                     focus_idx,
                 )?;
             }
@@ -13849,16 +14021,23 @@ impl App {
         mut entry_type_idx: usize,
         mut status_idx: usize,
         mut category_idx: usize,
+        mut date_val: String,
         mut focus_idx: usize,
     ) -> Result<()> {
         let categories = crate::services::TreasuryService::new(&self.db).categories(project_id)?;
+        // La fecha solo se puede tocar al editar un movimiento existente — un movimiento
+        // nuevo siempre nace "hoy" (create_entry lo fuerza), así que no tiene sentido
+        // ofrecer el campo ahí. Editar en cambio sí respeta la fecha elegida.
+        let field_count = if entry_id.is_some() { 6 } else { 5 };
         match key.code {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
                 return Ok(());
             }
-            KeyCode::Tab | KeyCode::Down => focus_idx = (focus_idx + 1) % 5,
-            KeyCode::BackTab | KeyCode::Up => focus_idx = (focus_idx + 4) % 5,
+            KeyCode::Tab | KeyCode::Down => focus_idx = (focus_idx + 1) % field_count,
+            KeyCode::BackTab | KeyCode::Up => {
+                focus_idx = (focus_idx + field_count - 1) % field_count
+            }
             KeyCode::Left if focus_idx == 2 => entry_type_idx = (entry_type_idx + 3) % 4,
             KeyCode::Right if focus_idx == 2 => entry_type_idx = (entry_type_idx + 1) % 4,
             KeyCode::Left if focus_idx == 3 => status_idx = (status_idx + 3) % 4,
@@ -13875,6 +14054,9 @@ impl App {
             KeyCode::Backspace if focus_idx == 1 => {
                 amount.pop();
             }
+            KeyCode::Backspace if focus_idx == 5 => {
+                date_val.pop();
+            }
             KeyCode::Char(character) if focus_idx == 0 && title.chars().count() < 100 => {
                 title.push(character)
             }
@@ -13885,7 +14067,10 @@ impl App {
             {
                 amount.push(character)
             }
-            KeyCode::Enter if focus_idx < 4 => focus_idx += 1,
+            KeyCode::Char(character) if focus_idx == 5 && date_val.chars().count() < 20 => {
+                date_val.push(character)
+            }
+            KeyCode::Enter if focus_idx < field_count - 1 => focus_idx += 1,
             KeyCode::Enter if !title.trim().is_empty() && !categories.is_empty() => {
                 let amount_minor = match crate::services::treasury::parse_minor(&amount) {
                     Ok(value) => value,
@@ -13899,6 +14084,7 @@ impl App {
                             entry_type_idx,
                             status_idx,
                             category_idx,
+                            date_val,
                             focus_idx: 1,
                         };
                         return Ok(());
@@ -13933,6 +14119,7 @@ impl App {
                             entry_type_idx,
                             status_idx: 0,
                             category_idx,
+                            date_val,
                             focus_idx: 3,
                         };
                         return Ok(());
@@ -13954,7 +14141,60 @@ impl App {
                     } else {
                         None
                     };
-                    service.update_entry(entry)?;
+                    // Cambiar la fecha del movimiento (la columna "Date" del Ledger) es un
+                    // acto de gobierno — solo el Owner o un Steward pueden reasentar cuándo
+                    // ocurrió. Si no se tocó el campo (mismo día que ya tenía), no hace falta
+                    // permiso ni se reescribe nada.
+                    let trimmed_date = date_val.trim();
+                    if !trimmed_date.is_empty() {
+                        match self.parse_due_date_input(trimmed_date) {
+                            Some(requested) => {
+                                let changed_day = requested.with_timezone(&Local).date_naive()
+                                    != entry.created_at.with_timezone(&Local).date_naive();
+                                if changed_day {
+                                    if !self.treasury_allows(
+                                        project_id,
+                                        crate::services::treasury_policy::TreasuryAction::ChangeEntryDate,
+                                    ) {
+                                        self.modal_state = ModalType::TreasuryEntry {
+                                            entry_id: Some(entry_id),
+                                            title,
+                                            amount,
+                                            entry_type_idx,
+                                            status_idx,
+                                            category_idx,
+                                            date_val: entry
+                                                .created_at
+                                                .with_timezone(&Local)
+                                                .format("%Y-%m-%d")
+                                                .to_string(),
+                                            focus_idx: 5,
+                                        };
+                                        return Ok(());
+                                    }
+                                    entry.created_at = requested;
+                                }
+                            }
+                            None => {
+                                self.notifications.push(Notification::warning(
+                                    "Could not read that date. Try YYYY-MM-DD, \"today\", or \"in 3 days\"."
+                                        .to_string(),
+                                ));
+                                self.modal_state = ModalType::TreasuryEntry {
+                                    entry_id: Some(entry_id),
+                                    title,
+                                    amount,
+                                    entry_type_idx,
+                                    status_idx,
+                                    category_idx,
+                                    date_val,
+                                    focus_idx: 5,
+                                };
+                                return Ok(());
+                            }
+                        }
+                    }
+                    crate::services::TreasuryService::new(&self.db).update_entry(entry)?;
                 } else {
                     service.create_entry(crate::models::LedgerEntry {
                         id: Uuid::new_v4(),
@@ -13995,6 +14235,7 @@ impl App {
             entry_type_idx,
             status_idx,
             category_idx,
+            date_val,
             focus_idx,
         };
         Ok(())
@@ -18778,6 +19019,25 @@ impl App {
         self.save_streak_schedule()
     }
 
+    // Días adelante que puede competir una quest por Main Quest / Next Quest / Quick Win /
+    // Upcoming Threats — None significa "All" (sin límite).
+    pub(crate) fn quest_visibility_horizon_days(&self) -> Option<i64> {
+        let idx = self
+            .quest_visibility_horizon_idx
+            .min(QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1);
+        QUEST_VISIBILITY_HORIZON_PRESETS[idx].1
+    }
+
+    fn adjust_quest_visibility_horizon(&mut self, delta: i32) -> Result<()> {
+        let len = QUEST_VISIBILITY_HORIZON_PRESETS.len() as i32;
+        self.quest_visibility_horizon_idx =
+            (self.quest_visibility_horizon_idx as i32 + delta).rem_euclid(len) as usize;
+        let days = QUEST_VISIBILITY_HORIZON_PRESETS[self.quest_visibility_horizon_idx].1;
+        self.db.set_quest_visibility_horizon_days(days)?;
+        self.db.queue_quest_visibility_horizon_sync()?;
+        Ok(())
+    }
+
     fn pywal_colors_modified() -> Option<std::time::SystemTime> {
         let home = std::env::var("HOME").ok()?;
         std::fs::metadata(std::path::Path::new(&home).join(".cache/wal/colors.json"))
@@ -23386,6 +23646,7 @@ mod app_tests {
             entry_type_idx: 1,
             status_idx: 2, // Paid
             category_idx: 0,
+            date_val: String::new(),
             focus_idx: 4,
         };
 
@@ -23450,6 +23711,121 @@ mod app_tests {
                 .campaign_currency(project_id)
                 .unwrap(),
             crate::models::Currency::Usd
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn steward_can_backdate_a_treasury_entry() {
+        let db_file = Path::new("test_questline_treasury_steward_reschedule.db");
+        let (mut app, _, entry_id) = treasury_role_app(db_file, "Steward");
+        let original = crate::services::TreasuryService::new(&app.db)
+            .get_entry(entry_id)
+            .unwrap()
+            .unwrap();
+
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(entry_id),
+            title: original.title.clone(),
+            amount: crate::services::treasury::format_minor(original.amount_minor),
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2020-01-15".to_string(),
+            focus_idx: 5,
+        };
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid date must save");
+        let updated = crate::services::TreasuryService::new(&app.db)
+            .get_entry(entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.created_at.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2020, 1, 15).unwrap(),
+            "a Steward must be able to move an entry's date"
+        );
+        assert_ne!(
+            updated.created_at.date_naive(),
+            original.created_at.date_naive(),
+            "the date must actually have moved"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn companion_cannot_change_an_entry_date_even_their_own() {
+        let db_file = Path::new("test_questline_treasury_companion_reschedule.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        let service = crate::services::TreasuryService::new(&app.db);
+        let category = service.categories(project_id).unwrap().remove(0);
+        let now = Utc::now();
+        let mine = service
+            .create_entry(crate::models::LedgerEntry {
+                id: Uuid::new_v4(),
+                campaign_id: project_id,
+                title: "My own planned expense".to_string(),
+                description: String::new(),
+                entry_type: crate::models::LedgerEntryType::Expense,
+                category_id: category.id,
+                amount_minor: 3_00,
+                currency_code: "USD".to_string(),
+                status: crate::models::LedgerStatus::Planned,
+                due_date: None,
+                payment_date: None,
+                vendor_source: None,
+                related_task_id: None,
+                notes: None,
+                attachment_ref: None,
+                recurrence: crate::models::LedgerRecurrence::None,
+                custom_recurrence: None,
+                version: 0,
+                created_at: now,
+                updated_at: now,
+                created_by_identity: Some(app.identity.public_key.clone()),
+            })
+            .unwrap();
+
+        // Un Companion sigue pudiendo editar su propio movimiento en Planned...
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(mine.id),
+            title: mine.title.clone(),
+            amount: crate::services::treasury::format_minor(mine.amount_minor),
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2020-01-15".to_string(),
+            focus_idx: 5,
+        };
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        // ...pero no puede tocar cuándo ocurrió.
+        assert!(
+            last_warning(&app).contains("Only the Owner or a Steward may change"),
+            "changing the date must be refused for a Companion, got {:?}",
+            last_warning(&app)
+        );
+        assert!(
+            matches!(app.modal_state, ModalType::TreasuryEntry { .. }),
+            "the modal must stay open so the rest of the edit isn't lost"
+        );
+        let unchanged = crate::services::TreasuryService::new(&app.db)
+            .get_entry(mine.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.created_at.date_naive(),
+            now.date_naive(),
+            "the date must not have moved"
         );
 
         drop(app);

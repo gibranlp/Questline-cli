@@ -890,10 +890,7 @@ impl<'a> SyncEngine<'a> {
                         None
                     }
                 }
-                "setting"
-                    if crate::database::SYNCED_STREAK_SETTING_KEYS
-                        .contains(&entity_id.as_str()) =>
-                {
+                "setting" if crate::database::is_synced_setting_key(&entity_id) => {
                     self.db.get_setting(&entity_id).ok().flatten().map(|value| {
                         serde_json::json!({
                             "key": entity_id,
@@ -1708,9 +1705,7 @@ impl<'a> SyncEngine<'a> {
                 }
                 "ritual" => self.incoming_entity_is_newer("rituals", &log),
                 "ritual_history" => true,
-                "setting" => {
-                    crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&log.entity_id.as_str())
-                }
+                "setting" => crate::database::is_synced_setting_key(&log.entity_id),
                 "codex" => self.incoming_entity_is_newer("codices", &log),
                 // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
@@ -2383,7 +2378,8 @@ impl<'a> SyncEngine<'a> {
                                       vendor_source=excluded.vendor_source, related_task_id=excluded.related_task_id,
                                       notes=excluded.notes, attachment_ref=excluded.attachment_ref,
                                       recurrence=excluded.recurrence, custom_recurrence=excluded.custom_recurrence,
-                                      version=excluded.version, updated_at=excluded.updated_at,
+                                      version=excluded.version, created_at=excluded.created_at,
+                                      updated_at=excluded.updated_at,
                                       created_by_identity=COALESCE(excluded.created_by_identity,
                                                                    ledger_entries.created_by_identity)",
                                     params![value.id.to_string(), value.campaign_id.to_string(), value.title,
@@ -2572,7 +2568,7 @@ impl<'a> SyncEngine<'a> {
                                 let key = setting["key"].as_str().unwrap_or_default();
                                 let value = setting["value"].as_str().unwrap_or_default();
                                 if key == log.entity_id
-                                    && crate::database::SYNCED_STREAK_SETTING_KEYS.contains(&key)
+                                    && crate::database::is_synced_setting_key(key)
                                 {
                                     let _ = self.db.set_setting(key, value);
                                     pulled_count += 1;
@@ -4636,6 +4632,74 @@ mod tests {
                 .currency_code,
             "USD"
         );
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    /// Backdatear un movimiento (columna "Date" del Ledger) tiene que propagar igual que
+    /// cualquier otro campo — el UPDATE local y el ON CONFLICT del pull deben cubrir created_at.
+    #[test]
+    fn entry_date_change_alone_syncs_to_the_other_device() {
+        let identity = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let (path_a, db_a) = treasury_test_db("treasury_sync_entry_date_only_a");
+        let (path_b, db_b) = treasury_test_db("treasury_sync_entry_date_only_b");
+        db_a.insert_project(&shared_campaign_project(campaign_id, &identity, false))
+            .unwrap();
+        db_a.insert_task(&campaign_task(task_id, campaign_id, &identity))
+            .unwrap();
+        let (_, entry_id) = seed_treasury(&db_a, campaign_id, task_id, &identity.public_key);
+
+        let server = SharedEventLog::default();
+        let sync = |db: &Database, device: &str, serve: bool| {
+            SyncEngine {
+                db,
+                identity: &identity,
+                device_id: device,
+                provider: Box::new(RecordingProvider {
+                    events: server.clone(),
+                    serve,
+                    project_scope_only: false,
+                    withhold: None,
+                }),
+            }
+            .sync()
+            .unwrap();
+        };
+
+        sync(&db_a, "device-a", false);
+        sync(&db_b, "device-b", true);
+
+        // Único cambio de esta ronda: mover la fecha del movimiento. Nada más cambia.
+        let before = server.0.lock().unwrap().len();
+        let service_a = crate::services::TreasuryService::new(&db_a);
+        let mut entry = service_a.get_entry(entry_id).unwrap().unwrap();
+        let backdated = chrono::DateTime::parse_from_rfc3339("2020-01-15T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        entry.created_at = backdated;
+        service_a.update_entry(entry).unwrap();
+        sync(&db_a, "device-a", false);
+        let pushed = server.0.lock().unwrap()[before..]
+            .iter()
+            .map(|event| event.entity_type.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            pushed.iter().any(|kind| kind == "ledger_entry"),
+            "the date change alone was never pushed: {pushed:?}"
+        );
+
+        sync(&db_b, "device-b", true);
+        let service_b = crate::services::TreasuryService::new(&db_b);
+        let entry_on_b = service_b.get_entry(entry_id).unwrap().unwrap();
+        assert_eq!(
+            entry_on_b.created_at, backdated,
+            "the backdated created_at must reach the other device"
+        );
+
         drop(db_a);
         drop(db_b);
         let _ = std::fs::remove_file(&path_a);

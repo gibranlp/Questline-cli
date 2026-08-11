@@ -74,6 +74,9 @@ pub enum TreasuryAction {
     SetTaskCost,
     /// Importe facturable y estado de cobro: decisión de gobierno.
     SetTaskBilling,
+    /// Cambiar la fecha del movimiento (la que aparece en la columna "Date" del Ledger):
+    /// backdatear o postdatear un movimiento es un acto de gobierno, no de registro.
+    ChangeEntryDate,
 }
 
 impl TreasuryAction {
@@ -97,7 +100,7 @@ pub fn allows(role: TreasuryRole, action: TreasuryAction) -> bool {
         }
         SetTaskCost => role != TreasuryRole::Observer,
         ApproveEntry | MarkPaid | SetOverallBudget | SetCategoryBudget | ManageCategories
-        | SetTaskBilling => role.governs(),
+        | SetTaskBilling | ChangeEntryDate => role.governs(),
         // La divisa es la denominación de toda la campaña: solo quien la posee la cambia.
         SwitchCurrency => matches!(role, TreasuryRole::Solo | TreasuryRole::Owner),
     }
@@ -122,6 +125,9 @@ pub fn denial(role: TreasuryRole, action: TreasuryAction) -> String {
         SetTaskBilling => {
             "Only the Owner or a Steward may set billable amounts and payment status.".to_string()
         }
+        ChangeEntryDate => {
+            "Only the Owner or a Steward may change a Treasury entry's date.".to_string()
+        }
         EditEntry { mine, .. } | DeleteEntry { mine, .. } => {
             if mine {
                 "Once an entry leaves Planned, only the Owner or a Steward may change it."
@@ -137,7 +143,7 @@ pub fn denial(role: TreasuryRole, action: TreasuryAction) -> String {
 }
 
 /// Filas de la matriz de permisos, para mostrarla en la pantalla de ayuda y en Fellowship.
-pub fn capability_matrix() -> [(&'static str, [bool; 4]); 9] {
+pub fn capability_matrix() -> [(&'static str, [bool; 4]); 10] {
     [
         // Owner, Steward, Companion, Observer
         ("View treasury", [true, true, true, true]),
@@ -146,6 +152,7 @@ pub fn capability_matrix() -> [(&'static str, [bool; 4]); 9] {
         ("Edit/delete any entry", [true, true, false, false]),
         ("Approve entry", [true, true, false, false]),
         ("Settle payment", [true, true, false, false]),
+        ("Change entry date", [true, true, false, false]),
         ("Set budgets", [true, true, false, false]),
         ("Manage categories", [true, true, false, false]),
         ("Switch currency", [true, false, false, false]),
@@ -193,6 +200,7 @@ mod tests {
             TreasuryAction::SwitchCurrency,
             TreasuryAction::SetTaskCost,
             TreasuryAction::SetTaskBilling,
+            TreasuryAction::ChangeEntryDate,
             TreasuryAction::EditEntry {
                 mine: true,
                 status: LedgerStatus::Planned,
@@ -222,6 +230,7 @@ mod tests {
             TreasuryAction::ManageCategories,
             TreasuryAction::SwitchCurrency,
             TreasuryAction::SetTaskBilling,
+            TreasuryAction::ChangeEntryDate,
         ] {
             assert!(
                 !allows(TreasuryRole::Companion, action),
@@ -279,6 +288,19 @@ mod tests {
     }
 
     #[test]
+    fn only_owner_and_steward_change_an_entry_date() {
+        for role in [TreasuryRole::Solo, TreasuryRole::Owner, TreasuryRole::Steward] {
+            assert!(allows(role, TreasuryAction::ChangeEntryDate));
+        }
+        for role in [TreasuryRole::Companion, TreasuryRole::Observer] {
+            assert!(
+                !allows(role, TreasuryAction::ChangeEntryDate),
+                "{role:?} must be denied ChangeEntryDate"
+            );
+        }
+    }
+
+    #[test]
     fn every_role_and_action_has_a_denial_message() {
         for role in roles() {
             for action in [
@@ -291,6 +313,7 @@ mod tests {
                 TreasuryAction::SwitchCurrency,
                 TreasuryAction::SetTaskCost,
                 TreasuryAction::SetTaskBilling,
+                TreasuryAction::ChangeEntryDate,
                 TreasuryAction::EditEntry {
                     mine: false,
                     status: LedgerStatus::Paid,
@@ -313,7 +336,7 @@ mod tests {
             TreasuryRole::Companion,
             TreasuryRole::Observer,
         ];
-        let expectations: [(&str, TreasuryAction); 8] = [
+        let expectations: [(&str, TreasuryAction); 9] = [
             ("View treasury", TreasuryAction::View),
             ("Record entry", TreasuryAction::RecordEntry),
             (
@@ -332,6 +355,7 @@ mod tests {
             ),
             ("Approve entry", TreasuryAction::ApproveEntry),
             ("Settle payment", TreasuryAction::MarkPaid),
+            ("Change entry date", TreasuryAction::ChangeEntryDate),
             ("Set budgets", TreasuryAction::SetOverallBudget),
             ("Manage categories", TreasuryAction::ManageCategories),
         ];
