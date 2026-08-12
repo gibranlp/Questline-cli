@@ -4,11 +4,13 @@
 
 use crate::app::{App, DashboardCommandTarget, ModalType};
 use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
+use crate::screens::fellowship::notice_belongs_in_fellowship;
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
 use crate::services::planner::{self, DashboardPlan, format_duration};
 use crate::theme::Theme;
 use chrono::{Local, Timelike};
+use uuid::Uuid;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout},
@@ -1189,12 +1191,23 @@ fn draw_fellowship_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
 
     // Chronicle chat predates Council Notices, so combine both sources. Quest
     // Council mentions are identity-backed notices rather than Chronicle text.
+    // Fellowship is shared-projects-only, so both sources are scoped to
+    // messages/notices whose project is actually shared.
     let mut unread_count = 0;
     let mut mentions = 0;
-    if let Ok(mut stmt) = app.db.conn.prepare("SELECT content, sender_identity FROM chronicle_messages WHERE timestamp > ?1 AND sender_identity != ?2") {
+    if let Ok(mut stmt) = app.db.conn.prepare("SELECT content, sender_identity, project_id FROM chronicle_messages WHERE timestamp > ?1 AND sender_identity != ?2") {
         if let Ok(mut rows) = stmt.query(rusqlite::params![last_viewed, my_identity]) {
             while let Ok(Some(row)) = rows.next() {
                 let content: String = row.get(0).unwrap_or_default();
+                let project_id: Option<String> = row.get(2).unwrap_or(None);
+                let in_shared_project = project_id
+                    .as_deref()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .map(|pid| app.projects.iter().any(|p| p.id == pid && p.is_shared))
+                    .unwrap_or(false);
+                if !in_shared_project {
+                    continue;
+                }
                 unread_count += 1;
                 if !my_name.is_empty() && content.to_lowercase().contains(&format!("@{}", my_name.to_lowercase())) {
                     mentions += 1;
@@ -1202,21 +1215,16 @@ fn draw_fellowship_panel(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
             }
         }
     }
-    if let Ok((notice_unread, council_mentions)) = app.db.conn.query_row(
-        "SELECT
-             SUM(CASE WHEN read = 0 AND notification_type != 'chronicle_mention' THEN 1 ELSE 0 END),
-             SUM(CASE WHEN read = 0 AND notification_type = 'mention' THEN 1 ELSE 0 END)
-         FROM notifications",
-        [],
-        |row| {
-            Ok((
-                row.get::<_, Option<i64>>(0)?.unwrap_or(0),
-                row.get::<_, Option<i64>>(1)?.unwrap_or(0),
-            ))
-        },
-    ) {
-        unread_count += notice_unread as usize;
-        mentions += council_mentions as usize;
+    for (_, notification_type, _, _, target_id, read, _) in app.db.get_notifications().unwrap_or_default() {
+        if read || !notice_belongs_in_fellowship(app, &notification_type, &target_id) {
+            continue;
+        }
+        if notification_type != "chronicle_mention" {
+            unread_count += 1;
+        }
+        if notification_type == "mention" {
+            mentions += 1;
+        }
     }
 
     let border_color = if mentions > 0 {

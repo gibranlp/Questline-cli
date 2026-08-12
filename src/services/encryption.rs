@@ -121,26 +121,11 @@ pub fn decrypt(identity: &Identity, nonce: &str, ciphertext: &str, aad: &str) ->
     String::from_utf8(plaintext).map_err(|_| anyhow!("decrypted sync payload is not UTF-8"))
 }
 
-pub fn encrypt_with_project_key(
-    key: &[u8; 32],
-    plaintext: &str,
-    aad: &str,
-) -> Result<(String, String)> {
-    encrypt_with_key(key, plaintext.as_bytes(), aad.as_bytes())
-}
-
-pub fn decrypt_with_project_key(
-    key: &[u8; 32],
-    nonce: &str,
-    ciphertext: &str,
-    aad: &str,
-) -> Result<String> {
-    String::from_utf8(decrypt_with_key(key, nonce, ciphertext, aad.as_bytes())?)
-        .map_err(|_| anyhow!("decrypted project event is not UTF-8"))
-}
-
 fn decode_hex(value: &str) -> Result<Vec<u8>> {
-    if value.len() % 2 != 0 {
+    // Untrusted input (e.g. a server-supplied key envelope) can contain
+    // multi-byte UTF-8 characters. Reject anything that isn't pure ASCII hex
+    // up front so the byte-range slicing below can never land mid-character.
+    if value.len() % 2 != 0 || !value.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(anyhow!("invalid hex identity"));
     }
     (0..value.len())
@@ -413,10 +398,10 @@ mod tests {
     #[test]
     fn wrong_project_key_cannot_decrypt_payload() {
         let aad = "questline-sync-v2|event|note|id|upsert|timestamp|project-v1|project|route";
-        let (nonce, ciphertext) = encrypt_with_project_key(&[7u8; 32], "secret", aad).unwrap();
-        assert!(decrypt_with_project_key(&[8u8; 32], &nonce, &ciphertext, aad).is_err());
+        let (nonce, ciphertext) = encrypt_project_payload(&[7u8; 32], "secret", aad).unwrap();
+        assert!(decrypt_project_payload(&[8u8; 32], &nonce, &ciphertext, aad).is_err());
         assert_eq!(
-            decrypt_with_project_key(&[7u8; 32], &nonce, &ciphertext, aad).unwrap(),
+            decrypt_project_payload(&[7u8; 32], &nonce, &ciphertext, aad).unwrap(),
             "secret"
         );
     }

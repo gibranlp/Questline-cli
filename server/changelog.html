@@ -221,6 +221,36 @@
 
   <span class="hi">The party now shares more than a key. It shares the quest, and the coin.</span>
 
+  <span class="hi">Yet even a warded Fellowship can misread its own signals.</span>
+
+  The Dashboard had been counting messages from Campaigns that never joined a
+  Fellowship at all — a private ledger's own chronicle, mistaken for a
+  companion's voice. The unread bell now rings only for words a Fellowship
+  actually shared.
+
+  The coin drawer also widened. Euro, pound, Canadian dollar, Australian
+  dollar, and Swiss franc join the ledger beside the dollar and the peso —
+  each declared, none converted, exactly as before.
+
+  Beneath the surface, the wards were tightened further. A malformed key
+  envelope from a careless or compromised server could once stop the CLI cold
+  instead of being turned away; it is now simply refused. Resetting the cloud
+  now confirms the remote truly holds what was sent, rather than trusting a
+  lone report of success at its word. A Quest assignment queued the instant
+  before a Fellowship's doors closed no longer slips out afterward under the
+  wrong seal. And a Companion released from a Campaign no longer leaves their
+  unfinished Quests invisible to everyone left behind — the workload rolls
+  make room for them again.
+
+  The Command Center's judgment was corrected as well: a High-priority Quest
+  due a season away no longer shouts for attention it does not yet need.
+
+  And the halls themselves move faster. A Campaign's task filters no longer
+  ask the archive the same question once per Quest on every heartbeat of the
+  screen, and a large batch of offline work no longer asks the vault for the
+  same key once per change it carries — both now ask once, and remember the
+  answer.
+
 <span class="comment">// Changes in this version</span>
 <span class="cmd">  ✓  AES-256-GCM private sync-v2 encrypts content before it leaves the CLI or browser</span>
 <span class="cmd">  ✓  Ed25519 signatures authenticate complete encrypted envelopes before decryption</span>
@@ -263,6 +293,15 @@
 <span class="cmd">  ✓  Fixed a treasury row arriving before its Campaign, category, or Quest being dropped in silence</span>
 <span class="cmd">  ✓  Fixed an Observer's refused treasury write halting everything else that account was sending</span>
 <span class="cmd">  ✓  Fixed Treasury keys that paused and silenced the music instead of settling and sorting</span>
+<span class="cmd">  ✓  Fixed the Dashboard's Fellowship Unread and Mentions counting non-shared Campaigns</span>
+<span class="cmd">  ✓  Campaign Currency adds EUR, GBP, CAD, AUD, and CHF alongside USD and MXN</span>
+<span class="cmd">  ✓  Fixed a malformed sync-server key envelope crashing the client instead of being rejected</span>
+<span class="cmd">  ✓  Cloud Sync Reset now confirms the remote Fellowship history was truly replaced</span>
+<span class="cmd">  ✓  Fixed a queued Quest assignment leaking under the wrong key after an access revocation</span>
+<span class="cmd">  ✓  Removing a Companion now clears their assigned Quests from workload and unassigned queues</span>
+<span class="cmd">  ✓  Fixed the Command Center overstating urgency for High-priority Quests due far in the future</span>
+<span class="cmd">  ✓  Campaign task filters no longer query the archive once per Quest on every render</span>
+<span class="cmd">  ✓  A shared Campaign's encryption key is now cached for the length of a sync batch</span>
 <span class="cmd">  –  Authenticated calendar subscriptions remain sealed until their security gate is complete</span>
 <span class="cmd">  –  The server can still observe routing metadata, but never plaintext Quest or Council content</span>
 <span class="cmd">  –  Questline keeps no exchange rate; converting between currencies remains the hero's own work</span>
