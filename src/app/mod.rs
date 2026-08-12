@@ -13,9 +13,9 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::milestone_templates::{self, ProjectStats};
 use crate::models::{
-    Achievement, ClassType, DailyAdventure, DailyQuest, DailyReflection, FocusSession,
-    JournalEntry, Milestone, Note, Project, QuestStatus, RecurrenceType, Ritual, Statistics,
-    Streak, Task, TaskPriority, User, XPEvent, ZenTree,
+    Achievement, ClassType, DailyAdventure, DailyReflection, FocusSession, JournalEntry,
+    Milestone, Note, Project, QuestStatus, RecurrenceType, Ritual, Statistics, Streak, Task,
+    TaskPriority, User, XPEvent, ZenTree,
 };
 use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
@@ -1007,7 +1007,6 @@ pub struct App {
     pub class_quote: Option<String>,
     pub class_quote_author: Option<String>,
 
-    pub daily_quests: Vec<DailyQuest>,
     pub tasks_due_today: Vec<Task>,
     pub projects: Vec<Project>,
     pub should_quit: bool,
@@ -2430,7 +2429,6 @@ impl App {
             class_quote,
             class_quote_author,
 
-            daily_quests: Vec::new(),
             tasks_due_today: Vec::new(),
             projects: Vec::new(),
             should_quit: false,
@@ -2958,15 +2956,12 @@ impl App {
             self.all_tasks = self.db.get_tasks()?;
             self.all_notes = self.db.get_notes().unwrap_or_default();
             self.all_journals = self.db.get_journal_entries().unwrap_or_default();
-            let today = Utc::now().date_naive();
             self.tasks_due_today = self
                 .all_tasks
                 .iter()
                 .filter(|t| !t.completed)
                 .cloned()
                 .collect();
-
-            self.daily_quests = self.db.get_daily_quests_for_date(today)?;
 
             if let Some(pid) = self.active_project_id {
                 self.codices = self.db.get_codices_for_project(pid).unwrap_or_default();
@@ -3683,6 +3678,7 @@ impl App {
                                 "hydration_pause_focus",
                                 if chosen_pause { "true" } else { "false" },
                             );
+                            let _ = self.db.queue_hydration_settings_sync();
 
                             // Arm first reminder
                             self.hydration_next_reminder_at = Some(
@@ -3698,6 +3694,7 @@ impl App {
                             self.hydration_enabled = false;
                             self.hydration_next_reminder_at = None;
                             let _ = self.db.set_setting("hydration_enabled", "false");
+                            let _ = self.db.queue_hydration_settings_sync();
                             self.modal_state = ModalType::None;
                             self.notifications
                                 .push(Notification::info("Hydration reminders disabled."));

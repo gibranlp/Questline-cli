@@ -62,8 +62,15 @@ pub struct DailyAdventure {
 
 impl DailyAdventure {
     pub fn generate_daily_quests(today: NaiveDate) -> Vec<Self> {
+        use rand::rngs::StdRng;
         use rand::seq::SliceRandom;
-        let mut rng = rand::thread_rng();
+        use rand::SeedableRng;
+
+        // Seeded from the date (not thread_rng) so every PC on the same profile computes the
+        // identical 5-quest set — same titles, same ids — for a given day. Otherwise each
+        // device would roll its own random set and syncing would just merge two unrelated
+        // quest lists instead of one shared one. Don't swap this back to thread_rng().
+        let mut rng = StdRng::seed_from_u64(daily_seed(today));
 
         let mut pool = vec![
             ("Complete 3 Tasks", "complete_tasks", 3),
@@ -93,7 +100,7 @@ impl DailyAdventure {
         pool.into_iter()
             .take(5)
             .map(|(title, quest_type, target_count)| DailyAdventure {
-                id: Uuid::new_v4(),
+                id: deterministic_quest_id(today, quest_type, target_count),
                 title: title.to_string(),
                 quest_type: quest_type.to_string(),
                 target_count,
@@ -103,6 +110,31 @@ impl DailyAdventure {
             })
             .collect()
     }
+}
+
+// Hash del ISO date a un seed u64 — mismo día, mismo seed, en cualquier dispositivo.
+fn daily_seed(date: NaiveDate) -> u64 {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(date.format("%Y-%m-%d").to_string().as_bytes());
+    u64::from_le_bytes(digest[0..8].try_into().unwrap())
+}
+
+// Id determinístico por (fecha, tipo, meta) en vez de Uuid::new_v4() — así el mismo quest
+// generado en dos PCs distintas cae en la misma fila al sincronizar, en vez de duplicarse.
+fn deterministic_quest_id(date: NaiveDate, quest_type: &str, target_count: i32) -> Uuid {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(
+        format!(
+            "daily_adventure:{}:{}:{}",
+            date.format("%Y-%m-%d"),
+            quest_type,
+            target_count
+        )
+        .as_bytes(),
+    );
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[0..16]);
+    Uuid::from_bytes(bytes)
 }
 
 // Este struct fue creciendo por etapas del roadmap — los campos de Stage 4 y 5A se agregaron después, no son legacy

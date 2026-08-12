@@ -11,7 +11,7 @@ use std::path::Path;
 use uuid::Uuid;
 
 use crate::models::{
-    Achievement, ClassType, Codex, DailyAdventure, DailyQuest, DailyReflection, FocusSession,
+    Achievement, ClassType, Codex, DailyAdventure, DailyReflection, FocusSession,
     GlobalChronicleEntry, JournalEntry, Milestone, Note, Project, RecurrenceType, Ritual,
     Statistics, Streak, Task, TaskPriority, User, XPEvent, ZenTree,
 };
@@ -265,11 +265,22 @@ pub const SYNCED_QUEST_SETTING_KEYS: [&str; 1] = [QUEST_VISIBILITY_HORIZON_KEY];
 // 15 días — el mismo horizonte que antes vivía hardcodeado en el Planning Council.
 pub const DEFAULT_QUEST_VISIBILITY_HORIZON_DAYS: i64 = 15;
 
+pub const SYNCED_HYDRATION_SETTING_KEYS: [&str; 6] = [
+    "hydration_enabled",
+    "hydration_target",
+    "hydration_interval_mins",
+    "hydration_active_from",
+    "hydration_active_to",
+    "hydration_pause_focus",
+];
+
 /// True si esta clave de `settings` viaja a la nube — todo lo demás en esa tabla es
-/// puramente local (tema, sonidos, hidratación...). Una sola función para no repetir
-/// el `.contains()` en cada punto del sync engine que decide qué settings sincronizar.
+/// puramente local (tema, sonidos...). Una sola función para no repetir el `.contains()`
+/// en cada punto del sync engine que decide qué settings sincronizar.
 pub fn is_synced_setting_key(key: &str) -> bool {
-    SYNCED_STREAK_SETTING_KEYS.contains(&key) || SYNCED_QUEST_SETTING_KEYS.contains(&key)
+    SYNCED_STREAK_SETTING_KEYS.contains(&key)
+        || SYNCED_QUEST_SETTING_KEYS.contains(&key)
+        || SYNCED_HYDRATION_SETTING_KEYS.contains(&key)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2017,37 +2028,9 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_daily_quests_for_date(&self, date: NaiveDate) -> Result<Vec<DailyQuest>> {
-        let mut stmt = self.conn.prepare("SELECT id, title, description, completed, due_date FROM daily_quests WHERE due_date = ?1")?;
-        let rows = stmt.query_map([date.to_string()], |row| {
-            let id_str: String = row.get(0)?;
-            let title: String = row.get(1)?;
-            let description: Option<String> = row.get(2)?;
-            let completed_int: i32 = row.get(3)?;
-            let due_str: String = row.get(4)?;
-
-            let id = Uuid::parse_str(&id_str).map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-            let due_date = NaiveDate::parse_from_str(&due_str, "%Y-%m-%d")
-                .map_err(|_| rusqlite::Error::QueryReturnedNoRows)?;
-
-            Ok(DailyQuest {
-                id,
-                title,
-                description,
-                completed: completed_int != 0,
-                due_date,
-            })
-        })?;
-
-        let mut quests = Vec::new();
-        for r in rows {
-            quests.push(r?);
-        }
-        Ok(quests)
-    }
-
     pub fn insert_xp_event(&self, event: &XPEvent) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO xp_events (id, event_type, xp_gained, timestamp) VALUES (?1, ?2, ?3, ?4)",
             params![
                 event.id.to_string(),
@@ -2056,6 +2039,8 @@ impl Database {
                 event.timestamp.to_rfc3339()
             ],
         )?;
+        Self::log_change_on(&tx, "xp_event", &event.id.to_string(), "create")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2218,7 +2203,8 @@ impl Database {
     }
 
     pub fn update_streak(&self, streak: &Streak) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE streaks SET current_streak = ?1, best_streak = ?2, last_active_day = ?3 WHERE id = ?4",
             params![
                 streak.current_streak,
@@ -2227,6 +2213,8 @@ impl Database {
                 streak.id,
             ],
         )?;
+        Self::log_change_on(&tx, "streak", &streak.id, "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -2309,7 +2297,8 @@ impl Database {
     }
 
     pub fn insert_daily_adventure(&self, adv: &DailyAdventure) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO daily_adventures (id, title, quest_type, target_count, current_count, completed, created_date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 adv.id.to_string(),
@@ -2321,11 +2310,14 @@ impl Database {
                 adv.created_date.format("%Y-%m-%d").to_string(),
             ],
         )?;
+        Self::log_change_on(&tx, "daily_adventure", &adv.id.to_string(), "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 
     pub fn update_daily_adventure(&self, adv: &DailyAdventure) -> Result<()> {
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "UPDATE daily_adventures SET current_count = ?1, completed = ?2 WHERE id = ?3",
             params![
                 adv.current_count,
@@ -2333,6 +2325,8 @@ impl Database {
                 adv.id.to_string(),
             ],
         )?;
+        Self::log_change_on(&tx, "daily_adventure", &adv.id.to_string(), "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3004,18 +2998,20 @@ impl Database {
     pub fn hydration_drink_at(&self, now: DateTime<Utc>) -> Result<i32> {
         let today = now.with_timezone(&Local).date_naive().to_string();
         let now_str = now.to_rfc3339();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO hydration_log (log_date, count, reward_given, last_drink_at) VALUES (?1, 1, 0, ?2)
              ON CONFLICT(log_date) DO UPDATE SET count = count + 1, last_drink_at = excluded.last_drink_at",
             params![today, now_str],
         )?;
-        self.conn
-            .query_row(
-                "SELECT count FROM hydration_log WHERE log_date = ?1",
-                params![today],
-                |row| row.get(0),
-            )
-            .map_err(Into::into)
+        Self::log_change_on(&tx, "hydration_log", &today, "upsert")?;
+        let count = tx.query_row(
+            "SELECT count FROM hydration_log WHERE log_date = ?1",
+            params![today],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(count)
     }
 
     // Increments glass count; returns the new count.
@@ -3026,11 +3022,14 @@ impl Database {
     // Marks the daily reward as claimed so it doesn't fire again today.
     pub fn hydration_mark_reward_given(&self) -> Result<()> {
         let today = chrono::Local::now().date_naive().to_string();
-        self.conn.execute(
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
             "INSERT INTO hydration_log (log_date, count, reward_given) VALUES (?1, 0, 1)
              ON CONFLICT(log_date) DO UPDATE SET reward_given = 1",
             params![today],
         )?;
+        Self::log_change_on(&tx, "hydration_log", &today, "upsert")?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3912,6 +3911,10 @@ impl Database {
             ("category_budget", "category_budgets", "category_id"),
             ("ledger_entry", "ledger_entries", "id"),
             ("task_financials", "task_financials", "task_id"),
+            ("xp_event", "xp_events", "id"),
+            ("daily_adventure", "daily_adventures", "id"),
+            ("hydration_log", "hydration_log", "log_date"),
+            ("streak", "streaks", "id"),
         ];
 
         for (entity_type, table, id_col) in simple_tables {
@@ -3959,6 +3962,7 @@ impl Database {
         for key in SYNCED_STREAK_SETTING_KEYS
             .iter()
             .chain(SYNCED_QUEST_SETTING_KEYS.iter())
+            .chain(SYNCED_HYDRATION_SETTING_KEYS.iter())
         {
             if self.get_setting(key)?.is_some() {
                 self.log_change("setting", key, "upsert")?;
@@ -4222,6 +4226,19 @@ impl Database {
     pub fn queue_quest_visibility_horizon_sync(&self) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         for key in SYNCED_QUEST_SETTING_KEYS {
+            tx.execute(
+                "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
+                params![key],
+            )?;
+            Self::log_change_on(&tx, "setting", key, "upsert")?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn queue_hydration_settings_sync(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for key in SYNCED_HYDRATION_SETTING_KEYS {
             tx.execute(
                 "DELETE FROM sync_log WHERE synced = 0 AND entity_type = 'setting' AND entity_id = ?1",
                 params![key],
