@@ -72,14 +72,6 @@ CREATE TABLE IF NOT EXISTS notes (
     FOREIGN KEY(codex_id) REFERENCES codices(id) ON DELETE SET NULL
 );
 
-CREATE TABLE IF NOT EXISTS daily_quests (
-    id TEXT PRIMARY KEY,
-    title TEXT NOT NULL,
-    description TEXT,
-    completed INTEGER NOT NULL DEFAULT 0,
-    due_date TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS xp_events (
     id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,

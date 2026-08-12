@@ -204,13 +204,6 @@ impl CloudProvider for FileCloudProvider {
 
 use crate::services::ApiClient;
 
-fn total_user_progress_xp(user: &crate::models::User) -> i64 {
-    let completed_levels: i64 = (1..user.level.max(1))
-        .map(|level| crate::models::User::xp_for_next_level(level) as i64)
-        .sum();
-    completed_levels + user.xp.max(0) as i64
-}
-
 fn project_id_from_sync_content(
     entity_type: &str,
     entity_id: &str,
@@ -1104,6 +1097,66 @@ impl<'a> SyncEngine<'a> {
                     .get_zen_tree()
                     .ok()
                     .and_then(|t| serde_json::to_string(&t).ok()),
+                // Eventos de XP: inmutables, se insertan una sola vez — igual que focus_session
+                "xp_event" => self
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT id, event_type, xp_gained, timestamp FROM xp_events WHERE id = ?1",
+                        params![entity_id],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, String>(0)?,
+                                "event_type": row.get::<_, String>(1)?,
+                                "xp_gained": row.get::<_, i32>(2)?,
+                                "timestamp": row.get::<_, String>(3)?,
+                            })
+                            .to_string())
+                        },
+                    )
+                    .ok(),
+                "daily_adventure" => self
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT id, title, quest_type, target_count, current_count, completed, created_date FROM daily_adventures WHERE id = ?1",
+                        params![entity_id],
+                        |row| {
+                            let completed: i32 = row.get(5)?;
+                            Ok(serde_json::json!({
+                                "id": row.get::<_, String>(0)?,
+                                "title": row.get::<_, String>(1)?,
+                                "quest_type": row.get::<_, String>(2)?,
+                                "target_count": row.get::<_, i32>(3)?,
+                                "current_count": row.get::<_, i32>(4)?,
+                                "completed": completed != 0,
+                                "created_date": row.get::<_, String>(6)?,
+                            })
+                            .to_string())
+                        },
+                    )
+                    .ok(),
+                "hydration_log" => self
+                    .db
+                    .conn
+                    .query_row(
+                        "SELECT count, reward_given, last_drink_at FROM hydration_log WHERE log_date = ?1",
+                        params![entity_id],
+                        |row| {
+                            Ok(serde_json::json!({
+                                "count": row.get::<_, i32>(0)?,
+                                "reward_given": row.get::<_, i32>(1)?,
+                                "last_drink_at": row.get::<_, Option<String>>(2)?,
+                            })
+                            .to_string())
+                        },
+                    )
+                    .ok(),
+                "streak" => self
+                    .db
+                    .get_streak()
+                    .ok()
+                    .and_then(|s| serde_json::to_string(&s).ok()),
                 _ => None,
             };
 
@@ -1792,6 +1845,47 @@ impl<'a> SyncEngine<'a> {
                 "ledger_category" => self.incoming_entity_is_newer("ledger_categories", &log),
                 "category_budget" => self.incoming_entity_is_newer("category_budgets", &log),
                 "task_financials" => self.incoming_entity_is_newer("task_financials", &log),
+                // Eventos de XP: inmutables, se insertan una sola vez — igual que focus_session.
+                // Importa que esto sea estricto: reaplicar el mismo evento duplicaría XP real.
+                "xp_event" => {
+                    self.db
+                        .conn
+                        .query_row(
+                            "SELECT count(*) FROM xp_events WHERE id = ?1",
+                            params![log.entity_id],
+                            |row| row.get::<_, i32>(0),
+                        )
+                        .unwrap_or(0)
+                        == 0
+                }
+                // Daily quests: el merge (MAX/OR) nunca regresa progreso, así que siempre es seguro aplicar
+                "daily_adventure" => true,
+                // Hidratación: el merge (MAX por campo) nunca regresa el conteo, siempre seguro aplicar
+                "hydration_log" => true,
+                // Racha: current_streak/last_active_day se toman del lado con el día más reciente,
+                // best_streak nunca regresa — ver el arm de apply más abajo
+                "streak" => {
+                    if let Some(ref content) = log.content {
+                        if let Ok(remote) = serde_json::from_str::<crate::models::Streak>(content)
+                        {
+                            match self.db.get_streak() {
+                                Ok(local) => {
+                                    remote.best_streak > local.best_streak
+                                        || remote
+                                            .last_active_day
+                                            .zip(local.last_active_day)
+                                            .map(|(remote, local)| remote > local)
+                                            .unwrap_or(remote.last_active_day.is_some())
+                                }
+                                Err(_) => true,
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                }
                 // Dispositivos: siempre aplicamos — upsert idempotente
                 "device" => true,
                 _ => false,
@@ -1953,15 +2047,15 @@ impl<'a> SyncEngine<'a> {
                         "user" => {
                             if let Ok(mut u) = serde_json::from_str::<crate::models::User>(content)
                             {
-                                // Progression is monotonic. An older device snapshot must never
-                                // reduce level/XP earned on another device.
-                                let mut preserved_local_progress = false;
+                                // Level/XP now live in xp_events and are replayed additively by
+                                // the "xp_event" arm below — never overwritten by a whole-user
+                                // snapshot — so two devices that each earn XP independently both
+                                // keep their gains instead of whichever total happened to be
+                                // bigger silently winning. A snapshot's level/xp is only trusted
+                                // to seed a brand-new device that has no local profile yet.
                                 if let Ok(Some(local)) = self.db.get_user() {
-                                    if total_user_progress_xp(&local) > total_user_progress_xp(&u) {
-                                        u.level = local.level;
-                                        u.xp = local.xp;
-                                        preserved_local_progress = true;
-                                    }
+                                    u.level = local.level;
+                                    u.xp = local.xp;
                                 }
                                 let _ = self.db.conn.execute(
                                     "DELETE FROM users WHERE id != ?1",
@@ -1985,9 +2079,6 @@ impl<'a> SyncEngine<'a> {
                                         u.specialization
                                     ],
                                 );
-                                if preserved_local_progress {
-                                    let _ = self.db.log_change("user", &u.id.to_string(), "upsert");
-                                }
                                 pulled_count += 1;
                             }
                         }
@@ -2954,16 +3045,197 @@ impl<'a> SyncEngine<'a> {
                                     .as_ref()
                                     .map(|lt| lt.total_waterings)
                                     .unwrap_or(0);
+                                let local_last_watered =
+                                    local_tree.as_ref().and_then(|lt| lt.last_watered);
+
+                                // El más reciente de los dos gana — antes esto se sobrescribía
+                                // con el remoto sin comparar, así que una edición local más
+                                // nueva podía retroceder.
+                                let merged_last_watered = match (t.last_watered, local_last_watered)
+                                {
+                                    (Some(r), Some(l)) => Some(if r > l { r } else { l }),
+                                    (Some(r), None) => Some(r),
+                                    (None, Some(l)) => Some(l),
+                                    (None, None) => None,
+                                };
+
+                                // water_today está acotado al "hoy" local del dispositivo. Si el
+                                // riego remoto no fue hoy (según el reloj local), su conteo no
+                                // cuenta para el merge — de lo contrario, un dispositivo que ya
+                                // cruzó la medianoche y reseteó water_today a 0 en check_new_day()
+                                // vería resucitar el conteo de ayer al sincronizar con uno que
+                                // todavía no cruza esa medianoche.
+                                let today = chrono::Local::now().date_naive();
+                                let remote_water_today_counts = t
+                                    .last_watered
+                                    .map(|dt| dt.with_timezone(&chrono::Local).date_naive() == today)
+                                    .unwrap_or(false);
+                                let remote_water_today =
+                                    if remote_water_today_counts { t.water_today } else { 0 };
+
+                                // Tabla singleton — nunca hay más de una fila (ver el comentario
+                                // en schema.rs), así que no se filtra por id: el id remoto es
+                                // aleatorio por dispositivo y nunca coincide con el local, lo que
+                                // dejaba este UPDATE sin efecto.
                                 let _ = self.db.conn.execute(
-                                    "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6 WHERE id = ?7",
+                                    "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6",
                                     params![
                                         t.growth.max(local_growth),
                                         t.health.max(local_health),
                                         t.stage.max(local_stage),
-                                        t.last_watered.map(|dt| dt.to_rfc3339()),
-                                        t.water_today.max(local_water_today),
+                                        merged_last_watered.map(|dt| dt.to_rfc3339()),
+                                        remote_water_today.max(local_water_today),
                                         t.total_waterings.max(local_total_waterings),
-                                        t.id.to_string(),
+                                    ],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Eventos de XP: insert-once. Si el evento no existía localmente,
+                        // aplicamos su delta al nivel/xp del usuario igual que un grant_xp()
+                        // local — así el total converge sumando ambos lados en vez de que gane
+                        // la snapshot con el total más grande.
+                        "xp_event" => {
+                            if let Ok(evt) =
+                                serde_json::from_str::<crate::models::XPEvent>(content)
+                            {
+                                let inserted = self.db.conn.execute(
+                                    "INSERT OR IGNORE INTO xp_events (id, event_type, xp_gained, timestamp) VALUES (?1, ?2, ?3, ?4)",
+                                    params![
+                                        evt.id.to_string(),
+                                        evt.event_type,
+                                        evt.xp_gained,
+                                        evt.timestamp.to_rfc3339(),
+                                    ],
+                                ).unwrap_or(0);
+                                if inserted > 0 {
+                                    if let Ok(Some(mut user)) = self.db.get_user() {
+                                        user.apply_xp_delta(evt.xp_gained);
+                                        let _ = self.db.conn.execute(
+                                            "UPDATE users SET level = ?1, xp = ?2 WHERE id = ?3",
+                                            params![user.level, user.xp, user.id.to_string()],
+                                        );
+                                    }
+                                }
+                                pulled_count += 1;
+                            }
+                        }
+                        // Daily quests: merge de progreso vía upsert — MAX en current_count, OR
+                        // en completed. Nunca pasa por update_daily_adventure() para no
+                        // re-encolar el cambio y crear un loop de sync.
+                        "daily_adventure" => {
+                            if let Ok(adv) =
+                                serde_json::from_str::<crate::models::DailyAdventure>(content)
+                            {
+                                let _ = self.db.conn.execute(
+                                    "INSERT INTO daily_adventures (id, title, quest_type, target_count, current_count, completed, created_date)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     ON CONFLICT(id) DO UPDATE SET
+                                         current_count = MAX(daily_adventures.current_count, excluded.current_count),
+                                         completed = (daily_adventures.completed OR excluded.completed)",
+                                    params![
+                                        adv.id.to_string(),
+                                        adv.title,
+                                        adv.quest_type,
+                                        adv.target_count,
+                                        adv.current_count,
+                                        if adv.completed { 1 } else { 0 },
+                                        adv.created_date.format("%Y-%m-%d").to_string(),
+                                    ],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Hidratación: merge por día — MAX en count/reward_given, se queda con
+                        // el last_drink_at más reciente entre ambos lados.
+                        "hydration_log" => {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+                                let log_date = log.entity_id.clone();
+                                let remote_count = v["count"].as_i64().unwrap_or(0) as i32;
+                                let remote_reward = v["reward_given"].as_i64().unwrap_or(0) as i32;
+                                let remote_last_drink =
+                                    v["last_drink_at"].as_str().map(|s| s.to_string());
+                                let local = self
+                                    .db
+                                    .conn
+                                    .query_row(
+                                        "SELECT count, reward_given, last_drink_at FROM hydration_log WHERE log_date = ?1",
+                                        params![log_date],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i32>(0)?,
+                                                row.get::<_, i32>(1)?,
+                                                row.get::<_, Option<String>>(2)?,
+                                            ))
+                                        },
+                                    )
+                                    .ok();
+                                let (local_count, local_reward, local_last_drink) =
+                                    local.unwrap_or((0, 0, None));
+                                let merged_last_drink =
+                                    match (&remote_last_drink, &local_last_drink) {
+                                        (Some(r), Some(l)) => {
+                                            Some(if r > l { r.clone() } else { l.clone() })
+                                        }
+                                        (Some(r), None) => Some(r.clone()),
+                                        (None, Some(l)) => Some(l.clone()),
+                                        (None, None) => None,
+                                    };
+                                let _ = self.db.conn.execute(
+                                    "INSERT INTO hydration_log (log_date, count, reward_given, last_drink_at) VALUES (?1, ?2, ?3, ?4)
+                                     ON CONFLICT(log_date) DO UPDATE SET
+                                         count = excluded.count,
+                                         reward_given = excluded.reward_given,
+                                         last_drink_at = excluded.last_drink_at",
+                                    params![
+                                        log_date,
+                                        remote_count.max(local_count),
+                                        remote_reward.max(local_reward),
+                                        merged_last_drink,
+                                    ],
+                                );
+                                pulled_count += 1;
+                            }
+                        }
+                        // Racha: best_streak nunca regresa; current_streak/last_active_day se
+                        // toman del lado con el día más reciente (ver el is_newer arm de arriba
+                        // para el razonamiento — sin columna updated_at, last_active_day es la
+                        // señal de "más reciente" que ya existe en los datos).
+                        "streak" => {
+                            if let Ok(remote) =
+                                serde_json::from_str::<crate::models::Streak>(content)
+                            {
+                                let local = self.db.get_streak().ok();
+                                let local_best = local.as_ref().map(|s| s.best_streak).unwrap_or(0);
+                                let remote_is_more_recent = match (
+                                    remote.last_active_day,
+                                    local.as_ref().and_then(|s| s.last_active_day),
+                                ) {
+                                    (Some(r), Some(l)) => r > l,
+                                    (Some(_), None) => true,
+                                    _ => false,
+                                };
+                                let (current_streak, last_active_day) = if remote_is_more_recent {
+                                    (remote.current_streak, remote.last_active_day)
+                                } else {
+                                    (
+                                        local
+                                            .as_ref()
+                                            .map(|s| s.current_streak)
+                                            .unwrap_or(remote.current_streak),
+                                        local
+                                            .as_ref()
+                                            .and_then(|s| s.last_active_day)
+                                            .or(remote.last_active_day),
+                                    )
+                                };
+                                let _ = self.db.conn.execute(
+                                    "UPDATE streaks SET current_streak = ?1, best_streak = ?2, last_active_day = ?3 WHERE id = ?4",
+                                    params![
+                                        current_streak,
+                                        remote.best_streak.max(local_best),
+                                        last_active_day.map(|d| d.format("%Y-%m-%d").to_string()),
+                                        remote.id,
                                     ],
                                 );
                                 pulled_count += 1;
@@ -3349,27 +3621,6 @@ mod tests {
         assert_eq!(page.head_seq, 100);
         assert!(page.has_more);
         assert!(page.metadata_supported);
-    }
-
-    #[test]
-    fn user_progress_comparison_includes_completed_levels() {
-        let now = Utc::now();
-        let mut lower = crate::models::User {
-            id: Uuid::new_v4(),
-            username: "Hero".into(),
-            class: crate::models::ClassType::CodeWarlock,
-            level: 19,
-            xp: 1872,
-            created_at: now,
-            specialization: None,
-        };
-        let mut higher = lower.clone();
-        higher.xp = 2019;
-        assert!(total_user_progress_xp(&higher) > total_user_progress_xp(&lower));
-
-        lower.level = 20;
-        lower.xp = 0;
-        assert!(total_user_progress_xp(&lower) > total_user_progress_xp(&higher));
     }
 
     #[test]
@@ -4968,6 +5219,520 @@ mod tests {
         .unwrap();
 
         assert_treasury_matches(&db_b, campaign_id, category_id, entry_id, &owner.public_key);
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    fn seed_user(db: &Database, id: Uuid, level: i32, xp: i32) {
+        db.insert_user(&crate::models::User {
+            id,
+            username: "Hero".into(),
+            class: crate::models::ClassType::CodeWarlock,
+            level,
+            xp,
+            created_at: Utc::now(),
+            specialization: None,
+        })
+        .unwrap();
+    }
+
+    // El fix central de este cambio: dos dispositivos que ganan XP por su cuenta, antes de
+    // sincronizar, deben terminar sumando sus ganancias — no quedarse con la snapshot que
+    // tenía el total más grande (lo cual descartaría en silencio el XP del "perdedor").
+    #[test]
+    fn two_devices_grant_xp_independently_converge_by_summing() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("xp_sync_device_a");
+        let (path_b, db_b) = treasury_test_db("xp_sync_device_b");
+        let user_id = Uuid::new_v4();
+        seed_user(&db_a, user_id, 1, 0);
+        seed_user(&db_b, user_id, 1, 0);
+
+        let mut user_a = db_a.get_user().unwrap().unwrap();
+        crate::services::XPService::new(&db_a)
+            .grant_xp(&mut user_a, "Task", 50)
+            .unwrap();
+        let mut user_b = db_b.get_user().unwrap().unwrap();
+        crate::services::XPService::new(&db_b)
+            .grant_xp(&mut user_b, "Task", 30)
+            .unwrap();
+
+        let server = SharedEventLog::default();
+        let provider_for = |serve: bool| {
+            Box::new(RecordingProvider {
+                events: server.clone(),
+                serve,
+                project_scope_only: false,
+                withhold: None,
+            })
+        };
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: provider_for(false),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: provider_for(true),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: provider_for(true),
+        }
+        .sync()
+        .unwrap();
+
+        let final_a = db_a.get_user().unwrap().unwrap();
+        let final_b = db_b.get_user().unwrap().unwrap();
+        assert_eq!(final_a.xp, 80, "device A should end up with both devices' XP summed");
+        assert_eq!(final_b.xp, 80, "device B should end up with both devices' XP summed");
+        assert_eq!(final_a.level, 1);
+        assert_eq!(final_b.level, 1);
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Repetir sync() sobre el mismo dispositivo no debe volver a aplicar su propio XP —
+    // guarda contra una regresión donde el delta se sumara en cada pull en vez de una sola vez.
+    #[test]
+    fn resyncing_same_device_does_not_double_apply_xp() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("xp_resync_idempotent");
+        let user_id = Uuid::new_v4();
+        seed_user(&db_a, user_id, 1, 0);
+        let mut user = db_a.get_user().unwrap().unwrap();
+        crate::services::XPService::new(&db_a)
+            .grant_xp(&mut user, "Task", 40)
+            .unwrap();
+
+        let server = SharedEventLog::default();
+        for _ in 0..3 {
+            SyncEngine {
+                db: &db_a,
+                identity: &identity,
+                device_id: "device-a",
+                provider: Box::new(RecordingProvider {
+                    events: server.clone(),
+                    serve: true,
+                    project_scope_only: false,
+                    withhold: None,
+                }),
+            }
+            .sync()
+            .unwrap();
+        }
+
+        assert_eq!(db_a.get_user().unwrap().unwrap().xp, 40);
+
+        drop(db_a);
+        let _ = std::fs::remove_file(&path_a);
+    }
+
+    // Segundo pilar del fix: la generación de daily quests tiene que ser determinística por
+    // fecha — de lo contrario, sincronizar solo el progreso mezclaría dos listas distintas.
+    #[test]
+    fn daily_quest_generation_is_deterministic_across_devices() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let device_a_quests = crate::models::DailyAdventure::generate_daily_quests(today);
+        let device_b_quests = crate::models::DailyAdventure::generate_daily_quests(today);
+
+        assert_eq!(device_a_quests.len(), 5);
+        assert_eq!(device_b_quests.len(), 5);
+        for (a, b) in device_a_quests.iter().zip(device_b_quests.iter()) {
+            assert_eq!(a.id, b.id, "same day must produce the same quest ids everywhere");
+            assert_eq!(a.title, b.title);
+            assert_eq!(a.quest_type, b.quest_type);
+            assert_eq!(a.target_count, b.target_count);
+        }
+
+        let tomorrow = today.succ_opt().unwrap();
+        let tomorrow_quests = crate::models::DailyAdventure::generate_daily_quests(tomorrow);
+        assert_ne!(
+            device_a_quests.iter().map(|q| q.id).collect::<Vec<_>>(),
+            tomorrow_quests.iter().map(|q| q.id).collect::<Vec<_>>(),
+        );
+    }
+
+    // Con ids determinísticos, el progreso de una quest hecha en un dispositivo debe fusionarse
+    // en el otro sin resetear ni duplicar las demás quests del día.
+    #[test]
+    fn daily_quest_progress_syncs_without_regressing_other_quests() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("daily_quest_sync_device_a");
+        let (path_b, db_b) = treasury_test_db("daily_quest_sync_device_b");
+
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 11).unwrap();
+        let quests = crate::models::DailyAdventure::generate_daily_quests(today);
+        for q in &quests {
+            db_a.insert_daily_adventure(q).unwrap();
+            db_b.insert_daily_adventure(q).unwrap();
+        }
+
+        let mut completed = quests[0].clone();
+        completed.current_count = completed.target_count;
+        completed.completed = true;
+        db_a.update_daily_adventure(&completed).unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let b_quests = db_b.get_daily_adventures().unwrap();
+        let synced = b_quests.iter().find(|a| a.id == quests[0].id).unwrap();
+        assert!(synced.completed);
+        assert_eq!(synced.current_count, quests[0].target_count);
+        for q in &quests[1..] {
+            let untouched = b_quests.iter().find(|a| a.id == q.id).unwrap();
+            assert_eq!(untouched.current_count, 0);
+            assert!(!untouched.completed);
+        }
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Hidratación: el conteo más alto gana y se conserva el last_drink_at más reciente —
+    // ninguno de los dos lados debe poder regresar el progreso del otro.
+    #[test]
+    fn hydration_glasses_sync_merge_without_regressing() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("hydration_sync_device_a");
+        let (path_b, db_b) = treasury_test_db("hydration_sync_device_b");
+
+        let base = Utc::now();
+        db_a.hydration_drink_at(base).unwrap();
+        db_a.hydration_drink_at(base + chrono::Duration::hours(1))
+            .unwrap();
+        let a_last = base + chrono::Duration::hours(2);
+        db_a.hydration_drink_at(a_last).unwrap();
+
+        db_b.hydration_drink_at(base + chrono::Duration::minutes(30))
+            .unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let (count, _) = db_b.hydration_get_today().unwrap();
+        assert_eq!(
+            count, 3,
+            "the higher glass count must win, not be overwritten by B's own lower local count"
+        );
+        let last_drink = db_b.hydration_last_drink_at().unwrap().unwrap();
+        assert_eq!(last_drink.timestamp(), a_last.timestamp());
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Racha: best_streak nunca regresa; current_streak/last_active_day siguen al lado con el
+    // día más reciente.
+    #[test]
+    fn streak_sync_keeps_best_and_follows_latest_active_day() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("streak_sync_device_a");
+        let (path_b, db_b) = treasury_test_db("streak_sync_device_b");
+
+        let today = chrono::Local::now().date_naive();
+        let stale_day = today - chrono::Duration::days(5);
+
+        db_a.update_streak(&crate::models::Streak {
+            id: "streak_id".into(),
+            current_streak: 6,
+            best_streak: 6,
+            last_active_day: Some(today),
+        })
+        .unwrap();
+        db_b.update_streak(&crate::models::Streak {
+            id: "streak_id".into(),
+            current_streak: 0,
+            best_streak: 9,
+            last_active_day: Some(stale_day),
+        })
+        .unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let merged = db_b.get_streak().unwrap();
+        assert_eq!(
+            merged.current_streak, 6,
+            "B should adopt A's streak since A's last_active_day is more recent"
+        );
+        assert_eq!(merged.last_active_day, Some(today));
+        assert_eq!(
+            merged.best_streak, 9,
+            "best_streak must never regress even when the fresher side loses"
+        );
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Un dispositivo nuevo (sin perfil local) debe sembrar su nivel/xp inicial de la primera
+    // snapshot de "user" que recibe — el atajo de "preservar progreso local" no aplica cuando
+    // no hay progreso local todavía.
+    #[test]
+    fn brand_new_device_seeds_level_and_xp_from_first_user_snapshot() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("user_seed_device_a");
+        let (path_b, db_b) = treasury_test_db("user_seed_device_b");
+        let user_id = Uuid::new_v4();
+        seed_user(&db_a, user_id, 5, 120);
+
+        assert!(db_b.get_user().unwrap().is_none());
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let seeded = db_b.get_user().unwrap().unwrap();
+        assert_eq!(seeded.level, 5);
+        assert_eq!(seeded.xp, 120);
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // zen_tree es una tabla singleton, pero cada dispositivo le asigna un id aleatorio propio
+    // al inicializar su DB. El apply arm solía filtrar `WHERE id = <id remoto>`, que nunca
+    // coincidía con la fila local — el UPDATE no tocaba ninguna fila y el sync no tenía efecto.
+    #[test]
+    fn zen_tree_growth_syncs_despite_random_per_device_ids() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("zen_tree_sync_device_a");
+        let (path_b, db_b) = treasury_test_db("zen_tree_sync_device_b");
+
+        let tree_a = db_a.get_zen_tree().unwrap();
+        let tree_b_before = db_b.get_zen_tree().unwrap();
+        assert_ne!(
+            tree_a.id, tree_b_before.id,
+            "each device seeds its own random zen_tree id — this test only means something if they differ"
+        );
+
+        let mut grown = tree_a.clone();
+        grown.growth = 42;
+        grown.total_waterings = 3;
+        db_a.update_zen_tree(&grown).unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let tree_b_after = db_b.get_zen_tree().unwrap();
+        assert_eq!(
+            tree_b_after.growth, 42,
+            "growth must sync even though the two devices' zen_tree rows have different ids"
+        );
+        assert_eq!(tree_b_after.total_waterings, 3);
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Un dispositivo que ya cruzó la medianoche local y reseteó water_today a 0 (check_new_day)
+    // no debe ver resucitar el conteo de ayer al sincronizar con uno que todavía no cruza esa
+    // medianoche — pero los contadores de por vida (total_waterings) sí siguen mezclándose.
+    #[test]
+    fn zen_tree_water_today_does_not_resurrect_across_local_day_rollover() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("zen_tree_day_rollover_device_a");
+        let (path_b, db_b) = treasury_test_db("zen_tree_day_rollover_device_b");
+
+        let mut tree_a = db_a.get_zen_tree().unwrap();
+        tree_a.water_today = 5;
+        tree_a.total_waterings = 5;
+        tree_a.last_watered = Some(Utc::now() - chrono::Duration::days(1));
+        db_a.update_zen_tree(&tree_a).unwrap();
+
+        let mut tree_b = db_b.get_zen_tree().unwrap();
+        tree_b.water_today = 0;
+        tree_b.last_watered = None;
+        db_b.update_zen_tree(&tree_b).unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        let merged = db_b.get_zen_tree().unwrap();
+        assert_eq!(
+            merged.water_today, 0,
+            "yesterday's remote water_today must not resurrect after B's local day rollover reset it"
+        );
+        assert_eq!(
+            merged.total_waterings, 5,
+            "lifetime total_waterings still merges normally"
+        );
+
         drop(db_a);
         drop(db_b);
         let _ = std::fs::remove_file(&path_a);

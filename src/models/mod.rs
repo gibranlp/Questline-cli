@@ -3,7 +3,6 @@
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod chapter;
 pub mod codex;
-pub mod daily_quest;
 pub mod global_chronicle;
 pub mod journal_entry;
 pub mod note;
@@ -15,7 +14,6 @@ pub mod user;
 pub mod xp_event;
 
 pub use codex::Codex;
-pub use daily_quest::DailyQuest;
 pub use global_chronicle::GlobalChronicleEntry;
 pub use journal_entry::JournalEntry;
 pub use note::Note;
