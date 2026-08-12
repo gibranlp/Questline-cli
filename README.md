@@ -488,6 +488,17 @@ If Questline helps you on your adventures, consider starring the repository and 
   stopping audio instead of sorting the ledger. Both shortcuts were shadowed by
   global audio keys and had never worked.
 
+**Cross-device sync:**
+
+- XP history, daily quests, streaks, and hydration now sync across devices on
+  the same profile — previously they stayed stuck on whichever PC earned them.
+- Daily quests are now generated deterministically per day, so every device
+  gets the same 5 quests instead of each PC rolling its own random set.
+- Fixed a bug where Zen Tree progress could silently fail to sync because of a
+  random per-device ID mismatch, and where a tree that had already reset for a
+  new day could have yesterday's watering count resurrected by an older device.
+- Removed the unused `daily_quests` table and model (dead code).
+
 **Release-hardening pass:**
 
 - The full encryption implementation was audited against the design: private
