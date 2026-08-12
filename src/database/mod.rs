@@ -4763,6 +4763,11 @@ impl Database {
                 OR (entity_type = 'task_dependency' AND entity_id IN (
                     SELECT task_id || '__' || depends_on_task_id FROM task_dependencies WHERE project_id = ?1
                 ))
+                OR (entity_type = 'task_assignment' AND entity_id IN (
+                    SELECT tasks.id || '__' || task_assignments.user_identity
+                    FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id
+                    WHERE tasks.project_id = ?1
+                ))
                 OR (entity_type = 'note' AND entity_id IN (SELECT id FROM notes WHERE project_id = ?1))
                 OR (entity_type = 'codex' AND entity_id IN (SELECT id FROM codices WHERE project_id = ?1))
                 OR (entity_type = 'journal_entry' AND entity_id IN (SELECT id FROM journal_entries WHERE project_id = ?1))
@@ -4995,6 +5000,32 @@ impl Database {
             "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
             params![project_id, removed_identity],
         )?;
+        // A removed Companion's open Quests must not silently vanish from the
+        // workload/unassigned views — clear their assignments in this project
+        // and let the remaining members re-claim them.
+        let assigned_task_ids: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT task_assignments.task_id FROM task_assignments
+                 JOIN tasks ON tasks.id = task_assignments.task_id
+                 WHERE tasks.project_id = ?1 AND task_assignments.user_identity = ?2",
+            )?;
+            let rows = stmt.query_map(params![project_id, removed_identity], |row| {
+                row.get::<_, String>(0)
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for task_id in &assigned_task_ids {
+            tx.execute(
+                "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
+                params![task_id, removed_identity],
+            )?;
+            Self::log_change_on(
+                &tx,
+                "task_assignment",
+                &format!("{}__{}", task_id, removed_identity),
+                "delete",
+            )?;
+        }
         Self::log_change_on(&tx, "project_key", project_id, "upsert")?;
         Self::log_change_on(
             &tx,
@@ -5471,6 +5502,35 @@ impl Database {
         Ok(list)
     }
 
+    /// Bulk sibling of get_task_assignments — one query for every task in a project
+    /// instead of one per task, for callers (e.g. the workspace task-list filter)
+    /// that need assignments for many tasks at once.
+    pub fn get_task_assignments_by_project(
+        &self,
+        project_id: &str,
+    ) -> Result<std::collections::HashMap<String, Vec<(String, String)>>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT task_assignments.task_id, task_assignments.user_identity, task_assignments.user_username
+             FROM task_assignments
+             JOIN tasks ON tasks.id = task_assignments.task_id
+             WHERE tasks.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut map: std::collections::HashMap<String, Vec<(String, String)>> =
+            std::collections::HashMap::new();
+        for r in rows {
+            let (task_id, identity, username) = r?;
+            map.entry(task_id).or_default().push((identity, username));
+        }
+        Ok(map)
+    }
+
     pub fn get_task_ids_assigned_to(&self, user_identity: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT ta.task_id
@@ -5516,6 +5576,62 @@ impl Database {
         } else {
             Ok(stored_status)
         }
+    }
+
+    /// Bulk sibling of get_quest_status — computes every task's status for a whole
+    /// project in two queries instead of one query (plus a dependency check) per task.
+    pub fn get_quest_statuses_by_project(
+        &self,
+        project_id: &str,
+    ) -> Result<std::collections::HashMap<String, crate::models::QuestStatus>> {
+        let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT DISTINCT d.task_id
+                 FROM task_dependencies d
+                 JOIN tasks blocker ON blocker.id = d.depends_on_task_id
+                 WHERE d.project_id = ?1 AND blocker.completed = 0",
+            )?;
+            let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+            for r in rows {
+                blocked_ids.insert(r?);
+            }
+        }
+
+        let mut map = std::collections::HashMap::new();
+        let mut stmt = self.conn.prepare(
+            "SELECT tasks.id, tasks.completed, task_statuses.status
+             FROM tasks
+             LEFT JOIN task_statuses ON task_statuses.task_id = tasks.id
+             WHERE tasks.project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, bool>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for r in rows {
+            let (task_id, completed, stored) = r?;
+            let status = if completed {
+                crate::models::QuestStatus::Done
+            } else {
+                let stored_status = stored
+                    .as_deref()
+                    .map(crate::models::QuestStatus::from_str)
+                    .unwrap_or(crate::models::QuestStatus::Backlog);
+                if stored_status != crate::models::QuestStatus::Blocked
+                    && blocked_ids.contains(&task_id)
+                {
+                    crate::models::QuestStatus::Blocked
+                } else {
+                    stored_status
+                }
+            };
+            map.insert(task_id, status);
+        }
+        Ok(map)
     }
 
     pub fn set_quest_status(

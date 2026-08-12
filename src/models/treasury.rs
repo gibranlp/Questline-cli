@@ -9,15 +9,33 @@ pub enum Currency {
     #[default]
     Usd,
     Mxn,
+    Eur,
+    Gbp,
+    Cad,
+    Aud,
+    Chf,
 }
 
 impl Currency {
-    pub const ALL: [Self; 2] = [Self::Usd, Self::Mxn];
+    pub const ALL: [Self; 7] = [
+        Self::Usd,
+        Self::Mxn,
+        Self::Eur,
+        Self::Gbp,
+        Self::Cad,
+        Self::Aud,
+        Self::Chf,
+    ];
 
     pub fn code(self) -> &'static str {
         match self {
             Self::Usd => "USD",
             Self::Mxn => "MXN",
+            Self::Eur => "EUR",
+            Self::Gbp => "GBP",
+            Self::Cad => "CAD",
+            Self::Aud => "AUD",
+            Self::Chf => "CHF",
         }
     }
 
@@ -25,6 +43,11 @@ impl Currency {
         match self {
             Self::Usd => "US$",
             Self::Mxn => "MX$",
+            Self::Eur => "€",
+            Self::Gbp => "£",
+            Self::Cad => "CA$",
+            Self::Aud => "AU$",
+            Self::Chf => "CHF ",
         }
     }
 
@@ -32,6 +55,11 @@ impl Currency {
         match self {
             Self::Usd => "USD · US Dollar",
             Self::Mxn => "MXN · Mexican Peso",
+            Self::Eur => "EUR · Euro",
+            Self::Gbp => "GBP · British Pound",
+            Self::Cad => "CAD · Canadian Dollar",
+            Self::Aud => "AUD · Australian Dollar",
+            Self::Chf => "CHF · Swiss Franc",
         }
     }
 
@@ -39,6 +67,11 @@ impl Currency {
         match value.trim().to_ascii_uppercase().as_str() {
             "USD" => Some(Self::Usd),
             "MXN" => Some(Self::Mxn),
+            "EUR" => Some(Self::Eur),
+            "GBP" => Some(Self::Gbp),
+            "CAD" => Some(Self::Cad),
+            "AUD" => Some(Self::Aud),
+            "CHF" => Some(Self::Chf),
             _ => None,
         }
     }
@@ -50,10 +83,10 @@ impl Currency {
     }
 
     pub fn index(self) -> usize {
-        match self {
-            Self::Usd => 0,
-            Self::Mxn => 1,
-        }
+        Self::ALL
+            .iter()
+            .position(|currency| *currency == self)
+            .unwrap_or(0)
     }
 
     pub fn from_index(index: usize) -> Self {

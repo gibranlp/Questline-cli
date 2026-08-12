@@ -13,26 +13,50 @@ use ratatui::{
 };
 use uuid::Uuid;
 
-// Recordatorios de vencimiento ("due_soon"/"overdue") son personales — solo
-// pertenecen a las vistas de Fellowship si la tarea vive en una campaña
-// que de verdad está compartida. Todo lo demás (menciones, invitaciones,
-// asignaciones...) ya nace del contexto de Fellowship, así que pasa directo.
-fn notice_belongs_in_fellowship(app: &App, kind: &str, target_id: &Option<String>) -> bool {
-    if kind != "due_soon" && kind != "overdue" {
+// Fellowship es solo para proyectos compartidos. Cada tipo de Council Notice
+// guarda un `target_id` distinto (tarea, proyecto o asiento del libro
+// contable), así que hay que resolver cada uno a su proyecto antes de decidir
+// si de verdad pertenece a una campaña compartida. Tipos que no reconocemos
+// pasan directo, igual que antes.
+pub(crate) fn notice_belongs_in_fellowship(app: &App, kind: &str, target_id: &Option<String>) -> bool {
+    // Unrecognized notice types keep the old permissive default — they don't
+    // carry a project/task target we know how to resolve.
+    if !matches!(
+        kind,
+        "due_soon" | "overdue" | "mention" | "chronicle_mention" | "treasury_budget" | "treasury_large_expense" | "treasury_income"
+    ) {
         return true;
     }
-    let Some(task_id) = target_id
-        .as_deref()
-        .and_then(|s| Uuid::parse_str(s).ok())
-    else {
+    let Some(target) = target_id.as_deref().and_then(|s| Uuid::parse_str(s).ok()) else {
         return false;
     };
-    app.all_tasks
-        .iter()
-        .find(|t| t.id == task_id)
-        .and_then(|t| t.project_id)
-        .map(|pid| app.projects.iter().any(|p| p.id == pid && p.is_shared))
-        .unwrap_or(false)
+    match kind {
+        // target_id = task id
+        "due_soon" | "overdue" | "mention" => app
+            .all_tasks
+            .iter()
+            .find(|t| t.id == target)
+            .and_then(|t| t.project_id)
+            .map(|pid| app.projects.iter().any(|p| p.id == pid && p.is_shared))
+            .unwrap_or(false),
+        // target_id = project/campaign id directly
+        "chronicle_mention" | "treasury_budget" => {
+            app.projects.iter().any(|p| p.id == target && p.is_shared)
+        }
+        // target_id = ledger entry id — resolve to its campaign first
+        _ => app
+            .db
+            .conn
+            .query_row(
+                "SELECT campaign_id FROM ledger_entries WHERE id = ?1",
+                rusqlite::params![target.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|cid| Uuid::parse_str(&cid).ok())
+            .map(|pid| app.projects.iter().any(|p| p.id == pid && p.is_shared))
+            .unwrap_or(false),
+    }
 }
 
 // La función principal — pinta toda la pantalla de fellowship, tabs y modales incluidos

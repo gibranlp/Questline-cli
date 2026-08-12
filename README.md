@@ -516,6 +516,39 @@ If Questline helps you on your adventures, consider starring the repository and 
 - Removed unreachable key-handling code and repaired the test suite so it runs
   clean, keeping unrelated failures from masking a real encryption regression.
 
+**Fellowship, Currency, and Sync Hardening:**
+
+- Fixed the Dashboard's Fellowship widget counting unread Chronicle messages
+  and Council Notices from private, non-shared Campaigns toward its Unread and
+  Mentions totals. Both are now scoped to shared Campaigns only, matching the
+  rule that Fellowship is for shared projects.
+- Campaign Currency now offers five more denominations — EUR, GBP, CAD, AUD,
+  and CHF — alongside USD and MXN. As before, Questline performs no currency
+  conversion; switching only relabels the existing ledger.
+- Fixed a crash risk where a malformed or malicious hex field in a sync
+  server's response could panic the client instead of being rejected as an
+  invalid key envelope.
+- Cloud Sync Reset now re-confirms the remote Fellowship history was actually
+  replaced after the snapshot upload, instead of trusting a successful
+  response alone.
+- Fixed a queued Quest assignment change that could survive a Fellowship
+  access revocation and go out under the wrong encryption scope on the next
+  sync.
+- Removing a Companion from a Fellowship now also clears their assigned
+  Quests, so those Quests correctly reappear in Council Briefing's workload
+  breakdown and unassigned queue instead of silently vanishing from both.
+- Fixed the Command Center dashboard mislabeling a High-priority Quest due
+  more than a month out as demanding immediate action instead of showing its
+  actual due-date urgency.
+- Task-list filters (My Quests, Assignee, Unassigned, Blocked, Review) in a
+  Campaign workspace no longer query the database once per Quest on every
+  render frame, fixing a performance drag on larger Campaigns.
+- Sync now caches a shared Campaign's encryption key once per push batch
+  instead of re-reading it for every pending change, speeding up syncing a
+  large batch of offline edits.
+- Removed duplicate encrypt/decrypt helper functions in the sync engine that
+  had drifted into two names for the same operation.
+
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
 

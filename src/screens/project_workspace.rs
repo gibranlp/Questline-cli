@@ -96,42 +96,50 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
         steps
     } else {
         // Vista principal: padres filtrados y ordenados, con sus steps inline debajo
+        //
+        // Assignee/status filters used to hit SQLite once per task, every single
+        // render frame (~20Hz) — for a project with N tasks that's O(N) blocking
+        // queries/sec just for the screen sitting open. Fetch each lookup once per
+        // draw() call instead, and only when the active filter actually needs it.
+        let project_id_str = project.id.to_string();
+        let needs_assignments = task_filter == "MyQuests"
+            || task_filter == "Unassigned"
+            || task_filter.starts_with("Assignee:");
+        let assignments_by_task = if needs_assignments {
+            app.db
+                .get_task_assignments_by_project(&project_id_str)
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+        let needs_status = task_filter == "Blocked" || task_filter == "Review";
+        let statuses_by_task = if needs_status {
+            app.db
+                .get_quest_statuses_by_project(&project_id_str)
+                .unwrap_or_default()
+        } else {
+            std::collections::HashMap::new()
+        };
+
         let mut parents: Vec<&Task> = tasks
             .iter()
             .filter(|t| t.project_id == Some(project.id) && t.parent_task_id.is_none())
             .filter(|t| match task_filter.as_str() {
                 "Incomplete" => !t.completed,
                 "Completed" => t.completed,
-                "MyQuests" => app
-                    .db
-                    .get_task_assignments(&t.id.to_string())
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|(identity, _)| identity == &app.identity.public_key),
-                filter if filter.starts_with("Assignee:") => app
-                    .db
-                    .get_task_assignments(&t.id.to_string())
-                    .unwrap_or_default()
-                    .iter()
-                    .any(|(identity, _)| identity == filter.trim_start_matches("Assignee:")),
-                "Unassigned" => app
-                    .db
-                    .get_task_assignments(&t.id.to_string())
-                    .unwrap_or_default()
-                    .is_empty(),
-                "Blocked" => {
-                    app.db
-                        .get_quest_status(&t.id.to_string(), t.completed)
-                        .is_ok_and(|status| status == crate::models::QuestStatus::Blocked)
-                        || app
-                            .db
-                            .has_unresolved_task_dependencies(&t.id.to_string())
-                            .unwrap_or(false)
-                }
-                "Review" => app
-                    .db
-                    .get_quest_status(&t.id.to_string(), t.completed)
-                    .is_ok_and(|status| status == crate::models::QuestStatus::Review),
+                "MyQuests" => assignments_by_task
+                    .get(&t.id.to_string())
+                    .is_some_and(|list| list.iter().any(|(identity, _)| identity == &app.identity.public_key)),
+                filter if filter.starts_with("Assignee:") => assignments_by_task
+                    .get(&t.id.to_string())
+                    .is_some_and(|list| list.iter().any(|(identity, _)| identity == filter.trim_start_matches("Assignee:"))),
+                "Unassigned" => assignments_by_task
+                    .get(&t.id.to_string())
+                    .is_none_or(|list| list.is_empty()),
+                "Blocked" => statuses_by_task.get(&t.id.to_string())
+                    == Some(&crate::models::QuestStatus::Blocked),
+                "Review" => statuses_by_task.get(&t.id.to_string())
+                    == Some(&crate::models::QuestStatus::Review),
                 "Overdue" => !t.completed && t.due_date.is_some_and(|due| due < Utc::now()),
                 "HighPriority" => t.priority == TaskPriority::High,
                 "DueSoon" => {

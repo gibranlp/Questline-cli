@@ -92,7 +92,10 @@ fn score_task(task: &Task, today: NaiveDate) -> (i32, &'static str) {
     match task.priority {
         TaskPriority::High => {
             score += 14;
-            if score <= 14 {
+            // Only override the reason when there's truly no due date to explain
+            // the ranking — a far-future due date also leaves score at 14 here,
+            // but should keep its own "not urgent yet" reason, not this one.
+            if task.due_date.is_none() {
                 reason = "High priority. The realm demands action.";
             }
         }

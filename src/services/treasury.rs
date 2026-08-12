@@ -1393,8 +1393,8 @@ mod tests {
     fn currency_codes_round_trip() {
         assert_eq!(Currency::parse("mxn"), Some(Currency::Mxn));
         assert_eq!(Currency::parse(" USD "), Some(Currency::Usd));
-        assert_eq!(Currency::parse("EUR"), None);
-        assert_eq!(Currency::from_code_or_default("EUR"), Currency::Usd);
+        assert_eq!(Currency::parse("XYZ"), None);
+        assert_eq!(Currency::from_code_or_default("XYZ"), Currency::Usd);
         for currency in Currency::ALL {
             assert_eq!(Currency::from_index(currency.index()), currency);
             assert_eq!(Currency::parse(currency.code()), Some(currency));

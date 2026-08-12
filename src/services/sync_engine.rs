@@ -621,6 +621,17 @@ impl<'a> SyncEngine<'a> {
         Ok(pushed)
     }
 
+    /// Confirms the remote actually reflects a just-completed snapshot replace, rather than
+    /// trusting a 200 response alone — a network hiccup between the server committing and this
+    /// client seeing the response would otherwise look identical to success. `sync/v2/snapshot`
+    /// commits transactionally server-side, so this only needs to rule out "we never actually
+    /// landed," not verify an exact event count. Returns the remote's reported head_seq.
+    pub fn verify_remote_has_events(&self) -> Result<i64> {
+        let raw = self.provider.pull(&self.identity.public_key, "", 0)?;
+        let page = parse_pull_page(&raw, 0)?;
+        Ok(page.head_seq)
+    }
+
     // One page of sync. `sync()` calls this in pull-before-push order; when `push_local` is true
     // this normally performs a small post-push pull so the cursor catches any concurrent events.
     fn sync_once(
@@ -643,6 +654,13 @@ impl<'a> SyncEngine<'a> {
         // Rol por campaña resuelto una sola vez — se consulta por cada evento pendiente.
         let mut observer_routes: std::collections::HashMap<String, bool> =
             std::collections::HashMap::new();
+        // Llave de cifrado por proyecto, cacheada igual que el rol de arriba — sin esto,
+        // un lote grande de la misma campaña compartida repite la misma consulta a SQLite
+        // una vez por evento pendiente en vez de una vez por proyecto distinto.
+        let mut project_key_cache: std::collections::HashMap<
+            (String, bool),
+            Option<(String, [u8; 32])>,
+        > = std::collections::HashMap::new();
 
         for (log_id, entity_type, entity_id, operation, timestamp) in pending {
             let uuid = Uuid::parse_str(&entity_id).unwrap_or_default();
@@ -1173,18 +1191,21 @@ impl<'a> SyncEngine<'a> {
                     .unwrap_or_else(|_| "null".to_string())
             });
             let project_id = project_id_from_sync_content(&entity_type, &entity_id, &plaintext);
+            let is_delete = operation == "delete";
             let project_encryption = project_id.as_deref().and_then(|project_id| {
-                if operation == "delete" {
-                    self.db
-                        .get_project_encryption_key_for_tombstone(project_id)
-                        .ok()
-                        .flatten()
-                } else {
-                    self.db
-                        .get_project_encryption_key(project_id)
-                        .ok()
-                        .flatten()
-                }
+                project_key_cache
+                    .entry((project_id.to_string(), is_delete))
+                    .or_insert_with(|| {
+                        if is_delete {
+                            self.db
+                                .get_project_encryption_key_for_tombstone(project_id)
+                                .ok()
+                                .flatten()
+                        } else {
+                            self.db.get_project_encryption_key(project_id).ok().flatten()
+                        }
+                    })
+                    .clone()
             });
             // El servidor rechaza con 403 cualquier escritura de un Observer sobre una ruta
             // compartida, y ese rechazo revierte el lote completo: un solo evento así
@@ -1242,7 +1263,7 @@ impl<'a> SyncEngine<'a> {
             };
             let (nonce, ciphertext) = match project_encryption {
                 Some((_, key)) => {
-                    crate::services::encryption::encrypt_with_project_key(&key, &plaintext, &aad)?
+                    crate::services::encryption::encrypt_project_payload(&key, &plaintext, &aad)?
                 }
                 None => crate::services::encryption::encrypt(self.identity, &plaintext, &aad)?,
             };
@@ -1461,7 +1482,7 @@ impl<'a> SyncEngine<'a> {
                     .ok_or_else(|| {
                         anyhow!("missing Fellowship key for routing id {}", log.routing_id)
                     })?;
-                crate::services::encryption::decrypt_with_project_key(
+                crate::services::encryption::decrypt_project_payload(
                     &key,
                     &log.nonce,
                     &log.ciphertext,
@@ -5185,7 +5206,7 @@ mod tests {
             &sample.routing_id,
         );
         assert!(
-            crate::services::encryption::decrypt_with_project_key(
+            crate::services::encryption::decrypt_project_payload(
                 &[12u8; 32],
                 &sample.nonce,
                 &sample.ciphertext,
@@ -5195,7 +5216,7 @@ mod tests {
             "a wrong Fellowship key must not open a treasury event"
         );
         assert!(
-            crate::services::encryption::decrypt_with_project_key(
+            crate::services::encryption::decrypt_project_payload(
                 &project_key,
                 &sample.nonce,
                 &sample.ciphertext,

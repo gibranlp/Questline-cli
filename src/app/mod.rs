@@ -18626,6 +18626,15 @@ impl App {
                     Some(&server_url),
                 )?;
                 let pushed = sync_engine.replace_with_pending_snapshot()?;
+                if pushed > 0 {
+                    let remote_head_seq = sync_engine.verify_remote_has_events()?;
+                    if remote_head_seq <= 0 {
+                        return Err(anyhow::anyhow!(
+                            "Cloud reset verification failed: server reports no events after replacing {} pending changes",
+                            pushed
+                        ));
+                    }
+                }
                 let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
                 let _ = db.set_setting("sync_restore_hold", "0");
                 let _ = db.set_setting("conflict_count", "0");
