@@ -1043,7 +1043,9 @@ pub struct App {
     // state — lives here rather than on EditorState, so it isn't part of
     // undo/redo snapshots.
     pub hit_regions: crate::screens::hit_test::HitRegions,
-    pub last_click: Option<(std::time::Instant, u16, u16)>,
+    // (time, col, row, run length) — run length lets a same-cell click chain
+    // distinguish single/double/triple click instead of only double.
+    pub last_click: Option<(std::time::Instant, u16, u16, u8)>,
     pub mouse_drag_anchor: Option<(usize, usize)>,
 
     pub dashboard_task_focus: bool,
@@ -7391,25 +7393,49 @@ impl App {
                 };
 
                 let now = std::time::Instant::now();
-                let is_double_click = self
-                    .last_click
-                    .map(|(t, c, r)| {
-                        t.elapsed() < std::time::Duration::from_millis(400)
+                let click_run = match self.last_click {
+                    Some((t, c, r, run))
+                        if t.elapsed() < std::time::Duration::from_millis(400)
                             && c == mouse.column
-                            && r == mouse.row
-                    })
-                    .unwrap_or(false);
-                self.last_click = Some((now, mouse.column, mouse.row));
+                            && r == mouse.row =>
+                    {
+                        (run + 1).min(3)
+                    }
+                    _ => 1,
+                };
+                self.last_click = Some((now, mouse.column, mouse.row, click_run));
+
+                // Shift+click extends the existing selection (or starts one
+                // anchored at the pre-click cursor) to the click point,
+                // regardless of click_run — matches the usual GUI convention
+                // and is simpler than also tracking shift-double/triple-click.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let state = self.editor_state.as_mut().unwrap();
+                    if state.visual_range().is_none() {
+                        state.enter_visual_char();
+                    }
+                    state.cursor_y = line;
+                    state.cursor_x = x;
+                    self.mouse_drag_anchor = Some((line, x));
+                    return;
+                }
 
                 let state = self.editor_state.as_mut().unwrap();
                 state.cursor_y = line;
                 state.cursor_x = x;
-                if is_double_click {
-                    state.select_word_at_cursor();
-                    self.mouse_drag_anchor = None;
-                } else {
-                    state.enter_visual_char();
-                    self.mouse_drag_anchor = Some((line, x));
+                match click_run {
+                    3 => {
+                        state.enter_visual_line();
+                        self.mouse_drag_anchor = None;
+                    }
+                    2 => {
+                        state.select_word_at_cursor();
+                        self.mouse_drag_anchor = None;
+                    }
+                    _ => {
+                        state.enter_visual_char();
+                        self.mouse_drag_anchor = Some((line, x));
+                    }
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
@@ -21627,6 +21653,87 @@ mod app_tests {
         let tree = app.db.get_zen_tree().unwrap();
         assert_eq!(tree.growth, 10);
         assert_eq!(tree.stage, 2); // evolved to sprout
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Test fixture: an App parked on the editor screen with a body hit
+    // region wide enough to avoid wrapping, matching what draw() would have
+    // stashed on the last frame.
+    fn editor_app_for_mouse_tests(db_file: &Path, content: &str) -> App {
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let mut state =
+            crate::screens::editor::EditorState::new(Uuid::new_v4(), None, String::new(), content.to_string());
+        state.editing_title = false;
+        state.mode = crate::screens::editor::EditorMode::Normal;
+        app.editor_state = Some(state);
+        app.active_screen = ActiveScreen::Editor;
+        app.hit_regions.editor = Some(crate::screens::hit_test::EditorHitRegions {
+            body: ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            },
+            title: ratatui::layout::Rect::default(),
+            status: ratatui::layout::Rect::default(),
+            quick_note: false,
+        });
+        app
+    }
+
+    fn left_click(app: &mut App, col: u16, row: u16, modifiers: KeyModifiers) {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers,
+        })
+        .unwrap();
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn triple_click_in_editor_selects_the_whole_line() {
+        let db_file = Path::new("test_questline_mouse_triple_click.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let state = app.editor_state.as_ref().unwrap();
+        assert!(matches!(
+            state.mode,
+            crate::screens::editor::EditorMode::Visual {
+                line_mode: true,
+                ..
+            }
+        ));
+        assert_eq!(state.get_visual_text(), "hello world");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn shift_click_extends_selection_from_the_current_cursor() {
+        let db_file = Path::new("test_questline_mouse_shift_click.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+        app.editor_state.as_mut().unwrap().cursor_x = 1; // sitting on the 'e'
+
+        left_click(&mut app, 9, 0, KeyModifiers::SHIFT); // extend to the 'l' in "world"
+
+        let state = app.editor_state.as_ref().unwrap();
+        assert_eq!(state.visual_range(), Some((0, 1, 0, 9, false)));
+        assert_eq!(state.get_visual_text(), "ello worl");
 
         let _ = std::fs::remove_file(db_file);
     }
