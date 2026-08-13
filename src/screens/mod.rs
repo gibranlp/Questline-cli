@@ -10,6 +10,7 @@ pub mod fellowship;
 pub mod focus;
 pub mod gateway;
 pub mod great_chronicle;
+pub mod hit_test;
 pub mod intro;
 pub mod legends;
 pub mod library;
