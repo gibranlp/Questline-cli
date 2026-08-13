@@ -14,7 +14,10 @@
 
 use anyhow::{Result, anyhow};
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -780,7 +783,12 @@ async fn main() -> Result<()> {
     // Órale, a preparar la terminal — raw mode, pantalla alterna, backend de crossterm
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -795,7 +803,12 @@ async fn main() -> Result<()> {
             print!("\x1b]111\x07");
             let _ = std::io::Write::flush(&mut std::io::stdout());
             disable_raw_mode()?;
-            execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+            execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            )?;
             return Err(e);
         }
     };
@@ -871,6 +884,7 @@ async fn main() -> Result<()> {
                     app.handle_key_event(key)?;
                 }
                 Event::Paste(text) => app.handle_paste(&text),
+                Event::Mouse(mouse) => app.handle_mouse_event(mouse)?,
                 _ => {}
             }
         }
@@ -996,12 +1010,13 @@ async fn main() -> Result<()> {
                         screens::dashboard::draw(f, &app, &theme, dashboard_area);
                     }
                     if let Some(ref mut s) = app.editor_state {
-                        if quick_note {
+                        let regions = if quick_note {
                             let area = screens::intro::centered_rect(84, 86, size);
-                            screens::editor::draw_in_area(f, s, &theme, area);
+                            screens::editor::draw_in_area(f, s, &theme, area)
                         } else {
-                            screens::editor::draw(f, s, &theme);
-                        }
+                            screens::editor::draw(f, s, &theme)
+                        };
+                        app.hit_regions.editor = Some(regions);
                     }
                 }
                 ActiveScreen::Workspace => {
@@ -2959,6 +2974,7 @@ async fn main() -> Result<()> {
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;

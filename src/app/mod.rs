@@ -1037,6 +1037,15 @@ pub struct App {
     pub task_calendar: Option<TaskCalendarState>,
     pub pending_calendar_due_date: Option<NaiveDate>,
 
+    // Mouse support: rendered widget bounds stashed by the last frame's draw()
+    // calls (nothing else persists Rects between frames), plus interaction
+    // state for click/drag handling. UI interaction state, not document
+    // state — lives here rather than on EditorState, so it isn't part of
+    // undo/redo snapshots.
+    pub hit_regions: crate::screens::hit_test::HitRegions,
+    pub last_click: Option<(std::time::Instant, u16, u16)>,
+    pub mouse_drag_anchor: Option<(usize, usize)>,
+
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
 
@@ -2456,6 +2465,9 @@ impl App {
             task_title_editing: false,
             task_calendar: None,
             pending_calendar_due_date: None,
+            hit_regions: crate::screens::hit_test::HitRegions::default(),
+            last_click: None,
+            mouse_drag_anchor: None,
             dashboard_task_focus: true,
             selected_dashboard_task_idx: 0,
             searching: false,
@@ -2971,6 +2983,71 @@ impl App {
             self.refresh_stats_cache();
         }
         Ok(())
+    }
+
+    // ── Mouse ─────────────────────────────────────────────────────────────────
+    //
+    // Phase 1: full click/drag/scroll support in the Notes editor, plus
+    // universal scroll-wheel support on a few screens that already track a
+    // scroll offset. Click-to-select for list/menu screens is a deferred
+    // follow-up — see handle_generic_scroll_mouse for the extension point.
+    pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        // Modals/overlays/the calendar intercept keys before they reach the
+        // underlying screen — mirror that for mouse events. No hit-testing
+        // exists for them yet, so swallow rather than let a click leak
+        // through to whatever screen is underneath.
+        if self.modal_state != ModalType::None
+            || self.overlay_modal != ModalType::None
+            || self.task_calendar.is_some()
+        {
+            return Ok(());
+        }
+
+        match self.active_screen {
+            ActiveScreen::Editor => self.handle_editor_mouse(mouse),
+            _ => self.handle_generic_scroll_mouse(mouse),
+        }
+        Ok(())
+    }
+
+    fn handle_generic_scroll_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        let delta: i64 = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return,
+        };
+
+        // Each arm mirrors that screen's existing keyboard scroll handler —
+        // adding wheel support elsewhere is copying one more arm here.
+        match self.active_screen {
+            ActiveScreen::About => {
+                let content = self.about_content_lines.get();
+                let visible = self.terminal_height.saturating_sub(5);
+                let max_scroll = content.saturating_sub(visible);
+                self.about_scroll =
+                    (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
+            }
+            ActiveScreen::GreatChronicle => {
+                if self.chapter_panel_focused {
+                    self.chapter_panel_scroll =
+                        (self.chapter_panel_scroll as i64 + delta * 3).max(0) as usize;
+                } else {
+                    self.great_chronicle_scroll =
+                        (self.great_chronicle_scroll as i64 + delta * 3).max(0) as usize;
+                }
+            }
+            ActiveScreen::Library => {
+                if self.library_active_col == 2 {
+                    self.library_scroll_offset =
+                        (self.library_scroll_offset as i64 + delta).max(0) as u16;
+                } else {
+                    self.library_item_scroll_offset =
+                        (self.library_item_scroll_offset as i64 + delta).max(0) as usize;
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -7283,6 +7360,115 @@ impl App {
         } else {
             self.active_screen = ActiveScreen::Workspace;
             self.workspace_tab_idx = 1;
+        }
+    }
+
+    fn handle_editor_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::editor;
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.editor else {
+            return;
+        };
+        let overlay_active = self
+            .editor_state
+            .as_ref()
+            .map(|s| s.editing_title || s.editing_project || s.confirm_close || s.show_help)
+            .unwrap_or(true);
+        if overlay_active {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.body, mouse.column, mouse.row) {
+                    return;
+                }
+                let (line, x) = {
+                    let state = self.editor_state.as_ref().unwrap();
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row)
+                };
+
+                let now = std::time::Instant::now();
+                let is_double_click = self
+                    .last_click
+                    .map(|(t, c, r)| {
+                        t.elapsed() < std::time::Duration::from_millis(400)
+                            && c == mouse.column
+                            && r == mouse.row
+                    })
+                    .unwrap_or(false);
+                self.last_click = Some((now, mouse.column, mouse.row));
+
+                let state = self.editor_state.as_mut().unwrap();
+                state.cursor_y = line;
+                state.cursor_x = x;
+                if is_double_click {
+                    state.select_word_at_cursor();
+                    self.mouse_drag_anchor = None;
+                } else {
+                    state.enter_visual_char();
+                    self.mouse_drag_anchor = Some((line, x));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_drag_anchor.is_none() {
+                    return;
+                }
+                let Some(state) = self.editor_state.as_mut() else {
+                    return;
+                };
+                let (line, x) =
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row);
+                state.cursor_y = line;
+                state.cursor_x = x;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Selection (EditorMode::Visual) stays active after a drag so the
+                // existing 'y' yank / Esc-to-cancel keybindings keep working.
+                self.mouse_drag_anchor = None;
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if !HitRegions::contains(regions.body, mouse.column, mouse.row) {
+                    return;
+                }
+                let (line, x) = {
+                    let state = self.editor_state.as_ref().unwrap();
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row)
+                };
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.cursor_y = line;
+                    state.cursor_x = x;
+                }
+                self.editor_paste_at_cursor();
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.scroll_offset = state.scroll_offset.saturating_add(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Right-click paste in the editor. Right-click (not middle-click) because
+    // middle-click-paste is an X11 primary-selection convention that doesn't
+    // map to "the clipboard" on Windows/macOS.
+    fn editor_paste_at_cursor(&mut self) {
+        let Some(state) = self.editor_state.as_mut() else {
+            return;
+        };
+        if state.editing_title || state.editing_project || state.confirm_close {
+            return;
+        }
+        if let Ok(text) = crate::services::identity::paste_from_clipboard() {
+            state.insert_text(&text);
         }
     }
 

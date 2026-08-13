@@ -2,6 +2,7 @@
 // screens/editor.rs — vim-mode note editor
 // ─────────────────────────────────────────────────────────────────────────────
 
+use crate::screens::hit_test::EditorHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -827,6 +828,28 @@ impl EditorState {
         };
     }
 
+    // Mouse double-click: select the word under the cursor by entering visual
+    // mode with the anchor and cursor placed at the word's start/end — reuses
+    // the same `inner_word_range` word-boundary logic as `dw`/`ciw`.
+    pub fn select_word_at_cursor(&mut self) {
+        if self.editing_title || self.editing_project {
+            return;
+        }
+        let (start, end) = self.inner_word_range();
+        if end <= start {
+            self.enter_visual_char();
+            return;
+        }
+        let anchor_y = self.cursor_y;
+        self.mode = EditorMode::Visual {
+            anchor_y,
+            anchor_x: start,
+            line_mode: false,
+        };
+        let line = &self.lines[self.cursor_y];
+        self.cursor_x = floor_char_boundary(line, end.saturating_sub(1).max(start));
+    }
+
     // Normalized selection bounds: (start_y, start_x, end_y, end_x, line_mode)
     pub fn visual_range(&self) -> Option<(usize, usize, usize, usize, bool)> {
         if let EditorMode::Visual {
@@ -1323,13 +1346,134 @@ fn cursor_visual_row(state: &EditorState, width: u16) -> usize {
         .saturating_sub(1)
 }
 
-// ── draw ──────────────────────────────────────────────────────────────────────
+// ── Mouse: screen coordinates → buffer position ──────────────────────────────
+//
+// `cursor_visual_row` above is the *forward* mapping (logical cursor → wrapped
+// visual row), used to keep `scroll_offset` following the cursor. A mouse
+// click needs the inverse: given a screen (col, row) inside the rendered body
+// Rect, which logical (line, byte_x) does it correspond to? Ratatui's
+// `Paragraph`/`Wrap` doesn't expose the wrap break points it computes (only
+// the total row count via `line_count`), so `wrap_line_into_rows` re-derives
+// them with a small greedy word-wrap that mirrors `Wrap { trim: false }`
+// closely enough for click positioning. This assumes one screen column per
+// character — wide/CJK characters won't click-position perfectly, a known
+// Phase 1 limitation.
 
-pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) {
-    draw_in_area(f, state, theme, f.size());
+/// Splits `line` into the (start_byte, end_byte) span of each visual row it
+/// would wrap into at `width` columns. Always returns at least one row.
+fn wrap_line_into_rows(line: &str, width: u16) -> Vec<(usize, usize)> {
+    let width = width.max(1) as usize;
+    if line.is_empty() {
+        return vec![(0, 0)];
+    }
+
+    let mut rows = Vec::new();
+    let mut row_start = 0usize;
+    let mut row_cols = 0usize;
+    let mut last_space_end: Option<usize> = None;
+    let mut i = 0usize;
+
+    while i < line.len() {
+        let ch = line[i..].chars().next().unwrap();
+        let next_i = i + ch.len_utf8();
+
+        if row_cols + 1 > width {
+            // Row is full. If the character that overflowed is itself a space,
+            // breaking right here never splits a word — a word that happens to
+            // end exactly at the width boundary keeps its full row instead of
+            // being pushed to the next one. Otherwise we're mid-word: back up
+            // to the last space so the word wraps whole.
+            if ch == ' ' {
+                rows.push((row_start, i));
+                row_start = i;
+                row_cols = 0;
+            } else {
+                match last_space_end.filter(|&b| b > row_start) {
+                    Some(break_at) => {
+                        rows.push((row_start, break_at));
+                        // Characters between break_at and i were already
+                        // counted into this row and now belong to the new
+                        // one — carry their count over instead of dropping it.
+                        row_cols = line[break_at..i].chars().count();
+                        row_start = break_at;
+                    }
+                    None => {
+                        rows.push((row_start, i));
+                        row_start = i;
+                        row_cols = 0;
+                    }
+                }
+            }
+            last_space_end = None;
+            continue;
+        }
+
+        row_cols += 1;
+        if ch == ' ' {
+            last_space_end = Some(next_i);
+        }
+        i = next_i;
+    }
+
+    if row_start < line.len() || rows.is_empty() {
+        rows.push((row_start, line.len()));
+    }
+    rows
 }
 
-pub fn draw_in_area(f: &mut Frame, state: &mut EditorState, theme: &Theme, size: Rect) {
+/// Byte offset into `line` for `target_col` (visual column, 0-based) within
+/// wrapped row `row_within_line` (also 0-based).
+fn byte_x_for_wrapped_col(line: &str, width: u16, row_within_line: usize, target_col: usize) -> usize {
+    let rows = wrap_line_into_rows(line, width);
+    let (start, end) = rows[row_within_line.min(rows.len() - 1)];
+    let mut byte = start;
+    let mut col = 0usize;
+    while byte < end && col < target_col {
+        byte += line[byte..].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+        col += 1;
+    }
+    byte.min(end)
+}
+
+/// Inverse of `cursor_visual_row`: maps a screen (col, row) inside the
+/// rendered body Rect to the logical (line index, byte_x) it points at,
+/// accounting for `state.scroll_offset` and soft-wrap at `body.width`.
+pub fn screen_to_buffer_pos(state: &EditorState, body: Rect, col: u16, row: u16) -> (usize, usize) {
+    let last_line = state.lines.len().saturating_sub(1);
+    if body.width == 0 || state.lines.is_empty() {
+        return (last_line, state.lines.get(last_line).map(|l| l.len()).unwrap_or(0));
+    }
+
+    let target_visual_row = state.scroll_offset + row.saturating_sub(body.y) as usize;
+    let target_col = col.saturating_sub(body.x) as usize;
+
+    let mut visual_row = 0usize;
+    for (line_i, line) in state.lines.iter().enumerate() {
+        let rows_for_line = wrap_line_into_rows(line, body.width).len();
+        if target_visual_row < visual_row + rows_for_line {
+            let row_within_line = target_visual_row - visual_row;
+            let byte_x = byte_x_for_wrapped_col(line, body.width, row_within_line, target_col);
+            return (line_i, byte_x);
+        }
+        visual_row += rows_for_line;
+    }
+
+    // Click landed below all content — clamp to the end of the last line.
+    (last_line, state.lines[last_line].len())
+}
+
+// ── draw ──────────────────────────────────────────────────────────────────────
+
+pub fn draw(f: &mut Frame, state: &mut EditorState, theme: &Theme) -> EditorHitRegions {
+    draw_in_area(f, state, theme, f.size())
+}
+
+pub fn draw_in_area(
+    f: &mut Frame,
+    state: &mut EditorState,
+    theme: &Theme,
+    size: Rect,
+) -> EditorHitRegions {
     let accent = theme.primary;
 
     if state.quick_note {
@@ -1604,6 +1748,18 @@ pub fn draw_in_area(f: &mut Frame, state: &mut EditorState, theme: &Theme, size:
     if state.confirm_close {
         draw_unsaved_changes_popup(f, size, theme);
     }
+
+    EditorHitRegions {
+        body: Rect {
+            x: chunks[body_idx].x + 1,
+            y: chunks[body_idx].y + 1,
+            width: body_width,
+            height: body_height as u16,
+        },
+        title: chunks[0],
+        status: chunks[status_idx],
+        quick_note: state.quick_note,
+    }
 }
 
 fn draw_unsaved_changes_popup(f: &mut Frame, area: Rect, theme: &Theme) {
@@ -1866,6 +2022,99 @@ mod tests {
     }
 
     #[test]
+    fn wrap_line_into_rows_breaks_at_word_boundaries_not_mid_word() {
+        // No spaces: hard-break every `width` characters.
+        assert_eq!(wrap_line_into_rows("abcdefghij", 5), vec![(0, 5), (5, 10)]);
+
+        // "ab cd" fills the row exactly (5 cols) — the word "cd" is not pushed
+        // to the next row just because the space after it would overflow.
+        assert_eq!(wrap_line_into_rows("ab cd ef", 5), vec![(0, 5), (5, 8)]);
+
+        // "a " backs up off "wordtoolong" instead of splitting into it; the
+        // 11-char word is then too long for the width on its own and hard-breaks.
+        assert_eq!(
+            wrap_line_into_rows("a wordtoolong", 5),
+            vec![(0, 2), (2, 7), (7, 12), (12, 13)]
+        );
+
+        assert_eq!(wrap_line_into_rows("", 5), vec![(0, 0)]);
+    }
+
+    #[test]
+    fn screen_to_buffer_pos_maps_clicks_on_a_single_line() {
+        let project_id = Uuid::new_v4();
+        let editor = EditorState::new(project_id, None, String::new(), "hello world".to_string());
+        let body = Rect {
+            x: 2,
+            y: 1,
+            width: 20,
+            height: 5,
+        };
+
+        // Click on the 'w' of "world" (screen col 2+6=8, row 1).
+        assert_eq!(screen_to_buffer_pos(&editor, body, 8, 1), (0, 6));
+        // Click past the end of the line clamps to end-of-line.
+        assert_eq!(screen_to_buffer_pos(&editor, body, 2 + 50, 1), (0, 11));
+    }
+
+    #[test]
+    fn screen_to_buffer_pos_accounts_for_wrapping_and_scroll_offset() {
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(
+            project_id,
+            None,
+            String::new(),
+            "first\nabcdefghij".to_string(),
+        );
+        editor.scroll_offset = 1; // scrolled past "first", which occupies visual row 0
+        let body = Rect {
+            x: 0,
+            y: 0,
+            width: 5,
+            height: 5,
+        };
+
+        // With scroll_offset = 1, screen row 0 is visual row 1 = "abcde" (the
+        // first wrapped half of the second logical line).
+        assert_eq!(screen_to_buffer_pos(&editor, body, 2, 0), (1, 2));
+        // Screen row 1 is visual row 2 = "fghij", the second wrapped half.
+        assert_eq!(screen_to_buffer_pos(&editor, body, 3, 1), (1, 8));
+    }
+
+    #[test]
+    fn mouse_click_and_drag_extends_visual_selection_like_shift_click() {
+        let project_id = Uuid::new_v4();
+        let mut editor =
+            EditorState::new(project_id, None, String::new(), "hello world".to_string());
+        editor.editing_title = false;
+        editor.mode = EditorMode::Normal;
+
+        // Mouse-down at the 'e' (index 1) anchors a char-visual selection...
+        editor.cursor_x = 1;
+        editor.enter_visual_char();
+        // ...then dragging to 'o' of "world" (index 9) just moves the cursor —
+        // visual_range() derives the selection live from (anchor, cursor).
+        editor.cursor_x = 9;
+
+        assert_eq!(editor.visual_range(), Some((0, 1, 0, 9, false)));
+        assert_eq!(editor.get_visual_text(), "ello worl");
+    }
+
+    #[test]
+    fn double_click_selects_the_word_under_the_cursor() {
+        let project_id = Uuid::new_v4();
+        let mut editor =
+            EditorState::new(project_id, None, String::new(), "hello world".to_string());
+        editor.editing_title = false;
+        editor.mode = EditorMode::Normal;
+        editor.cursor_x = 8; // inside "world"
+
+        editor.select_word_at_cursor();
+
+        assert_eq!(editor.get_visual_text(), "world");
+    }
+
+    #[test]
     fn editor_scrolls_when_wrapped_cursor_reaches_below_the_panel() {
         let project_id = Uuid::new_v4();
         let content = "wrapped text ".repeat(40);
@@ -1878,7 +2127,9 @@ mod tests {
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
 
         terminal
-            .draw(|frame| draw(frame, &mut editor, &theme))
+            .draw(|frame| {
+                draw(frame, &mut editor, &theme);
+            })
             .unwrap();
 
         assert!(editor.scroll_offset > 0);

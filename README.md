@@ -548,6 +548,21 @@ If Questline helps you on your adventures, consider starring the repository and 
   large batch of offline edits.
 - Removed duplicate encrypt/decrypt helper functions in the sync engine that
   had drifted into two names for the same operation.
+- Fixed yank/copy in the Notes editor (and other Copy to Clipboard actions)
+  silently failing under WSL: the clipboard helper now detects WSL at runtime
+  and hands text to Windows via `clip.exe` (falling back to PowerShell's
+  `Set-Clipboard`) instead of only trying Linux tools like `wl-copy`/`xclip`
+  that have no display to talk to. It also checks that the clipboard command
+  actually succeeded instead of just that it launched, so a failed copy is no
+  longer reported as if it worked.
+- Added mouse support to the Notes editor on Windows, macOS, and Linux:
+  click to place the cursor, click-and-drag to select text, double-click to
+  select a word, and scroll wheel to scroll. Right-click pastes from the
+  system clipboard, backed by a new cross-platform clipboard-read helper
+  (`pbpaste`/PowerShell `Get-Clipboard`/`wl-paste`/`xclip`/`xsel`) alongside
+  the existing copy helper. Scroll-wheel support was also added to the About,
+  Great Chronicle, and Library screens. Click-to-select in other list screens
+  is planned as a follow-up.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
