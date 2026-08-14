@@ -3015,6 +3015,9 @@ impl App {
             ActiveScreen::Focus => self.handle_focus_mouse(mouse),
             ActiveScreen::Projects => self.handle_projects_mouse(mouse),
             ActiveScreen::Dashboard => self.handle_dashboard_mouse(mouse),
+            ActiveScreen::Soundscapes => self.handle_soundscapes_mouse(mouse),
+            ActiveScreen::Library => self.handle_library_mouse(mouse),
+            ActiveScreen::Settings => self.handle_settings_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -3028,29 +3031,18 @@ impl App {
             _ => return,
         };
 
-        // Each arm mirrors that screen's existing keyboard scroll handler —
-        // adding wheel support elsewhere is copying one more arm here.
-        // (GreatChronicle used to have an arm here too, but it now gets a
-        // dedicated handle_great_chronicle_mouse for click support, so its
-        // scroll handling lives there instead — see handle_mouse_event.)
-        match self.active_screen {
-            ActiveScreen::About => {
-                let content = self.about_content_lines.get();
-                let visible = self.terminal_height.saturating_sub(5);
-                let max_scroll = content.saturating_sub(visible);
-                self.about_scroll =
-                    (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
-            }
-            ActiveScreen::Library => {
-                if self.library_active_col == 2 {
-                    self.library_scroll_offset =
-                        (self.library_scroll_offset as i64 + delta).max(0) as u16;
-                } else {
-                    self.library_item_scroll_offset =
-                        (self.library_item_scroll_offset as i64 + delta).max(0) as usize;
-                }
-            }
-            _ => {}
+        // About is the only screen left here — every other screen with
+        // scroll support (GreatChronicle, Library, ...) now gets its own
+        // dedicated handle_*_mouse so click and scroll share one dispatch
+        // arm; see handle_mouse_event. Add a screen back as a match arm
+        // (not an if) the moment a second one needs generic scroll-only
+        // support again.
+        if self.active_screen == ActiveScreen::About {
+            let content = self.about_content_lines.get();
+            let visible = self.terminal_height.saturating_sub(5);
+            let max_scroll = content.saturating_sub(visible);
+            self.about_scroll =
+                (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
         }
     }
 
@@ -3260,6 +3252,123 @@ impl App {
         // to re-derive dashboard_command_targets() just to re-validate it.
         self.dashboard_task_focus = true;
         self.selected_dashboard_task_idx = *action_idx;
+    }
+
+    fn handle_soundscapes_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.soundscapes else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        if let Some(tracks) = regions.local_tracks
+            && HitRegions::contains(tracks.area, mouse.column, mouse.row)
+        {
+            let line = (mouse.row - tracks.area.y) as usize;
+            if line == tracks.row_start {
+                self.selected_local_track_idx = 0; // "Random shuffle"
+            } else if line > tracks.row_start && line <= tracks.row_start + tracks.track_count {
+                self.selected_local_track_idx = line - tracks.row_start;
+            }
+            return;
+        }
+
+        if HitRegions::contains(regions.source_list, mouse.column, mouse.row) {
+            // Fixed 4-line-tall rows, no scroll offset.
+            let idx = (mouse.row - regions.source_list.y) as usize / 4;
+            if idx < regions.item_count {
+                self.selected_soundscape_idx = idx;
+            }
+        }
+    }
+
+    fn handle_library_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.library else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.cat_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.cat_list.y) as usize;
+                    if idx < regions.cat_count {
+                        self.library_active_col = 0;
+                        if self.selected_library_cat_idx != idx {
+                            self.selected_library_cat_idx = idx;
+                            self.reset_library_item_view();
+                        }
+                    }
+                } else if HitRegions::contains(regions.item_list, mouse.column, mouse.row) {
+                    // item_start_idx is the scroll window's top row, computed
+                    // at draw time via .skip(start_idx).take(visible_rows) —
+                    // not a ListState offset, but the same idea.
+                    let idx = regions.item_start_idx + (mouse.row - regions.item_list.y) as usize;
+                    if idx < regions.item_count {
+                        self.library_active_col = 1;
+                        self.selected_library_item_idx = idx;
+                        self.update_library_item_scroll();
+                    }
+                } else if HitRegions::contains(regions.detail_panel, mouse.column, mouse.row) {
+                    self.library_active_col = 2;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                if self.library_active_col == 2 {
+                    self.library_scroll_offset =
+                        (self.library_scroll_offset as i64 + delta).max(0) as u16;
+                } else {
+                    self.library_item_scroll_offset =
+                        (self.library_item_scroll_offset as i64 + delta).max(0) as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_settings_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.settings else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        // Click only moves focus, same as Projects/Dashboard/Library — see
+        // SettingsHitRegions for why a click doesn't also flip a toggle.
+        if HitRegions::contains(regions.theme_list, mouse.column, mouse.row) {
+            let idx = (mouse.row - regions.theme_list.y) as usize;
+            if idx < regions.theme_count {
+                self.selected_settings_focus_idx = 0;
+                self.selected_settings_theme_idx = idx;
+            }
+        } else if HitRegions::contains(regions.alerts_panel, mouse.column, mouse.row) {
+            let row = (mouse.row - regions.alerts_panel.y) as usize;
+            if row < regions.alerts_row_count {
+                self.selected_settings_focus_idx = 1 + row;
+            }
+        } else if HitRegions::contains(regions.oath_panel, mouse.column, mouse.row) {
+            let row = (mouse.row - regions.oath_panel.y) as usize;
+            if row < regions.oath_row_count {
+                self.selected_settings_focus_idx = 6 + row;
+            }
+        }
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -25145,6 +25254,101 @@ mod app_tests {
         left_click(&mut app, 2, 2, KeyModifiers::empty()); // logical row 4 — QuickWin
         assert!(app.dashboard_task_focus);
         assert_eq!(app.selected_dashboard_task_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 tier 3 mouse: Soundscapes/Library/Settings ──────────────────
+
+    #[test]
+    fn soundscapes_click_selects_source_and_local_track_separately() {
+        use crate::screens::hit_test::{LocalTracksHitRegions, SoundscapesHitRegions};
+
+        let db_file = Path::new("test_questline_mouse_soundscapes.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Soundscapes);
+        app.hit_regions.soundscapes = Some(SoundscapesHitRegions {
+            source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
+            item_count: 4,
+            local_tracks: Some(LocalTracksHitRegions {
+                area: ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 },
+                row_start: 3,
+                track_count: 2,
+            }),
+        });
+
+        // Each source row is 4 lines tall — row 8 is source index 2.
+        left_click(&mut app, 2, 8, KeyModifiers::empty());
+        assert_eq!(app.selected_soundscape_idx, 2);
+
+        left_click(&mut app, 32, 3, KeyModifiers::empty()); // "Random shuffle" row
+        assert_eq!(app.selected_local_track_idx, 0);
+
+        left_click(&mut app, 32, 5, KeyModifiers::empty()); // second track row (row_start + 2)
+        assert_eq!(app.selected_local_track_idx, 2);
+
+        left_click(&mut app, 32, 6, KeyModifiers::empty()); // past track_count — no-op
+        assert_eq!(app.selected_local_track_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn library_click_moves_column_focus_and_maps_item_row_through_scroll_start() {
+        use crate::screens::hit_test::LibraryHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_library.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Library);
+        app.hit_regions.library = Some(LibraryHitRegions {
+            cat_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 6 },
+            cat_count: 6,
+            item_list: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 4 },
+            item_start_idx: 10,
+            item_count: 20,
+            detail_panel: ratatui::layout::Rect { x: 40, y: 0, width: 15, height: 10 },
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // category row 3
+        assert_eq!(app.library_active_col, 0);
+        assert_eq!(app.selected_library_cat_idx, 3);
+
+        left_click(&mut app, 22, 1, KeyModifiers::empty()); // item row 1 -> logical 10+1
+        assert_eq!(app.library_active_col, 1);
+        assert_eq!(app.selected_library_item_idx, 11);
+
+        left_click(&mut app, 42, 2, KeyModifiers::empty()); // detail panel — focus only
+        assert_eq!(app.library_active_col, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_click_moves_focus_across_theme_alerts_and_oath_panels() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // theme row 3
+        assert_eq!(app.selected_settings_focus_idx, 0);
+        assert_eq!(app.selected_settings_theme_idx, 3);
+
+        left_click(&mut app, 22, 4, KeyModifiers::empty()); // last alerts row -> focus_idx 5
+        assert_eq!(app.selected_settings_focus_idx, 5);
+
+        left_click(&mut app, 2, 19, KeyModifiers::empty()); // oath row 9 -> focus_idx 15
+        assert_eq!(app.selected_settings_focus_idx, 15);
+
+        // A click on the trailing decorative lines (row 10, past oath_row_count) is a no-op.
+        left_click(&mut app, 2, 20, KeyModifiers::empty());
+        assert_eq!(app.selected_settings_focus_idx, 15);
 
         let _ = std::fs::remove_file(db_file);
     }
