@@ -582,9 +582,21 @@ If Questline helps you on your adventures, consider starring the repository and 
   Alerts & Audio row, or an Oath Calendar row in Settings to focus it (a
   click only selects — several of those rows are live toggles, and a
   misclick flipping one would be worse than requiring the existing
-  Enter/Space keys to commit). The remaining list/menu screens (Character,
-  Fellowship, Sync, Project Workspace) are still keyboard-only and planned
-  as further follow-ups.
+  Enter/Space keys to commit).
+- Extended click-to-select to Character, Sync, and tab-switching in
+  Fellowship: click an Adventure Log entry (even the hand word-wrapped,
+  variable-height ones) or a Reflections row to select it, or the
+  Reflection Detail pane to focus it; on Sync, click "Press [Enter] to
+  Sync Now", the Cloud Sync row, or the Auto Sync row to activate them
+  immediately, same as their keybindings (Sync has no existing selection
+  index at all, unlike every other screen here, and most of it is
+  read-only stats text with no keyboard action to hook into — only these
+  three rows got a click target); in Fellowship, click a tab to switch to
+  it. Fellowship's 8 tabs each have their own differently-shaped sub-list
+  (project list, notifications, invitations, members, notices, chat
+  transcript) — click-to-select within those, and all of Project
+  Workspace (its own multi-tab sub-screen, ~6000 lines), remain
+  keyboard-only and are planned as further follow-ups.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

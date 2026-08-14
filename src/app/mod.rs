@@ -3018,6 +3018,9 @@ impl App {
             ActiveScreen::Soundscapes => self.handle_soundscapes_mouse(mouse),
             ActiveScreen::Library => self.handle_library_mouse(mouse),
             ActiveScreen::Settings => self.handle_settings_mouse(mouse),
+            ActiveScreen::Character => self.handle_character_mouse(mouse),
+            ActiveScreen::SyncSettings => self.handle_sync_mouse(mouse),
+            ActiveScreen::Fellowship => self.handle_fellowship_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -3368,6 +3371,154 @@ impl App {
             if row < regions.oath_row_count {
                 self.selected_settings_focus_idx = 6 + row;
             }
+        }
+    }
+
+    /// Confirms the Sync screen's "Press [Enter] to Sync Now" CTA — shared
+    /// by the Enter keybinding and a click on that row.
+    fn activate_sync_now(&mut self) {
+        if self.config.sync_enabled {
+            self.start_forced_sync();
+        } else {
+            self.sync_status_msg = "Cloud Sync disabled — local data only".to_string();
+        }
+    }
+
+    /// Toggles Cloud Sync — shared by the s/S keybinding and a click on the
+    /// "Cloud Sync: ... [s] toggle" row.
+    fn toggle_cloud_sync_enabled(&mut self) -> Result<()> {
+        self.config.sync_enabled = !self.config.sync_enabled;
+        #[cfg(not(test))]
+        self.config.save()?;
+        self.sync_status_msg = if self.config.sync_enabled {
+            "Cloud Sync Enabled — press Enter to sync".to_string()
+        } else {
+            "Cloud Sync Disabled — Questline is local-only".to_string()
+        };
+        self.notifications
+            .push(Notification::info(self.sync_status_msg.clone()));
+        Ok(())
+    }
+
+    /// Toggles Auto Sync — shared by the a/A keybinding and a click on the
+    /// "Auto Sync: ... [a] toggle" row.
+    fn toggle_auto_sync(&mut self) {
+        self.auto_sync = !self.auto_sync;
+        let _ = self
+            .db
+            .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
+        self.sync_status_msg = format!(
+            "Auto Sync {}",
+            if self.auto_sync { "Enabled" } else { "Disabled" }
+        );
+    }
+
+    fn handle_character_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.character.clone() else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
+            let row = (mouse.row - regions.adventure_log.y) as usize;
+            if let Some(entry_idx) = regions.adventure_log_rows.get(row) {
+                self.character_focus = 0;
+                self.selected_chronicle_idx = *entry_idx;
+            }
+            return;
+        }
+        if let Some(list) = regions.reflections_list
+            && HitRegions::contains(list, mouse.column, mouse.row)
+        {
+            let idx = (mouse.row - list.y) as usize;
+            if idx < regions.reflections_count {
+                self.character_focus = 1;
+                self.selected_reflection_idx = idx;
+            }
+            return;
+        }
+        if let Some(detail) = regions.reflection_detail
+            && HitRegions::contains(detail, mouse.column, mouse.row)
+        {
+            self.character_focus = 2;
+        }
+    }
+
+    fn handle_sync_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.sync else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        // Each of these activates immediately, same as its keybinding — see
+        // SyncHitRegions for why (unlike Settings) that's fine here.
+        if HitRegions::contains(regions.sync_now, mouse.column, mouse.row) {
+            self.activate_sync_now();
+        } else if HitRegions::contains(regions.cloud_sync_toggle, mouse.column, mouse.row) {
+            if let Err(e) = self.toggle_cloud_sync_enabled() {
+                self.notifications.push(Notification::warning(format!(
+                    "Failed to save Cloud Sync setting: {}",
+                    e
+                )));
+            }
+        } else if HitRegions::contains(regions.auto_sync_toggle, mouse.column, mouse.row) {
+            self.toggle_auto_sync();
+        }
+    }
+
+    fn handle_fellowship_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.fellowship else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if let Some(idx) = regions
+            .tabs
+            .iter()
+            .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+        {
+            self.activate_fellowship_tab(idx);
+        }
+    }
+
+    /// Switches to Fellowship tab `idx`, resetting whatever that tab's own
+    /// keyboard shortcut (c/i/p/a//,y,b,t) resets when it switches there —
+    /// except 'a', whose shortcut doubles as "mark all read" when already on
+    /// an empty Chat tab. That's a context-dependent overload of the *key*,
+    /// not something a click on the Activity tab should also trigger, so
+    /// this only ever switches tabs, deliberately not sharing code with that
+    /// keybinding's handler.
+    fn activate_fellowship_tab(&mut self, idx: usize) {
+        self.selected_fellowship_tab = idx;
+        match idx {
+            0 => {
+                self.fellowship_focus_left = false;
+                self.fellowship_composing = false;
+            }
+            4 => {
+                self.modal_state = ModalType::SearchMessages {
+                    query: String::new(),
+                };
+            }
+            5 => self.selected_my_quest_idx = 0,
+            6 => self.selected_notification_idx = 0,
+            _ => {}
         }
     }
 
@@ -8597,39 +8748,15 @@ impl App {
         if self.active_screen == ActiveScreen::SyncSettings {
             match key.code {
                 KeyCode::Enter => {
-                    if self.config.sync_enabled {
-                        self.start_forced_sync();
-                    } else {
-                        self.sync_status_msg = "Cloud Sync disabled — local data only".to_string();
-                    }
+                    self.activate_sync_now();
                     return Ok(());
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    self.config.sync_enabled = !self.config.sync_enabled;
-                    #[cfg(not(test))]
-                    self.config.save()?;
-                    self.sync_status_msg = if self.config.sync_enabled {
-                        "Cloud Sync Enabled — press Enter to sync".to_string()
-                    } else {
-                        "Cloud Sync Disabled — Questline is local-only".to_string()
-                    };
-                    self.notifications
-                        .push(Notification::info(self.sync_status_msg.clone()));
+                    self.toggle_cloud_sync_enabled()?;
                     return Ok(());
                 }
                 KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.auto_sync = !self.auto_sync;
-                    let _ = self
-                        .db
-                        .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
-                    self.sync_status_msg = format!(
-                        "Auto Sync {}",
-                        if self.auto_sync {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
-                    );
+                    self.toggle_auto_sync();
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
@@ -25349,6 +25476,86 @@ mod app_tests {
         // A click on the trailing decorative lines (row 10, past oath_row_count) is a no-op.
         left_click(&mut app, 2, 20, KeyModifiers::empty());
         assert_eq!(app.selected_settings_focus_idx, 15);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 hardest tier mouse: Character/Sync/Fellowship ───────────────
+
+    #[test]
+    fn character_click_maps_adventure_log_rows_and_moves_reflection_focus() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        // Mirrors 3 chronicle entries of heights 1, 2, 1 — entry 1 (screen
+        // rows 1 and 2) is the two-line one.
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![0, 1, 1, 2],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 3,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // second screen row of entry 1
+        assert_eq!(app.character_focus, 0);
+        assert_eq!(app.selected_chronicle_idx, 1);
+
+        left_click(&mut app, 52, 2, KeyModifiers::empty()); // reflections list row 2
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 2);
+
+        left_click(&mut app, 72, 1, KeyModifiers::empty()); // detail pane — focus only
+        assert_eq!(app.character_focus, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn sync_click_activates_the_same_as_its_keybinding() {
+        use crate::screens::hit_test::SyncHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_sync.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::SyncSettings);
+        let was_auto_sync = app.auto_sync;
+        let was_sync_enabled = app.config.sync_enabled;
+        app.hit_regions.sync = Some(SyncHitRegions {
+            sync_now: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 1 },
+            cloud_sync_toggle: ratatui::layout::Rect { x: 0, y: 5, width: 30, height: 1 },
+            auto_sync_toggle: ratatui::layout::Rect { x: 0, y: 6, width: 30, height: 1 },
+        });
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // auto sync row
+        assert_eq!(app.auto_sync, !was_auto_sync);
+
+        left_click(&mut app, 2, 5, KeyModifiers::empty()); // cloud sync row
+        assert_eq!(app.config.sync_enabled, !was_sync_enabled);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_click_switches_tabs_and_resets_that_tabs_own_state() {
+        use crate::screens::hit_test::FellowshipHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_fellowship.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_notification_idx = 7;
+        let tabs: [ratatui::layout::Rect; 8] = std::array::from_fn(|i| ratatui::layout::Rect {
+            x: (i as u16) * 10,
+            y: 0,
+            width: 9,
+            height: 1,
+        });
+        app.hit_regions.fellowship = Some(FellowshipHitRegions { tabs });
+
+        left_click(&mut app, 65, 0, KeyModifiers::empty()); // tab 6 (Council)
+        assert_eq!(app.selected_fellowship_tab, 6);
+        assert_eq!(app.selected_notification_idx, 0); // reset, mirroring the 'b' key
+
+        left_click(&mut app, 25, 0, KeyModifiers::empty()); // tab 2 (Companions)
+        assert_eq!(app.selected_fellowship_tab, 2);
 
         let _ = std::fs::remove_file(db_file);
     }

@@ -24,6 +24,9 @@ pub struct HitRegions {
     pub soundscapes: Option<SoundscapesHitRegions>,
     pub library: Option<LibraryHitRegions>,
     pub settings: Option<SettingsHitRegions>,
+    pub character: Option<CharacterHitRegions>,
+    pub sync: Option<SyncHitRegions>,
+    pub fellowship: Option<FellowshipHitRegions>,
 }
 
 /// The regions `screens::editor::draw`/`draw_in_area` rendered on the last frame.
@@ -198,6 +201,65 @@ pub struct SettingsHitRegions {
     /// focus_idx 6.
     pub oath_panel: Rect,
     pub oath_row_count: usize,
+}
+
+/// `screens::character::draw` — three focus areas (`character_focus` 0/1/2).
+/// The Adventure Log is the hard one: each entry is a hand word-wrapped,
+/// *variable*-height `ListItem` inside a `ListState`-driven `List` that
+/// auto-scrolls by whole items. `adventure_log_rows` is built right after
+/// `render_stateful_widget` mutates the state (same `ListState::offset()`
+/// readback as Dashboard) by walking forward from that entry, accumulating
+/// each entry's real line count — one vec entry per rendered screen row, so
+/// the click handler does a plain index instead of re-deriving the wrap.
+/// Reflections is a plain single-line list; `reflection_detail` has no
+/// sub-selection, a click there just moves focus.
+#[derive(Debug, Clone)]
+pub struct CharacterHitRegions {
+    /// Inner Adventure Log area — borders already excluded.
+    pub adventure_log: Rect,
+    /// One entry per rendered screen row, top to bottom; empty if the log
+    /// itself is empty (nothing real to select).
+    pub adventure_log_rows: Vec<usize>,
+    /// Inner Reflections list area. `None` when there are no reflections —
+    /// that panel renders a hint message instead of the list/detail split.
+    pub reflections_list: Option<Rect>,
+    pub reflections_count: usize,
+    /// Full reflection detail pane, border included — `None` alongside
+    /// `reflections_list`.
+    pub reflection_detail: Option<Rect>,
+}
+
+/// `screens::sync::draw` — unlike every other screen here, Sync has no
+/// existing selection index to hook into: it's a wall of status/stat text
+/// with single-letter-hotkey actions, most of which are read-only info (device
+/// list, revision log, RPG stats) with no keyboard action of their own. Rather
+/// than inventing click targets for all of it, only the three rows with an
+/// obvious toggle/CTA affordance ("[s] toggle", "[a] toggle", the
+/// "Press [Enter] to Sync Now" banner) get one — each one line tall, at a
+/// fixed offset inside the left panel `Paragraph`. A click on one of these
+/// activates it immediately (same as the keybinding), unlike Settings'
+/// click-only-selects: these three are spaced apart with explicit inline
+/// hints, not a dense field of similar-looking rows a stray click could hit
+/// by mistake.
+#[derive(Debug, Clone, Copy)]
+pub struct SyncHitRegions {
+    pub sync_now: Rect,
+    pub cloud_sync_toggle: Rect,
+    pub auto_sync_toggle: Rect,
+}
+
+/// `screens::fellowship::draw` — the tab bar is one `Paragraph` of
+/// concatenated `Span`s, not a `Tabs` widget with per-tab `Rect`s, so each
+/// tab's on-screen column range has to be computed by summing the
+/// compile-time-constant label widths that come before it (done once at
+/// draw time, same as everything else here). Only tab *switching* gets a
+/// hit region in this pass — each of the 8 tabs behind
+/// `selected_fellowship_tab` has its own sub-list rendering (project list,
+/// notifications, invitations, members, notices, chat transcript) with
+/// different shapes; click-to-select within those is a follow-up.
+#[derive(Debug, Clone, Copy)]
+pub struct FellowshipHitRegions {
+    pub tabs: [Rect; 8],
 }
 
 impl HitRegions {
