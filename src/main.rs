@@ -1009,7 +1009,9 @@ async fn main() -> Result<()> {
                             .direction(Direction::Vertical)
                             .constraints([Constraint::Min(5), Constraint::Length(3)])
                             .split(size)[0];
-                        screens::dashboard::draw(f, &app, &theme, dashboard_area);
+                        // Discarded: the editor owns mouse dispatch while it's
+                        // active, so this backdrop's hit regions are never used.
+                        let _ = screens::dashboard::draw(f, &app, &theme, dashboard_area);
                     }
                     if let Some(ref mut s) = app.editor_state {
                         let regions = if quick_note {
@@ -1042,7 +1044,8 @@ async fn main() -> Result<()> {
                     // Render Screen Body
                     match app.active_screen {
                         ActiveScreen::Dashboard => {
-                            screens::dashboard::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::dashboard::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.dashboard = Some(regions);
                         },
 
                         ActiveScreen::Focus => {
@@ -1050,7 +1053,7 @@ async fn main() -> Result<()> {
                             app.hit_regions.focus = regions;
                         },
                         ActiveScreen::Projects => {
-                            screens::projects::draw(
+                            let regions = screens::projects::draw(
                                 f,
                                 &app.projects,
                                 &app.all_tasks,
@@ -1061,6 +1064,7 @@ async fn main() -> Result<()> {
                                 &theme,
                                 chunks[0],
                             );
+                            app.hit_regions.projects = Some(regions);
                         }
 
                         ActiveScreen::Character => {

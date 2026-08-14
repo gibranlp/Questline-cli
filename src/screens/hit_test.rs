@@ -19,6 +19,8 @@ pub struct HitRegions {
     pub onboarding: Option<OnboardingHitRegions>,
     pub legends: Option<LegendsHitRegions>,
     pub focus: Option<FocusHitRegions>,
+    pub projects: Option<ProjectsHitRegions>,
+    pub dashboard: Option<DashboardHitRegions>,
 }
 
 /// The regions `screens::editor::draw`/`draw_in_area` rendered on the last frame.
@@ -82,6 +84,45 @@ pub struct LegendsHitRegions {
 #[derive(Debug, Clone, Copy)]
 pub struct FocusHitRegions {
     pub cards: [Rect; 4],
+}
+
+/// What clicking a given rendered row of `screens::projects::draw`'s list
+/// should do — mirrors the "All" pinned entry vs. a real campaign row.
+#[derive(Debug, Clone, Copy)]
+pub enum ProjectsRowTarget {
+    All,
+    Project(usize),
+}
+
+/// `screens::projects::draw` — the campaign list interleaves a pinned "All
+/// Campaigns" row and a non-selectable "◇ Shared Campaigns" separator
+/// wherever the shared/unshared boundary falls, so — unlike Archive/Legends
+/// — the rendered row index isn't the project index. `row_targets` is one
+/// entry per rendered row (`None` for the separator/placeholder rows),
+/// built by the exact same loop draw() uses to lay out `list_items`.
+#[derive(Debug, Clone)]
+pub struct ProjectsHitRegions {
+    /// Inner list area — borders already excluded.
+    pub list: Rect,
+    pub row_targets: Vec<Option<ProjectsRowTarget>>,
+}
+
+/// `screens::dashboard::draw_today_command_center` — the Command Center list
+/// interleaves non-selectable separator rows ("-- Quick Wins --" etc.)
+/// between the real Main/Next/Quick-Win/Sidequest/Daily entries, so
+/// `row_targets` maps each *rendered* row to the logical action index
+/// `dashboard_command_targets()` uses (`None` for a separator/placeholder
+/// row). The list is `ListState`-driven and auto-scrolls to keep the
+/// keyboard selection visible, so `visible_start` records
+/// `ListState::offset()` *after* that frame's render — the true first
+/// visible logical row — rather than trying to recompute ratatui's
+/// scroll-into-view algorithm ourselves.
+#[derive(Debug, Clone)]
+pub struct DashboardHitRegions {
+    /// Inner list area — borders already excluded.
+    pub list: Rect,
+    pub row_targets: Vec<Option<usize>>,
+    pub visible_start: usize,
 }
 
 impl HitRegions {

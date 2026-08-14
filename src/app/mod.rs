@@ -3013,6 +3013,8 @@ impl App {
             ActiveScreen::Onboarding => self.handle_onboarding_mouse(mouse),
             ActiveScreen::Legends => self.handle_legends_mouse(mouse),
             ActiveScreen::Focus => self.handle_focus_mouse(mouse),
+            ActiveScreen::Projects => self.handle_projects_mouse(mouse),
+            ActiveScreen::Dashboard => self.handle_dashboard_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -3194,6 +3196,70 @@ impl App {
         {
             self.selected_focus_field_idx = idx;
         }
+    }
+
+    // Phase 2b: Projects and Dashboard both interleave non-selectable
+    // separator rows into an otherwise plain list, so — unlike the easy
+    // batch above — the rendered row index isn't the item index. Each
+    // draw() builds a row_targets map alongside its list_items/rows in
+    // lockstep, so the click handler just indexes into it instead of
+    // re-deriving where the separators land.
+
+    fn handle_projects_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::{HitRegions, ProjectsRowTarget};
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.projects.clone() else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+            return;
+        }
+        let row = (mouse.row - regions.list.y) as usize;
+        let Some(Some(target)) = regions.row_targets.get(row) else {
+            return;
+        };
+        match target {
+            ProjectsRowTarget::All => {
+                self.projects_all_selected = true;
+            }
+            ProjectsRowTarget::Project(idx) => {
+                self.projects_all_selected = false;
+                self.selected_project_idx = *idx;
+            }
+        }
+    }
+
+    fn handle_dashboard_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.dashboard.clone() else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+            return;
+        }
+        // The list is ListState-driven and auto-scrolls, so the logical row
+        // is the visible offset stashed at render time plus the on-screen
+        // offset — not just the on-screen offset by itself.
+        let row = regions.visible_start + (mouse.row - regions.list.y) as usize;
+        let Some(Some(action_idx)) = regions.row_targets.get(row) else {
+            return;
+        };
+        // action_idx came straight out of this exact frame's render, same as
+        // every other click handler trusting its stashed regions — no need
+        // to re-derive dashboard_command_targets() just to re-validate it.
+        self.dashboard_task_focus = true;
+        self.selected_dashboard_task_idx = *action_idx;
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -25015,6 +25081,70 @@ mod app_tests {
 
         left_click(&mut app, 22, 1, KeyModifiers::empty()); // inside cards[2]
         assert_eq!(app.selected_focus_field_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2b mouse: Projects/Dashboard — row_targets skip separators ────
+
+    #[test]
+    fn projects_click_maps_rows_through_the_all_entry_and_the_shared_separator() {
+        use crate::screens::hit_test::{ProjectsHitRegions, ProjectsRowTarget};
+
+        let db_file = Path::new("test_questline_mouse_projects.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        // Mirrors what projects::draw would build for: All, Project(0),
+        // a "Shared Campaigns" separator, then Project(1).
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![
+                Some(ProjectsRowTarget::All),
+                Some(ProjectsRowTarget::Project(0)),
+                None,
+                Some(ProjectsRowTarget::Project(1)),
+            ],
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Project(0) row
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // separator row — no-op
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // Project(1) row, past the separator
+        assert_eq!(app.selected_project_idx, 1);
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // back to the All row
+        assert!(app.projects_all_selected);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn dashboard_click_maps_through_visible_start_and_skips_separators() {
+        use crate::screens::hit_test::DashboardHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_dashboard.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.dashboard_task_focus = false;
+        // Logical rows: Main(0), Next(1), 2 separator rows, QuickWin(2). The
+        // list has auto-scrolled 2 rows down (visible_start = 2), so on-screen
+        // row 0 is logical row 2 (a separator), not Main.
+        app.hit_regions.dashboard = Some(DashboardHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            row_targets: vec![Some(0), Some(1), None, None, Some(2)],
+            visible_start: 2,
+        });
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // logical row 2 — separator
+        assert!(!app.dashboard_task_focus);
+        assert_eq!(app.selected_dashboard_task_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // logical row 4 — QuickWin
+        assert!(app.dashboard_task_focus);
+        assert_eq!(app.selected_dashboard_task_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
     }
