@@ -3584,22 +3584,80 @@ impl App {
 
         // Mirrors handle_workspace_key: while the shortcut codex overlay is
         // open, only Esc/'?' do anything — a click shouldn't reach the
-        // sidebar underneath it.
+        // sidebar or content underneath it.
         if self.workspace_help_open {
             return;
         }
-        let Some(regions) = self.hit_regions.workspace else {
+        // Non-Copy (each per-tab list holds a Vec) — clone the small
+        // per-frame snapshot out rather than holding a borrow of self
+        // across the mutations below.
+        let Some(regions) = self.hit_regions.workspace.clone() else {
             return;
         };
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
-        if !HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+
+        if HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+            let row = (mouse.row - regions.sidebar.y) as usize;
+            if let Some(&tab_idx) = regions.sidebar_tab_order.get(row) {
+                self.activate_workspace_tab(tab_idx);
+            }
             return;
         }
-        let row = (mouse.row - regions.sidebar.y) as usize;
-        if let Some(&tab_idx) = regions.sidebar_tab_order.get(row) {
-            self.activate_workspace_tab(tab_idx);
+
+        // Each tab's own content list, active_tab-gated the same way
+        // selected_item_idx is picked in project_workspace::draw — a click
+        // both selects the row and moves focus off the sidebar, mirroring
+        // every other content click in this file.
+        match self.workspace_tab_idx {
+            0 => {
+                if let Some(list) = &regions.tasks
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_task_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            1 => {
+                if let Some(notes) = &regions.notes {
+                    if let Some(idx) = notes.list.row_index(mouse.column, mouse.row) {
+                        self.selected_notes_flat_idx = idx;
+                        self.workspace_sidebar_focused = false;
+                        self.note_preview_focused = false;
+                    } else if let Some(preview) = notes.preview
+                        && HitRegions::contains(preview, mouse.column, mouse.row)
+                    {
+                        self.workspace_sidebar_focused = false;
+                        self.note_preview_focused = true;
+                    }
+                }
+            }
+            2 => {
+                if let Some(list) = &regions.journal
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_journal_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            3 => {
+                if let Some(list) = &regions.milestones
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_milestone_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            4 => {
+                if let Some(list) = &regions.treasury
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_treasury_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -25731,6 +25789,11 @@ mod app_tests {
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
             sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
         });
 
         left_click(&mut app, 2, 3, KeyModifiers::empty()); // row 3 = "Treasury" = tab 4
@@ -25742,6 +25805,165 @@ mod app_tests {
         app.workspace_help_open = true;
         left_click(&mut app, 2, 1, KeyModifiers::empty()); // row 1 = "Tasks" = tab 0
         assert_eq!(app.workspace_tab_idx, 4); // unchanged
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_tasks_click_selects_a_row_and_unfocuses_the_sidebar() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_tasks.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = true;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(1), Some(2)],
+            }),
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_task_idx, 1);
+        assert!(!app.workspace_sidebar_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_milestones_click_selects_across_variable_height_rows() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_milestones.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 3; // Overview
+        // Milestone 0 has 3 rows (header + 2 requirements), milestone 1 has 1.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(0), Some(0), Some(1)],
+            }),
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+        });
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // milestone 0's 3rd row
+        assert_eq!(app.selected_milestone_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_milestone_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_treasury_click_selects_a_ledger_row_below_the_header() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_treasury.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 4;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            // Table header row lives one row above area.y — the header
+            // itself isn't part of this region at all.
+            treasury: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 1, width: 30, height: 5 },
+                row_targets: vec![Some(0), Some(1), Some(2)],
+            }),
+            journal: None,
+            notes: None,
+            tasks: None,
+        });
+
+        app.selected_treasury_idx = 99; // sentinel — proves the next click is a genuine no-op
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // above the region — the header row
+        assert_eq!(app.selected_treasury_idx, 99);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // area row 1 -> ledger entry 1
+        assert_eq!(app.selected_treasury_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_journal_click_selects_across_variable_height_entries() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_journal.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 2;
+        // Entry 0 is a 2-line entry (header + one content line + blank = 3
+        // rows), entry 1 follows right after.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(0), Some(0), Some(1)],
+            }),
+            notes: None,
+            tasks: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_journal_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_journal_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_click_selects_row_skips_dividers_and_focuses_preview() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.note_preview_focused = false;
+        // Row 1 is a non-selectable "── Unassigned ──" divider.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0), None, Some(1)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+            }),
+            tasks: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // divider row — no-op
+        assert_eq!(app.selected_notes_flat_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty());
+        assert_eq!(app.selected_notes_flat_idx, 1);
+        assert!(!app.note_preview_focused);
+
+        left_click(&mut app, 32, 1, KeyModifiers::empty()); // preview pane — focus only
+        assert!(app.note_preview_focused);
 
         let _ = std::fs::remove_file(db_file);
     }
