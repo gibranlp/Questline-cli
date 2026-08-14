@@ -28,6 +28,58 @@ pub struct HitRegions {
     pub sync: Option<SyncHitRegions>,
     pub fellowship: Option<FellowshipHitRegions>,
     pub workspace: Option<WorkspaceHitRegions>,
+    /// Deliberately NOT stashed by any draw() call, unlike every field
+    /// above — modals have no single draw() that returns a HitRegions
+    /// value (rendering is scattered across main.rs's inline per-variant
+    /// blocks plus a handful of screen-local draw functions), and adding
+    /// an out-parameter to thread through all of them was judged riskier
+    /// than the alternative: App::compute_modal_hit_regions() recomputes
+    /// this fresh from `modal_state`/`overlay_modal` on demand, using the
+    /// exact same centered_rect/Layout calls each modal's own render code
+    /// uses. This does carry the "drift out of sync" risk this module's
+    /// own doc comment warns about — a modal's popup dimensions changing
+    /// in its render code without the matching arm in
+    /// compute_modal_hit_regions being updated to match.
+    pub modal: Option<ModalHitRegions>,
+}
+
+/// Regions for whichever modal is currently open. See the `modal` field
+/// comment on `HitRegions` for why this is computed on demand rather than
+/// stashed from a render pass like every other field here.
+#[derive(Debug, Clone)]
+pub struct ModalHitRegions {
+    /// The modal's outer popup bounds. A click outside this cancels the
+    /// modal — synthesizes Esc, replicating whatever that modal's own Esc
+    /// keybinding already does, side effects included (a few modals save
+    /// their draft on Esc rather than discard it, e.g. NewProject/
+    /// EditProject — this is existing behavior, not something new).
+    pub popup_area: Rect,
+    /// Set for confirm-style dialogs where the whole popup interior (minus
+    /// any list) is one big "click to confirm" target — carries that
+    /// dialog's own primary keybinding, which isn't always the same key
+    /// across dialogs (mostly 'y'/'Y', but Enter for a few, and None for
+    /// progress modals that aren't dismissible yet).
+    pub confirm_key: Option<crossterm::event::KeyCode>,
+    /// Set for list-picker modals — clicking selects a row/item (mirrors
+    /// Up/Down), never confirms/activates it.
+    pub list: Option<ModalListRegion>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ModalListRegion {
+    /// A uniform vertical list, one item per screen row.
+    /// `first_visible_index` accounts for ratatui's ListState auto-scroll
+    /// on the few modals that use it — 0 for modals that render every item
+    /// unconditionally (the common case here).
+    Rows {
+        area: Rect,
+        count: usize,
+        first_visible_index: usize,
+    },
+    /// Discrete, non-uniform item Rects — e.g. per-tier boxes in
+    /// MilestoneTierSelect, or per-choice spans in ShareNote/
+    /// JournalVisibility. Position in the Vec is the item's index.
+    Items(Vec<Rect>),
 }
 
 /// The regions `screens::editor::draw`/`draw_in_area` rendered on the last frame.
