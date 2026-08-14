@@ -607,6 +607,90 @@ If Questline helps you on your adventures, consider starring the repository and 
   the list view, 6 status columns of cards — is clickable too: click any
   card in any column to select it. This closes out Phase 2 entirely — every
   list, table, and menu in the app now supports click-to-select.
+- Added double-click-to-open on top of click-to-select on Campaigns,
+  Dashboard, Project Workspace (including Kanban), Fellowship, Character,
+  Sync, Focus, Soundscapes, the Lore Library, Settings, the Archive, and
+  Onboarding — every screen where a keyboard action beyond plain selection
+  already existed. Double-clicking a row now does what Enter (or, for a
+  Treasury entry, 'e'; for a Class Quest, Space; for an archived Campaign,
+  'r') would have — open a Campaign into its War Room, open a Quest's edit
+  modal or drill into its steps on the Kanban board, open a Scroll in the
+  Editor, open a Treasury entry, accept a pending Fellowship invitation,
+  jump to a Council notice's target, open a "My Quests" entry in its
+  Campaign, jump straight to a Reflection's detail pane, start a Focus
+  session with whichever duration/Campaign/Quest/Soundscape is currently
+  selected, play a Soundscape (or a Local Folder track), start/complete a
+  Class Quest, apply a theme or flip an Alerts toggle in Settings, restore
+  an archived/completed Campaign, or confirm a class and finish
+  Onboarding. Rows with no existing keyboard "open" action (the pinned
+  "All Campaigns" row, Journal, Milestones, Companions, Chat messages, the
+  Adventure Log, Sync's already-immediate toggles, every Library category
+  besides Class Quests, and Settings' Sound Volume/Oath Calendar rows,
+  which are +/- adjustable rather than Enter-activated) are unchanged —
+  double-click stays a no-op there beyond selecting. Archive's Delete
+  action stays keyboard-only on purpose: double-click mirrors 'r' (restore
+  — reversible, one step) rather than Delete (permanent, and already
+  gated behind its own confirm modal). Great Chronicle, Hall of Legends,
+  and Gateway are the only screens left without it: the first two have no
+  "open" action to mirror at all beyond moving focus/selection, and
+  Gateway already activates on the very first click, same as Sync. Also
+  fixed a pre-existing bug where pressing Enter on Fellowship's Chat tab,
+  when no Campaign is shared yet, never actually marked its fallback
+  notification read — the branch handling that case sat after an
+  unconditional `active_screen == Fellowship` arm that always matched
+  first, so it could never run.
+- Added scroll-wheel support to the 13 screens that had none: Archive,
+  Onboarding, Hall of Legends, Focus, Campaigns, Dashboard, Soundscapes,
+  Settings, Character, Fellowship, and Project Workspace (Editor, Great
+  Chronicle, and Library already had it).
+  The wheel now does exactly what Up/Down/'k'/'j' already did on each
+  screen — cycling a selection with the same wrap-around, or scrolling a
+  raw offset with the same clamp, as the keyboard. Multi-pane screens route
+  the wheel to whichever pane makes sense for that screen: Character and
+  Project Workspace's Scrolls-tab preview target the pane the cursor is
+  actually over (matching their click behavior); Focus and Settings target
+  whichever field/row is currently focused, regardless of cursor position
+  (matching Great Chronicle/Library's existing convention); Fellowship's
+  always-visible left Campaign list scrolls independently of whichever tab
+  is active, while its sub-list (Invites/Companions/My Quests/Council/Chat)
+  scrolls whatever that tab is currently showing — including the Chat
+  transcript's message-browsing cursor, which has no raw scroll offset of
+  its own to begin with. Gateway and Sync need no scroll wheel at all —
+  Gateway's 2 options both fit on screen with nothing to page through, and
+  Sync's rows are static stats/toggles, not a navigable list.
+- Added basic mouse support to modals — all 63 `ModalType` variants, which
+  were previously 100% keyboard-only (every mouse event was swallowed
+  outright while any modal was open). Clicking outside a modal's popup now
+  cancels it, exactly like pressing Esc — including a handful of modals
+  where Esc isn't a pure discard (`NewProject`/`EditProject` actually save
+  the draft on Esc; `EncryptionMigrationPrompt` and `UpdateAvailable` have
+  their own Esc side effects) — clicking outside faithfully reproduces
+  whichever of those a modal's own Esc keybinding already does, rather than
+  inventing new "cancel" behavior. Confirm-style dialogs (Quit, Archive/
+  Delete/Conquer a Campaign, remove a Companion, prune old Quests, clean up
+  local history, etc.) can be confirmed with a single click anywhere inside
+  the dialog — there's no separate Yes/No button widget today (both are
+  just text in one message), so this is "click the dialog to confirm,
+  click away from it to cancel" rather than two distinct click targets.
+  List-picker modals (Theme, Milestone Tier/Template, Assign Quest, Refile
+  Codex/Quest/Scroll, Council Briefing, Share Scroll/Journal permissions,
+  and more) support clicking a row or item to select it, same as Up/Down —
+  never confirming/activating it, matching how click-to-select already
+  works everywhere else in the app. Progress modals (Cloud Backup/Sync/
+  Restore) only become clickable once they're actually done — clicking
+  one mid-run does nothing, same as any key. Three list-pickers
+  (`RefileTask`, `SelectProjectForAction`, `RefileScroll`) use ratatui's
+  auto-scrolling list widget; when the list is long enough to have
+  actually scrolled, clicking is a safe no-op rather than risk mapping to
+  the wrong row. Out of scope for this pass: clicking to focus or edit a
+  text field inside the ~27 multi-field forms (`NewTask`/`EditTask`,
+  `TreasuryEntry`, `InviteMember`, etc.) — those still only get "click
+  outside to cancel"; editing them stays keyboard-only. Implementation
+  note: unlike every other screen's click support, a modal's popup bounds
+  are recomputed fresh from the same layout math its own render code uses,
+  rather than captured during rendering — no existing render function
+  needed to change to add this, at the cost of the two staying in sync by
+  convention rather than by construction.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

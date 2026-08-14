@@ -2987,6 +2987,619 @@ impl App {
         Ok(())
     }
 
+    /// Recomputes whichever modal is currently open's popup bounds (and,
+    /// for confirm/list-shaped modals, its click targets) from scratch,
+    /// using the exact same centered_rect/Layout calls that modal's own
+    /// render code uses. See the `modal` field doc on `HitRegions` for why
+    /// this recomputes rather than stashes from a render pass like every
+    /// other screen's hit-testing.
+    fn compute_modal_hit_regions(&self) -> Option<crate::screens::hit_test::ModalHitRegions> {
+        use crate::screens::hit_test::{ModalHitRegions, ModalListRegion};
+        use crossterm::event::KeyCode;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        // overlay_modal stacks on top of modal_state (e.g. creating a step
+        // while its parent task's modal is open) — mirrors the priority
+        // handle_rpg_modal_key already gives it.
+        let modal = if self.overlay_modal != ModalType::None {
+            &self.overlay_modal
+        } else {
+            &self.modal_state
+        };
+
+        let term = Rect {
+            x: 0,
+            y: 0,
+            width: self.terminal_width,
+            height: self.terminal_height,
+        };
+        // The catch-all screen layout (main.rs's `_ =>` arm) splits the
+        // terminal into a body area and a 3-row footer before handing the
+        // body to Dashboard/Sync/Fellowship/etc.'s own draw() — several
+        // modals are centered against that body area, not the raw terminal.
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(term)[0];
+
+        // Replicates main.rs's private `centered_rect_fixed_height` — not
+        // reachable from here since main.rs is the binary crate, not the
+        // library `app`/`screens` modules live in.
+        let fixed_h = |percent_x: u16, height_lines: u16, r: Rect| -> Rect {
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(r.height.saturating_sub(height_lines) / 2),
+                    Constraint::Length(height_lines),
+                    Constraint::Length(r.height.saturating_sub(height_lines) / 2),
+                ])
+                .split(r);
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage((100 - percent_x) / 2),
+                    Constraint::Percentage(percent_x),
+                    Constraint::Percentage((100 - percent_x) / 2),
+                ])
+                .split(v[1])[1]
+        };
+        let pct =
+            |percent_x: u16, percent_y: u16, r: Rect| crate::screens::intro::centered_rect(percent_x, percent_y, r);
+        // Every confirm/list popup here renders `Block::bordered()`, so the
+        // interior (where content/list rows actually start) is the popup
+        // shrunk by 1 cell on every side.
+        let inner = |r: Rect| Rect {
+            x: r.x + 1,
+            y: r.y + 1,
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
+        };
+        let confirm = |popup_area: Rect, key: KeyCode| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: Some(key),
+                list: None,
+            })
+        };
+        let outside_only = |popup_area: Rect| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                list: None,
+            })
+        };
+        let rows = |popup_area: Rect, header_lines: u16, count: usize, first_visible_index: usize| {
+            let list_inner = inner(popup_area);
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                list: Some(ModalListRegion::Rows {
+                    area: Rect {
+                        x: list_inner.x,
+                        y: list_inner.y + header_lines,
+                        width: list_inner.width,
+                        height: list_inner.height.saturating_sub(header_lines),
+                    },
+                    count,
+                    first_visible_index,
+                }),
+            })
+        };
+
+        match modal {
+            ModalType::None => None,
+
+            // ── Confirm / info dialogs — click inside confirms, outside cancels ──
+            ModalType::ChapterComplete => {
+                let (w, h) = (66u16, 35u16);
+                confirm(
+                    Rect {
+                        x: term.width.saturating_sub(w) / 2,
+                        y: term.height.saturating_sub(h) / 2,
+                        width: w.min(term.width),
+                        height: h.min(term.height),
+                    },
+                    KeyCode::Enter,
+                )
+            }
+            ModalType::SupportRealm => confirm(fixed_h(58, 14, term), KeyCode::Enter),
+            ModalType::KeyboardHelp => confirm(pct(75, 35, term), KeyCode::Enter),
+            ModalType::EncryptionMigrationPrompt => confirm(fixed_h(68, 15, term), KeyCode::Char('m')),
+            // ui::draw_hydration_reminder_modal's own centered_rect(40, 35, area)
+            ModalType::HydrationReminder => confirm(pct(40, 35, term), KeyCode::Char('d')),
+            ModalType::QuitConfirm { .. } => confirm(fixed_h(64, 17, term), KeyCode::Char('y')),
+            ModalType::ConfirmArchiveProject { .. } => confirm(fixed_h(55, 9, term), KeyCode::Char('y')),
+            ModalType::ConfirmDeleteProject { .. } => confirm(fixed_h(55, 10, term), KeyCode::Char('y')),
+            ModalType::ConfirmRemoveFellowshipMember { .. } => {
+                confirm(fixed_h(62, 11, term), KeyCode::Char('y'))
+            }
+            ModalType::ConfirmConquerProject { .. } => confirm(fixed_h(58, 11, term), KeyCode::Char('y')),
+            ModalType::ConfirmDeleteCodex { .. } => confirm(fixed_h(55, 9, term), KeyCode::Char('y')),
+            ModalType::ConfirmPruneTasks { .. } => confirm(fixed_h(55, 10, term), KeyCode::Char('y')),
+            ModalType::ConfirmCleanupLocalHistory { .. } => confirm(fixed_h(62, 12, term), KeyCode::Char('y')),
+            ModalType::UpdateAvailable { .. } => confirm(fixed_h(62, 12, term), KeyCode::Char('y')),
+            ModalType::Celebration { .. } => confirm(pct(68, 52, term), KeyCode::Enter),
+            ModalType::CloudBackupProgress { step, .. }
+            | ModalType::SyncProgress { step, .. }
+            | ModalType::CloudRestoreProgress { step, .. } => {
+                // screens::sync's own private centered_rect, against
+                // content_area (chunks[0] passed into sync::draw), not term.
+                let popup_area = pct(58, 40, content_area);
+                // Only dismissible once done (step >= 2) — matches the
+                // guarded Esc|Enter|q arm; clicking while still running
+                // does nothing, same as any other key.
+                if *step >= 2 {
+                    confirm(popup_area, KeyCode::Enter)
+                } else {
+                    outside_only(popup_area)
+                }
+            }
+
+            // ── Click-outside-only form/text modals (editing fields is out of scope) ──
+            ModalType::NewProject { .. } | ModalType::EditProject { .. } => outside_only(pct(60, 40, term)),
+            ModalType::NewTask { .. } | ModalType::EditTask { .. } => {
+                // Real height depends on hide_desc/show_recurrence/step
+                // count — deliberately overestimated (full terminal height)
+                // so a click near the edge of the real, shorter popup is
+                // never misread as "outside" and accidentally saves/closes
+                // it; the only cost is a slightly oversized inert margin.
+                let full_width = pct(65, 100, term);
+                outside_only(Rect {
+                    x: full_width.x,
+                    y: 0,
+                    width: full_width.width,
+                    height: term.height,
+                })
+            }
+            ModalType::TreasuryEntry { .. } => outside_only(pct(62, 48, term)),
+            ModalType::TreasuryBudget { .. } => outside_only(pct(56, 34, term)),
+            ModalType::TaskFinancials { .. } => outside_only(pct(58, 42, term)),
+            ModalType::DailyReflection { .. } => outside_only(pct(55, 45, content_area)),
+            ModalType::NewRitual { .. } => outside_only(pct(55, 55, content_area)),
+            ModalType::InviteMember { .. } => {
+                let modal_height = term.height.saturating_sub(2).min(26);
+                outside_only(fixed_h(68, modal_height, term))
+            }
+            ModalType::HydrationSettings { .. } => outside_only(pct(52, 55, content_area)),
+            ModalType::NewCodex { .. } | ModalType::RenameCodex { .. } => outside_only(Rect {
+                x: term.width / 4,
+                y: term.height / 3,
+                width: term.width / 2,
+                height: 5,
+            }),
+            ModalType::NewJournalEntry { .. } => outside_only(pct(55, 30, term)),
+            ModalType::TreasuryCategory { .. } => outside_only(pct(52, 24, term)),
+            ModalType::CustomFocusDuration { .. } => outside_only(pct(40, 25, term)),
+            ModalType::EditServerUrl { .. } => outside_only(pct(50, 20, content_area)),
+            ModalType::RestoreIdentity { .. } => outside_only(pct(60, 35, content_area)),
+            ModalType::SearchMessages { .. } => outside_only(pct(55, 30, content_area)),
+            ModalType::PostMessage { .. } => outside_only(pct(50, 20, content_area)),
+            ModalType::ExportProfile { .. } => outside_only(pct(70, 46, content_area)),
+            ModalType::LocalMusicFolder { suggestions, .. } => {
+                let percent_y = if !suggestions.is_empty() { 40 } else { 20 };
+                outside_only(pct(60, percent_y, term))
+            }
+            ModalType::QuestCouncil { .. } => outside_only(pct(70, 66, term)),
+            // main.rs's own block renders after (so visually on top of)
+            // fellowship.rs's copy of this modal — its Rect (against the
+            // full terminal) is the one a click actually lands on.
+            ModalType::ProjectSharing { .. } => outside_only(fixed_h(60, 11, term)),
+            ModalType::AddReaction { .. } => outside_only(pct(40, 20, content_area)),
+            ModalType::SearchEverywhere { .. } => outside_only(pct(70, 45, term)),
+            ModalType::CommandPalette { .. } => outside_only(pct(70, 45, term)),
+
+            // ── List-select modals ────────────────────────────────────────────
+            ModalType::ThemeSelect { choices, .. } => rows(pct(40, 30, term), 0, choices.len(), 0),
+            ModalType::MentionSelect { usernames, .. } => rows(pct(35, 25, term), 0, usernames.len(), 0),
+            ModalType::SpecializationSelect { choices, .. } => {
+                rows(pct(50, 30, content_area), 3, choices.len(), 0)
+            }
+            ModalType::TreasuryCurrency { .. } => {
+                rows(pct(58, 34, term), 2, crate::models::Currency::ALL.len(), 0)
+            }
+            ModalType::CampaignTemplateSelect { .. } => {
+                let popup = pct(72, 72, term);
+                let count = crate::campaign_templates::TEMPLATES.len();
+                // The list has its own nested border inside the popup's
+                // first Layout chunk (Length(count+2)) — one more inset
+                // than the plain `inner()` helper accounts for.
+                let list_area = inner(popup);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Rows {
+                        area: Rect {
+                            x: list_area.x,
+                            y: list_area.y + 1,
+                            width: list_area.width,
+                            height: (count as u16).min(list_area.height.saturating_sub(1)),
+                        },
+                        count,
+                        first_visible_index: 0,
+                    }),
+                })
+            }
+            ModalType::MilestoneTierSelect { .. } => {
+                let popup = pct(60, 50, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Items(vec![chunks[1], chunks[3], chunks[5]])),
+                })
+            }
+            ModalType::MilestoneTemplateSelect { tier, .. } => {
+                let popup = pct(70, 80, term);
+                let block_inner = inner(popup);
+                let n = crate::milestone_templates::templates_for_tier(
+                    crate::milestone_templates::Tier::from_u8(*tier)
+                        .unwrap_or(crate::milestone_templates::Tier::Initiate),
+                )
+                .count();
+                let mut constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Min(5)).collect();
+                constraints.push(Constraint::Length(2));
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(constraints)
+                    .split(block_inner);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Items(chunks[..n].to_vec())),
+                })
+            }
+            ModalType::AssignTask { .. } => {
+                let popup = pct(50, 40, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(5),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let proj_id = self.active_project_id?;
+                let count = self
+                    .db
+                    .get_project_members(&proj_id.to_string())
+                    .unwrap_or_default()
+                    .len();
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Rows {
+                        area: chunks[1],
+                        count,
+                        first_visible_index: 0,
+                    }),
+                })
+            }
+            ModalType::QuestDependencies { task_id, .. } => {
+                let popup = pct(68, 64, term);
+                let candidates_len = self
+                    .all_tasks
+                    .iter()
+                    .filter(|t| t.id != *task_id && t.parent_task_id.is_none())
+                    .count();
+                rows(popup, 0, candidates_len, 0)
+            }
+            ModalType::CouncilBriefing { .. } => {
+                let popup = pct(82, 82, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(7),
+                        Constraint::Percentage(27),
+                        Constraint::Percentage(23),
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let Some(p_id) = self.active_project_id else {
+                    return None;
+                };
+                let members_len = self
+                    .db
+                    .get_presence_for_project(&p_id.to_string())
+                    .unwrap_or_default()
+                    .len();
+                // Both selectable lists have their own nested border — items
+                // start 1 row into each chunk. Sections chunk holds exactly
+                // 5 fixed items; workload chunk holds one row per member.
+                let sections_area = Rect {
+                    x: chunks[0].x + 1,
+                    y: chunks[0].y + 1,
+                    width: chunks[0].width.saturating_sub(2),
+                    height: 5,
+                };
+                let workload_area = Rect {
+                    x: chunks[1].x + 1,
+                    y: chunks[1].y + 1,
+                    width: chunks[1].width.saturating_sub(2),
+                    height: chunks[1].height.saturating_sub(2),
+                };
+                let mut items = Vec::new();
+                for row in 0..5 {
+                    items.push(Rect {
+                        x: sections_area.x,
+                        y: sections_area.y + row,
+                        width: sections_area.width,
+                        height: 1,
+                    });
+                }
+                for row in 0..members_len as u16 {
+                    if row >= workload_area.height {
+                        break;
+                    }
+                    items.push(Rect {
+                        x: workload_area.x,
+                        y: workload_area.y + row,
+                        width: workload_area.width,
+                        height: 1,
+                    });
+                }
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Items(items)),
+                })
+            }
+            ModalType::RefileCodex { codex_id, .. } => {
+                let count = self.refile_codex_targets(*codex_id).len() + 1;
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                rows(popup, 0, count, 0)
+            }
+            ModalType::RefileTask { task_id, selected_idx } => {
+                let count = self.refile_task_targets(*task_id).len() + 1;
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                let list_inner = inner(popup);
+                // Uses ListState, which auto-scrolls to keep `selected_idx`
+                // visible — only safe to reconstruct when everything fits
+                // in the rendered height already (the common case for a
+                // refile-target list); if it's actually scrolled, skip
+                // rather than risk mapping a click to the wrong row.
+                if count > list_inner.height as usize {
+                    return outside_only(popup);
+                }
+                // The list never scrolls once we've established the whole
+                // thing fits above, so the render's ListState offset is
+                // always 0 regardless of what's currently selected.
+                let _ = selected_idx;
+                rows(popup, 0, count, 0)
+            }
+            ModalType::RefileScroll {
+                destinations,
+                selected_idx,
+                ..
+            } => {
+                let count = destinations.len();
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                let list_inner = inner(popup);
+                if count > list_inner.height as usize {
+                    return outside_only(popup);
+                }
+                // The list never scrolls once we've established the whole
+                // thing fits above, so the render's ListState offset is
+                // always 0 regardless of what's currently selected.
+                let _ = selected_idx;
+                rows(popup, 0, count, 0)
+            }
+            ModalType::TaskExpenseCompletion { .. } => {
+                let popup = pct(58, 38, term);
+                rows(popup, 3, 3, 0)
+            }
+            ModalType::SelectProjectForAction { .. } => {
+                let popup = pct(55, 50, term);
+                let list_inner = inner(popup);
+                let active_len = self
+                    .projects
+                    .iter()
+                    .filter(|p| !p.archived && !p.completed)
+                    .count();
+                if active_len > list_inner.height as usize {
+                    return outside_only(popup);
+                }
+                rows(popup, 0, active_len, 0)
+            }
+            ModalType::ShareNote { .. } => {
+                let popup = pct(50, 30, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                // 3 fixed choices on one horizontal line — approximated as
+                // equal thirds of the row's width rather than replicating
+                // each span's exact rendered text width.
+                let row = chunks[1];
+                let third = row.width / 3;
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Items(vec![
+                        Rect { x: row.x, y: row.y, width: third, height: row.height },
+                        Rect { x: row.x + third, y: row.y, width: third, height: row.height },
+                        Rect {
+                            x: row.x + third * 2,
+                            y: row.y,
+                            width: row.width - third * 2,
+                            height: row.height,
+                        },
+                    ])),
+                })
+            }
+            ModalType::JournalVisibility { .. } => {
+                let popup = pct(50, 30, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let row = chunks[1];
+                let third = row.width / 3;
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    list: Some(ModalListRegion::Items(vec![
+                        Rect { x: row.x, y: row.y, width: third, height: row.height },
+                        Rect { x: row.x + third, y: row.y, width: third, height: row.height },
+                        Rect {
+                            x: row.x + third * 2,
+                            y: row.y,
+                            width: row.width - third * 2,
+                            height: row.height,
+                        },
+                    ])),
+                })
+            }
+        }
+    }
+
+    /// Writes `idx` into whatever selection field the currently open
+    /// list-picker modal uses. Mirrors what clicking a row/item means
+    /// everywhere else in the app: select only, never confirm/activate —
+    /// the modal's own Enter/Space keybinding still owns that.
+    fn set_modal_list_selection(&mut self, idx: usize) {
+        let modal = if self.overlay_modal != ModalType::None {
+            &mut self.overlay_modal
+        } else {
+            &mut self.modal_state
+        };
+        match modal {
+            ModalType::ThemeSelect { selected_idx, .. }
+            | ModalType::MentionSelect { selected_idx, .. }
+            | ModalType::SpecializationSelect { selected_idx, .. }
+            | ModalType::TreasuryCurrency { selected_idx, .. }
+            | ModalType::CampaignTemplateSelect { selected_idx, .. }
+            | ModalType::RefileCodex { selected_idx, .. }
+            | ModalType::RefileTask { selected_idx, .. }
+            | ModalType::RefileScroll { selected_idx, .. }
+            | ModalType::TaskExpenseCompletion { selected_idx, .. }
+            | ModalType::SelectProjectForAction { selected_idx, .. }
+            | ModalType::MilestoneTierSelect { selected_idx, .. }
+            | ModalType::MilestoneTemplateSelect { selected_idx, .. } => {
+                *selected_idx = idx;
+            }
+            ModalType::AssignTask {
+                selected_member_idx, ..
+            } => {
+                *selected_member_idx = idx;
+            }
+            ModalType::QuestDependencies {
+                selected_quest_idx, ..
+            } => {
+                *selected_quest_idx = idx;
+            }
+            ModalType::CouncilBriefing {
+                selected_section_idx,
+                ..
+            } => {
+                *selected_section_idx = idx;
+            }
+            ModalType::ShareNote { permission_idx, .. } => {
+                *permission_idx = idx;
+            }
+            ModalType::JournalVisibility { visibility_idx, .. } => {
+                *visibility_idx = idx;
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles a mouse event while a modal (or overlay_modal) is open.
+    /// Click outside the popup cancels it (synthesizes Esc); click a list
+    /// row/item selects it; click anywhere else inside a confirm-style
+    /// dialog's popup confirms it (synthesizes that dialog's own primary
+    /// key). Reuses handle_key_event wholesale for both, rather than
+    /// re-deriving each modal's routing/side effects here, so keyboard and
+    /// mouse are guaranteed to agree.
+    fn handle_modal_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crate::screens::hit_test::{HitRegions, ModalListRegion};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        let Some(regions) = self.compute_modal_hit_regions() else {
+            return Ok(());
+        };
+        if !HitRegions::contains(regions.popup_area, mouse.column, mouse.row) {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if let Some(list) = &regions.list {
+            match list {
+                ModalListRegion::Rows {
+                    area,
+                    count,
+                    first_visible_index,
+                } => {
+                    if HitRegions::contains(*area, mouse.column, mouse.row) {
+                        let row = (mouse.row - area.y) as usize;
+                        let idx = first_visible_index + row;
+                        if idx < *count {
+                            self.set_modal_list_selection(idx);
+                        }
+                    }
+                }
+                ModalListRegion::Items(rects) => {
+                    if let Some(idx) = rects
+                        .iter()
+                        .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                    {
+                        self.set_modal_list_selection(idx);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if let Some(confirm_key) = regions.confirm_key {
+            return self.handle_key_event(KeyEvent::new(confirm_key, KeyModifiers::NONE));
+        }
+        Ok(())
+    }
+
     // ── Mouse ─────────────────────────────────────────────────────────────────
     //
     // Phase 1: full click/drag/scroll support in the Notes editor, plus
@@ -2994,15 +3607,14 @@ impl App {
     // scroll offset. Click-to-select for list/menu screens is a deferred
     // follow-up — see handle_generic_scroll_mouse for the extension point.
     pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
-        // Modals/overlays/the calendar intercept keys before they reach the
-        // underlying screen — mirror that for mouse events. No hit-testing
-        // exists for them yet, so swallow rather than let a click leak
-        // through to whatever screen is underneath.
-        if self.modal_state != ModalType::None
-            || self.overlay_modal != ModalType::None
-            || self.task_calendar.is_some()
-        {
+        // The task calendar has its own future mouse-support gap — not part
+        // of this pass. Modals now get real hit-testing via
+        // handle_modal_mouse; task_calendar clicks still swallow.
+        if self.task_calendar.is_some() {
             return Ok(());
+        }
+        if self.modal_state != ModalType::None || self.overlay_modal != ModalType::None {
+            return self.handle_modal_mouse(mouse);
         }
 
         match self.active_screen {
@@ -3056,6 +3668,31 @@ impl App {
     // follows: hit-test against last frame's stashed Rects, then reuse the
     // same field the keyboard handler for that screen already writes to.
 
+    /// Restores the selected archived/completed Campaign — un-archives and
+    /// un-completes it. Mirrors the 'r' key's Archive branch in
+    /// handle_key_event, and is shared with it so keyboard and mouse can't
+    /// drift apart. Deliberately not Delete's confirm-modal branch: 'r' is
+    /// the reversible, one-step action, so it's the one double-click mirrors
+    /// — a permanent delete stays a keyboard-only, two-step action.
+    fn restore_selected_archived_project(&mut self) -> Result<()> {
+        let archived: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|p| p.archived || p.completed)
+            .collect();
+        if !archived.is_empty() && self.selected_archive_idx < archived.len() {
+            let mut p = archived[self.selected_archive_idx].clone();
+            p.archived = false;
+            p.completed = false;
+            self.db.update_project(&p)?;
+            self.mark_dirty();
+            self.apply_class_passive("project_restore", 0)?;
+            self.selected_archive_idx = 0;
+            self.reload_data()?;
+        }
+        Ok(())
+    }
+
     fn handle_archive_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3063,17 +3700,55 @@ impl App {
         let Some(regions) = self.hit_regions.archive else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
-            return;
-        }
-        // The list renders from row 0 with no ListState/scroll offset, so
-        // the row offset inside the inner area is the item index directly.
-        let idx = (mouse.row - regions.list.y) as usize;
-        if idx < regions.item_count {
-            self.selected_archive_idx = idx;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                    return;
+                }
+                // The list renders from row 0 with no ListState/scroll
+                // offset, so the row offset inside the inner area is the
+                // item index directly.
+                let idx = (mouse.row - regions.list.y) as usize;
+                if idx < regions.item_count {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_archive_idx = idx;
+                    // Double-click restores the Campaign, same as 'r'.
+                    if is_double_click {
+                        if let Err(e) = self.restore_selected_archived_project() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't restore: {}", e)));
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Archive.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let archive_len = self
+                    .projects
+                    .iter()
+                    .filter(|p| p.archived || p.completed)
+                    .count();
+                if archive_len == 0 {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_archive_idx = if self.selected_archive_idx > 0 {
+                        self.selected_archive_idx - 1
+                    } else {
+                        archive_len - 1
+                    };
+                } else {
+                    self.selected_archive_idx = if self.selected_archive_idx < archive_len - 1 {
+                        self.selected_archive_idx + 1
+                    } else {
+                        0
+                    };
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3140,17 +3815,60 @@ impl App {
         let Some(regions) = self.hit_regions.onboarding else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-        if HitRegions::contains(regions.name_input, mouse.column, mouse.row) {
-            self.onboarding_focus = OnboardingFocus::NameInput;
-        } else if HitRegions::contains(regions.class_list, mouse.column, mouse.row) {
-            let idx = (mouse.row - regions.class_list.y) as usize;
-            if idx < regions.class_count {
-                self.onboarding_class_idx = idx;
-                self.onboarding_focus = OnboardingFocus::ClassSelect;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.name_input, mouse.column, mouse.row) {
+                    self.onboarding_focus = OnboardingFocus::NameInput;
+                } else if HitRegions::contains(regions.class_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.class_list.y) as usize;
+                    if idx < regions.class_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.onboarding_class_idx = idx;
+                        self.onboarding_focus = OnboardingFocus::ClassSelect;
+                        // Double-click confirms the class and finishes
+                        // onboarding, same as Enter on ClassSelect.
+                        // complete_onboarding() already self-validates the
+                        // username, so this is safe to call regardless of
+                        // what step the user was on before this click.
+                        if is_double_click {
+                            if let Err(e) = self.complete_onboarding() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't finish onboarding: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
             }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm for OnboardingFocus::ClassSelect — the
+            // name field has no Up/Down binding either, so this is a no-op
+            // while it's focused, same as the keyboard.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.onboarding_focus != OnboardingFocus::ClassSelect
+                    || self.onboarding_classes.is_empty()
+                {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.onboarding_class_idx = if self.onboarding_class_idx > 0 {
+                        self.onboarding_class_idx - 1
+                    } else {
+                        self.onboarding_classes.len() - 1
+                    };
+                } else {
+                    self.onboarding_class_idx =
+                        if self.onboarding_class_idx < self.onboarding_classes.len() - 1 {
+                            self.onboarding_class_idx + 1
+                        } else {
+                            0
+                        };
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3161,18 +3879,134 @@ impl App {
         let Some(regions) = self.hit_regions.legends else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.relic_list, mouse.column, mouse.row) {
+                    return;
+                }
+                // Fixed-height list, no scroll offset — a click past the
+                // last rendered row (or past the real relic count) is a
+                // no-op.
+                let idx = (mouse.row - regions.relic_list.y) as usize;
+                if idx < regions.item_count {
+                    self.selected_relic_idx = idx;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Legends.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let relics = self.db.get_relics().unwrap_or_default();
+                if relics.is_empty() {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_relic_idx = if self.selected_relic_idx > 0 {
+                        self.selected_relic_idx - 1
+                    } else {
+                        relics.len() - 1
+                    };
+                } else {
+                    self.selected_relic_idx = if self.selected_relic_idx < relics.len() - 1 {
+                        self.selected_relic_idx + 1
+                    } else {
+                        0
+                    };
+                }
+            }
+            _ => {}
         }
-        if !HitRegions::contains(regions.relic_list, mouse.column, mouse.row) {
-            return;
+    }
+
+    /// Starts a Focus session using whatever duration/Campaign/Quest/
+    /// Soundscape is currently selected across all 4 fields — independent
+    /// of which field happens to be focused, same as Enter. Mirrors the
+    /// KeyCode::Enter arm in handle_focus_screen_key, and is shared with it
+    /// so keyboard and mouse can't drift apart.
+    fn start_selected_focus_session(&mut self) -> Result<()> {
+        if self.active_focus_session.is_some() {
+            // Mirrors handle_focus_screen_key's own guard — Enter (and so a
+            // double-click) means something else entirely once a session is
+            // already running (pause/cancel keys, not "start a new one").
+            return Ok(());
         }
-        // Fixed-height list, no scroll offset — a click past the last
-        // rendered row (or past the real relic count) is a no-op.
-        let idx = (mouse.row - regions.relic_list.y) as usize;
-        if idx < regions.item_count {
-            self.selected_relic_idx = idx;
+
+        let active_projects: Vec<Project> = self
+            .projects
+            .iter()
+            .filter(|p| !p.completed && !p.archived)
+            .cloned()
+            .collect();
+
+        let mut active_tasks: Vec<Task> = Vec::new();
+        if self.selected_focus_project_idx > 0
+            && self.selected_focus_project_idx <= active_projects.len()
+        {
+            let selected_p_id = active_projects[self.selected_focus_project_idx - 1].id;
+            active_tasks = self
+                .all_tasks
+                .iter()
+                .filter(|t| t.project_id == Some(selected_p_id) && !t.completed)
+                .cloned()
+                .collect();
         }
+
+        let duration_mins = match self.selected_focus_duration_idx {
+            0 => 15,
+            1 => 25,
+            2 => 45,
+            3 => 60,
+            4 => 90,
+            5 => -1,
+            _ => 25,
+        };
+
+        if duration_mins == -1 {
+            self.modal_state = ModalType::CustomFocusDuration {
+                input: String::new(),
+            };
+            return Ok(());
+        }
+
+        let project_id = if self.selected_focus_project_idx > 0
+            && self.selected_focus_project_idx <= active_projects.len()
+        {
+            Some(active_projects[self.selected_focus_project_idx - 1].id)
+        } else {
+            None
+        };
+
+        let task_id = if self.selected_focus_task_idx > 0
+            && self.selected_focus_task_idx <= active_tasks.len()
+        {
+            Some(active_tasks[self.selected_focus_task_idx - 1].id)
+        } else {
+            None
+        };
+
+        // If Local Folder is selected but no folder is configured, prompt first
+        use crate::audio::SOUNDSCAPES;
+        let is_local_folder = self.selected_focus_soundscape_idx > 0
+            && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name == "Local Folder";
+        if is_local_folder {
+            let folder = self
+                .db
+                .get_setting("local_music_folder")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if folder.trim().is_empty() {
+                self.modal_state = ModalType::LocalMusicFolder {
+                    input: String::new(),
+                    suggestions: vec![],
+                    selected: 0,
+                };
+                return Ok(());
+            }
+        }
+
+        self.start_focus_session(duration_mins, project_id, task_id)?;
+        Ok(())
     }
 
     fn handle_focus_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -3182,15 +4016,33 @@ impl App {
         let Some(regions) = self.hit_regions.focus else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-        if let Some(idx) = regions
-            .cards
-            .iter()
-            .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
-        {
-            self.selected_focus_field_idx = idx;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = regions
+                    .cards
+                    .iter()
+                    .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_focus_field_idx = idx;
+                    if is_double_click {
+                        if let Err(e) = self.start_selected_focus_session() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't start: {}", e)));
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Cycles
+            // whichever card selected_focus_field_idx currently points at —
+            // same as Up/Down/'k'/'j' — regardless of where over the screen
+            // the wheel was used, same convention as Great Chronicle/Library.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cycle_selected_focus_field(matches!(mouse.kind, MouseEventKind::ScrollDown));
+            }
+            _ => {}
         }
     }
 
@@ -3201,6 +4053,38 @@ impl App {
     // lockstep, so the click handler just indexes into it instead of
     // re-deriving where the separators land.
 
+    /// Opens the selected Campaign into its War Room (the Workspace screen).
+    /// Mirrors the KeyCode::Enter arm's Projects branch in handle_key_event,
+    /// and is shared with it so keyboard and mouse can't drift apart.
+    fn open_selected_campaign(&mut self) -> Result<()> {
+        let active = ordered_active_projects(&self.projects);
+        if !active.is_empty() && self.selected_project_idx < active.len() {
+            let proj = active[self.selected_project_idx];
+            let proj_is_shared = proj.is_shared;
+            self.active_project_id = Some(proj.id);
+            self.active_screen = ActiveScreen::Workspace;
+            self.workspace_tab_idx = 0;
+            // Campaign entry owns its initial view. Do not leak the
+            // previous Campaign's Ledger/Kanban toggle globally.
+            self.quest_board_open = self.quest_board_preference(proj.id, proj_is_shared);
+            self.viewing_step_for_task = None;
+            // Campaign-specific teamwork filters must not leak into the
+            // next Campaign or hide content in a revoked private copy.
+            self.task_filter = "All".to_string();
+            self.audio_player.play_open_tasks();
+            self.workspace_sidebar_focused = true;
+            self.selected_task_idx = 0;
+            self.selected_note_idx = 0;
+            self.selected_notes_flat_idx = 0;
+            self.selected_journal_idx = 0;
+            self.reload_data()?;
+            if proj_is_shared {
+                self.start_background_sync();
+            }
+        }
+        Ok(())
+    }
+
     fn handle_projects_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::{HitRegions, ProjectsRowTarget};
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3210,24 +4094,65 @@ impl App {
         let Some(regions) = self.hit_regions.projects.clone() else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
-        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
-            return;
-        }
-        let row = (mouse.row - regions.list.y) as usize;
-        let Some(Some(target)) = regions.row_targets.get(row) else {
-            return;
-        };
-        match target {
-            ProjectsRowTarget::All => {
-                self.projects_all_selected = true;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                    return;
+                }
+                let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                let row = (mouse.row - regions.list.y) as usize;
+                let Some(Some(target)) = regions.row_targets.get(row) else {
+                    return;
+                };
+                match target {
+                    ProjectsRowTarget::All => {
+                        self.projects_all_selected = true;
+                    }
+                    ProjectsRowTarget::Project(idx) => {
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = *idx;
+                        // Double-click does what Enter does — open the
+                        // Campaign into its War Room — same as every other
+                        // select-then-open screen.
+                        if is_double_click {
+                            if let Err(e) = self.open_selected_campaign() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't open: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
             }
-            ProjectsRowTarget::Project(idx) => {
-                self.projects_all_selected = false;
-                self.selected_project_idx = *idx;
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Projects, including
+            // its wrap through the pinned "All Campaigns" row.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let active_len = ordered_active_projects(&self.projects).len();
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    if self.projects_all_selected {
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = active_len.saturating_sub(1);
+                    } else if self.selected_project_idx > 0 {
+                        self.selected_project_idx -= 1;
+                    } else {
+                        self.projects_all_selected = true;
+                    }
+                } else if self.projects_all_selected {
+                    self.projects_all_selected = false;
+                    self.selected_project_idx = 0;
+                } else if active_len > 0 {
+                    if self.selected_project_idx < active_len - 1 {
+                        self.selected_project_idx += 1;
+                    } else {
+                        self.projects_all_selected = true;
+                    }
+                }
             }
+            _ => {}
         }
     }
 
@@ -3238,24 +4163,93 @@ impl App {
         let Some(regions) = self.hit_regions.dashboard.clone() else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                    return;
+                }
+                let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                // The list is ListState-driven and auto-scrolls, so the
+                // logical row is the visible offset stashed at render time
+                // plus the on-screen offset — not just the on-screen offset
+                // by itself.
+                let row = regions.visible_start + (mouse.row - regions.list.y) as usize;
+                let Some(Some(action_idx)) = regions.row_targets.get(row) else {
+                    return;
+                };
+                // action_idx came straight out of this exact frame's render,
+                // same as every other click handler trusting its stashed
+                // regions — no need to re-derive dashboard_command_targets()
+                // just to re-validate it.
+                self.dashboard_task_focus = true;
+                self.selected_dashboard_task_idx = *action_idx;
+                // Double-click does what Enter does — open the selected
+                // command — same as every other select-then-open screen's
+                // mouse handler.
+                if is_double_click {
+                    if let Err(e) = self.open_selected_dashboard_command() {
+                        self.notifications
+                            .push(Notification::warning(format!("Couldn't open: {}", e)));
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Dashboard.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.dashboard_task_focus = true;
+                let targets = self.dashboard_command_targets();
+                if targets.is_empty() {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_dashboard_task_idx = if self.selected_dashboard_task_idx > 0 {
+                        self.selected_dashboard_task_idx - 1
+                    } else {
+                        targets.len() - 1
+                    };
+                } else {
+                    self.selected_dashboard_task_idx =
+                        (self.selected_dashboard_task_idx + 1) % targets.len();
+                }
+            }
+            _ => {}
         }
-        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
-            return;
+    }
+
+    /// Plays the selected Soundscape (or toggles the OS media player, or
+    /// opens the Local Folder picker/track browser for that special entry).
+    /// Mirrors the KeyCode::Enter arm's Soundscapes branch in
+    /// handle_key_event, and is shared with it so keyboard and mouse can't
+    /// drift apart.
+    fn play_selected_soundscape(&mut self) -> Result<()> {
+        use crate::audio::SOUNDSCAPES;
+        let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
+        if s_name == "Media Player" {
+            crate::audio::mpris_player::play_pause();
+            return Ok(());
         }
-        // The list is ListState-driven and auto-scrolls, so the logical row
-        // is the visible offset stashed at render time plus the on-screen
-        // offset — not just the on-screen offset by itself.
-        let row = regions.visible_start + (mouse.row - regions.list.y) as usize;
-        let Some(Some(action_idx)) = regions.row_targets.get(row) else {
-            return;
-        };
-        // action_idx came straight out of this exact frame's render, same as
-        // every other click handler trusting its stashed regions — no need
-        // to re-derive dashboard_command_targets() just to re-validate it.
-        self.dashboard_task_focus = true;
-        self.selected_dashboard_task_idx = *action_idx;
+        if s_name == "Local Folder" {
+            let folder = self
+                .db
+                .get_setting("local_music_folder")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if folder.trim().is_empty() {
+                self.modal_state = ModalType::LocalMusicFolder {
+                    input: String::new(),
+                    suggestions: vec![],
+                    selected: 0,
+                };
+                return Ok(());
+            }
+            self.play_selected_local_choice();
+            return Ok(());
+        }
+        let _ = self.db.set_setting("last_music_source", s_name);
+        self.audio_player.play(s_name);
+        Ok(())
     }
 
     fn handle_soundscapes_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -3265,28 +4259,68 @@ impl App {
         let Some(regions) = self.hit_regions.soundscapes else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
 
-        if let Some(tracks) = regions.local_tracks
-            && HitRegions::contains(tracks.area, mouse.column, mouse.row)
-        {
-            let line = (mouse.row - tracks.area.y) as usize;
-            if line == tracks.row_start {
-                self.selected_local_track_idx = 0; // "Random shuffle"
-            } else if line > tracks.row_start && line <= tracks.row_start + tracks.track_count {
-                self.selected_local_track_idx = line - tracks.row_start;
-            }
-            return;
-        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(tracks) = regions.local_tracks
+                    && HitRegions::contains(tracks.area, mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    let line = (mouse.row - tracks.area.y) as usize;
+                    if line == tracks.row_start {
+                        self.selected_local_track_idx = 0; // "Random shuffle"
+                    } else if line > tracks.row_start
+                        && line <= tracks.row_start + tracks.track_count
+                    {
+                        self.selected_local_track_idx = line - tracks.row_start;
+                    } else {
+                        return;
+                    }
+                    if is_double_click {
+                        self.play_selected_local_choice();
+                    }
+                    return;
+                }
 
-        if HitRegions::contains(regions.source_list, mouse.column, mouse.row) {
-            // Fixed 4-line-tall rows, no scroll offset.
-            let idx = (mouse.row - regions.source_list.y) as usize / 4;
-            if idx < regions.item_count {
-                self.selected_soundscape_idx = idx;
+                if HitRegions::contains(regions.source_list, mouse.column, mouse.row) {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    // Fixed 4-line-tall rows, no scroll offset.
+                    let idx = (mouse.row - regions.source_list.y) as usize / 4;
+                    if idx < regions.item_count {
+                        self.selected_soundscape_idx = idx;
+                        // Double-click plays the source, same as Enter.
+                        if is_double_click {
+                            if let Err(e) = self.play_selected_soundscape() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't play: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
             }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The Local
+            // Folder track browser (when open) takes priority, same as
+            // clicks — it's an overlay on top of the source list, so only
+            // one of the two is ever the intended scroll target. Both reuse
+            // the same select_previous_*/select_next_* helpers the 'b'/'n'
+            // keys and Up/Down already call.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if regions.local_tracks.is_some() {
+                    if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        self.select_previous_local_track();
+                    } else {
+                        self.select_next_local_track();
+                    }
+                } else if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.select_previous_soundscape();
+                } else {
+                    self.select_next_soundscape();
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3315,9 +4349,24 @@ impl App {
                     // not a ListState offset, but the same idea.
                     let idx = regions.item_start_idx + (mouse.row - regions.item_list.y) as usize;
                     if idx < regions.item_count {
+                        let is_double_click =
+                            self.register_click_run(mouse.column, mouse.row) >= 2;
                         self.library_active_col = 1;
                         self.selected_library_item_idx = idx;
                         self.update_library_item_scroll();
+                        // Double-click does what Space does — start/complete
+                        // the quest — same as every other select-then-open
+                        // screen. handle_library_action already no-ops
+                        // outside the Class Quests category, so this is safe
+                        // to call unconditionally.
+                        if is_double_click {
+                            if let Err(e) = self.handle_library_action() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't update quest: {}",
+                                    e
+                                )));
+                            }
+                        }
                     }
                 } else if HitRegions::contains(regions.detail_panel, mouse.column, mouse.row) {
                     self.library_active_col = 2;
@@ -3343,6 +4392,58 @@ impl App {
         }
     }
 
+    /// Activates whatever the currently focused Settings row's Enter action
+    /// is — applies the selected theme (focus 0), or toggles External
+    /// Notifications/Task Notifications/Sound Effects (focus 1/2/3). Every
+    /// other row (Sound Volume, the Oath Calendar rows) has no Enter action
+    /// at all — those are adjusted with +/- instead — so this is a no-op
+    /// for them, same as Enter already is. Mirrors the KeyCode::Enter arm
+    /// gated on ActiveScreen::Settings in handle_key_event, and is shared
+    /// with it so keyboard and mouse can't drift apart.
+    fn activate_selected_settings_row(&mut self) -> Result<()> {
+        match self.selected_settings_focus_idx {
+            0 => {
+                if let Some(choice) = crate::theme::Theme::all_choices()
+                    .get(self.selected_settings_theme_idx)
+                    .copied()
+                {
+                    self.apply_theme_choice(choice)?;
+                    self.reload_data()?;
+                }
+            }
+            1 => self.toggle_external_notifications()?,
+            2 => self.toggle_task_notifications()?,
+            3 => self.toggle_sound_effects()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Cycles Settings' current row/theme by one step, wrapping — mirrors
+    /// the Up/Down/'k'/'j' arms gated on ActiveScreen::Settings, and is
+    /// shared with them so keyboard and mouse can't drift apart.
+    fn cycle_selected_settings_row(&mut self, forward: bool) {
+        if self.selected_settings_focus_idx == 0 {
+            let choices_len = crate::theme::Theme::all_choices().len();
+            if choices_len == 0 {
+                return;
+            }
+            self.selected_settings_theme_idx = if forward {
+                (self.selected_settings_theme_idx + 1) % choices_len
+            } else if self.selected_settings_theme_idx > 0 {
+                self.selected_settings_theme_idx - 1
+            } else {
+                choices_len - 1
+            };
+        } else {
+            self.selected_settings_focus_idx = if forward {
+                Self::next_settings_option_focus(self.selected_settings_focus_idx)
+            } else {
+                Self::previous_settings_option_focus(self.selected_settings_focus_idx)
+            };
+        }
+    }
+
     fn handle_settings_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3350,28 +4451,58 @@ impl App {
         let Some(regions) = self.hit_regions.settings else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
 
-        // Click only moves focus, same as Projects/Dashboard/Library — see
-        // SettingsHitRegions for why a click doesn't also flip a toggle.
-        if HitRegions::contains(regions.theme_list, mouse.column, mouse.row) {
-            let idx = (mouse.row - regions.theme_list.y) as usize;
-            if idx < regions.theme_count {
-                self.selected_settings_focus_idx = 0;
-                self.selected_settings_theme_idx = idx;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A single click only moves focus, same as Projects/
+                // Dashboard/Library — see SettingsHitRegions for why a
+                // click doesn't also flip a toggle. A double-click, though,
+                // is a deliberate enough gesture that it now activates the
+                // row, same as Enter — see activate_selected_settings_row
+                // for which rows that's a no-op on.
+                if HitRegions::contains(regions.theme_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.theme_list.y) as usize;
+                    if idx < regions.theme_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.selected_settings_focus_idx = 0;
+                        self.selected_settings_theme_idx = idx;
+                        if is_double_click {
+                            if let Err(e) = self.activate_selected_settings_row() {
+                                self.notifications
+                                    .push(Notification::warning(format!("Couldn't apply: {}", e)));
+                            }
+                        }
+                    }
+                } else if HitRegions::contains(regions.alerts_panel, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.alerts_panel.y) as usize;
+                    if row < regions.alerts_row_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.selected_settings_focus_idx = 1 + row;
+                        if is_double_click {
+                            if let Err(e) = self.activate_selected_settings_row() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't toggle: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                } else if HitRegions::contains(regions.oath_panel, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.oath_panel.y) as usize;
+                    if row < regions.oath_row_count {
+                        self.selected_settings_focus_idx = 6 + row;
+                    }
+                }
             }
-        } else if HitRegions::contains(regions.alerts_panel, mouse.column, mouse.row) {
-            let row = (mouse.row - regions.alerts_panel.y) as usize;
-            if row < regions.alerts_row_count {
-                self.selected_settings_focus_idx = 1 + row;
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Cycles
+            // whichever row/theme is currently focused — same as Up/Down —
+            // regardless of where over the screen the wheel was used, same
+            // convention as Great Chronicle/Library.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cycle_selected_settings_row(matches!(mouse.kind, MouseEventKind::ScrollDown));
             }
-        } else if HitRegions::contains(regions.oath_panel, mouse.column, mouse.row) {
-            let row = (mouse.row - regions.oath_panel.y) as usize;
-            if row < regions.oath_row_count {
-                self.selected_settings_focus_idx = 6 + row;
-            }
+            _ => {}
         }
     }
 
@@ -3414,6 +4545,51 @@ impl App {
         );
     }
 
+    /// Cycles whichever Character pane `character_focus` currently points
+    /// at (Adventure Log entry, Reflection row, or the Reflection detail
+    /// scroll) by one step. Mirrors the Up/Down key arm gated on
+    /// ActiveScreen::Character, and is shared with it so keyboard and
+    /// mouse can't drift apart.
+    fn cycle_character_focus_pane(&mut self, forward: bool) {
+        match self.character_focus {
+            0 => {
+                let entries = self.db.get_chronicle_entries().unwrap_or_default();
+                if entries.is_empty() {
+                    return;
+                }
+                self.selected_chronicle_idx = if forward {
+                    (self.selected_chronicle_idx + 1) % entries.len()
+                } else if self.selected_chronicle_idx > 0 {
+                    self.selected_chronicle_idx - 1
+                } else {
+                    entries.len() - 1
+                };
+            }
+            1 => {
+                let reflections = self.db.get_reflections().unwrap_or_default();
+                if reflections.is_empty() {
+                    return;
+                }
+                self.selected_reflection_idx = if forward {
+                    (self.selected_reflection_idx + 1) % reflections.len()
+                } else if self.selected_reflection_idx > 0 {
+                    self.selected_reflection_idx - 1
+                } else {
+                    reflections.len() - 1
+                };
+                self.reflection_detail_scroll = 0;
+            }
+            2 => {
+                if forward {
+                    self.reflection_detail_scroll += 1;
+                } else if self.reflection_detail_scroll > 0 {
+                    self.reflection_detail_scroll -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_character_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3423,32 +4599,57 @@ impl App {
         let Some(regions) = self.hit_regions.character.clone() else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
 
-        if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
-            let row = (mouse.row - regions.adventure_log.y) as usize;
-            if let Some(entry_idx) = regions.adventure_log_rows.get(row) {
-                self.character_focus = 0;
-                self.selected_chronicle_idx = *entry_idx;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.adventure_log.y) as usize;
+                    if let Some(entry_idx) = regions.adventure_log_rows.get(row) {
+                        self.character_focus = 0;
+                        self.selected_chronicle_idx = *entry_idx;
+                    }
+                    return;
+                }
+                if let Some(list) = regions.reflections_list
+                    && HitRegions::contains(list, mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    let idx = (mouse.row - list.y) as usize;
+                    if idx < regions.reflections_count {
+                        self.character_focus = if is_double_click { 2 } else { 1 };
+                        self.selected_reflection_idx = idx;
+                    }
+                    return;
+                }
+                if let Some(detail) = regions.reflection_detail
+                    && HitRegions::contains(detail, mouse.column, mouse.row)
+                {
+                    self.character_focus = 2;
+                }
             }
-            return;
-        }
-        if let Some(list) = regions.reflections_list
-            && HitRegions::contains(list, mouse.column, mouse.row)
-        {
-            let idx = (mouse.row - list.y) as usize;
-            if idx < regions.reflections_count {
-                self.character_focus = 1;
-                self.selected_reflection_idx = idx;
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Unlike
+            // Focus/Settings, Character's 3 panes are disjoint screen
+            // areas, so the wheel targets whichever one the cursor is over
+            // — moving focus there first, same as a click would — then
+            // cycles it exactly like Up/Down/'k'/'j' already do.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
+                    self.character_focus = 0;
+                } else if let Some(list) = regions.reflections_list
+                    && HitRegions::contains(list, mouse.column, mouse.row)
+                {
+                    self.character_focus = 1;
+                } else if let Some(detail) = regions.reflection_detail
+                    && HitRegions::contains(detail, mouse.column, mouse.row)
+                {
+                    self.character_focus = 2;
+                } else {
+                    return;
+                }
+                self.cycle_character_focus_pane(matches!(mouse.kind, MouseEventKind::ScrollDown));
             }
-            return;
-        }
-        if let Some(detail) = regions.reflection_detail
-            && HitRegions::contains(detail, mouse.column, mouse.row)
-        {
-            self.character_focus = 2;
+            _ => {}
         }
     }
 
@@ -3479,6 +4680,419 @@ impl App {
         }
     }
 
+    /// Opens the target of the selected Quest Council notice — jumps to the
+    /// mentioning Chronicle, the Invites tab, the onboarding Campaign, or
+    /// the mentioned Quest, depending on notice type. Mirrors the
+    /// KeyCode::Enter arm's Fellowship tab-6 branch in handle_key_event, and
+    /// is shared with that arm so keyboard and mouse can't drift apart.
+    fn open_selected_council_notice(&mut self) -> Result<()> {
+        let notices = self.council_notices();
+        if let Some(notice) = notices.get(self.selected_notification_idx) {
+            self.db.mark_notification_read(&notice.0)?;
+            match notice.1.as_str() {
+                "chronicle_mention" => {
+                    if let Some(project_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        let shared = self
+                            .projects
+                            .iter()
+                            .filter(|project| project.is_shared)
+                            .collect::<Vec<_>>();
+                        if let Some(index) =
+                            shared.iter().position(|project| project.id == project_id)
+                        {
+                            self.selected_fellowship_project_idx = index;
+                            self.selected_fellowship_tab = 0;
+                            self.fellowship_focus_left = false;
+                        }
+                    }
+                }
+                "invitation" => {
+                    self.selected_fellowship_tab = 1;
+                    self.selected_invitation_idx = 0;
+                }
+                "onboarding" => {
+                    if let Some(project_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        self.active_project_id = Some(project_id);
+                        self.active_screen = ActiveScreen::Workspace;
+                        self.workspace_tab_idx = 0;
+                        self.workspace_sidebar_focused = false;
+                        self.reload_data()?;
+                    }
+                }
+                _ => {
+                    if let Some(task_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        let _ = self.open_quest_in_workspace(task_id)?;
+                    } else {
+                        self.reload_data()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the selected "My Quests" row's task in the Workspace. Mirrors
+    /// the KeyCode::Enter arm's Fellowship tab-5 branch in handle_key_event.
+    fn open_selected_my_quest(&mut self) -> Result<()> {
+        let assigned = self
+            .db
+            .get_task_ids_assigned_to(&self.identity.public_key)
+            .unwrap_or_default();
+        if let Some(task_id) = assigned.get(self.selected_my_quest_idx) {
+            if let Ok(task_uuid) = Uuid::parse_str(task_id) {
+                let _ = self.open_quest_in_workspace(task_uuid)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Accepts the selected Fellowship invitation if it's still Pending:
+    /// decrypts its envelope, confirms acceptance with the server, and
+    /// inserts the resulting shared project locally. Mirrors the
+    /// KeyCode::Enter arm's Fellowship tab-1 branch in handle_key_event.
+    fn accept_selected_fellowship_invitation(&mut self) -> Result<()> {
+        let invites = self.db.get_invitations().unwrap_or_default();
+        if invites.is_empty() || self.selected_invitation_idx >= invites.len() {
+            return Ok(());
+        }
+        let invite = invites[self.selected_invitation_idx].clone();
+        if invite.7 != "Pending" {
+            return Ok(());
+        }
+        if !self.config.sync_enabled {
+            self.notifications.push(Notification::warning(
+                "Enable Cloud Sync before accepting a Fellowship invitation.".to_string(),
+            ));
+            return Ok(());
+        }
+
+        // Authenticate and decrypt the locally cached envelope before the
+        // server changes its state. A corrupt invitation therefore remains
+        // Pending and can be retried after a clean download.
+        let validated = (|| -> Result<_> {
+            let encrypted = self
+                .db
+                .get_encrypted_invitation(&invite.0)?
+                .ok_or_else(|| anyhow::anyhow!("Invitation is missing locally"))?;
+            if encrypted.routing_id.is_empty()
+                || encrypted.inviter_encryption_key.is_empty()
+                || encrypted.key_nonce.is_empty()
+                || encrypted.key_ciphertext.is_empty()
+                || encrypted.project_name_nonce.is_empty()
+                || encrypted.project_name_ciphertext.is_empty()
+                || encrypted.project_id_nonce.is_empty()
+                || encrypted.project_id_ciphertext.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Invitation does not contain a complete encrypted envelope"
+                ));
+            }
+            let key = crate::services::encryption::unwrap_project_key(
+                &self.identity,
+                &encrypted.inviter_encryption_key,
+                &encrypted.routing_id,
+                &encrypted.key_nonce,
+                &encrypted.key_ciphertext,
+            )?;
+            let project_id = crate::services::encryption::decrypt_project_payload(
+                &key,
+                &encrypted.project_id_nonce,
+                &encrypted.project_id_ciphertext,
+                &format!("questline/fellowship/id/v1/{}", encrypted.routing_id),
+            )?;
+            let project_uuid = Uuid::parse_str(&project_id)
+                .map_err(|_| anyhow::anyhow!("Invitation contains an invalid project ID"))?;
+            let project_name = crate::services::encryption::decrypt_project_payload(
+                &key,
+                &encrypted.project_name_nonce,
+                &encrypted.project_name_ciphertext,
+                &format!("questline/fellowship/name/v1/{}", encrypted.routing_id),
+            )?;
+            if project_name.trim().is_empty() {
+                return Err(anyhow::anyhow!("Invitation contains an empty project name"));
+            }
+            Ok((encrypted, key, project_uuid, project_name))
+        })();
+        let (encrypted, project_key, project_uuid, restored_project_name) = match validated {
+            Ok(value) => value,
+            Err(error) => {
+                self.notifications.push(Notification::warning(format!(
+                    "Invitation remains pending: {error}"
+                )));
+                return Ok(());
+            }
+        };
+        let restored_project_id = project_uuid.to_string();
+
+        let client = crate::services::api_client::ApiClient::new(
+            &self.server_url,
+            self.identity.clone(),
+            &self.device_id,
+        );
+        let my_username = self
+            .user
+            .as_ref()
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "invite_id": invite.0,
+            "username": my_username
+        })
+        .to_string();
+        let response = client.send_request("POST", "accept", &body)?;
+        let accepted: serde_json::Value = serde_json::from_str(&response)?;
+        if accepted["status"].as_str() != Some("success") {
+            return Err(anyhow::anyhow!(
+                "Server did not confirm invitation acceptance"
+            ));
+        }
+
+        let new_proj = Project {
+            id: project_uuid,
+            name: restored_project_name.clone(),
+            description: Some("Fellowship shared project".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: Some(invite.3.clone()),
+            owner_username: Some(invite.4.clone()),
+            is_shared: true,
+        };
+        if let Some(mut existing) = self
+            .db
+            .get_projects()?
+            .into_iter()
+            .find(|project| project.id == project_uuid)
+        {
+            existing.name = restored_project_name.clone();
+            existing.owner_identity = Some(invite.3.clone());
+            existing.owner_username = Some(invite.4.clone());
+            existing.is_shared = true;
+            self.db.update_project(&existing)?;
+        } else {
+            self.db.insert_project(&new_proj)?;
+        }
+        self.db.save_project_encryption_key(
+            &restored_project_id,
+            &encrypted.routing_id,
+            &project_key,
+        )?;
+        self.db.add_project_member(
+            &restored_project_id,
+            &invite.3,
+            &invite.4,
+            "Owner",
+        )?;
+        self.db.add_project_member(
+            &restored_project_id,
+            &self.identity.public_key,
+            &my_username,
+            &invite.6,
+        )?;
+        self.db.update_invitation_status(&invite.0, "Accepted")?;
+
+        if self
+            .db
+            .get_setting("fellowship_onboarding_offered")?
+            .is_none()
+        {
+            self.db.create_notification_once(
+                "fellowship:onboarding:first-campaign",
+                "onboarding",
+                "Fellowship Field Guide",
+                "Verify Companion Keys · assign a Quest · choose its stance · convene the Quest Council · test offline sync.",
+                Some(&restored_project_id),
+            )?;
+            self.db
+                .set_setting("fellowship_onboarding_offered", "true")?;
+        }
+
+        let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
+
+        self.notifications.push(Notification::info(format!(
+            "Accepted invitation to '{}'",
+            restored_project_name
+        )));
+
+        let shared_projs_count = self.projects.iter().filter(|p| p.is_shared).count() + 1;
+        if shared_projs_count >= 25 {
+            let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'alliance_builder' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
+        }
+
+        self.mark_dirty();
+        self.reload_data()?;
+        // Pull the inviter's encrypted snapshot immediately instead of
+        // leaving an accepted Campaign empty until the next auto-sync.
+        self.start_background_sync();
+        Ok(())
+    }
+
+    /// Marks the selected notification read on Fellowship's Chat-tab
+    /// no-shared-campaigns fallback list. Mirrors the KeyCode::Enter arm's
+    /// Fellowship tab-0 branch in handle_key_event.
+    fn open_selected_fellowship_notification(&mut self) -> Result<()> {
+        let notifications = self.db.get_notifications().unwrap_or_default();
+        if !notifications.is_empty() && self.selected_notification_idx < notifications.len() {
+            let notif = &notifications[self.selected_notification_idx];
+            self.db.mark_notification_read(&notif.0)?;
+            self.reload_data()?;
+        }
+        Ok(())
+    }
+
+    /// Cycles Fellowship's currently visible sub-list — the active tab's
+    /// own list (Invitations/Companions/My Quests/Council), or (for tabs
+    /// without one of their own — Chat when no Campaign is shared yet,
+    /// Activity, Search, Treasury) the shared Campaign list, delegated to
+    /// cycle_fellowship_project_selection. Mirrors the Up/Down key arm
+    /// gated on ActiveScreen::Fellowship in handle_key_event (excluding
+    /// Chat message browsing, which cycle_fellowship_chat_message owns
+    /// separately), and is shared with it so keyboard and mouse can't
+    /// drift apart.
+    fn cycle_fellowship_selection(&mut self, forward: bool) {
+        if self.selected_fellowship_tab == 6 {
+            let notices = self.council_notices();
+            if notices.is_empty() {
+                return;
+            }
+            self.selected_notification_idx = if forward {
+                (self.selected_notification_idx + 1) % notices.len()
+            } else {
+                self.selected_notification_idx
+                    .checked_sub(1)
+                    .unwrap_or(notices.len() - 1)
+            };
+        } else if self.selected_fellowship_tab == 5 {
+            let assigned = self
+                .db
+                .get_task_ids_assigned_to(&self.identity.public_key)
+                .unwrap_or_default();
+            if assigned.is_empty() {
+                return;
+            }
+            self.selected_my_quest_idx = if forward {
+                (self.selected_my_quest_idx + 1) % assigned.len()
+            } else {
+                self.selected_my_quest_idx
+                    .checked_sub(1)
+                    .unwrap_or(assigned.len() - 1)
+            };
+        } else if self.selected_fellowship_tab == 1 {
+            let invites = self.db.get_invitations().unwrap_or_default();
+            if invites.is_empty() {
+                return;
+            }
+            self.selected_invitation_idx = if forward {
+                (self.selected_invitation_idx + 1) % invites.len()
+            } else if self.selected_invitation_idx > 0 {
+                self.selected_invitation_idx - 1
+            } else {
+                invites.len() - 1
+            };
+        } else if self.selected_fellowship_tab == 2 {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            if let Some(project) = shared.get(self.selected_fellowship_project_idx) {
+                let members = self
+                    .db
+                    .get_presence_for_project(&project.id.to_string())
+                    .unwrap_or_default();
+                if members.is_empty() {
+                    return;
+                }
+                self.selected_fellowship_member_idx = if forward {
+                    (self.selected_fellowship_member_idx + 1) % members.len()
+                } else {
+                    self.selected_fellowship_member_idx
+                        .checked_sub(1)
+                        .unwrap_or(members.len() - 1)
+                };
+            }
+        } else if self.projects.iter().any(|p| p.is_shared) {
+            self.cycle_fellowship_project_selection(forward);
+        } else if self.selected_fellowship_tab == 0 {
+            let notifications = self.db.get_notifications().unwrap_or_default();
+            if notifications.is_empty() {
+                return;
+            }
+            self.selected_notification_idx = if forward {
+                (self.selected_notification_idx + 1) % notifications.len()
+            } else if self.selected_notification_idx > 0 {
+                self.selected_notification_idx - 1
+            } else {
+                notifications.len() - 1
+            };
+        }
+    }
+
+    /// Cycles the shared Campaign list on Fellowship's left panel —
+    /// tab-independent, since that list is always visible regardless of
+    /// which tab is active. Mirrors the Up/Down key arm's fallback branch
+    /// (tabs without their own sub-list) in handle_key_event, and is
+    /// shared with it — via cycle_fellowship_selection — so keyboard and
+    /// mouse can't drift apart.
+    fn cycle_fellowship_project_selection(&mut self, forward: bool) {
+        let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+        if shared_projects.is_empty() {
+            return;
+        }
+        let new_idx = if forward {
+            (self.selected_fellowship_project_idx + 1) % shared_projects.len()
+        } else if self.selected_fellowship_project_idx > 0 {
+            self.selected_fellowship_project_idx - 1
+        } else {
+            shared_projects.len() - 1
+        };
+        if new_idx != self.selected_fellowship_project_idx {
+            self.fellowship_selected_msg_idx = usize::MAX;
+            self.fellowship_chat_input.clear();
+            self.fellowship_composing = false;
+        }
+        self.selected_fellowship_project_idx = new_idx;
+    }
+
+    /// Moves the Chat tab's browsed-message cursor, entering "browsing"
+    /// from the bottom on Up, and leaving it (back to "not browsing" / stick
+    /// to the latest message) on Down past the last message. Down/scroll-
+    /// down while not browsing is a no-op, same as the keyboard. Mirrors
+    /// the Up/Down arm in handle_fellowship_chat_key, and is shared with it
+    /// so keyboard and mouse can't drift apart.
+    fn cycle_fellowship_chat_message(&mut self, forward: bool) {
+        let msgs = self.fellowship_current_messages();
+        if msgs.is_empty() {
+            return;
+        }
+        let browsing = self.fellowship_selected_msg_idx != usize::MAX;
+        if forward {
+            if browsing {
+                if self.fellowship_selected_msg_idx + 1 >= msgs.len() {
+                    self.fellowship_selected_msg_idx = usize::MAX;
+                } else {
+                    self.fellowship_selected_msg_idx += 1;
+                }
+            }
+        } else {
+            self.fellowship_selected_msg_idx = if browsing && self.fellowship_selected_msg_idx > 0
+            {
+                self.fellowship_selected_msg_idx - 1
+            } else {
+                msgs.len() - 1
+            };
+        }
+    }
+
     fn handle_fellowship_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3488,56 +5102,114 @@ impl App {
         let Some(regions) = self.hit_regions.fellowship.clone() else {
             return;
         };
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return;
-        }
 
-        if let Some(idx) = regions
-            .tabs
-            .iter()
-            .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
-        {
-            self.activate_fellowship_tab(idx);
-            return;
-        }
-
-        // The active tab's sub-list takes priority when both it and the
-        // left campaign list could contain the click — in practice they
-        // never overlap (left panel vs. right panel), but check sub_list
-        // first anyway since it's what the user is more likely aiming at.
-        if let Some(sub_list) = &regions.sub_list {
-            use crate::screens::hit_test::FellowshipSubList;
-            match sub_list {
-                FellowshipSubList::Uniform(list) => {
-                    if let Some(idx) = list.row_index(mouse.column, mouse.row) {
-                        self.select_fellowship_sub_list_row(idx);
-                    }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = regions
+                    .tabs
+                    .iter()
+                    .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                {
+                    self.activate_fellowship_tab(idx);
                     return;
                 }
-                FellowshipSubList::Chat(chat) => {
-                    if HitRegions::contains(chat.area, mouse.column, mouse.row) {
-                        let logical_line = chat.scroll + (mouse.row - chat.area.y);
-                        // Largest message index whose start line is still
-                        // <= the clicked line — partition_point finds the
-                        // first index where the predicate flips false, so
-                        // subtracting 1 gives the last index where it held.
-                        let msg_idx = chat
-                            .msg_start_lines
-                            .partition_point(|&start| start <= logical_line);
-                        if msg_idx > 0 && msg_idx <= chat.message_count {
-                            self.fellowship_selected_msg_idx = msg_idx - 1;
+
+                // The active tab's sub-list takes priority when both it and
+                // the left campaign list could contain the click — in
+                // practice they never overlap (left panel vs. right panel),
+                // but check sub_list first anyway since it's what the user
+                // is more likely aiming at.
+                if let Some(sub_list) = &regions.sub_list {
+                    use crate::screens::hit_test::FellowshipSubList;
+                    match sub_list {
+                        FellowshipSubList::Uniform(list) => {
+                            if let Some(idx) = list.row_index(mouse.column, mouse.row) {
+                                let is_double_click =
+                                    self.register_click_run(mouse.column, mouse.row) >= 2;
+                                self.select_fellowship_sub_list_row(idx);
+                                // Mirrors the KeyCode::Enter arm's Fellowship
+                                // dispatch in handle_key_event — tabs with no
+                                // keyboard "open" action (Companions, and
+                                // Chat once a Campaign is shared) fall
+                                // through to Ok(()), a no-op beyond select.
+                                if is_double_click {
+                                    let result = match self.selected_fellowship_tab {
+                                        6 => self.open_selected_council_notice(),
+                                        5 => self.open_selected_my_quest(),
+                                        1 => self.accept_selected_fellowship_invitation(),
+                                        0 if self.projects.iter().filter(|p| p.is_shared).count()
+                                            == 0 =>
+                                        {
+                                            self.open_selected_fellowship_notification()
+                                        }
+                                        _ => Ok(()),
+                                    };
+                                    if let Err(e) = result {
+                                        self.notifications.push(Notification::warning(format!(
+                                            "Couldn't open: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        FellowshipSubList::Chat(chat) => {
+                            if HitRegions::contains(chat.area, mouse.column, mouse.row) {
+                                let logical_line = chat.scroll + (mouse.row - chat.area.y);
+                                // Largest message index whose start line is
+                                // still <= the clicked line —
+                                // partition_point finds the first index
+                                // where the predicate flips false, so
+                                // subtracting 1 gives the last index where
+                                // it held.
+                                let msg_idx = chat
+                                    .msg_start_lines
+                                    .partition_point(|&start| start <= logical_line);
+                                if msg_idx > 0 && msg_idx <= chat.message_count {
+                                    self.fellowship_selected_msg_idx = msg_idx - 1;
+                                }
+                            }
+                            return;
                         }
                     }
-                    return;
+                }
+
+                if let Some(list) = regions.left_list
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.fellowship_focus_left = true;
+                    self.selected_fellowship_project_idx = idx;
                 }
             }
-        }
-
-        if let Some(list) = regions.left_list
-            && let Some(idx) = list.row_index(mouse.column, mouse.row)
-        {
-            self.fellowship_focus_left = true;
-            self.selected_fellowship_project_idx = idx;
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The left
+            // Campaign list is always visible regardless of tab, so it
+            // takes priority (same as clicks effectively do, since the two
+            // panels never overlap) and always cycles the Campaign list
+            // itself, tab-independent — never whatever the active tab's own
+            // sub-list happens to be.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let forward = matches!(mouse.kind, MouseEventKind::ScrollDown);
+                if let Some(list) = regions.left_list
+                    && HitRegions::contains(list.area, mouse.column, mouse.row)
+                {
+                    self.cycle_fellowship_project_selection(forward);
+                    return;
+                }
+                if let Some(sub_list) = &regions.sub_list {
+                    use crate::screens::hit_test::FellowshipSubList;
+                    match sub_list {
+                        FellowshipSubList::Uniform(_) => self.cycle_fellowship_selection(forward),
+                        FellowshipSubList::Chat(chat) => {
+                            if HitRegions::contains(chat.area, mouse.column, mouse.row) {
+                                self.cycle_fellowship_chat_message(forward);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
         }
     }
 
@@ -3578,6 +5250,179 @@ impl App {
         }
     }
 
+    /// Opens the selected Ledger/Kanban task — drilling into its subtasks
+    /// if it's a top-level task with the Kanban board open and no step
+    /// already open, otherwise opening its edit modal. `allow_drill` mirrors
+    /// the `key.code == KeyCode::Enter` gate in handle_workspace_key's
+    /// Enter/'e' arm ('e' never drills; only Enter and double-click can).
+    fn open_or_drill_selected_workspace_task(&mut self, allow_drill: bool) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let all_tasks = self.all_tasks.clone();
+        let mut proj_tasks = visible_workspace_tasks(
+            &all_tasks,
+            p_id,
+            self.viewing_step_for_task,
+            &self.task_filter,
+            &self.task_sort,
+            &self.search_query,
+            Some(&self.db),
+            &self.identity.public_key,
+        );
+        if self.quest_board_open && self.viewing_step_for_task.is_none() {
+            proj_tasks.retain(|task| task.parent_task_id.is_none());
+        }
+        if proj_tasks.is_empty() || self.selected_task_idx >= proj_tasks.len() {
+            return Ok(());
+        }
+        let t = &proj_tasks[self.selected_task_idx];
+        if allow_drill
+            && self.quest_board_open
+            && self.viewing_step_for_task.is_none()
+            && t.parent_task_id.is_none()
+        {
+            self.viewing_step_for_task = Some(t.id);
+            self.selected_task_idx = 0;
+        } else {
+            self.modal_state = edit_task_modal_from_task(t);
+        }
+        Ok(())
+    }
+
+    /// Opens the selected Scrolls/Notes-tab row: an actual note opens it in
+    /// the Editor (unless it's a read-only shared note, which surfaces the
+    /// existing sealed-note warning instead), a codex header toggles its
+    /// collapsed state. Mirrors what pressing Enter does in
+    /// handle_workspace_key's tab-1 branch — renaming a codex header via 'e'
+    /// stays a separate, keyboard-only action there, since a double-click
+    /// should behave like Enter, not 'e'.
+    fn open_selected_workspace_scroll(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let proj_notes: Vec<Note> = self
+            .all_notes
+            .iter()
+            .filter(|n| {
+                n.project_id == Some(p_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| {
+                                self.codices
+                                    .iter()
+                                    .any(|c| c.id == codex_id && c.project_id == p_id)
+                            })
+                            .unwrap_or(true))
+            })
+            .filter(|n| {
+                if !self.search_query.is_empty() {
+                    n.title
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+        match flat.get(self.selected_notes_flat_idx) {
+            Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
+                let n = &proj_notes[*note_idx];
+                let is_mine = n
+                    .owner_identity
+                    .as_deref()
+                    .map(|oi| oi == self.identity.public_key.as_str())
+                    .unwrap_or(true);
+                if n.sharing_permission == "read_only" && !is_mine {
+                    self.notifications.push(Notification::warning(
+                        "This scroll is sealed — you may read but not inscribe.".to_string(),
+                    ));
+                    return Ok(());
+                }
+                let mut state =
+                    EditorState::new(p_id, Some(n.id), n.title.clone(), n.markdown_content.clone());
+                state.codex_id = n.codex_id;
+                self.editor_state = Some(state);
+                self.active_screen = ActiveScreen::Editor;
+            }
+            Some((Some(codex_id), None)) => {
+                let cid = *codex_id;
+                if let Some(codex) = self.codices.iter_mut().find(|c| c.id == cid) {
+                    codex.collapsed = !codex.collapsed;
+                    let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
+                }
+                let new_flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                if self.selected_notes_flat_idx >= new_flat.len() {
+                    self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Opens the selected Treasury-tab ledger entry's edit modal, subject to
+    /// the same permission check as the keyboard path. Mirrors the
+    /// KeyCode::Char('e') arm's tab-4 branch in handle_workspace_key — 'e'
+    /// is Treasury's only keyboard "open" key (plain Enter does nothing on
+    /// this tab), so double-click mirrors 'e' here rather than Enter.
+    fn open_selected_treasury_entry(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let selected = crate::services::TreasuryService::new(&self.db)
+            .entries(p_id, &self.treasury_filter, self.treasury_sort)?
+            .get(self.selected_treasury_idx)
+            .cloned();
+        let Some(entry) = selected else {
+            return Ok(());
+        };
+        let (mine, status) = crate::services::treasury_policy::TreasuryAction::for_entry(
+            &entry,
+            &self.identity.public_key,
+        );
+        if !self.treasury_allows(
+            p_id,
+            crate::services::treasury_policy::TreasuryAction::EditEntry { mine, status },
+        ) {
+            return Ok(());
+        }
+        let categories = crate::services::TreasuryService::new(&self.db).categories(p_id)?;
+        let amount = crate::services::treasury::format_minor(entry.amount_minor);
+        self.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(entry.id),
+            title_cursor: entry.title.len(),
+            title: entry.title.clone(),
+            amount_cursor: amount.len(),
+            amount,
+            entry_type_idx: match entry.entry_type {
+                crate::models::LedgerEntryType::Income => 0,
+                crate::models::LedgerEntryType::Expense => 1,
+                crate::models::LedgerEntryType::Transfer => 2,
+                crate::models::LedgerEntryType::Adjustment => 3,
+            },
+            status_idx: match entry.status {
+                crate::models::LedgerStatus::Planned => 0,
+                crate::models::LedgerStatus::Approved => 1,
+                crate::models::LedgerStatus::Paid => 2,
+                crate::models::LedgerStatus::Cancelled => 3,
+            },
+            category_idx: categories
+                .iter()
+                .position(|category| category.id == entry.category_id)
+                .unwrap_or(0),
+            date_val: entry
+                .created_at
+                .with_timezone(&Local)
+                .format("%Y-%m-%d")
+                .to_string(),
+            focus_idx: 0,
+        };
+        Ok(())
+    }
+
     fn handle_workspace_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -3594,6 +5439,33 @@ impl App {
         let Some(regions) = self.hit_regions.workspace.clone() else {
             return;
         };
+
+        if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = mouse.kind {
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The
+            // sidebar and the Scrolls tab's preview pane are their own
+            // scroll targets (moving focus there first, same as a click
+            // would); anywhere else scrolls whichever list the active tab
+            // is currently showing — same as Up/Down/'k'/'j' already do.
+            let forward = matches!(mouse.kind, MouseEventKind::ScrollDown);
+            if HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+                self.workspace_sidebar_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
+            if let Some(notes) = &regions.notes
+                && let Some(preview) = notes.preview
+                && HitRegions::contains(preview, mouse.column, mouse.row)
+            {
+                self.note_preview_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
+            self.workspace_sidebar_focused = false;
+            self.note_preview_focused = false;
+            self.cycle_workspace_selection(forward);
+            return;
+        }
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
@@ -3620,21 +5492,42 @@ impl App {
                         .iter()
                         .find_map(|col| col.row_index(mouse.column, mouse.row))
                 {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
                     self.selected_task_idx = idx;
                     self.workspace_sidebar_focused = false;
+                    if is_double_click {
+                        if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
                 } else if let Some(list) = &regions.tasks
                     && let Some(idx) = list.row_index(mouse.column, mouse.row)
                 {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
                     self.selected_task_idx = idx;
                     self.workspace_sidebar_focused = false;
+                    if is_double_click {
+                        if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
                 }
             }
             1 => {
                 if let Some(notes) = &regions.notes {
                     if let Some(idx) = notes.list.row_index(mouse.column, mouse.row) {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
                         self.selected_notes_flat_idx = idx;
                         self.workspace_sidebar_focused = false;
                         self.note_preview_focused = false;
+                        if is_double_click {
+                            if let Err(e) = self.open_selected_workspace_scroll() {
+                                self.notifications
+                                    .push(Notification::warning(format!("Couldn't open: {}", e)));
+                            }
+                        }
                     } else if let Some(preview) = notes.preview
                         && HitRegions::contains(preview, mouse.column, mouse.row)
                     {
@@ -3663,8 +5556,15 @@ impl App {
                 if let Some(list) = &regions.treasury
                     && let Some(idx) = list.row_index(mouse.column, mouse.row)
                 {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
                     self.selected_treasury_idx = idx;
                     self.workspace_sidebar_focused = false;
+                    if is_double_click {
+                        if let Err(e) = self.open_selected_treasury_entry() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
                 }
             }
             _ => {}
@@ -7304,22 +9204,12 @@ impl App {
                 if msgs.is_empty() {
                     return Ok(false);
                 }
-                self.fellowship_selected_msg_idx =
-                    if browsing && self.fellowship_selected_msg_idx > 0 {
-                        self.fellowship_selected_msg_idx - 1
-                    } else {
-                        msgs.len() - 1
-                    };
+                self.cycle_fellowship_chat_message(false);
                 return Ok(true);
             }
             KeyCode::Down => {
                 if browsing {
-                    let msgs = self.fellowship_current_messages();
-                    if self.fellowship_selected_msg_idx + 1 >= msgs.len() {
-                        self.fellowship_selected_msg_idx = usize::MAX;
-                    } else {
-                        self.fellowship_selected_msg_idx += 1;
-                    }
+                    self.cycle_fellowship_chat_message(true);
                     return Ok(true);
                 }
             }
@@ -7990,6 +9880,26 @@ impl App {
         }
     }
 
+    /// Registers a Down(Left) click at (col, row) against the shared
+    /// same-cell click tracker and returns the resulting run length: 1 for a
+    /// single click, 2 for a double, capped at 3 for a triple. Shared by the
+    /// Notes editor (single/double/triple distinguish cursor-place /
+    /// word-select / line-select) and every select-then-open screen's mouse
+    /// handler, where only run >= 2 (double-click-to-open) matters.
+    fn register_click_run(&mut self, col: u16, row: u16) -> u8 {
+        let now = std::time::Instant::now();
+        let click_run = match self.last_click {
+            Some((t, c, r, run))
+                if t.elapsed() < std::time::Duration::from_millis(400) && c == col && r == row =>
+            {
+                (run + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, col, row, click_run));
+        click_run
+    }
+
     fn handle_editor_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::editor;
         use crate::screens::hit_test::HitRegions;
@@ -8017,18 +9927,7 @@ impl App {
                     editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row)
                 };
 
-                let now = std::time::Instant::now();
-                let click_run = match self.last_click {
-                    Some((t, c, r, run))
-                        if t.elapsed() < std::time::Duration::from_millis(400)
-                            && c == mouse.column
-                            && r == mouse.row =>
-                    {
-                        (run + 1).min(3)
-                    }
-                    _ => 1,
-                };
-                self.last_click = Some((now, mouse.column, mouse.row, click_run));
+                let click_run = self.register_click_run(mouse.column, mouse.row);
 
                 // Shift+click extends the existing selection (or starts one
                 // anchored at the pre-click cursor) to the click point,
@@ -9630,46 +11529,13 @@ impl App {
                     Self::previous_settings_block_focus(self.selected_settings_focus_idx);
             }
             KeyCode::Up | KeyCode::Char('k') if self.active_screen == ActiveScreen::Settings => {
-                if self.selected_settings_focus_idx == 0 {
-                    let choices_len = crate::theme::Theme::all_choices().len();
-                    self.selected_settings_theme_idx = if self.selected_settings_theme_idx > 0 {
-                        self.selected_settings_theme_idx - 1
-                    } else {
-                        choices_len.saturating_sub(1)
-                    };
-                } else {
-                    self.selected_settings_focus_idx =
-                        Self::previous_settings_option_focus(self.selected_settings_focus_idx);
-                }
+                self.cycle_selected_settings_row(false);
             }
             KeyCode::Down | KeyCode::Char('j') if self.active_screen == ActiveScreen::Settings => {
-                if self.selected_settings_focus_idx == 0 {
-                    let choices_len = crate::theme::Theme::all_choices().len();
-                    if choices_len > 0 {
-                        self.selected_settings_theme_idx =
-                            (self.selected_settings_theme_idx + 1) % choices_len;
-                    }
-                } else {
-                    self.selected_settings_focus_idx =
-                        Self::next_settings_option_focus(self.selected_settings_focus_idx);
-                }
+                self.cycle_selected_settings_row(true);
             }
             KeyCode::Enter if self.active_screen == ActiveScreen::Settings => {
-                match self.selected_settings_focus_idx {
-                    0 => {
-                        if let Some(choice) = crate::theme::Theme::all_choices()
-                            .get(self.selected_settings_theme_idx)
-                            .copied()
-                        {
-                            self.apply_theme_choice(choice)?;
-                            self.reload_data()?;
-                        }
-                    }
-                    1 => self.toggle_external_notifications()?,
-                    2 => self.toggle_task_notifications()?,
-                    3 => self.toggle_sound_effects()?,
-                    _ => {}
-                }
+                self.activate_selected_settings_row()?;
             }
             KeyCode::Char('n') if self.active_screen == ActiveScreen::Settings => {
                 self.toggle_external_notifications()?;
@@ -9695,30 +11561,7 @@ impl App {
             // Screen specific arrows and edits
             KeyCode::Up => {
                 if self.active_screen == ActiveScreen::Character {
-                    if self.character_focus == 0 {
-                        let entries = self.db.get_chronicle_entries().unwrap_or_default();
-                        if !entries.is_empty() {
-                            if self.selected_chronicle_idx > 0 {
-                                self.selected_chronicle_idx -= 1;
-                            } else {
-                                self.selected_chronicle_idx = entries.len() - 1;
-                            }
-                        }
-                    } else if self.character_focus == 1 {
-                        let reflections = self.db.get_reflections().unwrap_or_default();
-                        if !reflections.is_empty() {
-                            if self.selected_reflection_idx > 0 {
-                                self.selected_reflection_idx -= 1;
-                            } else {
-                                self.selected_reflection_idx = reflections.len() - 1;
-                            }
-                            self.reflection_detail_scroll = 0;
-                        }
-                    } else if self.character_focus == 2 {
-                        if self.reflection_detail_scroll > 0 {
-                            self.reflection_detail_scroll -= 1;
-                        }
-                    }
+                    self.cycle_character_focus_pane(false);
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = ordered_active_projects(&self.projects).len();
                     if self.projects_all_selected {
@@ -9765,75 +11608,7 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     self.select_previous_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 6 {
-                        let notices = self.council_notices();
-                        if !notices.is_empty() {
-                            self.selected_notification_idx = self
-                                .selected_notification_idx
-                                .checked_sub(1)
-                                .unwrap_or(notices.len() - 1);
-                        }
-                    } else if self.selected_fellowship_tab == 5 {
-                        let assigned = self
-                            .db
-                            .get_task_ids_assigned_to(&self.identity.public_key)
-                            .unwrap_or_default();
-                        if !assigned.is_empty() {
-                            self.selected_my_quest_idx = self
-                                .selected_my_quest_idx
-                                .checked_sub(1)
-                                .unwrap_or(assigned.len() - 1);
-                        }
-                    } else if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() {
-                            self.selected_invitation_idx = if self.selected_invitation_idx > 0 {
-                                self.selected_invitation_idx - 1
-                            } else {
-                                invites.len() - 1
-                            };
-                        }
-                    } else if self.selected_fellowship_tab == 2 {
-                        let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-                        if let Some(project) = shared.get(self.selected_fellowship_project_idx) {
-                            let members = self
-                                .db
-                                .get_presence_for_project(&project.id.to_string())
-                                .unwrap_or_default();
-                            if !members.is_empty() {
-                                self.selected_fellowship_member_idx = self
-                                    .selected_fellowship_member_idx
-                                    .checked_sub(1)
-                                    .unwrap_or(members.len() - 1);
-                            }
-                        }
-                    } else {
-                        let shared_projects: Vec<_> =
-                            self.projects.iter().filter(|p| p.is_shared).collect();
-                        if !shared_projects.is_empty() {
-                            let new_idx = if self.selected_fellowship_project_idx > 0 {
-                                self.selected_fellowship_project_idx - 1
-                            } else {
-                                shared_projects.len() - 1
-                            };
-                            if new_idx != self.selected_fellowship_project_idx {
-                                self.fellowship_selected_msg_idx = usize::MAX;
-                                self.fellowship_chat_input.clear();
-                                self.fellowship_composing = false;
-                            }
-                            self.selected_fellowship_project_idx = new_idx;
-                        } else if self.selected_fellowship_tab == 0 {
-                            let notifications = self.db.get_notifications().unwrap_or_default();
-                            if !notifications.is_empty() {
-                                self.selected_notification_idx =
-                                    if self.selected_notification_idx > 0 {
-                                        self.selected_notification_idx - 1
-                                    } else {
-                                        notifications.len() - 1
-                                    };
-                            }
-                        }
-                    }
+                    self.cycle_fellowship_selection(false);
                 } else if self.active_screen == ActiveScreen::Library {
                     if self.library_active_col == 0 {
                         self.selected_library_cat_idx = if self.selected_library_cat_idx > 0 {
@@ -9869,22 +11644,7 @@ impl App {
             }
             KeyCode::Down => {
                 if self.active_screen == ActiveScreen::Character {
-                    if self.character_focus == 0 {
-                        let entries = self.db.get_chronicle_entries().unwrap_or_default();
-                        if !entries.is_empty() {
-                            self.selected_chronicle_idx =
-                                (self.selected_chronicle_idx + 1) % entries.len();
-                        }
-                    } else if self.character_focus == 1 {
-                        let reflections = self.db.get_reflections().unwrap_or_default();
-                        if !reflections.is_empty() {
-                            self.selected_reflection_idx =
-                                (self.selected_reflection_idx + 1) % reflections.len();
-                            self.reflection_detail_scroll = 0;
-                        }
-                    } else if self.character_focus == 2 {
-                        self.reflection_detail_scroll += 1;
-                    }
+                    self.cycle_character_focus_pane(true);
                 } else if self.active_screen == ActiveScreen::Projects {
                     let active_len = ordered_active_projects(&self.projects).len();
                     if self.projects_all_selected {
@@ -9933,59 +11693,7 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     self.select_next_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 6 {
-                        let notices = self.council_notices();
-                        if !notices.is_empty() {
-                            self.selected_notification_idx =
-                                (self.selected_notification_idx + 1) % notices.len();
-                        }
-                    } else if self.selected_fellowship_tab == 5 {
-                        let assigned = self
-                            .db
-                            .get_task_ids_assigned_to(&self.identity.public_key)
-                            .unwrap_or_default();
-                        if !assigned.is_empty() {
-                            self.selected_my_quest_idx =
-                                (self.selected_my_quest_idx + 1) % assigned.len();
-                        }
-                    } else if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() {
-                            self.selected_invitation_idx =
-                                (self.selected_invitation_idx + 1) % invites.len();
-                        }
-                    } else if self.selected_fellowship_tab == 2 {
-                        let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
-                        if let Some(project) = shared.get(self.selected_fellowship_project_idx) {
-                            let members = self
-                                .db
-                                .get_presence_for_project(&project.id.to_string())
-                                .unwrap_or_default();
-                            if !members.is_empty() {
-                                self.selected_fellowship_member_idx =
-                                    (self.selected_fellowship_member_idx + 1) % members.len();
-                            }
-                        }
-                    } else {
-                        let shared_projects: Vec<_> =
-                            self.projects.iter().filter(|p| p.is_shared).collect();
-                        if !shared_projects.is_empty() {
-                            let new_idx =
-                                (self.selected_fellowship_project_idx + 1) % shared_projects.len();
-                            if new_idx != self.selected_fellowship_project_idx {
-                                self.fellowship_selected_msg_idx = usize::MAX;
-                                self.fellowship_chat_input.clear();
-                                self.fellowship_composing = false;
-                            }
-                            self.selected_fellowship_project_idx = new_idx;
-                        } else if self.selected_fellowship_tab == 0 {
-                            let notifications = self.db.get_notifications().unwrap_or_default();
-                            if !notifications.is_empty() {
-                                self.selected_notification_idx =
-                                    (self.selected_notification_idx + 1) % notifications.len();
-                            }
-                        }
-                    }
+                    self.cycle_fellowship_selection(true);
                 } else if self.active_screen == ActiveScreen::Library {
                     if self.library_active_col == 0 {
                         self.selected_library_cat_idx = (self.selected_library_cat_idx + 1) % 6;
@@ -10013,329 +11721,29 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
-                    let active = ordered_active_projects(&self.projects);
-                    if !active.is_empty() && self.selected_project_idx < active.len() {
-                        let proj = active[self.selected_project_idx];
-                        let proj_is_shared = proj.is_shared;
-                        self.active_project_id = Some(proj.id);
-                        self.active_screen = ActiveScreen::Workspace;
-                        self.workspace_tab_idx = 0;
-                        // Campaign entry owns its initial view. Do not leak the
-                        // previous Campaign's Ledger/Kanban toggle globally.
-                        self.quest_board_open =
-                            self.quest_board_preference(proj.id, proj_is_shared);
-                        self.viewing_step_for_task = None;
-                        // Campaign-specific teamwork filters must not leak into the
-                        // next Campaign or hide content in a revoked private copy.
-                        self.task_filter = "All".to_string();
-                        self.audio_player.play_open_tasks();
-                        self.workspace_sidebar_focused = true;
-                        self.selected_task_idx = 0;
-                        self.selected_note_idx = 0;
-                        self.selected_notes_flat_idx = 0;
-                        self.selected_journal_idx = 0;
-                        self.reload_data()?;
-                        if proj_is_shared {
-                            self.start_background_sync();
-                        }
-                    }
+                    self.open_selected_campaign()?;
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     self.open_selected_dashboard_command()?;
                 } else if self.active_screen == ActiveScreen::Soundscapes {
-                    use crate::audio::SOUNDSCAPES;
-                    let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
-                    if s_name == "Media Player" {
-                        crate::audio::mpris_player::play_pause();
-                        return Ok(());
-                    }
-                    if s_name == "Local Folder" {
-                        let folder = self
-                            .db
-                            .get_setting("local_music_folder")
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                        if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder {
-                                input: String::new(),
-                                suggestions: vec![],
-                                selected: 0,
-                            };
-                            return Ok(());
-                        }
-                        self.play_selected_local_choice();
-                        return Ok(());
-                    }
-                    let _ = self.db.set_setting("last_music_source", s_name);
-                    self.audio_player.play(s_name);
+                    self.play_selected_soundscape()?;
                 } else if self.active_screen == ActiveScreen::Fellowship {
                     if self.selected_fellowship_tab == 6 {
-                        let notices = self.council_notices();
-                        if let Some(notice) = notices.get(self.selected_notification_idx) {
-                            self.db.mark_notification_read(&notice.0)?;
-                            match notice.1.as_str() {
-                                "chronicle_mention" => {
-                                    if let Some(project_id) = notice
-                                        .4
-                                        .as_deref()
-                                        .and_then(|target| Uuid::parse_str(target).ok())
-                                    {
-                                        let shared = self
-                                            .projects
-                                            .iter()
-                                            .filter(|project| project.is_shared)
-                                            .collect::<Vec<_>>();
-                                        if let Some(index) = shared
-                                            .iter()
-                                            .position(|project| project.id == project_id)
-                                        {
-                                            self.selected_fellowship_project_idx = index;
-                                            self.selected_fellowship_tab = 0;
-                                            self.fellowship_focus_left = false;
-                                        }
-                                    }
-                                }
-                                "invitation" => {
-                                    self.selected_fellowship_tab = 1;
-                                    self.selected_invitation_idx = 0;
-                                }
-                                "onboarding" => {
-                                    if let Some(project_id) = notice
-                                        .4
-                                        .as_deref()
-                                        .and_then(|target| Uuid::parse_str(target).ok())
-                                    {
-                                        self.active_project_id = Some(project_id);
-                                        self.active_screen = ActiveScreen::Workspace;
-                                        self.workspace_tab_idx = 0;
-                                        self.workspace_sidebar_focused = false;
-                                        self.reload_data()?;
-                                    }
-                                }
-                                _ => {
-                                    if let Some(task_id) = notice
-                                        .4
-                                        .as_deref()
-                                        .and_then(|target| Uuid::parse_str(target).ok())
-                                    {
-                                        let _ = self.open_quest_in_workspace(task_id)?;
-                                    } else {
-                                        self.reload_data()?;
-                                    }
-                                }
-                            }
-                        }
+                        self.open_selected_council_notice()?;
                     } else if self.selected_fellowship_tab == 5 {
-                        let assigned = self
-                            .db
-                            .get_task_ids_assigned_to(&self.identity.public_key)
-                            .unwrap_or_default();
-                        if let Some(task_id) = assigned.get(self.selected_my_quest_idx) {
-                            if let Ok(task_uuid) = Uuid::parse_str(task_id) {
-                                let _ = self.open_quest_in_workspace(task_uuid)?;
-                            }
-                        }
+                        self.open_selected_my_quest()?;
                     } else if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() && self.selected_invitation_idx < invites.len() {
-                            let invite = invites[self.selected_invitation_idx].clone();
-                            if invite.7 == "Pending" {
-                                if !self.config.sync_enabled {
-                                    self.notifications.push(Notification::warning(
-                                        "Enable Cloud Sync before accepting a Fellowship invitation."
-                                            .to_string(),
-                                    ));
-                                    return Ok(());
-                                }
-
-                                // Authenticate and decrypt the locally cached envelope before the
-                                // server changes its state. A corrupt invitation therefore remains
-                                // Pending and can be retried after a clean download.
-                                let validated = (|| -> Result<_> {
-                                    let encrypted =
-                                        self.db.get_encrypted_invitation(&invite.0)?.ok_or_else(
-                                            || anyhow::anyhow!("Invitation is missing locally"),
-                                        )?;
-                                    if encrypted.routing_id.is_empty()
-                                        || encrypted.inviter_encryption_key.is_empty()
-                                        || encrypted.key_nonce.is_empty()
-                                        || encrypted.key_ciphertext.is_empty()
-                                        || encrypted.project_name_nonce.is_empty()
-                                        || encrypted.project_name_ciphertext.is_empty()
-                                        || encrypted.project_id_nonce.is_empty()
-                                        || encrypted.project_id_ciphertext.is_empty()
-                                    {
-                                        return Err(anyhow::anyhow!(
-                                            "Invitation does not contain a complete encrypted envelope"
-                                        ));
-                                    }
-                                    let key = crate::services::encryption::unwrap_project_key(
-                                        &self.identity,
-                                        &encrypted.inviter_encryption_key,
-                                        &encrypted.routing_id,
-                                        &encrypted.key_nonce,
-                                        &encrypted.key_ciphertext,
-                                    )?;
-                                    let project_id =
-                                        crate::services::encryption::decrypt_project_payload(
-                                            &key,
-                                            &encrypted.project_id_nonce,
-                                            &encrypted.project_id_ciphertext,
-                                            &format!(
-                                                "questline/fellowship/id/v1/{}",
-                                                encrypted.routing_id
-                                            ),
-                                        )?;
-                                    let project_uuid =
-                                        Uuid::parse_str(&project_id).map_err(|_| {
-                                            anyhow::anyhow!(
-                                                "Invitation contains an invalid project ID"
-                                            )
-                                        })?;
-                                    let project_name =
-                                        crate::services::encryption::decrypt_project_payload(
-                                            &key,
-                                            &encrypted.project_name_nonce,
-                                            &encrypted.project_name_ciphertext,
-                                            &format!(
-                                                "questline/fellowship/name/v1/{}",
-                                                encrypted.routing_id
-                                            ),
-                                        )?;
-                                    if project_name.trim().is_empty() {
-                                        return Err(anyhow::anyhow!(
-                                            "Invitation contains an empty project name"
-                                        ));
-                                    }
-                                    Ok((encrypted, key, project_uuid, project_name))
-                                })();
-                                let (encrypted, project_key, project_uuid, restored_project_name) =
-                                    match validated {
-                                        Ok(value) => value,
-                                        Err(error) => {
-                                            self.notifications.push(Notification::warning(
-                                                format!("Invitation remains pending: {error}"),
-                                            ));
-                                            return Ok(());
-                                        }
-                                    };
-                                let restored_project_id = project_uuid.to_string();
-
-                                let client = crate::services::api_client::ApiClient::new(
-                                    &self.server_url,
-                                    self.identity.clone(),
-                                    &self.device_id,
-                                );
-                                let my_username = self
-                                    .user
-                                    .as_ref()
-                                    .map(|u| u.username.clone())
-                                    .unwrap_or_default();
-                                let body = serde_json::json!({
-                                    "invite_id": invite.0,
-                                    "username": my_username
-                                })
-                                .to_string();
-                                let response = client.send_request("POST", "accept", &body)?;
-                                let accepted: serde_json::Value = serde_json::from_str(&response)?;
-                                if accepted["status"].as_str() != Some("success") {
-                                    return Err(anyhow::anyhow!(
-                                        "Server did not confirm invitation acceptance"
-                                    ));
-                                }
-
-                                let new_proj = Project {
-                                    id: project_uuid,
-                                    name: restored_project_name.clone(),
-                                    description: Some("Fellowship shared project".to_string()),
-                                    created_at: Utc::now(),
-                                    updated_at: Utc::now(),
-                                    archived: false,
-                                    completed: false,
-                                    owner_identity: Some(invite.3.clone()),
-                                    owner_username: Some(invite.4.clone()),
-                                    is_shared: true,
-                                };
-                                if let Some(mut existing) = self
-                                    .db
-                                    .get_projects()?
-                                    .into_iter()
-                                    .find(|project| project.id == project_uuid)
-                                {
-                                    existing.name = restored_project_name.clone();
-                                    existing.owner_identity = Some(invite.3.clone());
-                                    existing.owner_username = Some(invite.4.clone());
-                                    existing.is_shared = true;
-                                    self.db.update_project(&existing)?;
-                                } else {
-                                    self.db.insert_project(&new_proj)?;
-                                }
-                                self.db.save_project_encryption_key(
-                                    &restored_project_id,
-                                    &encrypted.routing_id,
-                                    &project_key,
-                                )?;
-                                self.db.add_project_member(
-                                    &restored_project_id,
-                                    &invite.3,
-                                    &invite.4,
-                                    "Owner",
-                                )?;
-                                self.db.add_project_member(
-                                    &restored_project_id,
-                                    &self.identity.public_key,
-                                    &my_username,
-                                    &invite.6,
-                                )?;
-                                self.db.update_invitation_status(&invite.0, "Accepted")?;
-
-                                if self
-                                    .db
-                                    .get_setting("fellowship_onboarding_offered")?
-                                    .is_none()
-                                {
-                                    self.db.create_notification_once(
-                                        "fellowship:onboarding:first-campaign",
-                                        "onboarding",
-                                        "Fellowship Field Guide",
-                                        "Verify Companion Keys · assign a Quest · choose its stance · convene the Quest Council · test offline sync.",
-                                        Some(&restored_project_id),
-                                    )?;
-                                    self.db
-                                        .set_setting("fellowship_onboarding_offered", "true")?;
-                                }
-
-                                let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
-
-                                self.notifications.push(Notification::info(format!(
-                                    "Accepted invitation to '{}'",
-                                    restored_project_name
-                                )));
-
-                                let shared_projs_count =
-                                    self.projects.iter().filter(|p| p.is_shared).count() + 1;
-                                if shared_projs_count >= 25 {
-                                    let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'alliance_builder' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
-                                }
-
-                                self.mark_dirty();
-                                self.reload_data()?;
-                                // Pull the inviter's encrypted snapshot immediately instead of
-                                // leaving an accepted Campaign empty until the next auto-sync.
-                                self.start_background_sync();
-                            }
-                        }
-                    }
-                } else if self.active_screen == ActiveScreen::Fellowship
-                    && self.selected_fellowship_tab == 0
-                    && self.projects.iter().filter(|p| p.is_shared).count() == 0
-                {
-                    let notifications = self.db.get_notifications().unwrap_or_default();
-                    if !notifications.is_empty()
-                        && self.selected_notification_idx < notifications.len()
+                        self.accept_selected_fellowship_invitation()?;
+                    } else if self.selected_fellowship_tab == 0
+                        && self.projects.iter().filter(|p| p.is_shared).count() == 0
                     {
-                        let notif = &notifications[self.selected_notification_idx];
-                        self.db.mark_notification_read(&notif.0)?;
-                        self.reload_data()?;
+                        // NB: this branch used to live as a separate, unreachable
+                        // `else if self.active_screen == ActiveScreen::Fellowship && ...`
+                        // arm below this one — since this outer arm's condition
+                        // (active_screen == Fellowship) is a superset of that one's,
+                        // it always matched first and the tab-0 branch could never
+                        // run. Folded in here so Enter on Chat's no-Campaigns
+                        // notification fallback actually marks it read.
+                        self.open_selected_fellowship_notification()?;
                     }
                 }
             }
@@ -10506,21 +11914,7 @@ impl App {
                         };
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archived: Vec<&Project> = self
-                        .projects
-                        .iter()
-                        .filter(|p| p.archived || p.completed)
-                        .collect();
-                    if !archived.is_empty() && self.selected_archive_idx < archived.len() {
-                        let mut p = archived[self.selected_archive_idx].clone();
-                        p.archived = false;
-                        p.completed = false;
-                        self.db.update_project(&p)?;
-                        self.mark_dirty();
-                        self.apply_class_passive("project_restore", 0)?;
-                        self.selected_archive_idx = 0;
-                        self.reload_data()?;
-                    }
+                    self.restore_selected_archived_project()?;
                 } else if self.active_screen == ActiveScreen::Fellowship
                     && self.selected_fellowship_tab == 0
                 {
@@ -11389,6 +12783,207 @@ impl App {
         }
     }
 
+    /// Cycles Workspace's currently focused list/pane by one step — the
+    /// sidebar's tab order, the Scrolls tab's preview pane scroll, or the
+    /// active tab's own content list (Ledger/Kanban, Scrolls, Journal,
+    /// Milestones, Treasury). Mirrors the Up/Down key arm in
+    /// handle_workspace_key, and is shared with it so keyboard and mouse
+    /// can't drift apart.
+    fn cycle_workspace_selection(&mut self, forward: bool) {
+        if self.workspace_sidebar_focused {
+            self.workspace_tab_idx = if forward {
+                match self.workspace_tab_idx {
+                    3 => 0,
+                    0 => 1,
+                    1 => 4,
+                    4 => 2,
+                    _ => 3,
+                }
+            } else {
+                match self.workspace_tab_idx {
+                    3 => 2,
+                    0 => 3,
+                    1 => 0,
+                    4 => 1,
+                    _ => 4,
+                }
+            };
+            self.note_preview_focused = false;
+            return;
+        }
+        if self.note_preview_focused {
+            if forward {
+                self.note_preview_scroll = self
+                    .note_preview_scroll
+                    .saturating_add(1)
+                    .min(self.note_preview_max_scroll.get());
+            } else {
+                self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
+            }
+            return;
+        }
+
+        let Some(p_id) = self.active_project_id else {
+            return;
+        };
+
+        match self.workspace_tab_idx {
+            0 => {
+                let all_tasks = self.all_tasks.clone();
+                let mut proj_tasks = visible_workspace_tasks(
+                    &all_tasks,
+                    p_id,
+                    self.viewing_step_for_task,
+                    &self.task_filter,
+                    &self.task_sort,
+                    &self.search_query,
+                    Some(&self.db),
+                    &self.identity.public_key,
+                );
+                if self.quest_board_open && self.viewing_step_for_task.is_none() {
+                    proj_tasks.retain(|task| task.parent_task_id.is_none());
+                }
+                if self.quest_board_open {
+                    let statuses = proj_tasks
+                        .iter()
+                        .map(|task| {
+                            self.db
+                                .get_quest_status(&task.id.to_string(), task.completed)
+                                .unwrap_or(QuestStatus::Backlog)
+                        })
+                        .collect::<Vec<_>>();
+                    self.selected_task_idx = move_quest_board_selection(
+                        &statuses,
+                        self.selected_task_idx,
+                        0,
+                        if forward { 1 } else { -1 },
+                    );
+                } else if !proj_tasks.is_empty() {
+                    self.selected_task_idx = if forward {
+                        if self.selected_task_idx < proj_tasks.len() - 1 {
+                            self.selected_task_idx + 1
+                        } else {
+                            0
+                        }
+                    } else if self.selected_task_idx > 0 {
+                        self.selected_task_idx - 1
+                    } else {
+                        proj_tasks.len() - 1
+                    };
+                }
+            }
+            1 => {
+                let proj_notes: Vec<Note> = self
+                    .all_notes
+                    .iter()
+                    .filter(|n| {
+                        n.project_id == Some(p_id)
+                            || (n.project_id.is_none()
+                                && n.codex_id
+                                    .map(|codex_id| {
+                                        self.codices
+                                            .iter()
+                                            .any(|c| c.id == codex_id && c.project_id == p_id)
+                                    })
+                                    .unwrap_or(true))
+                    })
+                    .filter(|n| {
+                        if !self.search_query.is_empty() {
+                            n.title
+                                .to_lowercase()
+                                .contains(&self.search_query.to_lowercase())
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                if !flat.is_empty() {
+                    let len = flat.len();
+                    let mut idx = if forward {
+                        (self.selected_notes_flat_idx + 1) % len
+                    } else if self.selected_notes_flat_idx > 0 {
+                        self.selected_notes_flat_idx - 1
+                    } else {
+                        len - 1
+                    };
+                    // Los divisores (None, None) no son navegables — saltarlos
+                    while flat[idx] == (None, None) {
+                        idx = if forward {
+                            (idx + 1) % len
+                        } else if idx > 0 {
+                            idx - 1
+                        } else {
+                            len - 1
+                        };
+                    }
+                    self.selected_notes_flat_idx = idx;
+                    if let Some(note_idx) = flat[idx].1 {
+                        self.selected_note_idx = note_idx;
+                    }
+                    self.note_preview_scroll = 0;
+                    self.note_preview_focused = false;
+                }
+            }
+            2 => {
+                let proj_journals: Vec<JournalEntry> = self
+                    .all_journals
+                    .iter()
+                    .filter(|j| j.project_id == p_id)
+                    .filter(|j| {
+                        if !self.search_query.is_empty() {
+                            j.content
+                                .to_lowercase()
+                                .contains(&self.search_query.to_lowercase())
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if !proj_journals.is_empty() {
+                    self.selected_journal_idx = if forward {
+                        (self.selected_journal_idx + 1) % proj_journals.len()
+                    } else if self.selected_journal_idx > 0 {
+                        self.selected_journal_idx - 1
+                    } else {
+                        proj_journals.len() - 1
+                    };
+                }
+            }
+            3 => {
+                if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
+                    if !milestones.is_empty() {
+                        self.selected_milestone_idx = if forward {
+                            (self.selected_milestone_idx + 1) % milestones.len()
+                        } else if self.selected_milestone_idx > 0 {
+                            self.selected_milestone_idx - 1
+                        } else {
+                            milestones.len() - 1
+                        };
+                    }
+                }
+            }
+            4 => {
+                let count = crate::services::TreasuryService::new(&self.db)
+                    .entries(p_id, &self.treasury_filter, self.treasury_sort)
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                if count > 0 {
+                    self.selected_treasury_idx = if forward {
+                        (self.selected_treasury_idx + 1) % count
+                    } else if self.selected_treasury_idx > 0 {
+                        self.selected_treasury_idx - 1
+                    } else {
+                        count - 1
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn cycle_quest_stance(&mut self, task: &Task, project_id: Uuid, reverse: bool) -> Result<()> {
         if task.parent_task_id.is_some() {
             self.notifications.push(Notification::info(
@@ -11894,177 +13489,8 @@ impl App {
                     }
                 }
             }
-            KeyCode::Up if self.workspace_sidebar_focused => {
-                self.workspace_tab_idx = match self.workspace_tab_idx {
-                    3 => 2,
-                    0 => 3,
-                    1 => 0,
-                    4 => 1,
-                    _ => 4,
-                };
-                self.note_preview_focused = false;
-            }
-            KeyCode::Down if self.workspace_sidebar_focused => {
-                self.workspace_tab_idx = match self.workspace_tab_idx {
-                    3 => 0,
-                    0 => 1,
-                    1 => 4,
-                    4 => 2,
-                    _ => 3,
-                };
-                self.note_preview_focused = false;
-            }
-            KeyCode::Up if self.note_preview_focused => {
-                self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
-            }
-            KeyCode::Down if self.note_preview_focused => {
-                self.note_preview_scroll = self
-                    .note_preview_scroll
-                    .saturating_add(1)
-                    .min(self.note_preview_max_scroll.get());
-            }
-            KeyCode::Up => match self.workspace_tab_idx {
-                0 => {
-                    if self.quest_board_open {
-                        let statuses = proj_tasks
-                            .iter()
-                            .map(|task| {
-                                self.db
-                                    .get_quest_status(&task.id.to_string(), task.completed)
-                                    .unwrap_or(QuestStatus::Backlog)
-                            })
-                            .collect::<Vec<_>>();
-                        self.selected_task_idx =
-                            move_quest_board_selection(&statuses, self.selected_task_idx, 0, -1);
-                    } else if !proj_tasks.is_empty() {
-                        if self.selected_task_idx > 0 {
-                            self.selected_task_idx -= 1;
-                        } else {
-                            self.selected_task_idx = proj_tasks.len() - 1;
-                        }
-                    }
-                }
-                1 => {
-                    let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    if !flat.is_empty() {
-                        let len = flat.len();
-                        let mut idx = if self.selected_notes_flat_idx > 0 {
-                            self.selected_notes_flat_idx - 1
-                        } else {
-                            len - 1
-                        };
-                        // Los divisores (None, None) no son navegables — saltarlos
-                        while flat[idx] == (None, None) {
-                            idx = if idx > 0 { idx - 1 } else { len - 1 };
-                        }
-                        self.selected_notes_flat_idx = idx;
-                        if let Some(note_idx) = flat[idx].1 {
-                            self.selected_note_idx = note_idx;
-                        }
-                        self.note_preview_scroll = 0;
-                        self.note_preview_focused = false;
-                    }
-                }
-                2 => {
-                    if !proj_journals.is_empty() {
-                        if self.selected_journal_idx > 0 {
-                            self.selected_journal_idx -= 1;
-                        } else {
-                            self.selected_journal_idx = proj_journals.len() - 1;
-                        }
-                    }
-                }
-                3 => {
-                    if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
-                        if !milestones.is_empty() {
-                            self.selected_milestone_idx = if self.selected_milestone_idx > 0 {
-                                self.selected_milestone_idx - 1
-                            } else {
-                                milestones.len() - 1
-                            };
-                        }
-                    }
-                }
-                4 => {
-                    let count = crate::services::TreasuryService::new(&self.db)
-                        .entries(p_id, &self.treasury_filter, self.treasury_sort)
-                        .map(|entries| entries.len())
-                        .unwrap_or(0);
-                    if count > 0 {
-                        self.selected_treasury_idx = if self.selected_treasury_idx > 0 {
-                            self.selected_treasury_idx - 1
-                        } else {
-                            count - 1
-                        };
-                    }
-                }
-                _ => {}
-            },
-            KeyCode::Down => match self.workspace_tab_idx {
-                0 => {
-                    if self.quest_board_open {
-                        let statuses = proj_tasks
-                            .iter()
-                            .map(|task| {
-                                self.db
-                                    .get_quest_status(&task.id.to_string(), task.completed)
-                                    .unwrap_or(QuestStatus::Backlog)
-                            })
-                            .collect::<Vec<_>>();
-                        self.selected_task_idx =
-                            move_quest_board_selection(&statuses, self.selected_task_idx, 0, 1);
-                    } else if !proj_tasks.is_empty() {
-                        if self.selected_task_idx < proj_tasks.len() - 1 {
-                            self.selected_task_idx += 1;
-                        } else {
-                            self.selected_task_idx = 0;
-                        }
-                    }
-                }
-                1 => {
-                    let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    if !flat.is_empty() {
-                        let len = flat.len();
-                        let mut idx = (self.selected_notes_flat_idx + 1) % len;
-                        while flat[idx] == (None, None) {
-                            idx = (idx + 1) % len;
-                        }
-                        self.selected_notes_flat_idx = idx;
-                        if let Some(note_idx) = flat[idx].1 {
-                            self.selected_note_idx = note_idx;
-                        }
-                        self.note_preview_scroll = 0;
-                        self.note_preview_focused = false;
-                    }
-                }
-                2 => {
-                    if !proj_journals.is_empty() {
-                        if self.selected_journal_idx < proj_journals.len() - 1 {
-                            self.selected_journal_idx += 1;
-                        } else {
-                            self.selected_journal_idx = 0;
-                        }
-                    }
-                }
-                3 => {
-                    if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
-                        if !milestones.is_empty() {
-                            self.selected_milestone_idx =
-                                (self.selected_milestone_idx + 1) % milestones.len();
-                        }
-                    }
-                }
-                4 => {
-                    let count = crate::services::TreasuryService::new(&self.db)
-                        .entries(p_id, &self.treasury_filter, self.treasury_sort)
-                        .map(|entries| entries.len())
-                        .unwrap_or(0);
-                    if count > 0 {
-                        self.selected_treasury_idx = (self.selected_treasury_idx + 1) % count;
-                    }
-                }
-                _ => {}
-            },
+            KeyCode::Up => self.cycle_workspace_selection(false),
+            KeyCode::Down => self.cycle_workspace_selection(true),
             KeyCode::Char('g') if self.workspace_tab_idx == 0 => {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = proj_tasks[self.selected_task_idx].clone();
@@ -12601,126 +14027,27 @@ impl App {
                     && !proj_tasks.is_empty()
                     && self.selected_task_idx < proj_tasks.len()
                 {
-                    let t = &proj_tasks[self.selected_task_idx];
-                    if key.code == KeyCode::Enter
-                        && self.quest_board_open
-                        && self.viewing_step_for_task.is_none()
-                        && t.parent_task_id.is_none()
-                    {
-                        self.viewing_step_for_task = Some(t.id);
-                        self.selected_task_idx = 0;
-                    } else {
-                        self.modal_state = edit_task_modal_from_task(t);
-                    }
+                    self.open_or_drill_selected_workspace_task(key.code == KeyCode::Enter)?;
                 } else if self.workspace_tab_idx == 1 {
                     let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    match flat.get(self.selected_notes_flat_idx) {
-                        Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
-                            let n = &proj_notes[*note_idx];
-                            let is_mine = n
-                                .owner_identity
-                                .as_deref()
-                                .map(|oi| oi == self.identity.public_key.as_str())
-                                .unwrap_or(true);
-                            if n.sharing_permission == "read_only" && !is_mine {
-                                self.notifications.push(Notification::warning(
-                                    "This scroll is sealed — you may read but not inscribe."
-                                        .to_string(),
-                                ));
-                                return Ok(());
-                            }
-                            let mut state = EditorState::new(
-                                p_id,
-                                Some(n.id),
-                                n.title.clone(),
-                                n.markdown_content.clone(),
-                            );
-                            state.codex_id = n.codex_id;
-                            self.editor_state = Some(state);
-                            self.active_screen = ActiveScreen::Editor;
-                        }
-                        Some((Some(codex_id), None)) => {
+                    match (key.code, flat.get(self.selected_notes_flat_idx)) {
+                        (KeyCode::Char('e'), Some((Some(codex_id), None))) => {
                             let cid = *codex_id;
-                            if key.code == KeyCode::Char('e') {
-                                let current_name = self
-                                    .codices
-                                    .iter()
-                                    .find(|c| c.id == cid)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_default();
-                                self.modal_state = ModalType::RenameCodex {
-                                    codex_id: cid,
-                                    name: current_name,
-                                };
-                            } else if key.code == KeyCode::Enter {
-                                // Toggle collapse state — persists to DB and syncs via log_change
-                                if let Some(codex) = self.codices.iter_mut().find(|c| c.id == cid) {
-                                    codex.collapsed = !codex.collapsed;
-                                    let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
-                                }
-                                // Clamp selection in case previously visible items are now hidden
-                                let new_flat =
-                                    Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                                if self.selected_notes_flat_idx >= new_flat.len() {
-                                    self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
-                                }
-                            }
+                            let current_name = self
+                                .codices
+                                .iter()
+                                .find(|c| c.id == cid)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            self.modal_state = ModalType::RenameCodex {
+                                codex_id: cid,
+                                name: current_name,
+                            };
                         }
-                        _ => {}
+                        _ => self.open_selected_workspace_scroll()?,
                     }
                 } else if self.workspace_tab_idx == 4 && key.code == KeyCode::Char('e') {
-                    let selected = crate::services::TreasuryService::new(&self.db)
-                        .entries(p_id, &self.treasury_filter, self.treasury_sort)?
-                        .get(self.selected_treasury_idx)
-                        .cloned();
-                    if let Some(entry) = selected {
-                        let (mine, status) =
-                            crate::services::treasury_policy::TreasuryAction::for_entry(
-                                &entry,
-                                &self.identity.public_key,
-                            );
-                        if !self.treasury_allows(
-                            p_id,
-                            crate::services::treasury_policy::TreasuryAction::EditEntry {
-                                mine,
-                                status,
-                            },
-                        ) {
-                            return Ok(());
-                        }
-                        let categories =
-                            crate::services::TreasuryService::new(&self.db).categories(p_id)?;
-                        let amount = crate::services::treasury::format_minor(entry.amount_minor);
-                        self.modal_state = ModalType::TreasuryEntry {
-                            entry_id: Some(entry.id),
-                            title_cursor: entry.title.len(),
-                            title: entry.title.clone(),
-                            amount_cursor: amount.len(),
-                            amount,
-                            entry_type_idx: match entry.entry_type {
-                                crate::models::LedgerEntryType::Income => 0,
-                                crate::models::LedgerEntryType::Expense => 1,
-                                crate::models::LedgerEntryType::Transfer => 2,
-                                crate::models::LedgerEntryType::Adjustment => 3,
-                            },
-                            status_idx: match entry.status {
-                                crate::models::LedgerStatus::Planned => 0,
-                                crate::models::LedgerStatus::Approved => 1,
-                                crate::models::LedgerStatus::Paid => 2,
-                                crate::models::LedgerStatus::Cancelled => 3,
-                            },
-                            category_idx: categories
-                                .iter()
-                                .position(|category| category.id == entry.category_id)
-                                .unwrap_or(0),
-                            date_val: entry
-                                .created_at
-                                .with_timezone(&Local)
-                                .format("%Y-%m-%d")
-                                .to_string(),
-                            focus_idx: 0,
-                        };
-                    }
+                    self.open_selected_treasury_entry()?;
                 }
             }
             // Delete: Slay Note / Task / Codex / Milestone
@@ -21012,6 +22339,35 @@ impl App {
             return Ok(());
         }
 
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.selected_focus_field_idx = if self.selected_focus_field_idx > 0 {
+                    self.selected_focus_field_idx - 1
+                } else {
+                    3
+                };
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.selected_focus_field_idx = (self.selected_focus_field_idx + 1) % 4;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.cycle_selected_focus_field(false),
+            KeyCode::Down | KeyCode::Char('j') => self.cycle_selected_focus_field(true),
+            KeyCode::Enter => {
+                self.start_selected_focus_session()?;
+            }
+            _ => {
+                self.handle_top_screen_key(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cycles whichever Focus field is currently selected (duration/
+    /// Campaign/Quest/Soundscape) by one step, wrapping. `forward` mirrors
+    /// Down/'j' (true) vs Up/'k' (false). Shared by those keyboard arms in
+    /// handle_focus_screen_key and the mouse wheel over the Focus screen,
+    /// so they can't drift apart.
+    fn cycle_selected_focus_field(&mut self, forward: bool) {
         let active_projects: Vec<Project> = self
             .projects
             .iter()
@@ -21032,137 +22388,50 @@ impl App {
                 .collect();
         }
 
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.selected_focus_field_idx = if self.selected_focus_field_idx > 0 {
-                    self.selected_focus_field_idx - 1
+        match self.selected_focus_field_idx {
+            0 => {
+                self.selected_focus_duration_idx = if forward {
+                    (self.selected_focus_duration_idx + 1) % 6
+                } else if self.selected_focus_duration_idx > 0 {
+                    self.selected_focus_duration_idx - 1
                 } else {
-                    3
+                    5
                 };
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.selected_focus_field_idx = (self.selected_focus_field_idx + 1) % 4;
-            }
-            KeyCode::Up | KeyCode::Char('k') => match self.selected_focus_field_idx {
-                0 => {
-                    self.selected_focus_duration_idx = if self.selected_focus_duration_idx > 0 {
-                        self.selected_focus_duration_idx - 1
-                    } else {
-                        5
-                    };
-                }
-                1 => {
-                    let max_proj_idx = active_projects.len();
-                    self.selected_focus_project_idx = if self.selected_focus_project_idx > 0 {
-                        self.selected_focus_project_idx - 1
-                    } else {
-                        max_proj_idx
-                    };
-                    self.selected_focus_task_idx = 0;
-                }
-                2 => {
-                    let max_task_idx = active_tasks.len();
-                    self.selected_focus_task_idx = if self.selected_focus_task_idx > 0 {
-                        self.selected_focus_task_idx - 1
-                    } else {
-                        max_task_idx
-                    };
-                }
-                3 => {
-                    use crate::audio::SOUNDSCAPES;
-                    let total = SOUNDSCAPES.len() + 1;
-                    self.selected_focus_soundscape_idx = if self.selected_focus_soundscape_idx == 0
-                    {
-                        total - 1
-                    } else {
-                        self.selected_focus_soundscape_idx - 1
-                    };
-                }
-                _ => {}
-            },
-            KeyCode::Down | KeyCode::Char('j') => match self.selected_focus_field_idx {
-                0 => {
-                    self.selected_focus_duration_idx = (self.selected_focus_duration_idx + 1) % 6;
-                }
-                1 => {
-                    let max_proj_idx = active_projects.len();
-                    self.selected_focus_project_idx =
-                        (self.selected_focus_project_idx + 1) % (max_proj_idx + 1);
-                    self.selected_focus_task_idx = 0;
-                }
-                2 => {
-                    let max_task_idx = active_tasks.len();
-                    self.selected_focus_task_idx =
-                        (self.selected_focus_task_idx + 1) % (max_task_idx + 1);
-                }
-                3 => {
-                    use crate::audio::SOUNDSCAPES;
-                    self.selected_focus_soundscape_idx =
-                        (self.selected_focus_soundscape_idx + 1) % (SOUNDSCAPES.len() + 1);
-                }
-                _ => {}
-            },
-            KeyCode::Enter => {
-                let duration_mins = match self.selected_focus_duration_idx {
-                    0 => 15,
-                    1 => 25,
-                    2 => 45,
-                    3 => 60,
-                    4 => 90,
-                    5 => -1,
-                    _ => 25,
-                };
-
-                if duration_mins == -1 {
-                    self.modal_state = ModalType::CustomFocusDuration {
-                        input: String::new(),
-                    };
+            1 => {
+                let max_proj_idx = active_projects.len();
+                self.selected_focus_project_idx = if forward {
+                    (self.selected_focus_project_idx + 1) % (max_proj_idx + 1)
+                } else if self.selected_focus_project_idx > 0 {
+                    self.selected_focus_project_idx - 1
                 } else {
-                    let project_id = if self.selected_focus_project_idx > 0
-                        && self.selected_focus_project_idx <= active_projects.len()
-                    {
-                        Some(active_projects[self.selected_focus_project_idx - 1].id)
-                    } else {
-                        None
-                    };
-
-                    let task_id = if self.selected_focus_task_idx > 0
-                        && self.selected_focus_task_idx <= active_tasks.len()
-                    {
-                        Some(active_tasks[self.selected_focus_task_idx - 1].id)
-                    } else {
-                        None
-                    };
-
-                    // If Local Folder is selected but no folder is configured, prompt first
-                    use crate::audio::SOUNDSCAPES;
-                    let is_local_folder = self.selected_focus_soundscape_idx > 0
-                        && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name
-                            == "Local Folder";
-                    if is_local_folder {
-                        let folder = self
-                            .db
-                            .get_setting("local_music_folder")
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                        if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder {
-                                input: String::new(),
-                                suggestions: vec![],
-                                selected: 0,
-                            };
-                            return Ok(());
-                        }
-                    }
-
-                    self.start_focus_session(duration_mins, project_id, task_id)?;
-                }
+                    max_proj_idx
+                };
+                self.selected_focus_task_idx = 0;
             }
-            _ => {
-                self.handle_top_screen_key(key)?;
+            2 => {
+                let max_task_idx = active_tasks.len();
+                self.selected_focus_task_idx = if forward {
+                    (self.selected_focus_task_idx + 1) % (max_task_idx + 1)
+                } else if self.selected_focus_task_idx > 0 {
+                    self.selected_focus_task_idx - 1
+                } else {
+                    max_task_idx
+                };
             }
+            3 => {
+                use crate::audio::SOUNDSCAPES;
+                let total = SOUNDSCAPES.len() + 1;
+                self.selected_focus_soundscape_idx = if forward {
+                    (self.selected_focus_soundscape_idx + 1) % total
+                } else if self.selected_focus_soundscape_idx == 0 {
+                    total - 1
+                } else {
+                    self.selected_focus_soundscape_idx - 1
+                };
+            }
+            _ => {}
         }
-        Ok(())
     }
 
     pub fn check_traits(&mut self) -> Result<()> {
@@ -22293,6 +23562,14 @@ mod app_tests {
             modifiers,
         })
         .unwrap();
+    }
+
+    /// Two `left_click`s at the same cell in immediate succession — well
+    /// under `register_click_run`'s 400ms window since both calls run
+    /// synchronously — so the second one registers as a double-click.
+    fn double_click(app: &mut App, col: u16, row: u16, modifiers: KeyModifiers) {
+        left_click(app, col, row, modifiers);
+        left_click(app, col, row, modifiers);
     }
 
     #[test]
@@ -25184,6 +26461,204 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
     }
 
+    /// Same fixture as `kanban_enter_opens_selected_quest_steps`, but driven
+    /// through a mouse double-click on the Kanban card instead of Enter.
+    #[test]
+    fn workspace_kanban_double_click_drills_into_a_parent_tasks_steps() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceKanbanHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_kanban_double_click_drill.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Shared Steps".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Owner",
+                "Owner",
+            )
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &"bb".repeat(32),
+                "Bram",
+                "Companion",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(Uuid::new_v4(), "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+
+        let empty_col = || WorkspaceRowList {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceRowList {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![Some(0)],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                ],
+            }),
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.viewing_step_for_task, Some(parent_id));
+        assert!(app.quest_board_open);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Same fixture, but `quest_board_open` is false so the list view (not
+    /// Kanban) is active and both the parent and its step are visible rows —
+    /// double-clicking the step (index 1) must open its edit modal, never
+    /// drill (steps have no children to drill into).
+    #[test]
+    fn workspace_tasks_double_click_opens_edit_modal_for_a_leaf_task() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_tasks_double_click_leaf.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Shared Steps".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Owner",
+                "Owner",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = false;
+        // The list view interleaves each parent with its open steps right
+        // after it — index 0 is the parent, index 1 is its step.
+        app.selected_task_idx = 1;
+
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(1)],
+            }),
+            kanban: None,
+        });
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == step_id
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
     #[test]
     fn chronicles_use_n_while_j_remains_down_navigation() {
         let db_file = Path::new("test_questline_chronicle_shortcut.db");
@@ -25329,6 +26804,10 @@ mod app_tests {
     }
 
     fn scroll_mouse(app: &mut App, down: bool) {
+        scroll_mouse_at(app, 0, 0, down);
+    }
+
+    fn scroll_mouse_at(app: &mut App, col: u16, row: u16, down: bool) {
         use crossterm::event::{MouseEvent, MouseEventKind};
         app.handle_mouse_event(MouseEvent {
             kind: if down {
@@ -25336,8 +26815,8 @@ mod app_tests {
             } else {
                 MouseEventKind::ScrollUp
             },
-            column: 0,
-            row: 0,
+            column: col,
+            row,
             modifiers: KeyModifiers::empty(),
         })
         .unwrap();
@@ -25359,6 +26838,82 @@ mod app_tests {
         // must not move the selection.
         left_click(&mut app, 2, 4, KeyModifiers::empty());
         assert_eq!(app.selected_archive_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn archive_double_click_restores_the_selected_campaign() {
+        let db_file = Path::new("test_questline_mouse_archive_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Old Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: true,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 1,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let restored = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .expect("project should still exist");
+        assert!(!restored.archived, "double-click should restore, same as 'r'");
+        assert!(!restored.completed);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn archive_scroll_wheel_wraps_the_selection() {
+        let db_file = Path::new("test_questline_mouse_archive_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        let now = Utc::now();
+        app.projects = (0..3)
+            .map(|i| Project {
+                id: Uuid::new_v4(),
+                name: format!("Old Campaign {i}"),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: true,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .collect();
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 3,
+        });
+
+        scroll_mouse(&mut app, true); // down
+        assert_eq!(app.selected_archive_idx, 1);
+
+        scroll_mouse(&mut app, false); // up, back to 0
+        assert_eq!(app.selected_archive_idx, 0);
+
+        scroll_mouse(&mut app, false); // up, wraps to the last item
+        assert_eq!(app.selected_archive_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25427,6 +26982,33 @@ mod app_tests {
     }
 
     #[test]
+    fn onboarding_double_click_on_a_class_finishes_onboarding() {
+        let db_file = Path::new("test_questline_mouse_onboarding_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Onboarding);
+        let class_count = app.onboarding_classes.len();
+        assert!(class_count > 2, "fixture needs at least 3 classes");
+        app.onboarding_username = "Tester".to_string();
+        app.hit_regions.onboarding = Some(crate::screens::hit_test::OnboardingHitRegions {
+            name_input: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            class_list: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 5 },
+            class_count,
+        });
+        assert!(app.user.is_none());
+
+        double_click(&mut app, 2, 6, KeyModifiers::empty()); // class row index 1
+
+        assert_eq!(app.onboarding_class_idx, 1);
+        let user = app
+            .user
+            .as_ref()
+            .expect("double-click should finish onboarding, same as Enter");
+        assert_eq!(user.username, "Tester");
+        assert_eq!(user.class, app.onboarding_classes[1]);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn legends_click_selects_relic_but_ignores_clicks_past_item_count() {
         let db_file = Path::new("test_questline_mouse_legends.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Legends);
@@ -25459,6 +27041,68 @@ mod app_tests {
 
         left_click(&mut app, 22, 1, KeyModifiers::empty()); // inside cards[2]
         assert_eq!(app.selected_focus_field_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_double_click_starts_a_session_with_the_selected_duration() {
+        let db_file = Path::new("test_questline_mouse_focus_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+        assert!(app.active_focus_session.is_none());
+
+        // Default duration index 0 -> 15 minutes; no Campaign/Quest/Soundscape
+        // selected, so this starts an untethered 15-minute session.
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+
+        let session = app
+            .active_focus_session
+            .as_ref()
+            .expect("double-click should start a session, same as Enter");
+        assert_eq!(session.duration_mins, 15);
+        assert_eq!(app.active_screen, ActiveScreen::Focus);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_scroll_wheel_cycles_the_currently_selected_fields_value() {
+        let db_file = Path::new("test_questline_mouse_focus_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+        assert_eq!(app.selected_focus_field_idx, 0); // duration card, by default
+        assert_eq!(app.selected_focus_duration_idx, 0);
+
+        scroll_mouse(&mut app, true); // down
+        assert_eq!(app.selected_focus_duration_idx, 1);
+
+        scroll_mouse(&mut app, false); // up, back to 0
+        assert_eq!(app.selected_focus_duration_idx, 0);
+
+        scroll_mouse(&mut app, false); // up, wraps to the last duration choice
+        assert_eq!(app.selected_focus_duration_idx, 5);
+
+        // Switching cards changes which field the wheel cycles.
+        left_click(&mut app, 32, 1, KeyModifiers::empty()); // soundscape card
+        assert_eq!(app.selected_focus_field_idx, 3);
+        scroll_mouse(&mut app, true);
+        assert_eq!(app.selected_focus_soundscape_idx, 1);
+        assert_eq!(app.selected_focus_duration_idx, 5); // untouched
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25501,6 +27145,70 @@ mod app_tests {
     }
 
     #[test]
+    fn projects_double_click_opens_the_selected_campaign_into_its_war_room() {
+        use crate::screens::hit_test::{ProjectsHitRegions, ProjectsRowTarget};
+
+        let db_file = Path::new("test_questline_mouse_projects_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![Some(ProjectsRowTarget::All), Some(ProjectsRowTarget::Project(0))],
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // single click — select only
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+        assert_eq!(app.active_project_id, Some(project_id));
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn projects_scroll_wheel_wraps_through_the_all_entry() {
+        use crate::screens::hit_test::ProjectsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_projects_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.projects_all_selected = true;
+        // The scroll arm doesn't hit-test position, but the handler still
+        // bails out entirely if no frame has ever rendered hit_regions yet.
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![],
+        });
+
+        scroll_mouse(&mut app, true); // down, from "All" into the first project
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        scroll_mouse(&mut app, false); // up, back to "All"
+        assert!(app.projects_all_selected);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn dashboard_click_maps_through_visible_start_and_skips_separators() {
         use crate::screens::hit_test::DashboardHitRegions;
 
@@ -25523,6 +27231,68 @@ mod app_tests {
         left_click(&mut app, 2, 2, KeyModifiers::empty()); // logical row 4 — QuickWin
         assert!(app.dashboard_task_focus);
         assert_eq!(app.selected_dashboard_task_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn dashboard_double_click_opens_the_selected_task_edit_modal() {
+        use crate::screens::hit_test::DashboardHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_dashboard_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        // No due date and no open steps — the only parent task on the board,
+        // so it's guaranteed to land as the Main Quest (dashboard_command_targets()
+        // index 0), whatever the exact scoring rules do with it.
+        let task = Task {
+            id: task_id,
+            project_id: Some(project_id),
+            title: "Forge the sword".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        app.db.insert_task(&task).unwrap();
+        app.projects = vec![project];
+
+        app.hit_regions.dashboard = Some(DashboardHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            row_targets: vec![Some(0)],
+            visible_start: 0,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == task_id
+        ));
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25562,6 +27332,32 @@ mod app_tests {
     }
 
     #[test]
+    fn soundscapes_double_click_plays_the_selected_source() {
+        use crate::screens::hit_test::SoundscapesHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_soundscapes_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Soundscapes);
+        app.hit_regions.soundscapes = Some(SoundscapesHitRegions {
+            source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
+            item_count: 4,
+            local_tracks: None,
+        });
+
+        // Each source row is 4 lines tall — row 4 is source index 1
+        // ("Music For Programming" — a plain source, not Media Player or
+        // Local Folder's special-cased entries).
+        double_click(&mut app, 2, 4, KeyModifiers::empty());
+
+        assert_eq!(app.selected_soundscape_idx, 1);
+        assert_eq!(
+            app.db.get_setting("last_music_source").unwrap(),
+            Some("Music For Programming".to_string())
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn library_click_moves_column_focus_and_maps_item_row_through_scroll_start() {
         use crate::screens::hit_test::LibraryHitRegions;
 
@@ -25586,6 +27382,51 @@ mod app_tests {
 
         left_click(&mut app, 42, 2, KeyModifiers::empty()); // detail panel — focus only
         assert_eq!(app.library_active_col, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn library_double_click_starts_the_selected_available_class_quest() {
+        use crate::screens::hit_test::LibraryHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_library_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Library);
+        app.user = Some(User {
+            id: Uuid::new_v4(),
+            username: "Tester".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: Utc::now(),
+            specialization: None,
+        });
+        app.db
+            .conn
+            .execute(
+                "INSERT INTO class_quests (class_name, unlock_level, quest_name, description, status, progress, target, lore_reward) VALUES (?1, ?2, ?3, ?4, 'Available', 0, ?5, ?6)",
+                params!["Code Warlock", 1, "First Compile", "desc", 10, "Lore"],
+            )
+            .unwrap();
+        // Category 0 (Class Quests) is the only one handle_library_action
+        // acts on — everything else it silently no-ops for.
+        app.selected_library_cat_idx = 0;
+        app.hit_regions.library = Some(LibraryHitRegions {
+            cat_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 6 },
+            cat_count: 6,
+            item_list: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 4 },
+            item_start_idx: 0,
+            item_count: 1,
+            detail_panel: ratatui::layout::Rect { x: 40, y: 0, width: 15, height: 10 },
+        });
+
+        double_click(&mut app, 22, 0, KeyModifiers::empty());
+
+        let quests = app.db.get_class_quests("Code Warlock").unwrap();
+        assert_eq!(
+            quests[0].4, "Active",
+            "double-click should start the Available quest, same as Space"
+        );
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25618,6 +27459,76 @@ mod app_tests {
         // A click on the trailing decorative lines (row 10, past oath_row_count) is a no-op.
         left_click(&mut app, 2, 20, KeyModifiers::empty());
         assert_eq!(app.selected_settings_focus_idx, 15);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_double_click_on_an_alerts_row_activates_its_toggle() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        let was_enabled = app.task_notifications_enabled;
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        // Alerts row 1 -> focus_idx 2 -> Task Notifications toggle.
+        double_click(&mut app, 22, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_settings_focus_idx, 2);
+        assert_eq!(
+            app.task_notifications_enabled, !was_enabled,
+            "double-click should toggle it, same as Enter"
+        );
+
+        // A single click at a different row resets the click-run tracker —
+        // still select-only, proving the double-click check is per-cell.
+        left_click(&mut app, 22, 0, KeyModifiers::empty()); // alerts row 0 -> focus_idx 1
+        assert_eq!(app.selected_settings_focus_idx, 1);
+        assert_eq!(app.task_notifications_enabled, !was_enabled); // unchanged by a single click
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_scroll_wheel_cycles_theme_and_wraps_within_the_alerts_block() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        let theme_count = crate::theme::Theme::all_choices().len();
+        assert!(theme_count > 1, "fixture needs multiple themes");
+        // The scroll arm doesn't hit-test position, but the handler still
+        // bails out entirely if no frame has ever rendered hit_regions yet.
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        scroll_mouse(&mut app, true); // down, theme idx 0 -> 1
+        assert_eq!(app.selected_settings_theme_idx, 1);
+
+        scroll_mouse(&mut app, false); // up, back to 0
+        assert_eq!(app.selected_settings_theme_idx, 0);
+
+        // Up/Down only cycles within the current block — moving into the
+        // Alerts block itself is Tab's job, not the wheel's.
+        app.selected_settings_focus_idx = 5; // last row of the Alerts block
+        scroll_mouse(&mut app, true); // down, wraps 5 -> 1
+        assert_eq!(app.selected_settings_focus_idx, 1);
+
+        scroll_mouse(&mut app, false); // up, back to 5
+        assert_eq!(app.selected_settings_focus_idx, 5);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25655,6 +27566,79 @@ mod app_tests {
     }
 
     #[test]
+    fn character_double_click_on_reflection_jumps_focus_to_detail() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 3,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        double_click(&mut app, 52, 2, KeyModifiers::empty());
+        assert_eq!(app.character_focus, 2); // jumps straight to detail, same as an extra Tab
+        assert_eq!(app.selected_reflection_idx, 2);
+
+        // A single click at a different row resets the click-run tracker —
+        // still select-only, proving the double-click check is per-cell.
+        left_click(&mut app, 52, 1, KeyModifiers::empty());
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn character_scroll_wheel_targets_whichever_pane_the_cursor_is_over() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        app.db.add_chronicle_entry(1, "Entry one").unwrap();
+        app.db.add_chronicle_entry(2, "Entry two").unwrap();
+        app.db
+            .insert_reflection(&crate::models::DailyReflection {
+                created_date: chrono::Local::now().date_naive(),
+                what_went_well: "Shipped a feature".to_string(),
+                what_can_improve: "Sleep more".to_string(),
+            })
+            .unwrap();
+        app.db
+            .insert_reflection(&crate::models::DailyReflection {
+                created_date: chrono::Local::now().date_naive() - chrono::Duration::days(1),
+                what_went_well: "Fixed a bug".to_string(),
+                what_can_improve: "Write tests first".to_string(),
+            })
+            .unwrap();
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![0, 1],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 2,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        // Scrolling over the adventure log moves focus there and cycles it,
+        // regardless of which pane was previously focused.
+        app.character_focus = 1;
+        scroll_mouse_at(&mut app, 2, 2, true); // over the adventure log
+        assert_eq!(app.character_focus, 0);
+        assert_eq!(app.selected_chronicle_idx, 1);
+
+        // Scrolling over the reflections list moves focus there instead.
+        scroll_mouse_at(&mut app, 52, 2, true);
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 1);
+        assert_eq!(app.reflection_detail_scroll, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn sync_click_activates_the_same_as_its_keybinding() {
         use crate::screens::hit_test::SyncHitRegions;
 
@@ -25673,6 +27657,35 @@ mod app_tests {
 
         left_click(&mut app, 2, 5, KeyModifiers::empty()); // cloud sync row
         assert_eq!(app.config.sync_enabled, !was_sync_enabled);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn sync_double_click_toggles_are_unchanged_from_single_click() {
+        use crate::screens::hit_test::SyncHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_sync_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::SyncSettings);
+        let was_sync_enabled = app.config.sync_enabled;
+        app.hit_regions.sync = Some(SyncHitRegions {
+            sync_now: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 1 },
+            cloud_sync_toggle: ratatui::layout::Rect { x: 0, y: 5, width: 30, height: 1 },
+            auto_sync_toggle: ratatui::layout::Rect { x: 0, y: 6, width: 30, height: 1 },
+        });
+
+        // Sync's rows activate immediately on every Down(Left), independent
+        // of any click-run tracking — unlike the other 4 screens, there's no
+        // "select, then open on the second click" here. This documents that
+        // double-clicking the Cloud Sync toggle flips it twice (on, then
+        // back off) rather than being treated specially — deliberate, per
+        // handle_sync_mouse's own comment on why immediate activation is
+        // fine for this screen.
+        left_click(&mut app, 2, 5, KeyModifiers::empty());
+        assert_eq!(app.config.sync_enabled, !was_sync_enabled);
+
+        left_click(&mut app, 2, 5, KeyModifiers::empty());
+        assert_eq!(app.config.sync_enabled, was_sync_enabled);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25732,6 +27745,116 @@ mod app_tests {
     }
 
     #[test]
+    fn fellowship_left_list_scroll_wheel_is_tab_independent() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_left_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        let now = Utc::now();
+        app.projects = (0..2)
+            .map(|i| Project {
+                id: Uuid::new_v4(),
+                name: format!("Shared Campaign {i}"),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: true,
+            })
+            .collect();
+        app.selected_fellowship_tab = 1; // Invites — has its own sub-list
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: Some(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 2,
+            }),
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 12 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 0,
+            })),
+        });
+
+        scroll_mouse_at(&mut app, 2, 0, true); // over the left Campaign list
+
+        assert_eq!(
+            app.selected_fellowship_project_idx, 1,
+            "scroll over the left list should move the Campaign list, not Invites"
+        );
+        assert_eq!(app.selected_invitation_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_chat_scroll_wheel_enters_and_leaves_browsing() {
+        use crate::screens::hit_test::{FellowshipChatHitRegions, FellowshipHitRegions, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_chat_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Shared Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_chronicle_message(
+                &project.id.to_string(),
+                &app.identity.public_key,
+                "Me",
+                "Hello",
+                "text",
+            )
+            .unwrap();
+        app.db
+            .add_chronicle_message(
+                &project.id.to_string(),
+                &app.identity.public_key,
+                "Me",
+                "World",
+                "text",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        app.selected_fellowship_tab = 0;
+        app.fellowship_selected_msg_idx = usize::MAX; // not browsing
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Chat(FellowshipChatHitRegions {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+                scroll: 0,
+                msg_start_lines: vec![0, 1],
+                message_count: 2,
+            })),
+        });
+
+        scroll_mouse_at(&mut app, 2, 2, false); // up, enters browsing at the last message
+        assert_eq!(app.fellowship_selected_msg_idx, 1);
+
+        scroll_mouse_at(&mut app, 2, 2, true); // down, past the last message -> exits browsing
+        assert_eq!(app.fellowship_selected_msg_idx, usize::MAX);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn fellowship_uniform_sub_list_click_selects_row_for_the_active_tab() {
         use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
 
@@ -25754,6 +27877,137 @@ mod app_tests {
 
         left_click(&mut app, 2, 1, KeyModifiers::empty()); // inside the header rows — no-op
         assert_eq!(app.selected_fellowship_member_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_invites_double_click_on_a_non_pending_invitation_is_a_no_op() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_invite_non_pending.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.config.sync_enabled = true;
+        app.db
+            .create_invitation(
+                &Uuid::new_v4().to_string(),
+                "Some Campaign",
+                &"aa".repeat(32),
+                "Aria",
+                &app.identity.public_key,
+                "Companion",
+            )
+            .unwrap();
+        let invite_id = app.db.get_invitations().unwrap()[0].0.clone();
+        app.db
+            .conn
+            .execute(
+                "UPDATE invitations SET status = 'Accepted' WHERE id = ?1",
+                params![invite_id],
+            )
+            .unwrap();
+        app.selected_fellowship_tab = 1; // Invites
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 1,
+            })),
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.selected_invitation_idx, 0); // selection still happens
+        let status_after = app
+            .db
+            .get_invitations()
+            .unwrap()
+            .into_iter()
+            .find(|invite| invite.0 == invite_id)
+            .map(|invite| invite.7)
+            .unwrap();
+        assert_eq!(status_after, "Accepted"); // untouched — no accept, no network call
+        assert_eq!(app.modal_state, ModalType::None);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_invites_double_click_requires_cloud_sync_first() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_invite_no_sync.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.config.sync_enabled = false;
+        app.db
+            .create_invitation(
+                &Uuid::new_v4().to_string(),
+                "Some Campaign",
+                &"aa".repeat(32),
+                "Aria",
+                &app.identity.public_key,
+                "Companion",
+            )
+            .unwrap();
+        let invite_id = app.db.get_invitations().unwrap()[0].0.clone();
+        app.selected_fellowship_tab = 1; // Invites
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 1,
+            })),
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let status_after = app
+            .db
+            .get_invitations()
+            .unwrap()
+            .into_iter()
+            .find(|invite| invite.0 == invite_id)
+            .map(|invite| invite.7)
+            .unwrap();
+        assert_eq!(status_after, "Pending"); // never reached the network call
+        assert!(
+            last_warning(&app).contains("Enable Cloud Sync"),
+            "expected the Cloud Sync guard warning, got {:?}",
+            last_warning(&app)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_companions_double_click_is_a_no_op_beyond_select() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_companions_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 2; // Companions — no keyboard "open" action exists
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 3,
+                row_height: 4,
+                count: 2,
+            })),
+        });
+
+        double_click(&mut app, 2, 8, KeyModifiers::empty()); // offset(3) + 1*4 = 7..10 -> idx 1
+
+        assert_eq!(app.selected_fellowship_member_idx, 1); // still just selected
+        assert_eq!(app.modal_state, ModalType::None);
+        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -25914,6 +28168,38 @@ mod app_tests {
     }
 
     #[test]
+    fn workspace_treasury_double_click_opens_the_entry_modal() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_treasury_double_click.db");
+        // Owners govern the Treasury and may edit any entry, including one
+        // `treasury_role_app` seeded as recorded by someone else.
+        let (mut app, _project_id, entry_id) = treasury_role_app(db_file, "Owner");
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 5 },
+                row_targets: vec![Some(0)],
+            }),
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::TreasuryEntry { entry_id: Some(id), .. } if id == entry_id
+        ));
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn workspace_journal_click_selects_across_variable_height_entries() {
         use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
 
@@ -25985,6 +28271,113 @@ mod app_tests {
     }
 
     #[test]
+    fn workspace_notes_double_click_opens_the_editor() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_double_click_open.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.workspace_tab_idx = 1;
+        app.active_project_id = Some(project_id);
+        app.codices = vec![];
+        app.all_notes = vec![Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "My Note".to_string(),
+            markdown_content: "some content".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "private".to_string(),
+            codex_id: None,
+            owner_identity: Some(app.identity.public_key.clone()),
+        }];
+        // build_notes_flat puts a lone codex-less note behind an "Unassigned"
+        // divider row (flat index 0) — the note itself lands at flat index 1.
+        app.selected_notes_flat_idx = 1;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(1)],
+                },
+                preview: None,
+            }),
+            tasks: None,
+            kanban: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert_eq!(
+            app.editor_state.as_ref().unwrap().note_id,
+            Some(note_id)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_double_click_on_a_sealed_note_shows_a_warning_instead() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_double_click_sealed.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.workspace_tab_idx = 1;
+        app.active_project_id = Some(project_id);
+        app.codices = vec![];
+        app.all_notes = vec![Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "Someone Else's Note".to_string(),
+            markdown_content: "some content".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "read_only".to_string(),
+            codex_id: None,
+            owner_identity: Some("someone-else".to_string()),
+        }];
+        app.selected_notes_flat_idx = 1; // same "Unassigned" layout as above
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(1)],
+                },
+                preview: None,
+            }),
+            tasks: None,
+            kanban: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.active_screen, ActiveScreen::Workspace); // never opened
+        assert!(
+            last_warning(&app).contains("sealed"),
+            "expected the sealed-note warning, got {:?}",
+            last_warning(&app)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn workspace_kanban_click_selects_a_card_in_any_column() {
         use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceKanbanHitRegions, WorkspaceRowList};
 
@@ -26030,6 +28423,397 @@ mod app_tests {
 
         left_click(&mut app, 22, 0, KeyModifiers::empty()); // Review column, row 0
         assert_eq!(app.selected_task_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_sidebar_scroll_wheel_cycles_tabs_via_the_permutation() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace_sidebar_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 3; // Milestones — first in the sidebar order
+        app.workspace_sidebar_focused = false;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+        });
+
+        scroll_mouse_at(&mut app, 2, 0, true); // down: 3 -> 0
+        assert!(app.workspace_sidebar_focused);
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        scroll_mouse_at(&mut app, 2, 0, true); // down: 0 -> 1
+        assert_eq!(app.workspace_tab_idx, 1);
+
+        scroll_mouse_at(&mut app, 2, 0, false); // up: 1 -> 0
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_preview_scroll_wheel_is_clamped_both_ends() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_preview_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.workspace_sidebar_focused = false;
+        app.note_preview_max_scroll.set(2);
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+            }),
+            tasks: None,
+            kanban: None,
+        });
+
+        scroll_mouse_at(&mut app, 32, 1, false); // up at scroll 0 — stays at 0
+        assert_eq!(app.note_preview_scroll, 0);
+        assert!(app.note_preview_focused);
+
+        scroll_mouse_at(&mut app, 32, 1, true);
+        assert_eq!(app.note_preview_scroll, 1);
+        scroll_mouse_at(&mut app, 32, 1, true);
+        assert_eq!(app.note_preview_scroll, 2);
+        scroll_mouse_at(&mut app, 32, 1, true); // down past max — stays clamped at 2
+        assert_eq!(app.note_preview_scroll, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Modal mouse support ──────────────────────────────────────────────
+    //
+    // compute_modal_hit_regions() recomputes each modal's popup/list Rects
+    // fresh, rather than being stashed from a render pass — these tests
+    // call it directly to derive real click coordinates, so they exercise
+    // the actual layout math (percentage rounding included) instead of
+    // hand-guessing pixel positions.
+
+    #[test]
+    fn modal_click_outside_a_confirm_dialog_cancels_it() {
+        let db_file = Path::new("test_questline_modal_confirm_cancel.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::QuitConfirm {
+            quote: "Onward.".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        assert!(regions.popup_area.y > 0, "popup should be inset from the top edge");
+
+        // The very top-left corner is always outside a centered popup.
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        assert!(!app.should_quit, "cancel must not also quit");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_a_confirm_dialog_confirms_it() {
+        let db_file = Path::new("test_questline_modal_confirm_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Doomed Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        // Persisted, not just set in memory — the archive flow's own
+        // grow_tree() call reloads self.user straight from the db, which
+        // would otherwise clobber an in-memory-only user back to None.
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Tester".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: now,
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Doomed Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let archived = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(archived.archived, "click inside should confirm, same as 'y'");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_outside_a_form_replicates_its_save_on_esc_side_effect() {
+        // NewProject's Esc arm doesn't just discard the draft — it saves
+        // it. Clicking outside must replicate that faithfully rather than
+        // silently dropping the in-progress Campaign name.
+        let db_file = Path::new("test_questline_modal_form_click_outside.db");
+        // NewProject/EditProject are only reachable via handle_project_modal_key,
+        // gated on active_screen == Projects — matches how this modal can
+        // only ever be opened from the Projects screen in the real app.
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "Half-written Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        // save_project_modal only inserts into the db — app.projects itself
+        // isn't refreshed until the next reload_data(), same as pressing
+        // Esc for real, so check the persisted source of truth.
+        assert!(
+            app.db
+                .get_projects()
+                .unwrap()
+                .iter()
+                .any(|p| p.name == "Half-written Campaign"),
+            "click outside should save the draft, same as Esc"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_row_selects_it_in_a_simple_list_modal() {
+        let db_file = Path::new("test_questline_modal_list_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::ThemeSelect {
+            choices: vec!["Forest".to_string(), "Ocean".to_string(), "Mountain".to_string()],
+            selected_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let list_area = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows { area, .. } => area,
+            _ => panic!("ThemeSelect should be a Rows list"),
+        };
+
+        left_click(&mut app, list_area.x, list_area.y + 2, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ThemeSelect { selected_idx, .. } => assert_eq!(*selected_idx, 2),
+            other => panic!("expected ThemeSelect, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_tier_box_selects_it_in_milestone_tier_select() {
+        let db_file = Path::new("test_questline_modal_tier_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        app.modal_state = ModalType::MilestoneTierSelect {
+            project_id,
+            selected_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let items = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Items(items) => items,
+            _ => panic!("MilestoneTierSelect should be an Items list"),
+        };
+        assert_eq!(items.len(), 3);
+        let tier2 = items[2];
+
+        left_click(&mut app, tier2.x, tier2.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::MilestoneTierSelect { selected_idx, .. } => assert_eq!(*selected_idx, 2),
+            other => panic!("expected MilestoneTierSelect, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_span_selects_it_in_share_note() {
+        let db_file = Path::new("test_questline_modal_share_note_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let note_id = Uuid::new_v4();
+        app.modal_state = ModalType::ShareNote {
+            note_id,
+            permission_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let items = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Items(items) => items,
+            _ => panic!("ShareNote should be an Items list"),
+        };
+        assert_eq!(items.len(), 3);
+        let editable_span = items[1];
+
+        left_click(&mut app, editable_span.x, editable_span.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ShareNote { permission_idx, .. } => assert_eq!(*permission_idx, 1),
+            other => panic!("expected ShareNote, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_a_running_progress_modal_does_nothing() {
+        let db_file = Path::new("test_questline_modal_progress_running.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::CloudBackupProgress {
+            step: 0,
+            message: "Exporting...".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        assert!(regions.confirm_key.is_none(), "still running — nothing should confirm it yet");
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        assert!(
+            matches!(app.modal_state, ModalType::CloudBackupProgress { .. }),
+            "a running progress modal must not be dismissible by clicking it"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_a_finished_progress_modal_dismisses_it() {
+        let db_file = Path::new("test_questline_modal_progress_finished.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::CloudBackupProgress {
+            step: 2,
+            message: "Done.".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_an_overscrolled_refile_list_is_a_safe_no_op() {
+        // RefileTask uses ListState's auto-scroll, which this feature can't
+        // safely reconstruct once the list no longer fits on screen —
+        // clicking should do nothing rather than risk selecting the wrong
+        // target, instead of guessing.
+        let db_file = Path::new("test_questline_modal_refile_overscrolled.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Big Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let task_id = Uuid::new_v4();
+        let make_task = |id: Uuid, title: &str, parent: Option<Uuid>| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: parent,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let root = make_task(task_id, "Root Quest", None);
+        // Enough sibling top-level tasks that the refile-target list can't
+        // possibly fit in the terminal's 40 rows.
+        let mut all = vec![root];
+        for i in 0..60 {
+            all.push(make_task(Uuid::new_v4(), &format!("Sibling {i}"), None));
+        }
+        app.all_tasks = all;
+        app.modal_state = ModalType::RefileTask {
+            task_id,
+            selected_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        assert!(regions.list.is_none(), "an overscrolled list should fall back to outside-only");
+
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::RefileTask { selected_idx, .. } => {
+                assert_eq!(*selected_idx, 0, "an inside click on an overscrolled list must not move selection")
+            }
+            other => panic!("expected RefileTask to remain open, got {other:?}"),
+        }
 
         let _ = std::fs::remove_file(db_file);
     }
