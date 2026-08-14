@@ -27,6 +27,7 @@ pub struct HitRegions {
     pub character: Option<CharacterHitRegions>,
     pub sync: Option<SyncHitRegions>,
     pub fellowship: Option<FellowshipHitRegions>,
+    pub workspace: Option<WorkspaceHitRegions>,
 }
 
 /// The regions `screens::editor::draw`/`draw_in_area` rendered on the last frame.
@@ -313,6 +314,21 @@ pub struct FellowshipChatHitRegions {
 pub enum FellowshipSubList {
     Uniform(FellowshipRowList),
     Chat(FellowshipChatHitRegions),
+}
+
+/// `screens::project_workspace::draw` — only the 5-item sidebar (Overview /
+/// Tasks / Scrolls / Treasury / Chronicle) gets a hit region for now; each
+/// of its 5 tabs is effectively its own sub-screen with independent list
+/// rendering (subtask trees, tables, a note-preview split, ...) and is its
+/// own follow-up. The sidebar is a plain `List`, single-line rows, no
+/// scroll — same shape as Archive/Gateway — except its *display* order
+/// (Overview, Tasks, Scrolls, Treasury, Chronicle) isn't `workspace_tab_idx`
+/// order, so `sidebar_tab_order[row]` is the real tab index for that row.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceHitRegions {
+    /// Inner sidebar list area — borders already excluded.
+    pub sidebar: Rect,
+    pub sidebar_tab_order: [usize; 5],
 }
 
 impl HitRegions {

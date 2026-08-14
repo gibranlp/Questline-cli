@@ -1024,11 +1024,8 @@ async fn main() -> Result<()> {
                     }
                 }
                 ActiveScreen::Workspace => {
-                    screens::project_workspace::draw(
-                        f,
-                        &app,
-                        &theme,
-                    );
+                    let regions = screens::project_workspace::draw(f, &app, &theme);
+                    app.hit_regions.workspace = Some(regions);
                 }
 
                 _ => {
