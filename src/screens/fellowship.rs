@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::app::{App, ModalType, extract_url};
+use crate::screens::hit_test::FellowshipHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -61,7 +62,7 @@ pub(crate) fn notice_belongs_in_fellowship(app: &App, kind: &str, target_id: &Op
 
 // La función principal — pinta toda la pantalla de fellowship, tabs y modales incluidos
 // Órale, aquí vive todo: proyectos compartidos, chat, compañeros y búsqueda
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHitRegions {
     let size = area;
     let accent_color = theme.primary;
 
@@ -172,7 +173,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         " [b] Council ",
         " [t] Treasury ",
     ];
+    let tab_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border));
+    let tab_inner = tab_block.inner(right_chunks[0]);
+    const TAB_SEPARATOR_WIDTH: u16 = 3; // " | "
     let mut tab_spans = Vec::new();
+    let mut tab_rects = [Rect::default(); 8];
+    let mut cursor_x = tab_inner.x;
     for (idx, title) in tabs_titles.iter().enumerate() {
         let is_selected = idx == app.selected_fellowship_tab;
         let style = if is_selected {
@@ -183,18 +192,22 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         } else {
             Style::default().fg(theme.text)
         };
+        let title_width = title.chars().count() as u16;
+        tab_rects[idx] = Rect {
+            x: cursor_x,
+            y: tab_inner.y,
+            width: title_width,
+            height: 1,
+        };
+        cursor_x += title_width;
         tab_spans.push(Span::styled(*title, style));
         if idx < tabs_titles.len() - 1 {
             tab_spans.push(Span::styled(" | ", Style::default().fg(theme.muted)));
+            cursor_x += TAB_SEPARATOR_WIDTH;
         }
     }
     let tab_line = Line::from(tab_spans);
-    let tab_p = Paragraph::new(tab_line).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border)),
-    );
+    let tab_p = Paragraph::new(tab_line).block(tab_block);
     f.render_widget(tab_p, right_chunks[0]);
 
     // Aquí se decide qué pintar según el tab activo — cada rama es una pantalla distinta
@@ -1372,6 +1385,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             .style(Style::default().fg(theme.muted));
         f.render_widget(help_p, inner_layout[2]);
     }
+
+    FellowshipHitRegions { tabs: tab_rects }
 }
 
 /// Tesorería de la campaña compartida seleccionada: totales, quién asentó cada

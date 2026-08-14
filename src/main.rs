@@ -1077,7 +1077,7 @@ async fn main() -> Result<()> {
                             let tree = &app.stats_cache.zen_tree;
                             let streak_obj = &app.stats_cache.streak;
 
-                            screens::character::draw(
+                            let regions = screens::character::draw(
                                 f,
                                 app.user.as_ref().unwrap(),
                                 achievements_count,
@@ -1100,6 +1100,7 @@ async fn main() -> Result<()> {
                                 &theme,
                                 chunks[0],
                             );
+                            app.hit_regions.character = Some(regions);
                         }
                         ActiveScreen::Archive => {
                             let regions =
@@ -1116,10 +1117,12 @@ async fn main() -> Result<()> {
                             app.hit_regions.settings = Some(regions);
                         }
                         ActiveScreen::SyncSettings => {
-                            screens::sync::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::sync::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.sync = Some(regions);
                         }
                         ActiveScreen::Fellowship => {
-                            screens::fellowship::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::fellowship::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.fellowship = Some(regions);
                         }
                         ActiveScreen::About => {
                             screens::about::draw(f, &app, &theme, chunks[0]);

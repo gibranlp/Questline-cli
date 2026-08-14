@@ -4,6 +4,7 @@
 
 use crate::app::{App, ModalType};
 use crate::models::Achievement;
+use crate::screens::hit_test::SyncHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -15,7 +16,7 @@ use ratatui::{
 
 // pantalla gorda de sync — aquí va todo: identidad, dispositivos, stats y los modales
 // divide en dos columnas, izquierda config/stats, derecha devices/snapshots/progresión RPG
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegions {
     let size = area;
     let accent_color = theme.primary;
 
@@ -88,6 +89,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         theme.danger
     };
     let top_health_color = health_color;
+
+    // Fixed row indices into left_text below, for the three lines that get
+    // a click target — counted from the vec![] literal's start (index 0);
+    // update these if a line is added/removed above any of them.
+    const SYNC_NOW_ROW: u16 = 4;
+    const CLOUD_SYNC_TOGGLE_ROW: u16 = 22;
+    const AUTO_SYNC_TOGGLE_ROW: u16 = 23;
 
     let mut left_text = vec![
         Line::from(""),
@@ -400,18 +408,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    let left_panel = Paragraph::new(left_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(accent_color))
-            .title(Span::styled(
-                " Questline Sync Node Settings ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Questline Sync Node Settings ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
@@ -419,6 +425,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .constraints([Constraint::Length(36), Constraint::Min(6)])
         .split(chunks[0]);
 
+    let left_inner = left_block.inner(left_chunks[0]);
+    let one_row = |row: u16| Rect {
+        x: left_inner.x,
+        y: left_inner.y + row,
+        width: left_inner.width,
+        height: 1,
+    };
+    let sync_hit_regions = SyncHitRegions {
+        sync_now: one_row(SYNC_NOW_ROW),
+        cloud_sync_toggle: one_row(CLOUD_SYNC_TOGGLE_ROW),
+        auto_sync_toggle: one_row(AUTO_SYNC_TOGGLE_ROW),
+    };
+    let left_panel = Paragraph::new(left_text).block(left_block);
     f.render_widget(left_panel, left_chunks[0]);
 
     // pues hay que mostrar las estadísticas de trabajo del héroe — tasks, notas, journals, etc.
@@ -1166,6 +1185,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             [25, 65, 100],
         );
     }
+
+    sync_hit_regions
 }
 
 fn draw_cloud_progress_modal(
