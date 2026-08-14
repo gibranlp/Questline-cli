@@ -6,6 +6,7 @@ use crate::milestone_templates::{self, ProjectStats, Tier};
 use crate::models::RecurrenceType;
 use crate::models::{JournalEntry, Milestone, Note, Project, QuestStatus, Task, TaskPriority};
 use crate::screens::editor::{EditorMode, EditorState, render_body_line};
+use crate::screens::hit_test::WorkspaceHitRegions;
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
 use chrono::{DateTime, Datelike, Duration, Local, NaiveDate, Utc};
@@ -21,7 +22,7 @@ use ratatui::{
 };
 
 // El jefe máximo de renderizado — desde aquí se coordina todo el workspace
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     let size = f.size();
     let accent_color = theme.primary;
 
@@ -349,17 +350,18 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     } else {
         Style::default().fg(theme.border)
     };
-    let menu_list = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(sidebar_border_style)
-            .title(if app.workspace_sidebar_focused {
-                " Workspace [FOCUS] "
-            } else {
-                " Workspace "
-            }),
-    );
+    let menu_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(sidebar_border_style)
+        .title(if app.workspace_sidebar_focused {
+            " Workspace [FOCUS] "
+        } else {
+            " Workspace "
+        });
+    let sidebar_inner = menu_block.inner(body_chunks[0]);
+    let sidebar_tab_order: [usize; 5] = std::array::from_fn(|i| menu_items[i].1);
+    let menu_list = List::new(list_items).block(menu_block);
     f.render_widget(menu_list, body_chunks[0]);
 
     // 2b. El panel derecho cambia según el tab activo — aquí resolvemos qué va ahí
@@ -969,6 +971,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
     // 7. Codex de atajos — se abre con [?] y cubre todo
     if app.workspace_help_open {
         draw_workspace_help(f, app, theme, is_shared);
+    }
+
+    WorkspaceHitRegions {
+        sidebar: sidebar_inner,
+        sidebar_tab_order,
     }
 }
 
@@ -5961,7 +5968,7 @@ mod tests {
         let theme = Theme::default_theme();
         let backend = TestBackend::new(120, 44);
         let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        terminal.draw(|frame| { draw(frame, &app, &theme); }).unwrap();
         let ledger = terminal
             .backend()
             .buffer()
@@ -5972,7 +5979,7 @@ mod tests {
         assert!(!ledger.contains("[c] convene"));
 
         app.workspace_help_open = true;
-        terminal.draw(|frame| draw(frame, &app, &theme)).unwrap();
+        terminal.draw(|frame| { draw(frame, &app, &theme); }).unwrap();
         let help = terminal
             .backend()
             .buffer()

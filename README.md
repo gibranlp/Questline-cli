@@ -597,9 +597,13 @@ If Questline helps you on your adventures, consider starring the repository and 
   itself — to select it (Activity and Treasury are read-only, nothing to
   select there). Chat messages are variable height and manually scrolled
   rather than a real list widget, so a click maps the screen line back to
-  whichever message's line range it fell in. All of Project Workspace (its
-  own multi-tab sub-screen, ~6000 lines) remains keyboard-only and is
-  planned as a further follow-up.
+  whichever message's line range it fell in. Project Workspace's sidebar
+  (Overview/Tasks/Scrolls/Treasury/Chronicle) is now clickable too — click
+  a row to jump straight to that tab, same as pressing 1-5. Its 5 tabs are
+  each effectively their own sub-screen (subtask trees, tables, a
+  note-preview split, ...) with independent list rendering; click-to-select
+  within those tabs' content remains keyboard-only and is planned as a
+  further follow-up.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

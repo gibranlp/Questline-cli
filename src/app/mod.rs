@@ -3021,6 +3021,7 @@ impl App {
             ActiveScreen::Character => self.handle_character_mouse(mouse),
             ActiveScreen::SyncSettings => self.handle_sync_mouse(mouse),
             ActiveScreen::Fellowship => self.handle_fellowship_mouse(mouse),
+            ActiveScreen::Workspace => self.handle_workspace_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -3574,6 +3575,31 @@ impl App {
             5 => self.selected_my_quest_idx = 0,
             6 => self.selected_notification_idx = 0,
             _ => {}
+        }
+    }
+
+    fn handle_workspace_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Mirrors handle_workspace_key: while the shortcut codex overlay is
+        // open, only Esc/'?' do anything — a click shouldn't reach the
+        // sidebar underneath it.
+        if self.workspace_help_open {
+            return;
+        }
+        let Some(regions) = self.hit_regions.workspace else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if !HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+            return;
+        }
+        let row = (mouse.row - regions.sidebar.y) as usize;
+        if let Some(&tab_idx) = regions.sidebar_tab_order.get(row) {
+            self.activate_workspace_tab(tab_idx);
         }
     }
 
@@ -11252,6 +11278,14 @@ impl App {
         self.note_preview_focused = false;
     }
 
+    /// Jumps straight to workspace tab `idx` and focuses its content —
+    /// shared by the 1-5 number-key shortcuts and a click on that sidebar
+    /// row (both are "go to this tab" gestures, not just a selection move).
+    fn activate_workspace_tab(&mut self, idx: usize) {
+        self.workspace_tab_idx = idx;
+        self.reset_workspace_pane_focus();
+    }
+
     fn cycle_workspace_pane_focus(&mut self, reverse: bool) {
         match self.workspace_tab_idx {
             // Quests and Overview have two focusable panes: workspace menu and content.
@@ -11726,26 +11760,11 @@ impl App {
                     };
                 }
             }
-            KeyCode::Char('1') => {
-                self.workspace_tab_idx = 3;
-                self.reset_workspace_pane_focus();
-            }
-            KeyCode::Char('2') => {
-                self.workspace_tab_idx = 0;
-                self.reset_workspace_pane_focus();
-            }
-            KeyCode::Char('3') => {
-                self.workspace_tab_idx = 1;
-                self.reset_workspace_pane_focus();
-            }
-            KeyCode::Char('4') => {
-                self.workspace_tab_idx = 4;
-                self.reset_workspace_pane_focus();
-            }
-            KeyCode::Char('5') => {
-                self.workspace_tab_idx = 2;
-                self.reset_workspace_pane_focus();
-            }
+            KeyCode::Char('1') => self.activate_workspace_tab(3),
+            KeyCode::Char('2') => self.activate_workspace_tab(0),
+            KeyCode::Char('3') => self.activate_workspace_tab(1),
+            KeyCode::Char('4') => self.activate_workspace_tab(4),
+            KeyCode::Char('5') => self.activate_workspace_tab(2),
             KeyCode::Tab => {
                 self.cycle_workspace_pane_focus(false);
             }
@@ -25696,6 +25715,33 @@ mod app_tests {
 
         left_click(&mut app, 2, 4, KeyModifiers::empty()); // logical line 6 -> message 2 (last)
         assert_eq!(app.fellowship_selected_msg_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_sidebar_click_maps_display_row_to_the_real_tab_index() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_sidebar_focused = false;
+        // Display order is Overview/Tasks/Scrolls/Treasury/Chronicle, but
+        // those map to tab indices 3/0/1/4/2 respectively — not row order.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // row 3 = "Treasury" = tab 4
+        assert_eq!(app.workspace_tab_idx, 4);
+        assert!(!app.workspace_sidebar_focused); // activate_workspace_tab focuses content
+
+        // The shortcut codex overlay swallows the click entirely, same as
+        // every key but Esc/'?' while it's open.
+        app.workspace_help_open = true;
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // row 1 = "Tasks" = tab 0
+        assert_eq!(app.workspace_tab_idx, 4); // unchanged
 
         let _ = std::fs::remove_file(db_file);
     }
