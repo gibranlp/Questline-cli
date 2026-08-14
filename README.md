@@ -563,6 +563,15 @@ If Questline helps you on your adventures, consider starring the repository and 
   the existing copy helper. Scroll-wheel support was also added to the About,
   Great Chronicle, and Library screens. Click-to-select in other list screens
   is planned as a follow-up.
+- Extended click-to-select to the Archive, Gateway, Great Chronicle,
+  Onboarding, Hall of Legends, and Focus screens: clicking a row/option/card
+  now does what Enter or Up/Down would have — e.g. clicking an Archived
+  Campaign selects it, clicking a Gateway option activates it immediately,
+  and clicking either side of the Great Chronicle moves focus between the
+  Realm Activity feed and the Chapter panel. The remaining list/menu screens
+  (Projects, Dashboard, Character, Fellowship, Sync, Settings, Soundscapes,
+  Library, Project Workspace) are still keyboard-only and planned as further
+  follow-ups.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

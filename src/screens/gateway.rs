@@ -2,6 +2,7 @@
 // screens/gateway.rs — la puerta del Realm: ¿héroe nuevo o exiliado que regresa?
 // ─────────────────────────────────────────────────────────────────────────────
 
+use crate::screens::hit_test::GatewayHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -21,7 +22,7 @@ const PALETTE: &[Color] = &[
 
 /// Dibuja la pantalla de selección inicial — nuevo aventurero o retorno del exilio.
 /// Único punto de entrada al Realm para quienes no tienen usuario registrado.
-pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
+pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) -> GatewayHitRegions {
     let size = f.size();
     let accent = PALETTE[(ticks / 8) % PALETTE.len()];
     let muted = Color::Rgb(70, 70, 70);
@@ -118,6 +119,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
         )
     };
 
+    let option0_rect = center(layout[3]);
     let opt0 = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -146,7 +148,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
-        center(layout[3]),
+        option0_rect,
     );
 
     // ── Opción 1 — Continuar la Aventura ──────────────────────────────────────
@@ -165,6 +167,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
         )
     };
 
+    let option1_rect = center(layout[5]);
     let opt1 = vec![
         Line::from(""),
         Line::from(Span::styled(
@@ -193,7 +196,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
             )
             .alignment(Alignment::Center)
             .wrap(Wrap { trim: true }),
-        center(layout[5]),
+        option1_rect,
     );
 
     // ── Disclaimer ────────────────────────────────────────────────────────────
@@ -218,4 +221,9 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) {
         .alignment(Alignment::Center),
         center(layout[7]),
     );
+
+    GatewayHitRegions {
+        option0: option0_rect,
+        option1: option1_rect,
+    }
 }

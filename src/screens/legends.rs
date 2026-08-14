@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::models::Statistics;
+use crate::screens::hit_test::LegendsHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -206,7 +207,7 @@ pub fn draw(
     relics: &[(String, String, String, bool, Option<String>)],
     theme: &Theme,
     animation_ticks: usize,
-) {
+) -> LegendsHitRegions {
     let size = f.size();
     let accent_color = theme.primary;
 
@@ -413,13 +414,13 @@ pub fn draw(
         })
         .collect();
 
-    let relic_list = List::new(relic_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" Cosmetical Relics Inventory "),
-    );
+    let relic_list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(" Cosmetical Relics Inventory ");
+    let relic_list_inner = relic_list_block.inner(relics_layout[0]);
+    let relic_list = List::new(relic_items).block(relic_list_block);
     f.render_widget(relic_list, relics_layout[0]);
 
     // Selected Relic Detail (and ASCII drawing)
@@ -502,4 +503,9 @@ pub fn draw(
     )
     .alignment(Alignment::Center);
     f.render_widget(footer_p, main_chunks[2]);
+
+    LegendsHitRegions {
+        relic_list: relic_list_inner,
+        item_count: relics.len(),
+    }
 }

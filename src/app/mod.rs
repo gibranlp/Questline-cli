@@ -3007,6 +3007,12 @@ impl App {
 
         match self.active_screen {
             ActiveScreen::Editor => self.handle_editor_mouse(mouse),
+            ActiveScreen::Archive => self.handle_archive_mouse(mouse),
+            ActiveScreen::Gateway => self.handle_gateway_mouse(mouse),
+            ActiveScreen::GreatChronicle => self.handle_great_chronicle_mouse(mouse),
+            ActiveScreen::Onboarding => self.handle_onboarding_mouse(mouse),
+            ActiveScreen::Legends => self.handle_legends_mouse(mouse),
+            ActiveScreen::Focus => self.handle_focus_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -3022,6 +3028,9 @@ impl App {
 
         // Each arm mirrors that screen's existing keyboard scroll handler —
         // adding wheel support elsewhere is copying one more arm here.
+        // (GreatChronicle used to have an arm here too, but it now gets a
+        // dedicated handle_great_chronicle_mouse for click support, so its
+        // scroll handling lives there instead — see handle_mouse_event.)
         match self.active_screen {
             ActiveScreen::About => {
                 let content = self.about_content_lines.get();
@@ -3029,15 +3038,6 @@ impl App {
                 let max_scroll = content.saturating_sub(visible);
                 self.about_scroll =
                     (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
-            }
-            ActiveScreen::GreatChronicle => {
-                if self.chapter_panel_focused {
-                    self.chapter_panel_scroll =
-                        (self.chapter_panel_scroll as i64 + delta * 3).max(0) as usize;
-                } else {
-                    self.great_chronicle_scroll =
-                        (self.great_chronicle_scroll as i64 + delta * 3).max(0) as usize;
-                }
             }
             ActiveScreen::Library => {
                 if self.library_active_col == 2 {
@@ -3049,6 +3049,150 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    // Phase 2: click-to-select on the "easy batch" of list/menu screens —
+    // single Lists/static Rects with no separator rows or opaque
+    // auto-scrolling to fight. See handle_editor_mouse for the pattern this
+    // follows: hit-test against last frame's stashed Rects, then reuse the
+    // same field the keyboard handler for that screen already writes to.
+
+    fn handle_archive_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.archive else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+            return;
+        }
+        // The list renders from row 0 with no ListState/scroll offset, so
+        // the row offset inside the inner area is the item index directly.
+        let idx = (mouse.row - regions.list.y) as usize;
+        if idx < regions.item_count {
+            self.selected_archive_idx = idx;
+        }
+    }
+
+    fn handle_gateway_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.gateway else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        // Unlike Archive's browse-then-act list, Gateway's two boxes are
+        // buttons — a click both selects and activates, same as Enter.
+        if HitRegions::contains(regions.option0, mouse.column, mouse.row) {
+            self.gateway_selected_idx = 0;
+            self.activate_gateway_selection();
+        } else if HitRegions::contains(regions.option1, mouse.column, mouse.row) {
+            self.gateway_selected_idx = 1;
+            self.activate_gateway_selection();
+        }
+    }
+
+    fn handle_great_chronicle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(regions) = self.hit_regions.great_chronicle else {
+                    return;
+                };
+                if HitRegions::contains(regions.feed, mouse.column, mouse.row) {
+                    self.chapter_panel_focused = false;
+                } else if HitRegions::contains(regions.chapter_panel, mouse.column, mouse.row) {
+                    self.chapter_panel_focused = true;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                if self.chapter_panel_focused {
+                    self.chapter_panel_scroll =
+                        (self.chapter_panel_scroll as i64 + delta * 3).max(0) as usize;
+                } else {
+                    self.great_chronicle_scroll =
+                        (self.great_chronicle_scroll as i64 + delta * 3).max(0) as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_onboarding_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.onboarding else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if HitRegions::contains(regions.name_input, mouse.column, mouse.row) {
+            self.onboarding_focus = OnboardingFocus::NameInput;
+        } else if HitRegions::contains(regions.class_list, mouse.column, mouse.row) {
+            let idx = (mouse.row - regions.class_list.y) as usize;
+            if idx < regions.class_count {
+                self.onboarding_class_idx = idx;
+                self.onboarding_focus = OnboardingFocus::ClassSelect;
+            }
+        }
+    }
+
+    fn handle_legends_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.legends else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if !HitRegions::contains(regions.relic_list, mouse.column, mouse.row) {
+            return;
+        }
+        // Fixed-height list, no scroll offset — a click past the last
+        // rendered row (or past the real relic count) is a no-op.
+        let idx = (mouse.row - regions.relic_list.y) as usize;
+        if idx < regions.item_count {
+            self.selected_relic_idx = idx;
+        }
+    }
+
+    fn handle_focus_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.focus else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if let Some(idx) = regions
+            .cards
+            .iter()
+            .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+        {
+            self.selected_focus_field_idx = idx;
         }
     }
 
@@ -6109,24 +6253,30 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if self.gateway_selected_idx == 0 {
-                    // Nuevo aventurero → pantalla de selección de clase
-                    self.onboarding_from_gateway = true;
-                    self.onboarding_username = String::new();
-                    self.onboarding_class_idx = 0;
-                    self.onboarding_focus = OnboardingFocus::NameInput;
-                    self.onboarding_error = None;
-                    self.active_screen = ActiveScreen::Onboarding;
-                } else {
-                    // Exiliado con código → portal de restauración de identidad
-                    self.restore_input = String::new();
-                    self.restore_error = None;
-                    self.active_screen = ActiveScreen::Restore;
-                }
+                self.activate_gateway_selection();
             }
             _ => {}
         }
         Ok(())
+    }
+
+    /// Confirms whichever Gateway option is currently selected — shared by
+    /// the Enter/Space keybinding and a click on either option box.
+    fn activate_gateway_selection(&mut self) {
+        if self.gateway_selected_idx == 0 {
+            // Nuevo aventurero → pantalla de selección de clase
+            self.onboarding_from_gateway = true;
+            self.onboarding_username = String::new();
+            self.onboarding_class_idx = 0;
+            self.onboarding_focus = OnboardingFocus::NameInput;
+            self.onboarding_error = None;
+            self.active_screen = ActiveScreen::Onboarding;
+        } else {
+            // Exiliado con código → portal de restauración de identidad
+            self.restore_input = String::new();
+            self.restore_error = None;
+            self.active_screen = ActiveScreen::Restore;
+        }
     }
 
     /// Maneja las teclas del portal de restauración — procesa el código de transferencia al presionar Enter.
@@ -24721,6 +24871,150 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.modal_state, ModalType::None);
         assert!(app.should_quit);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 mouse: easy-batch list/menu screens ─────────────────────────
+
+    fn app_for_mouse_tests(db_file: &Path, screen: ActiveScreen) -> App {
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = screen;
+        app
+    }
+
+    fn scroll_mouse(app: &mut App, down: bool) {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.handle_mouse_event(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::empty(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn archive_click_selects_the_clicked_row_but_ignores_clicks_past_item_count() {
+        let db_file = Path::new("test_questline_mouse_archive.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 3,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_archive_idx, 1);
+
+        // Row 4 is inside the rendered Rect but past the last real item —
+        // must not move the selection.
+        left_click(&mut app, 2, 4, KeyModifiers::empty());
+        assert_eq!(app.selected_archive_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn gateway_click_selects_and_activates_that_option() {
+        let db_file = Path::new("test_questline_mouse_gateway.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Gateway);
+        app.hit_regions.gateway = Some(crate::screens::hit_test::GatewayHitRegions {
+            option0: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            option1: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 3 },
+        });
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // inside option1
+        assert_eq!(app.gateway_selected_idx, 1);
+        // A click activates immediately, same as Enter — navigates to Restore.
+        assert_eq!(app.active_screen, ActiveScreen::Restore);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn great_chronicle_click_moves_panel_focus_and_scroll_follows_it() {
+        let db_file = Path::new("test_questline_mouse_great_chronicle.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::GreatChronicle);
+        app.hit_regions.great_chronicle = Some(crate::screens::hit_test::GreatChronicleHitRegions {
+            feed: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 10 },
+            chapter_panel: ratatui::layout::Rect { x: 20, y: 0, width: 10, height: 10 },
+        });
+        assert!(!app.chapter_panel_focused);
+
+        scroll_mouse(&mut app, true);
+        assert_eq!(app.great_chronicle_scroll, 3);
+        assert_eq!(app.chapter_panel_scroll, 0);
+
+        left_click(&mut app, 21, 1, KeyModifiers::empty()); // inside chapter_panel
+        assert!(app.chapter_panel_focused);
+
+        scroll_mouse(&mut app, true);
+        assert_eq!(app.chapter_panel_scroll, 3);
+        assert_eq!(app.great_chronicle_scroll, 3); // unchanged now that focus moved
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn onboarding_click_selects_class_and_moves_focus_between_fields() {
+        let db_file = Path::new("test_questline_mouse_onboarding.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Onboarding);
+        let class_count = app.onboarding_classes.len();
+        assert!(class_count > 2, "fixture needs at least 3 classes");
+        app.hit_regions.onboarding = Some(crate::screens::hit_test::OnboardingHitRegions {
+            name_input: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            class_list: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 5 },
+            class_count,
+        });
+
+        left_click(&mut app, 2, 7, KeyModifiers::empty()); // class row index 2
+        assert_eq!(app.onboarding_class_idx, 2);
+        assert_eq!(app.onboarding_focus, OnboardingFocus::ClassSelect);
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // back to the name field
+        assert_eq!(app.onboarding_focus, OnboardingFocus::NameInput);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn legends_click_selects_relic_but_ignores_clicks_past_item_count() {
+        let db_file = Path::new("test_questline_mouse_legends.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Legends);
+        app.hit_regions.legends = Some(crate::screens::hit_test::LegendsHitRegions {
+            relic_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 7 },
+            item_count: 5,
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_relic_idx, 3);
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // row 6 is past item_count 5
+        assert_eq!(app.selected_relic_idx, 3);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_click_selects_the_clicked_picker_card() {
+        let db_file = Path::new("test_questline_mouse_focus.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+
+        left_click(&mut app, 22, 1, KeyModifiers::empty()); // inside cards[2]
+        assert_eq!(app.selected_focus_field_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
     }

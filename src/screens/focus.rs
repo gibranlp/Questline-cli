@@ -4,6 +4,7 @@
 
 use crate::app::{App, ModalType};
 use crate::models::{Project, Task};
+use crate::screens::hit_test::FocusHitRegions;
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
 use crate::theme::Theme;
@@ -17,15 +18,16 @@ use ratatui::{
 };
 
 // Punto de entrada — decide si mostrar la sesión activa o la pantalla de config
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> Option<FocusHitRegions> {
     let size = f.size();
     let accent_color = theme.primary;
 
-    if app.active_focus_session.is_some() {
+    let regions = if app.active_focus_session.is_some() {
         draw_active_session(f, app, theme, size);
+        None
     } else {
-        draw_config_screen(f, app, theme, size);
-    }
+        Some(draw_config_screen(f, app, theme, size))
+    };
 
     // Modal de duración custom — aparece encima de todo cuando el user quiere otro tiempo
     if let ModalType::CustomFocusDuration { input } = &app.modal_state {
@@ -71,6 +73,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) {
             .alignment(Alignment::Center);
         f.render_widget(p, area);
     }
+
+    regions
 }
 
 // Renderiza el timer en vivo — aquí es donde la sesión ya está corriendo, órale a trabajar
@@ -446,7 +450,7 @@ fn large_timer_rows(timer: &str) -> Vec<String> {
 }
 
 // Pantalla de configuración — el user elige duración, proyecto, tarea y soundscape antes de arrancar
-fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
+fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) -> FocusHitRegions {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -803,6 +807,15 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
     ];
     let footer = Paragraph::new(footer_text).alignment(Alignment::Center);
     f.render_widget(footer, chunks[4]);
+
+    FocusHitRegions {
+        cards: [
+            picker_chunks[0],
+            picker_chunks[1],
+            picker_chunks[2],
+            picker_chunks[3],
+        ],
+    }
 }
 
 // barras de espectro FFT en tiempo real — datos reales del audio local, animación sutil si no hay
