@@ -603,9 +603,10 @@ If Questline helps you on your adventures, consider starring the repository and 
   a milestone (including its requirement sub-rows) in Overview, a ledger
   row in Treasury, a chronicle entry in Journal, or a scroll (skipping
   non-selectable "── Unassigned ──" dividers) or the preview pane in Notes.
-  This closes out Phase 2's original scope — every list/menu screen in the
-  app now supports click-to-select. (The Tasks tab's Kanban/quest-board
-  view, opened separately from the list view, isn't covered by this pass.)
+  The Tasks tab's Kanban/quest-board view — a separate rendering mode from
+  the list view, 6 status columns of cards — is clickable too: click any
+  card in any column to select it. This closes out Phase 2 entirely — every
+  list, table, and menu in the app now supports click-to-select.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

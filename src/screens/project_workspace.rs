@@ -415,11 +415,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     let mut journal_hit = None;
     let mut treasury_hit = None;
     let mut milestones_hit = None;
+    let mut kanban_hit = None;
     match active_tab {
         0 if app.quest_board_open && app.viewing_step_for_task.is_none() => {
-            // Kanban board mode — not covered by this pass, see
-            // WorkspaceHitRegions's doc comment.
-            draw_quest_board(
+            kanban_hit = Some(draw_quest_board(
                 f,
                 body_chunks[1],
                 &sorted_tasks,
@@ -427,7 +426,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 app,
                 theme,
                 sidebar_focused,
-            );
+            ));
         }
         0 => {
             tasks_hit = draw_tasks_tab(
@@ -997,6 +996,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         journal: journal_hit,
         notes: notes_hit,
         tasks: tasks_hit,
+        kanban: kanban_hit,
     }
 }
 
@@ -3208,7 +3208,7 @@ fn draw_quest_board(
     app: &App,
     theme: &Theme,
     sidebar_focused: bool,
-) {
+) -> crate::screens::hit_test::WorkspaceKanbanHitRegions {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -3221,6 +3221,9 @@ fn draw_quest_board(
         QuestStatus::Review,
         QuestStatus::Done,
     ];
+    // Filled in column-by-column below, in the same row-major order as
+    // `statuses` — see WorkspaceKanbanHitRegions.
+    let mut kanban_columns: Vec<crate::screens::hit_test::WorkspaceRowList> = Vec::with_capacity(6);
 
     for (row_idx, row) in rows.iter().enumerate() {
         let columns = Layout::default()
@@ -3233,6 +3236,9 @@ fn draw_quest_board(
             .split(*row);
         for (column_idx, column) in columns.iter().enumerate() {
             let status = statuses[row_idx * 3 + column_idx];
+            // One entry per rendered card, in lockstep with `cards` below —
+            // every row here is a real, selectable card, no dividers.
+            let mut card_task_indices: Vec<Option<usize>> = Vec::new();
             let cards: Vec<ListItem> = tasks
                 .iter()
                 .enumerate()
@@ -3317,6 +3323,7 @@ fn draw_quest_board(
                     } else {
                         Style::default().fg(theme.text)
                     };
+                    card_task_indices.push(Some(task_idx));
                     Some(
                         ListItem::new(format!(
                             "{}{}{}{}{}",
@@ -3344,17 +3351,25 @@ fn draw_quest_board(
                 count,
                 if content_focused { " [FOCUS]" } else { "" }
             );
-            f.render_widget(
-                List::new(cards).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(border))
-                        .title(title),
-                ),
-                *column,
-            );
+            let card_block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border))
+                .title(title);
+            let card_inner = card_block.inner(*column);
+            f.render_widget(List::new(cards).block(card_block), *column);
+
+            kanban_columns.push(crate::screens::hit_test::WorkspaceRowList {
+                area: card_inner,
+                row_targets: card_task_indices,
+            });
         }
+    }
+
+    crate::screens::hit_test::WorkspaceKanbanHitRegions {
+        columns: kanban_columns
+            .try_into()
+            .expect("draw_quest_board always renders exactly 6 status columns"),
     }
 }
 
@@ -6015,7 +6030,9 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let tasks = app.all_tasks.iter().collect::<Vec<_>>();
         terminal
-            .draw(|frame| draw_quest_board(frame, frame.size(), &tasks, 0, &app, &theme, false))
+            .draw(|frame| {
+                draw_quest_board(frame, frame.size(), &tasks, 0, &app, &theme, false);
+            })
             .unwrap();
         terminal
             .draw(|frame| draw_council_briefing(frame, &app, 0, &theme))

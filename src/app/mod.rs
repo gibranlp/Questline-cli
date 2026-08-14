@@ -3611,8 +3611,18 @@ impl App {
         // both selects the row and moves focus off the sidebar, mirroring
         // every other content click in this file.
         match self.workspace_tab_idx {
+            // Kanban mode (quest_board_open) and the list view are mutually
+            // exclusive per frame — at most one of the two fields is Some.
             0 => {
-                if let Some(list) = &regions.tasks
+                if let Some(kanban) = &regions.kanban
+                    && let Some(idx) = kanban
+                        .columns
+                        .iter()
+                        .find_map(|col| col.row_index(mouse.column, mouse.row))
+                {
+                    self.selected_task_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                } else if let Some(list) = &regions.tasks
                     && let Some(idx) = list.row_index(mouse.column, mouse.row)
                 {
                     self.selected_task_idx = idx;
@@ -25794,6 +25804,7 @@ mod app_tests {
             journal: None,
             notes: None,
             tasks: None,
+            kanban: None,
         });
 
         left_click(&mut app, 2, 3, KeyModifiers::empty()); // row 3 = "Treasury" = tab 4
@@ -25828,6 +25839,7 @@ mod app_tests {
                 area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
                 row_targets: vec![Some(0), Some(1), Some(2)],
             }),
+            kanban: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty());
@@ -25856,6 +25868,7 @@ mod app_tests {
             journal: None,
             notes: None,
             tasks: None,
+            kanban: None,
         });
 
         left_click(&mut app, 2, 2, KeyModifiers::empty()); // milestone 0's 3rd row
@@ -25887,6 +25900,7 @@ mod app_tests {
             journal: None,
             notes: None,
             tasks: None,
+            kanban: None,
         });
 
         app.selected_treasury_idx = 99; // sentinel — proves the next click is a genuine no-op
@@ -25919,6 +25933,7 @@ mod app_tests {
             }),
             notes: None,
             tasks: None,
+            kanban: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty());
@@ -25953,6 +25968,7 @@ mod app_tests {
                 preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
             }),
             tasks: None,
+            kanban: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty()); // divider row — no-op
@@ -25964,6 +25980,56 @@ mod app_tests {
 
         left_click(&mut app, 32, 1, KeyModifiers::empty()); // preview pane — focus only
         assert!(app.note_preview_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_kanban_click_selects_a_card_in_any_column() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceKanbanHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_kanban.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        // Column 0 (Backlog) has tasks 0 and 1; column 4 (Review) has task 2.
+        // Kanban and the list view are mutually exclusive, so `tasks` stays
+        // None here — this proves the handler doesn't fall through to it.
+        let empty_col = || WorkspaceRowList {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceRowList {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![Some(0), Some(1)],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    WorkspaceRowList {
+                        area: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 5 },
+                        row_targets: vec![Some(2)],
+                    },
+                    empty_col(),
+                ],
+            }),
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Backlog column, row 1
+        assert_eq!(app.selected_task_idx, 1);
+        assert!(!app.workspace_sidebar_focused);
+
+        left_click(&mut app, 22, 0, KeyModifiers::empty()); // Review column, row 0
+        assert_eq!(app.selected_task_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
     }

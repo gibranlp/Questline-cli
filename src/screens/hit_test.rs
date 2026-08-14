@@ -335,6 +335,24 @@ pub struct WorkspaceHitRegions {
     pub journal: Option<WorkspaceRowList>,
     pub notes: Option<WorkspaceNotesHitRegions>,
     pub tasks: Option<WorkspaceRowList>,
+    /// Tasks tab's Kanban board (`quest_board_open`) — a separate rendering
+    /// mode from the list view `tasks` above (mutually exclusive: only one
+    /// of the two is ever Some for tab 0), so it gets its own field rather
+    /// than overloading that one.
+    pub kanban: Option<WorkspaceKanbanHitRegions>,
+}
+
+/// `screens::project_workspace::draw_quest_board` — 6 status columns (2 rows
+/// of 3), each a plain unscrolled `List` of single-line cards, same shape
+/// as every other row_targets user here. `columns[i]` corresponds to
+/// `statuses[i]` in `[Backlog, Ready, InProgress, Blocked, Review, Done]`
+/// order (row-major: row 0 is the first 3, row 1 the last 3) — the click
+/// handler doesn't need to know the status itself, just that a card's
+/// `row_targets` value is an index into the *same* task slice
+/// `selected_task_idx` already indexes.
+#[derive(Debug, Clone)]
+pub struct WorkspaceKanbanHitRegions {
+    pub columns: [WorkspaceRowList; 6],
 }
 
 /// A rendered row -> item-index map, built once at draw time — the same
