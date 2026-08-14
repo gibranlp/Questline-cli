@@ -134,22 +134,32 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
     } else {
         theme.border
     };
-    let left_block = Paragraph::new(proj_lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(left_border_color))
-            .title(Span::styled(
-                " Shared Fellowship Campaigns",
-                Style::default()
-                    .fg(if left_focused {
-                        theme.warning
-                    } else {
-                        Color::Gray
-                    })
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
+    let left_border = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(left_border_color))
+        .title(Span::styled(
+            " Shared Fellowship Campaigns",
+            Style::default()
+                .fg(if left_focused {
+                    theme.warning
+                } else {
+                    Color::Gray
+                })
+                .add_modifier(Modifier::BOLD),
+        ));
+    let left_inner = left_border.inner(chunks[0]);
+    let left_list = if shared_projects.is_empty() {
+        None
+    } else {
+        Some(crate::screens::hit_test::FellowshipRowList {
+            area: left_inner,
+            first_row_offset: 1, // the leading Line::from("") before any entry
+            row_height: 3,       // name/badge line, owner line, blank line
+            count: shared_projects.len(),
+        })
+    };
+    let left_block = Paragraph::new(proj_lines).block(left_border);
     f.render_widget(left_block, chunks[0]);
 
     // Columna derecha: barra de tabs arriba, panel activo en medio, footer de controles abajo
@@ -211,6 +221,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
     f.render_widget(tab_p, right_chunks[0]);
 
     // Aquí se decide qué pintar según el tab activo — cada rama es una pantalla distinta
+    let mut sub_list: Option<crate::screens::hit_test::FellowshipSubList> = None;
     match app.selected_fellowship_tab {
         0 => {
             // Tab de chat — si no hay proyectos compartidos muestra notificaciones en su lugar
@@ -311,18 +322,28 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                     }
                 }
 
-                let list_p = Paragraph::new(notif_lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(accent_color))
-                        .title(Span::styled(
-                            " Fellowship Notification Center ",
-                            Style::default()
-                                .fg(theme.warning)
-                                .add_modifier(Modifier::BOLD),
-                        )),
-                );
+                let notif_border = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(accent_color))
+                    .title(Span::styled(
+                        " Fellowship Notification Center ",
+                        Style::default()
+                            .fg(theme.warning)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                let notif_inner = notif_border.inner(sub_chunks[1]);
+                if !notifications.is_empty() {
+                    sub_list = Some(crate::screens::hit_test::FellowshipSubList::Uniform(
+                        crate::screens::hit_test::FellowshipRowList {
+                            area: notif_inner,
+                            first_row_offset: 1,
+                            row_height: 3,
+                            count: notifications.len(),
+                        },
+                    ));
+                }
+                let list_p = Paragraph::new(notif_lines).block(notif_border);
                 f.render_widget(list_p, sub_chunks[1]);
             } else if app.selected_fellowship_project_idx >= shared_projects.len() {
                 let p = Paragraph::new("\n\n   Invalid selected project index.")
@@ -572,28 +593,34 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                     String::new()
                 };
                 let chat_title = format!(" Chronicle: {}  {}", current_proj.name, online_badge);
-                let chat_p = Paragraph::new(chat_lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(chat_border_color))
-                            .title(vec![
-                                Span::styled(
-                                    format!(" Chronicle: {}  ", current_proj.name),
-                                    Style::default()
-                                        .fg(theme.warning)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                                Span::styled(
-                                    online_badge,
-                                    Style::default()
-                                        .fg(theme.success)
-                                        .add_modifier(Modifier::BOLD),
-                                ),
-                            ]),
-                    )
-                    .scroll((scroll, 0));
+                let chat_border = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(chat_border_color))
+                    .title(vec![
+                        Span::styled(
+                            format!(" Chronicle: {}  ", current_proj.name),
+                            Style::default()
+                                .fg(theme.warning)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            online_badge,
+                            Style::default()
+                                .fg(theme.success)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]);
+                let chat_inner = chat_border.inner(chat_chunks[0]);
+                sub_list = Some(crate::screens::hit_test::FellowshipSubList::Chat(
+                    crate::screens::hit_test::FellowshipChatHitRegions {
+                        area: chat_inner,
+                        scroll,
+                        msg_start_lines: msg_start_lines.clone(),
+                        message_count: messages.len(),
+                    },
+                ));
+                let chat_p = Paragraph::new(chat_lines).block(chat_border).scroll((scroll, 0));
                 let _ = chat_title;
                 f.render_widget(chat_p, chat_chunks[0]);
 
@@ -708,18 +735,28 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                 }
             }
 
-            let invite_p = Paragraph::new(invite_lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(accent_color))
-                    .title(Span::styled(
-                        " Shared Fellowship Invitations ",
-                        Style::default()
-                            .fg(theme.warning)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            );
+            let invite_border = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(Span::styled(
+                    " Shared Fellowship Invitations ",
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let invite_inner = invite_border.inner(right_chunks[1]);
+            if !invitations.is_empty() {
+                sub_list = Some(crate::screens::hit_test::FellowshipSubList::Uniform(
+                    crate::screens::hit_test::FellowshipRowList {
+                        area: invite_inner,
+                        first_row_offset: 1,
+                        row_height: 4,
+                        count: invitations.len(),
+                    },
+                ));
+            }
+            let invite_p = Paragraph::new(invite_lines).block(invite_border);
             f.render_widget(invite_p, right_chunks[1]);
         }
         2 => {
@@ -828,18 +865,28 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
             }
 
             let comp_title = format!(" {} — Members ", proj_name);
-            let comp_p = Paragraph::new(comp_lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(accent_color))
-                    .title(Span::styled(
-                        comp_title,
-                        Style::default()
-                            .fg(theme.warning)
-                            .add_modifier(Modifier::BOLD),
-                    )),
-            );
+            let comp_border = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(Span::styled(
+                    comp_title,
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let comp_inner = comp_border.inner(right_chunks[1]);
+            if !members.is_empty() {
+                sub_list = Some(crate::screens::hit_test::FellowshipSubList::Uniform(
+                    crate::screens::hit_test::FellowshipRowList {
+                        area: comp_inner,
+                        first_row_offset: 3, // leading blank + summary line + blank
+                        row_height: 4,
+                        count: members.len(),
+                    },
+                ));
+            }
+            let comp_p = Paragraph::new(comp_lines).block(comp_border);
             f.render_widget(comp_p, right_chunks[1]);
         }
         3 => {
@@ -1045,21 +1092,28 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                     })
                     .collect()
             };
-            f.render_widget(
-                Paragraph::new(lines).block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(accent_color))
-                        .title(Span::styled(
-                            format!(" My Quests — {} assigned ", assigned_tasks.len()),
-                            Style::default()
-                                .fg(theme.warning)
-                                .add_modifier(Modifier::BOLD),
-                        )),
-                ),
-                right_chunks[1],
-            );
+            let quests_border = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(Span::styled(
+                    format!(" My Quests — {} assigned ", assigned_tasks.len()),
+                    Style::default()
+                        .fg(theme.warning)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            let quests_inner = quests_border.inner(right_chunks[1]);
+            if !assigned_tasks.is_empty() {
+                sub_list = Some(crate::screens::hit_test::FellowshipSubList::Uniform(
+                    crate::screens::hit_test::FellowshipRowList {
+                        area: quests_inner,
+                        first_row_offset: 0,
+                        row_height: 1,
+                        count: assigned_tasks.len(),
+                    },
+                ));
+            }
+            f.render_widget(Paragraph::new(lines).block(quests_border), right_chunks[1]);
         }
         6 => {
             let notices = app
@@ -1116,18 +1170,32 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                     lines.push(Line::from(""));
                 }
             }
+            let notices_border = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(accent_color))
+                .title(format!(
+                    " Council Notices — {} unread · Filter: {} ",
+                    unread, app.council_notice_filter
+                ));
+            let notices_inner = notices_border.inner(right_chunks[1]);
+            if !notices.is_empty() {
+                // Notice bodies are unbounded-length free text under Wrap{trim:true} —
+                // a long one can wrap past its 3-line budget and throw the row math
+                // off by however many extra screen rows it took. Same accepted risk
+                // as narrow-terminal wrapping elsewhere, just more likely to hit here.
+                sub_list = Some(crate::screens::hit_test::FellowshipSubList::Uniform(
+                    crate::screens::hit_test::FellowshipRowList {
+                        area: notices_inner,
+                        first_row_offset: 1,
+                        row_height: 3,
+                        count: notices.len(),
+                    },
+                ));
+            }
             f.render_widget(
                 Paragraph::new(lines)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(accent_color))
-                            .title(format!(
-                                " Council Notices — {} unread · Filter: {} ",
-                                unread, app.council_notice_filter
-                            )),
-                    )
+                    .block(notices_border)
                     .wrap(ratatui::widgets::Wrap { trim: true }),
                 right_chunks[1],
             );
@@ -1386,7 +1454,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
         f.render_widget(help_p, inner_layout[2]);
     }
 
-    FellowshipHitRegions { tabs: tab_rects }
+    FellowshipHitRegions {
+        tabs: tab_rects,
+        left_list,
+        sub_list,
+    }
 }
 
 /// Tesorería de la campaña compartida seleccionada: totales, quién asentó cada
