@@ -3482,18 +3482,73 @@ impl App {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
 
-        let Some(regions) = self.hit_regions.fellowship else {
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.fellowship.clone() else {
             return;
         };
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return;
         }
+
         if let Some(idx) = regions
             .tabs
             .iter()
             .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
         {
             self.activate_fellowship_tab(idx);
+            return;
+        }
+
+        // The active tab's sub-list takes priority when both it and the
+        // left campaign list could contain the click — in practice they
+        // never overlap (left panel vs. right panel), but check sub_list
+        // first anyway since it's what the user is more likely aiming at.
+        if let Some(sub_list) = &regions.sub_list {
+            use crate::screens::hit_test::FellowshipSubList;
+            match sub_list {
+                FellowshipSubList::Uniform(list) => {
+                    if let Some(idx) = list.row_index(mouse.column, mouse.row) {
+                        self.select_fellowship_sub_list_row(idx);
+                    }
+                    return;
+                }
+                FellowshipSubList::Chat(chat) => {
+                    if HitRegions::contains(chat.area, mouse.column, mouse.row) {
+                        let logical_line = chat.scroll + (mouse.row - chat.area.y);
+                        // Largest message index whose start line is still
+                        // <= the clicked line — partition_point finds the
+                        // first index where the predicate flips false, so
+                        // subtracting 1 gives the last index where it held.
+                        let msg_idx = chat
+                            .msg_start_lines
+                            .partition_point(|&start| start <= logical_line);
+                        if msg_idx > 0 && msg_idx <= chat.message_count {
+                            self.fellowship_selected_msg_idx = msg_idx - 1;
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        if let Some(list) = regions.left_list
+            && let Some(idx) = list.row_index(mouse.column, mouse.row)
+        {
+            self.fellowship_focus_left = true;
+            self.selected_fellowship_project_idx = idx;
+        }
+    }
+
+    /// Applies a click on the active Fellowship tab's uniform-row sub-list
+    /// to whichever selection index that tab uses.
+    fn select_fellowship_sub_list_row(&mut self, idx: usize) {
+        match self.selected_fellowship_tab {
+            0 | 6 => self.selected_notification_idx = idx, // Chat's no-campaigns fallback shares this field with Council
+            1 => self.selected_invitation_idx = idx,
+            2 => self.selected_fellowship_member_idx = idx,
+            5 => self.selected_my_quest_idx = idx,
+            _ => {}
         }
     }
 
@@ -25548,7 +25603,11 @@ mod app_tests {
             width: 9,
             height: 1,
         });
-        app.hit_regions.fellowship = Some(FellowshipHitRegions { tabs });
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs,
+            left_list: None,
+            sub_list: None,
+        });
 
         left_click(&mut app, 65, 0, KeyModifiers::empty()); // tab 6 (Council)
         assert_eq!(app.selected_fellowship_tab, 6);
@@ -25556,6 +25615,87 @@ mod app_tests {
 
         left_click(&mut app, 25, 0, KeyModifiers::empty()); // tab 2 (Companions)
         assert_eq!(app.selected_fellowship_tab, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_left_list_click_selects_campaign_and_focuses_left() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_left.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.fellowship_focus_left = false;
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: Some(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 1,
+                row_height: 3,
+                count: 3,
+            }),
+            sub_list: None,
+        });
+
+        left_click(&mut app, 2, 4, KeyModifiers::empty()); // row 1: offset(1)+1*3=4
+        assert!(app.fellowship_focus_left);
+        assert_eq!(app.selected_fellowship_project_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_uniform_sub_list_click_selects_row_for_the_active_tab() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_sublist.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 2; // Companions
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 3,
+                row_height: 4,
+                count: 2,
+            })),
+        });
+
+        left_click(&mut app, 2, 8, KeyModifiers::empty()); // offset(3) + 1*4 = 7..10 -> idx 1
+        assert_eq!(app.selected_fellowship_member_idx, 1);
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // inside the header rows — no-op
+        assert_eq!(app.selected_fellowship_member_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_chat_click_maps_screen_line_to_message_index() {
+        use crate::screens::hit_test::{FellowshipChatHitRegions, FellowshipHitRegions, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_chat.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 0;
+        // 3 messages starting at lines 0, 2, 5 — scrolled down by 2, so
+        // on-screen row 0 is logical line 2 (message 1's first line).
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Chat(FellowshipChatHitRegions {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+                scroll: 2,
+                msg_start_lines: vec![0, 2, 5],
+                message_count: 3,
+            })),
+        });
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // logical line 2 -> message 1
+        assert_eq!(app.fellowship_selected_msg_idx, 1);
+
+        left_click(&mut app, 2, 4, KeyModifiers::empty()); // logical line 6 -> message 2 (last)
+        assert_eq!(app.fellowship_selected_msg_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
     }

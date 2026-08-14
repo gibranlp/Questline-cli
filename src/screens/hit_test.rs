@@ -252,14 +252,67 @@ pub struct SyncHitRegions {
 /// concatenated `Span`s, not a `Tabs` widget with per-tab `Rect`s, so each
 /// tab's on-screen column range has to be computed by summing the
 /// compile-time-constant label widths that come before it (done once at
-/// draw time, same as everything else here). Only tab *switching* gets a
-/// hit region in this pass — each of the 8 tabs behind
-/// `selected_fellowship_tab` has its own sub-list rendering (project list,
-/// notifications, invitations, members, notices, chat transcript) with
-/// different shapes; click-to-select within those is a follow-up.
-#[derive(Debug, Clone, Copy)]
+/// draw time, same as everything else here). Each of the 8 tabs behind
+/// `selected_fellowship_tab` renders a differently-shaped sub-list —
+/// `sub_list` carries whichever one the active tab needs (see
+/// `FellowshipSubList`); Activity and Treasury have no selection at all, so
+/// both leave it `None`.
+#[derive(Debug, Clone)]
 pub struct FellowshipHitRegions {
     pub tabs: [Rect; 8],
+    /// Shared Fellowship Campaigns list in the always-visible left panel —
+    /// tab-independent, so it's separate from `sub_list` below.
+    pub left_list: Option<FellowshipRowList>,
+    /// Whichever clickable list the *active* tab renders, if any — Activity
+    /// and Treasury have no selection to click into, so both stay None.
+    pub sub_list: Option<FellowshipSubList>,
+}
+
+/// A uniform-row-height list rendered inside a plain `Paragraph` (every
+/// Fellowship sub-list except Chat is hand-built `Line`s, not a `List`
+/// widget) — `first_row_offset` skips any header/summary lines before row 0
+/// (e.g. Companions' "N online • M members" line), `row_height` is how many
+/// screen rows each item occupies. Both counted once at draw time, same as
+/// everything else here, so the click handler is just arithmetic.
+#[derive(Debug, Clone, Copy)]
+pub struct FellowshipRowList {
+    pub area: Rect,
+    pub first_row_offset: u16,
+    pub row_height: u16,
+    pub count: usize,
+}
+
+impl FellowshipRowList {
+    /// (col, row) -> item index, or None if the click missed the area, fell
+    /// in the leading header rows, landed between two items, or is past the
+    /// last real item.
+    pub fn row_index(&self, col: u16, row: u16) -> Option<usize> {
+        if !HitRegions::contains(self.area, col, row) {
+            return None;
+        }
+        let offset_row = (row - self.area.y).checked_sub(self.first_row_offset)?;
+        let idx = (offset_row / self.row_height.max(1)) as usize;
+        (idx < self.count).then_some(idx)
+    }
+}
+
+/// The Chronicle chat transcript — variable-height messages in a plain
+/// `Paragraph`, manually scrolled (no `ListState`). draw() already computes
+/// `msg_start_lines` (each message's first line index) and `scroll` to
+/// render it, so this just carries those out instead of the click handler
+/// re-deriving them.
+#[derive(Debug, Clone)]
+pub struct FellowshipChatHitRegions {
+    pub area: Rect,
+    pub scroll: u16,
+    pub msg_start_lines: Vec<u16>,
+    pub message_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum FellowshipSubList {
+    Uniform(FellowshipRowList),
+    Chat(FellowshipChatHitRegions),
 }
 
 impl HitRegions {
