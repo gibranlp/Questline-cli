@@ -407,36 +407,50 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             .find(|t| t.id == parent_id)
             .map(|t| t.title.clone())
     });
+    // One of these gets filled in below, depending on active_tab — see
+    // WorkspaceHitRegions for why each tab needs its own field rather than
+    // a single shared shape.
+    let mut tasks_hit = None;
+    let mut notes_hit = None;
+    let mut journal_hit = None;
+    let mut treasury_hit = None;
+    let mut milestones_hit = None;
     match active_tab {
-        0 if app.quest_board_open && app.viewing_step_for_task.is_none() => draw_quest_board(
-            f,
-            body_chunks[1],
-            &sorted_tasks,
-            selected_item_idx,
-            app,
-            theme,
-            sidebar_focused,
-        ),
-        0 => draw_tasks_tab(
-            f,
-            body_chunks[1],
-            &sorted_tasks,
-            selected_item_idx,
-            task_filter,
-            task_sort,
-            &task_assignees,
-            selected_quest_status,
-            &selected_task_comments,
-            &selected_task_dependencies,
-            theme,
-            sidebar_focused,
-            &tasks,
-            viewing_step_for_task,
-            parent_quest_title.as_deref(),
-            is_shared,
-            &app.identity.public_key,
-            &app.db,
-        ),
+        0 if app.quest_board_open && app.viewing_step_for_task.is_none() => {
+            // Kanban board mode — not covered by this pass, see
+            // WorkspaceHitRegions's doc comment.
+            draw_quest_board(
+                f,
+                body_chunks[1],
+                &sorted_tasks,
+                selected_item_idx,
+                app,
+                theme,
+                sidebar_focused,
+            );
+        }
+        0 => {
+            tasks_hit = draw_tasks_tab(
+                f,
+                body_chunks[1],
+                &sorted_tasks,
+                selected_item_idx,
+                task_filter,
+                task_sort,
+                &task_assignees,
+                selected_quest_status,
+                &selected_task_comments,
+                &selected_task_dependencies,
+                theme,
+                sidebar_focused,
+                &tasks,
+                viewing_step_for_task,
+                parent_quest_title.as_deref(),
+                is_shared,
+                &app.identity.public_key,
+                &app.db,
+            );
+        }
         1 => {
             let project_codices: Vec<crate::models::Codex> = app
                 .codices
@@ -444,7 +458,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 .filter(|c| c.project_id == project.id)
                 .cloned()
                 .collect();
-            draw_notes_tab(
+            notes_hit = draw_notes_tab(
                 f,
                 body_chunks[1],
                 &filtered_notes,
@@ -468,7 +482,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 .take(8)
                 .map(|message| format!("{}  {}", &message.6[..10.min(message.6.len())], message.4))
                 .collect::<Vec<_>>();
-            draw_journal_tab(
+            journal_hit = draw_journal_tab(
                 f,
                 body_chunks[1],
                 &filtered_journals,
@@ -477,9 +491,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 theme,
                 sidebar_focused,
                 is_shared,
-            )
+            );
         }
-        4 => draw_treasury_tab(f, body_chunks[1], app, project.id, theme, sidebar_focused),
+        4 => {
+            treasury_hit = draw_treasury_tab(f, body_chunks[1], app, project.id, theme, sidebar_focused);
+        }
         _ => {
             let (overview_members, overview_activity) = if is_shared {
                 (
@@ -493,7 +509,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             } else {
                 (vec![], vec![])
             };
-            draw_overview_tab(
+            milestones_hit = draw_overview_tab(
                 f,
                 body_chunks[1],
                 project,
@@ -507,7 +523,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 sidebar_focused,
                 &overview_members,
                 &overview_activity,
-            )
+            );
         }
     }
 
@@ -976,6 +992,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     WorkspaceHitRegions {
         sidebar: sidebar_inner,
         sidebar_tab_order,
+        milestones: milestones_hit,
+        treasury: treasury_hit,
+        journal: journal_hit,
+        notes: notes_hit,
+        tasks: tasks_hit,
     }
 }
 
@@ -986,7 +1007,7 @@ fn draw_treasury_tab(
     campaign_id: uuid::Uuid,
     theme: &Theme,
     sidebar_focused: bool,
-) {
+) -> Option<crate::screens::hit_test::WorkspaceRowList> {
     let service = crate::services::TreasuryService::new(&app.db);
     let treasury = service.ensure_campaign(campaign_id).ok();
     let totals = service
@@ -1146,6 +1167,14 @@ fn draw_treasury_tab(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border)),
     );
+    // Table (unlike Block) doesn't hand its Block back after .block(), so
+    // .inner() is computed from an identical throwaway one instead — the
+    // border config alone (not title/style) is what .inner() depends on.
+    let table_inner = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .inner(sections[1]);
+    let entry_count = entries.len();
     f.render_widget(table, sections[1]);
 
     let lower = Layout::default()
@@ -1226,6 +1255,20 @@ fn draw_treasury_tab(
         ),
         lower[1],
     );
+
+    if entry_count == 0 {
+        None
+    } else {
+        Some(crate::screens::hit_test::WorkspaceRowList {
+            area: Rect {
+                x: table_inner.x,
+                y: table_inner.y + 1, // skip the header row
+                width: table_inner.width,
+                height: table_inner.height.saturating_sub(1),
+            },
+            row_targets: (0..entry_count).map(Some).collect(),
+        })
+    }
 }
 
 fn draw_treasury_entry_modal(
@@ -2330,7 +2373,7 @@ fn draw_tasks_tab(
     is_shared: bool,
     my_identity: &str,
     db: &crate::database::Database,
-) {
+) -> Option<crate::screens::hit_test::WorkspaceRowList> {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused {
         theme.border
@@ -2608,13 +2651,13 @@ fn draw_tasks_tab(
         )
     };
 
-    let list_widget = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(content_border))
-            .title(list_title),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(content_border))
+        .title(list_title);
+    let list_inner = list_block.inner(sub_chunks[0]);
+    let list_widget = List::new(list_items).block(list_block);
     f.render_widget(list_widget, sub_chunks[0]);
 
     // Panel derecho de detalles — muestra todo lo importante de la quest seleccionada
@@ -2800,6 +2843,18 @@ fn draw_tasks_tab(
             .wrap(ratatui::widgets::Wrap { trim: true })
     };
     f.render_widget(details_widget, sub_chunks[1]);
+
+    // Every branch above renders exactly one Line per task (even the
+    // multi-badge ones), so — like Archive/Legends — this is a plain,
+    // unscrolled List: row N is tasks[N] directly, no wrap/offset math.
+    if tasks.is_empty() {
+        None
+    } else {
+        Some(crate::screens::hit_test::WorkspaceRowList {
+            area: list_inner,
+            row_targets: (0..tasks.len()).map(Some).collect(),
+        })
+    }
 }
 
 fn draw_quest_dependencies_modal(
@@ -3791,7 +3846,7 @@ fn draw_notes_tab(
     preview_focused: bool,
     preview_scroll: usize,
     preview_max_scroll: &std::cell::Cell<usize>,
-) {
+) -> Option<crate::screens::hit_test::WorkspaceNotesHitRegions> {
     preview_max_scroll.set(0);
     let accent_color = theme.primary;
     let list_border = if sidebar_focused || preview_focused {
@@ -3851,6 +3906,7 @@ fn draw_notes_tab(
     let visible_height = sub_chunks[0].height.saturating_sub(2) as usize;
     let scroll_padding = (visible_height / 2).max(1);
 
+    let has_real_rows = !(flat_list.is_empty() && notes.is_empty());
     let list_items: Vec<ListItem> = if flat_list.is_empty() && notes.is_empty() {
         vec![ListItem::new("  No campaign scrolls. Press [n] to write.")]
     } else if flat_list.is_empty() {
@@ -3911,19 +3967,35 @@ fn draw_notes_tab(
     };
 
     let total_items = list_items.len();
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(content_border))
+        .title(" Campaign Scrolls");
+    let list_inner = list_block.inner(sub_chunks[0]);
     let list_widget = List::new(list_items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(content_border))
-                .title(" Campaign Scrolls"),
-        )
+        .block(list_block)
         .scroll_padding(scroll_padding);
 
     let mut list_state = ratatui::widgets::ListState::default()
         .with_selected(Some(selected_flat_idx.min(total_items.saturating_sub(1))));
     f.render_stateful_widget(list_widget, sub_chunks[0], &mut list_state);
+    // render_stateful_widget just mutated state.offset to whatever keeps the
+    // selection visible for this frame (same trick as Dashboard/Character) —
+    // read it back and build a plain row->flat-index map from it instead of
+    // re-deriving ratatui's scroll-into-view + scroll_padding math ourselves.
+    // Rows are uniform single-line here, so no per-item height accumulation
+    // is needed the way Character's word-wrapped log needed one.
+    let notes_visible_start = list_state.offset();
+    let notes_row_targets: Vec<Option<usize>> = (notes_visible_start..total_items)
+        .take(list_inner.height as usize)
+        .map(|flat_i| {
+            let is_divider = flat_list
+                .get(flat_i)
+                .is_some_and(|(_, note_idx, is_header)| note_idx.is_none() && !is_header);
+            (!is_divider).then_some(flat_i)
+        })
+        .collect();
 
     // Convertimos la posición plana a índice real de nota — los headers no tienen nota
     let selected_note_idx: Option<usize> = flat_list
@@ -4039,6 +4111,19 @@ fn draw_notes_tab(
             ))
     };
     f.render_widget(preview_widget, sub_chunks[1]);
+
+    if !has_real_rows {
+        return None;
+    }
+    Some(crate::screens::hit_test::WorkspaceNotesHitRegions {
+        list: crate::screens::hit_test::WorkspaceRowList {
+            area: list_inner,
+            row_targets: notes_row_targets,
+        },
+        // Full pane, border included — a click there just moves focus,
+        // there's no sub-selection inside the preview.
+        preview: Some(sub_chunks[1]),
+    })
 }
 
 // El tab de journal — muestra las entradas cronológicas del proyecto, con autor si es proyecto compartido
@@ -4051,7 +4136,7 @@ fn draw_journal_tab(
     theme: &Theme,
     sidebar_focused: bool,
     is_shared: bool,
-) {
+) -> Option<crate::screens::hit_test::WorkspaceRowList> {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused {
         theme.border
@@ -4089,6 +4174,9 @@ fn draw_journal_tab(
         chunks[1]
     };
 
+    // One entry per rendered row, in lockstep with items below — empty
+    // when journals itself is empty (the placeholder row isn't real).
+    let mut journal_rows: Vec<Option<usize>> = Vec::new();
     let items: Vec<ListItem> = if journals.is_empty() {
         vec![ListItem::new(
             "  No daily logs recorded. Press [n] to write chronicle.",
@@ -4128,19 +4216,31 @@ fn draw_journal_tab(
                 }
                 spans.push(Line::from(""));
 
+                for _ in 0..spans.len() {
+                    journal_rows.push(Some(i));
+                }
                 ListItem::new(spans)
             })
             .collect()
     };
 
-    let list_widget = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(content_border))
-            .title(" Campaign Chronicles"),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(content_border))
+        .title(" Campaign Chronicles");
+    let list_inner = list_block.inner(journal_area);
+    let list_widget = List::new(items).block(list_block);
     f.render_widget(list_widget, journal_area);
+
+    if journal_rows.is_empty() {
+        None
+    } else {
+        Some(crate::screens::hit_test::WorkspaceRowList {
+            area: list_inner,
+            row_targets: journal_rows,
+        })
+    }
 }
 
 // El tab de overview — métricas del proyecto, barra de progreso y lista de milestones con su avance
@@ -4167,7 +4267,7 @@ fn draw_overview_tab(
         String,
         String,
     )],
-) {
+) -> Option<crate::screens::hit_test::WorkspaceRowList> {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused {
         theme.border
@@ -4365,6 +4465,9 @@ fn draw_overview_tab(
     f.render_widget(stats_p, bottom_split[0]);
 
     // 3b. Lista de milestones — cada uno muestra su progreso de requisitos si tiene template
+    // milestone_rows stays empty when there's nothing real to select (the
+    // placeholder row below isn't a milestone).
+    let mut milestone_rows: Vec<Option<usize>> = Vec::new();
     let milestone_items: Vec<ListItem> = if milestones.is_empty() {
         vec![ListItem::new(
             "  No milestones established. Press [m] to formulate one.",
@@ -4434,18 +4537,24 @@ fn draw_overview_tab(
                     }
                 }
 
+                // Every screen row a milestone renders (header + however
+                // many requirement rows) maps back to that milestone — a
+                // click anywhere in its block selects it.
+                for _ in 0..rows.len() {
+                    milestone_rows.push(Some(idx));
+                }
                 rows
             })
             .collect()
     };
 
-    let mil_list = List::new(milestone_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(content_border))
-            .title(" Campaign Milestones — [Space] Toggle | [Delete] Slay | [m] New"),
-    );
+    let mil_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(content_border))
+        .title(" Campaign Milestones — [Space] Toggle | [Delete] Slay | [m] New");
+    let mil_inner = mil_block.inner(bottom_split[1]);
+    let mil_list = List::new(milestone_items).block(mil_block);
     f.render_widget(mil_list, bottom_split[1]);
 
     // Sección de Fellowship — solo se muestra si el proyecto es compartido
@@ -4526,6 +4635,15 @@ fn draw_overview_tab(
                 .title(" Fellowship Activity "),
         );
         f.render_widget(activity_list, fellowship_split[1]);
+    }
+
+    if milestone_rows.is_empty() {
+        None
+    } else {
+        Some(crate::screens::hit_test::WorkspaceRowList {
+            area: mil_inner,
+            row_targets: milestone_rows,
+        })
     }
 }
 

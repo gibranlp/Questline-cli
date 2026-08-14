@@ -316,19 +316,58 @@ pub enum FellowshipSubList {
     Chat(FellowshipChatHitRegions),
 }
 
-/// `screens::project_workspace::draw` — only the 5-item sidebar (Overview /
-/// Tasks / Scrolls / Treasury / Chronicle) gets a hit region for now; each
-/// of its 5 tabs is effectively its own sub-screen with independent list
-/// rendering (subtask trees, tables, a note-preview split, ...) and is its
-/// own follow-up. The sidebar is a plain `List`, single-line rows, no
-/// scroll — same shape as Archive/Gateway — except its *display* order
-/// (Overview, Tasks, Scrolls, Treasury, Chronicle) isn't `workspace_tab_idx`
-/// order, so `sidebar_tab_order[row]` is the real tab index for that row.
-#[derive(Debug, Clone, Copy)]
+/// `screens::project_workspace::draw` — the 5-item sidebar (Overview /
+/// Tasks / Scrolls / Treasury / Chronicle) plus whichever of the 5 tabs'
+/// own content lists is active. The sidebar is a plain `List`,
+/// single-line rows, no scroll — same shape as Archive/Gateway — except
+/// its *display* order isn't `workspace_tab_idx` order, so
+/// `sidebar_tab_order[row]` is the real tab index for that row.
+#[derive(Debug, Clone)]
 pub struct WorkspaceHitRegions {
     /// Inner sidebar list area — borders already excluded.
     pub sidebar: Rect,
     pub sidebar_tab_order: [usize; 5],
+    /// Overview tab's milestone list — one field per workspace tab, `None`
+    /// unless that tab is the one currently rendered (and, for each, unless
+    /// its list is non-empty — an empty-state placeholder row isn't real).
+    pub milestones: Option<WorkspaceRowList>,
+    pub treasury: Option<WorkspaceRowList>,
+    pub journal: Option<WorkspaceRowList>,
+    pub notes: Option<WorkspaceNotesHitRegions>,
+    pub tasks: Option<WorkspaceRowList>,
+}
+
+/// A rendered row -> item-index map, built once at draw time — the same
+/// idea as ProjectsHitRegions.row_targets (`None` for a non-selectable
+/// divider/header-only row, e.g. Notes' "── Unassigned / Ungrouped ──").
+/// Also covers variable-height rows (e.g. a milestone with unmet-requirement
+/// sub-rows) the same way CharacterHitRegions.adventure_log_rows does: one
+/// vec entry per rendered screen row, not per item.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRowList {
+    pub area: Rect,
+    pub row_targets: Vec<Option<usize>>,
+}
+
+impl WorkspaceRowList {
+    /// (col, row) -> item index, or None if the click missed the area,
+    /// landed past the last rendered row, or hit a divider row.
+    pub fn row_index(&self, col: u16, row: u16) -> Option<usize> {
+        if !HitRegions::contains(self.area, col, row) {
+            return None;
+        }
+        let offset = (row - self.area.y) as usize;
+        self.row_targets.get(offset).copied().flatten()
+    }
+}
+
+/// Notes/Scrolls tab — a list on the left and (when a note is selected and
+/// visible) a preview pane on the right; a click on the preview just moves
+/// focus there, mirroring Library/Character's detail panes.
+#[derive(Debug, Clone)]
+pub struct WorkspaceNotesHitRegions {
+    pub list: WorkspaceRowList,
+    pub preview: Option<Rect>,
 }
 
 impl HitRegions {
