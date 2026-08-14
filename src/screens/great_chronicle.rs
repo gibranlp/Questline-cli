@@ -5,6 +5,7 @@
 use crate::app::App;
 use crate::models::GlobalChronicleEntry;
 use crate::models::chapter::{Chapter, ChapterProgressData, get_active_chapter};
+use crate::screens::hit_test::GreatChronicleHitRegions;
 use crate::theme::Theme;
 use chrono::{DateTime, Utc};
 use ratatui::{
@@ -360,7 +361,12 @@ fn build_history_lines<'a>(app: &'a App, theme: &'a Theme) -> Vec<Line<'a>> {
 
 // función principal de la pantalla — header + body dividido, footer con controles
 // el body se parte en feed (izquierda) y panel de capítulo (derecha, con su propio sistema de tabs)
-pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
+pub fn draw(
+    f: &mut ratatui::Frame,
+    app: &App,
+    theme: &Theme,
+    area: ratatui::layout::Rect,
+) -> GreatChronicleHitRegions {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -654,4 +660,9 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
             .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(footer, chunks[2]);
+
+    GreatChronicleHitRegions {
+        feed: body_chunks[0],
+        chapter_panel: body_chunks[1],
+    }
 }

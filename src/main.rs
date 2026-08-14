@@ -967,12 +967,13 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveScreen::Gateway => {
-                    screens::gateway::draw(
+                    let regions = screens::gateway::draw(
                         f,
                         app.gateway_selected_idx,
                         app.intro_ticks,
                         &theme,
                     );
+                    app.hit_regions.gateway = Some(regions);
                 }
                 ActiveScreen::Restore => {
                     screens::restore::draw(
@@ -987,7 +988,7 @@ async fn main() -> Result<()> {
                     screens::prologue::draw(f, &app, &theme);
                 }
                 ActiveScreen::Onboarding => {
-                    screens::onboarding::draw(
+                    let regions = screens::onboarding::draw(
                         f,
                         &app.onboarding_username,
                         app.onboarding_class_idx,
@@ -995,6 +996,7 @@ async fn main() -> Result<()> {
                         &app.onboarding_classes,
                         app.onboarding_error.as_deref(),
                     );
+                    app.hit_regions.onboarding = Some(regions);
                 }
                 ActiveScreen::Editor => {
                     let quick_note = app
@@ -1044,7 +1046,8 @@ async fn main() -> Result<()> {
                         },
 
                         ActiveScreen::Focus => {
-                            screens::focus::draw(f, &app, &theme);
+                            let regions = screens::focus::draw(f, &app, &theme);
+                            app.hit_regions.focus = regions;
                         },
                         ActiveScreen::Projects => {
                             screens::projects::draw(
@@ -1095,7 +1098,9 @@ async fn main() -> Result<()> {
                             );
                         }
                         ActiveScreen::Archive => {
-                            screens::archive::draw(f, &app.projects, app.selected_archive_idx, &theme);
+                            let regions =
+                                screens::archive::draw(f, &app.projects, app.selected_archive_idx, &theme);
+                            app.hit_regions.archive = Some(regions);
                         }
 
                         ActiveScreen::Soundscapes => {
@@ -1114,7 +1119,8 @@ async fn main() -> Result<()> {
                             screens::about::draw(f, &app, &theme, chunks[0]);
                         }
                         ActiveScreen::GreatChronicle => {
-                            screens::great_chronicle::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::great_chronicle::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.great_chronicle = Some(regions);
                         }
 
                         ActiveScreen::Library => {
@@ -1149,7 +1155,7 @@ async fn main() -> Result<()> {
                         }
                         ActiveScreen::Legends => {
                             let relics = app.db.get_relics().unwrap_or_default();
-                            screens::legends::draw(
+                            let regions = screens::legends::draw(
                                 f,
                                 &app.stats_cache.statistics,
                                 app.selected_relic_idx,
@@ -1157,6 +1163,7 @@ async fn main() -> Result<()> {
                                 &theme,
                                 app.quit_confirm_ticks,
                             );
+                            app.hit_regions.legends = Some(regions);
                         }
                         _ => {}
                     }
