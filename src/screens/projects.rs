@@ -4,6 +4,7 @@
 
 use crate::app::{ModalType, ordered_active_projects};
 use crate::models::{Note, Project, Task};
+use crate::screens::hit_test::{ProjectsHitRegions, ProjectsRowTarget};
 use crate::screens::intro::centered_rect;
 use crate::theme::Theme;
 use ratatui::{
@@ -25,7 +26,7 @@ pub fn draw(
     modal: &ModalType,
     theme: &Theme,
     area: Rect,
-) {
+) -> ProjectsHitRegions {
     let size = area;
     let accent_color = theme.primary;
 
@@ -82,6 +83,9 @@ pub fn draw(
         .count();
 
     let mut list_items: Vec<ListItem> = Vec::new();
+    // One entry per list_items row, built in lockstep with it below — see
+    // ProjectsHitRegions for why the row index isn't just the project index.
+    let mut row_targets: Vec<Option<ProjectsRowTarget>> = Vec::new();
     let all_selected_style = if all_selected {
         Style::default()
             .fg(Color::Black)
@@ -145,12 +149,14 @@ pub fn draw(
         ));
     }
     list_items.push(ListItem::new(Line::from(all_spans)));
+    row_targets.push(Some(ProjectsRowTarget::All));
 
     if active_projects.is_empty() {
         list_items.push(
             ListItem::new("  No campaigns. Press [n] to create one.")
                 .style(Style::default().fg(theme.muted)),
         );
+        row_targets.push(None);
     } else {
         for (i, p) in active_projects.iter().enumerate() {
             if p.is_shared && (i == 0 || !active_projects[i - 1].is_shared) {
@@ -163,6 +169,7 @@ pub fn draw(
                     )]))
                     .style(Style::default().bg(theme.panel)),
                 );
+                row_targets.push(None);
             }
             let open_tasks = all_tasks
                 .iter()
@@ -236,6 +243,7 @@ pub fn draw(
                 spans.push(Span::styled(format!("#({}) ", scrolls), scroll_count_style));
             }
             list_items.push(ListItem::new(Line::from(spans)));
+            row_targets.push(Some(ProjectsRowTarget::Project(i)));
         }
     }
 
@@ -244,13 +252,13 @@ pub fn draw(
     } else {
         Style::default().fg(theme.border)
     };
-    let list_widget = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(list_border_style)
-            .title(" Active Campaigns"),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(list_border_style)
+        .title(" Active Campaigns");
+    let list_inner = list_block.inner(body_chunks[0]);
+    let list_widget = List::new(list_items).block(list_block);
     f.render_widget(list_widget, body_chunks[0]);
 
     // panel derecho: árbol de todas las tareas si "All" está seleccionado; si no, detalle del proyecto
@@ -492,6 +500,11 @@ pub fn draw(
             draw_campaign_template_select(f, *selected_idx, theme);
         }
         _ => {}
+    }
+
+    ProjectsHitRegions {
+        list: list_inner,
+        row_targets,
     }
 }
 

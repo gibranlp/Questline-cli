@@ -5,6 +5,7 @@
 use crate::app::{App, DashboardCommandTarget, ModalType};
 use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
 use crate::screens::fellowship::notice_belongs_in_fellowship;
+use crate::screens::hit_test::DashboardHitRegions;
 use crate::screens::intro::centered_rect;
 use crate::services::bonsai::BonsaiGrid;
 use crate::services::planner::{self, DashboardPlan, format_duration};
@@ -161,7 +162,7 @@ fn draw_today_command_center(
     all_tasks: &[Task],
     today: chrono::NaiveDate,
     plan: &DashboardPlan,
-) {
+) -> DashboardHitRegions {
     let (_, label_color) = workload_label(plan.estimated_minutes);
     let overdue = all_tasks
         .iter()
@@ -188,23 +189,30 @@ fn draw_today_command_center(
         .filter(|t| !t.completed && t.parent_task_id.is_none() && t.priority == TaskPriority::High)
         .count();
     let mut rows: Vec<ListItem> = Vec::new();
+    // One entry per rows row, built in lockstep with it below — see
+    // DashboardHitRegions for why the rendered row index isn't action_idx.
+    let mut row_targets: Vec<Option<usize>> = Vec::new();
     let mut selected_visual_idx = None;
     let mut action_idx = 0usize;
-    let push_separator = |rows: &mut Vec<ListItem>, label: &'static str, color: Color| {
-        if !rows.is_empty() {
-            rows.push(ListItem::new(Line::from("")));
-            rows.push(ListItem::new(Line::from(Span::styled(
-                format!("  -- {} --", label),
-                Style::default().fg(color),
-            ))));
-        }
-    };
+    let push_separator =
+        |rows: &mut Vec<ListItem>, row_targets: &mut Vec<Option<usize>>, label: &'static str, color: Color| {
+            if !rows.is_empty() {
+                rows.push(ListItem::new(Line::from("")));
+                row_targets.push(None);
+                rows.push(ListItem::new(Line::from(Span::styled(
+                    format!("  -- {} --", label),
+                    Style::default().fg(color),
+                ))));
+                row_targets.push(None);
+            }
+        };
 
     if let Some(main) = plan.main_quest.as_ref() {
         let (prio_label, prio_color) = priority_label(main.task.priority);
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
+        let this_idx = action_idx;
         action_idx += 1;
         rows.push(ListItem::new(Line::from(vec![
             Span::styled("MAIN  ", Style::default().fg(theme.warning)),
@@ -227,6 +235,7 @@ fn draw_today_command_center(
                 Style::default().fg(theme.muted),
             ),
         ])));
+        row_targets.push(Some(this_idx));
     }
 
     if let Some(next) = plan.next_quest.as_ref() {
@@ -234,6 +243,7 @@ fn draw_today_command_center(
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
+        let this_idx = action_idx;
         action_idx += 1;
         rows.push(ListItem::new(Line::from(vec![
             Span::styled("NEXT  ", Style::default().fg(theme.focus_timer)),
@@ -251,9 +261,10 @@ fn draw_today_command_center(
                 Style::default().fg(theme.muted),
             ),
         ])));
+        row_targets.push(Some(this_idx));
     }
 
-    push_separator(&mut rows, "Quick Wins", theme.primary);
+    push_separator(&mut rows, &mut row_targets, "Quick Wins", theme.primary);
     for task in &plan.quick_wins {
         let (prio_label, prio_color) = priority_label(task.priority);
         let project_name = app
@@ -266,6 +277,7 @@ fn draw_today_command_center(
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
+        let this_idx = action_idx;
         action_idx += 1;
         rows.push(ListItem::new(Line::from(vec![
             Span::styled("[ ] ", Style::default().fg(theme.text)),
@@ -283,9 +295,10 @@ fn draw_today_command_center(
                 Style::default().fg(energy_color),
             ),
         ])));
+        row_targets.push(Some(this_idx));
     }
 
-    push_separator(&mut rows, "Sidequests", theme.secondary);
+    push_separator(&mut rows, &mut row_targets, "Sidequests", theme.secondary);
     for ritual in &app.stats_cache.rituals {
         let (count, target) = app
             .stats_cache
@@ -299,6 +312,7 @@ fn draw_today_command_center(
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
+        let this_idx = action_idx;
         action_idx += 1;
         let mut spans = vec![
             Span::styled(
@@ -328,13 +342,15 @@ fn draw_today_command_center(
             ));
         }
         rows.push(ListItem::new(Line::from(spans)));
+        row_targets.push(Some(this_idx));
     }
 
-    push_separator(&mut rows, "Daily", theme.warning);
+    push_separator(&mut rows, &mut row_targets, "Daily", theme.warning);
     for adventure in &app.stats_cache.todays_daily_adventures {
         if action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
+        let this_idx = action_idx;
         action_idx += 1;
         rows.push(ListItem::new(Line::from(vec![
             Span::styled("DAILY ", Style::default().fg(theme.warning)),
@@ -352,6 +368,7 @@ fn draw_today_command_center(
                 Style::default().fg(theme.muted),
             ),
         ])));
+        row_targets.push(Some(this_idx));
     }
 
     if rows.is_empty() {
@@ -359,6 +376,7 @@ fn draw_today_command_center(
             "  The command board is clear.",
             Style::default().fg(theme.muted),
         )));
+        row_targets.push(None);
     }
 
     let mut state = ListState::default();
@@ -377,21 +395,29 @@ fn draw_today_command_center(
         high,
         format_duration(plan.estimated_minutes)
     );
-    let list = List::new(rows)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(label_color))
-                .title(title.as_str()),
-        )
-        .highlight_style(
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.selection)
-                .add_modifier(Modifier::BOLD),
-        );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(label_color))
+        .title(title.as_str());
+    let list_inner = list_block.inner(area);
+    let list = List::new(rows).block(list_block).highlight_style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(theme.selection)
+            .add_modifier(Modifier::BOLD),
+    );
     f.render_stateful_widget(list, area, &mut state);
+    // render_stateful_widget shifts `state.offset` to whatever keeps the
+    // selection visible for *this* frame — read it back instead of
+    // re-deriving ratatui's scroll-into-view algorithm ourselves.
+    let visible_start = state.offset();
+
+    DashboardHitRegions {
+        list: list_inner,
+        row_targets,
+        visible_start,
+    }
 }
 
 fn draw_campaign_intel(
@@ -1411,7 +1437,12 @@ fn draw_hydration_widget(f: &mut Frame, app: &App, theme: &Theme, area: ratatui:
 
 // ─── Función principal de renderizado ────────────────────────────────────────
 
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect) {
+pub fn draw(
+    f: &mut Frame,
+    app: &App,
+    theme: &Theme,
+    area: ratatui::layout::Rect,
+) -> DashboardHitRegions {
     let user = app.user.as_ref().unwrap();
     let today = chrono::Local::now().date_naive();
     let all_tasks = &app.all_tasks;
@@ -1486,7 +1517,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
         .split(right_rows[1]);
-    draw_today_command_center(f, app, theme, command_row[0], all_tasks, today, &plan);
+    let command_center_regions =
+        draw_today_command_center(f, app, theme, command_row[0], all_tasks, today, &plan);
 
     let intel_rows = Layout::default()
         .direction(Direction::Vertical)
@@ -1795,4 +1827,6 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: ratatui::layout::Rect
         }
         _ => {}
     }
+
+    command_center_regions
 }

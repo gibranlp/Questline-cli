@@ -568,10 +568,16 @@ If Questline helps you on your adventures, consider starring the repository and 
   now does what Enter or Up/Down would have — e.g. clicking an Archived
   Campaign selects it, clicking a Gateway option activates it immediately,
   and clicking either side of the Great Chronicle moves focus between the
-  Realm Activity feed and the Chapter panel. The remaining list/menu screens
-  (Projects, Dashboard, Character, Fellowship, Sync, Settings, Soundscapes,
-  Library, Project Workspace) are still keyboard-only and planned as further
-  follow-ups.
+  Realm Activity feed and the Chapter panel.
+- Extended click-to-select to Campaigns and the Command Center: both lists
+  interleave non-selectable rows (the pinned "All Campaigns" entry and a
+  "Shared Campaigns" divider; "-- Quick Wins --"/"-- Sidequests --"/"--
+  Daily --" dividers) among the real, clickable ones, so clicking now maps
+  the row you actually clicked back to the right campaign or quest instead
+  of an off-by-however-many-dividers-are-above-it one. The remaining
+  list/menu screens (Character, Fellowship, Sync, Settings, Soundscapes,
+  Library, Project Workspace) are still keyboard-only and planned as
+  further follow-ups.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
