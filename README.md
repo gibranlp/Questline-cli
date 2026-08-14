@@ -574,10 +574,17 @@ If Questline helps you on your adventures, consider starring the repository and 
   "Shared Campaigns" divider; "-- Quick Wins --"/"-- Sidequests --"/"--
   Daily --" dividers) among the real, clickable ones, so clicking now maps
   the row you actually clicked back to the right campaign or quest instead
-  of an off-by-however-many-dividers-are-above-it one. The remaining
-  list/menu screens (Character, Fellowship, Sync, Settings, Soundscapes,
-  Library, Project Workspace) are still keyboard-only and planned as
-  further follow-ups.
+  of an off-by-however-many-dividers-are-above-it one.
+- Extended click-to-select to Soundscapes, the Lore Library, and Settings:
+  click a source to select it (and, under Local Folder, click a track or
+  Random Shuffle in the nested list); click a category, entry, or the
+  details pane in the Library to move focus there; click a theme, an
+  Alerts & Audio row, or an Oath Calendar row in Settings to focus it (a
+  click only selects — several of those rows are live toggles, and a
+  misclick flipping one would be worse than requiring the existing
+  Enter/Space keys to commit). The remaining list/menu screens (Character,
+  Fellowship, Sync, Project Workspace) are still keyboard-only and planned
+  as further follow-ups.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*

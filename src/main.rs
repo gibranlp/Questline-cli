@@ -1108,10 +1108,12 @@ async fn main() -> Result<()> {
                         }
 
                         ActiveScreen::Soundscapes => {
-                            screens::soundscapes::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::soundscapes::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.soundscapes = Some(regions);
                         }
                         ActiveScreen::Settings => {
-                            screens::settings::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::settings::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.settings = Some(regions);
                         }
                         ActiveScreen::SyncSettings => {
                             screens::sync::draw(f, &app, &theme, chunks[0]);
@@ -1132,7 +1134,7 @@ async fn main() -> Result<()> {
                             let quests = app.db.get_class_quests(class_name).unwrap_or_default();
                             let lore = app.db.get_lore_entries().unwrap_or_default();
                             let used_soundscapes = app.db.get_unique_soundscapes_used().unwrap_or_default();
-                            screens::library::draw(
+                            let regions = screens::library::draw(
                                 f,
                                 app.library_active_col,
                                 app.selected_library_cat_idx,
@@ -1156,6 +1158,7 @@ async fn main() -> Result<()> {
                                 &theme,
                                 app.quit_confirm_ticks,
                             );
+                            app.hit_regions.library = Some(regions);
                         }
                         ActiveScreen::Legends => {
                             let relics = app.db.get_relics().unwrap_or_default();

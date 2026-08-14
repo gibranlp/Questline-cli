@@ -21,6 +21,9 @@ pub struct HitRegions {
     pub focus: Option<FocusHitRegions>,
     pub projects: Option<ProjectsHitRegions>,
     pub dashboard: Option<DashboardHitRegions>,
+    pub soundscapes: Option<SoundscapesHitRegions>,
+    pub library: Option<LibraryHitRegions>,
+    pub settings: Option<SettingsHitRegions>,
 }
 
 /// The regions `screens::editor::draw`/`draw_in_area` rendered on the last frame.
@@ -123,6 +126,78 @@ pub struct DashboardHitRegions {
     pub list: Rect,
     pub row_targets: Vec<Option<usize>>,
     pub visible_start: usize,
+}
+
+/// `screens::soundscapes::draw_local_files_panel` — the nested track list
+/// that only appears under the Local Folder source, once a folder with at
+/// least one supported file is configured.
+#[derive(Debug, Clone, Copy)]
+pub struct LocalTracksHitRegions {
+    /// Inner paragraph area — borders already excluded. Line 0 of the
+    /// paragraph's text starts at this Rect's top edge (no scroll offset).
+    pub area: Rect,
+    /// Line index (within the paragraph) of the "Random shuffle" row —
+    /// `selected_local_track_idx == 0`.
+    pub row_start: usize,
+    /// Real track rows rendered right after row_start, capped to whatever
+    /// fit (mirroring the "...and N more" fallback text below them).
+    pub track_count: usize,
+}
+
+/// `screens::soundscapes::draw` — the source list has fixed 4-line-tall
+/// rows and, like Archive/Legends, renders from item 0 with no scroll
+/// offset. `local_tracks` is only Some while the Local Folder source is
+/// selected, a folder is configured, and at least one track was found.
+#[derive(Debug, Clone, Copy)]
+pub struct SoundscapesHitRegions {
+    /// Inner list area — borders already excluded.
+    pub source_list: Rect,
+    pub item_count: usize,
+    pub local_tracks: Option<LocalTracksHitRegions>,
+}
+
+/// `screens::library::draw` — three columns (Categories / Items / Details).
+/// Categories is a fixed 6-row list with no scroll; Items is manually
+/// scrolled at draw time (`.skip(start_idx).take(visible_item_rows)` plus a
+/// separate `Scrollbar`, not a `ListState`), so `item_start_idx` is the
+/// piece a click needs to convert an on-screen row back to an item index.
+/// `detail_panel` has no sub-selection — a click there just moves focus.
+#[derive(Debug, Clone, Copy)]
+pub struct LibraryHitRegions {
+    /// Inner category list area — borders already excluded.
+    pub cat_list: Rect,
+    pub cat_count: usize,
+    /// Inner item list area — borders already excluded.
+    pub item_list: Rect,
+    pub item_start_idx: usize,
+    pub item_count: usize,
+    /// Full details column, border included.
+    pub detail_panel: Rect,
+}
+
+/// `screens::settings::draw` — a plain theme `List` (no `.block()`, so no
+/// border inset) plus two hand-built `Paragraph`s (Alerts & Audio rows,
+/// `selected_settings_focus_idx` 1-5; Oath Calendar rows, 6-15) where each
+/// row is one `Line` at a fixed offset from `settings_row()` — no wrapping
+/// in practice, though a narrow enough terminal could still wrap a row and
+/// throw this off (pre-existing risk, not something Phase 2 fixes). Click
+/// only moves focus here, same as Projects/Dashboard/Library — several of
+/// these rows are live toggles (notifications, weekday oaths) and a
+/// misclick flipping one is worse than requiring the existing Enter/Space
+/// keys to commit.
+#[derive(Debug, Clone, Copy)]
+pub struct SettingsHitRegions {
+    /// theme_cols[0] itself — the List has no block/border to inset for.
+    pub theme_list: Rect,
+    pub theme_count: usize,
+    /// Inner Alerts & Audio area — borders already excluded. Row 0 is
+    /// focus_idx 1.
+    pub alerts_panel: Rect,
+    pub alerts_row_count: usize,
+    /// Inner Oath Calendar area — borders already excluded. Row 0 is
+    /// focus_idx 6.
+    pub oath_panel: Rect,
+    pub oath_row_count: usize,
 }
 
 impl HitRegions {

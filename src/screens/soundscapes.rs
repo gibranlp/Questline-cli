@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 use crate::app::App;
 use crate::audio::{PlaybackStatus, SOUNDSCAPES};
+use crate::screens::hit_test::{LocalTracksHitRegions, SoundscapesHitRegions};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -13,7 +14,7 @@ use ratatui::{
 };
 use std::path::{Path, PathBuf};
 
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesHitRegions {
     let accent_color = theme.primary;
 
     let chunks = Layout::default()
@@ -78,25 +79,32 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ]));
     }
 
-    let list = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(accent_color))
-            .title(Span::styled(
-                " Sources ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Sources ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let list_inner = list_block.inner(chunks[0]);
+    let list = List::new(list_items).block(list_block);
     f.render_widget(list, chunks[0]);
 
     // RIGHT PANEL — cambia según si Media Player está seleccionado o no
-    if SOUNDSCAPES[app.selected_soundscape_idx].name == "Media Player" {
+    let local_tracks = if SOUNDSCAPES[app.selected_soundscape_idx].name == "Media Player" {
         draw_mpris_panel(f, app, theme, chunks[1]);
+        None
     } else {
-        draw_audio_control_panel(f, app, theme, chunks[1], &player_state, &playing_name);
+        draw_audio_control_panel(f, app, theme, chunks[1], &player_state, &playing_name)
+    };
+
+    SoundscapesHitRegions {
+        source_list: list_inner,
+        item_count: SOUNDSCAPES.len(),
+        local_tracks,
     }
 }
 
@@ -107,7 +115,7 @@ fn draw_audio_control_panel(
     area: Rect,
     player_state: &crate::audio::state::AudioState,
     playing_name: &str,
-) {
+) -> Option<LocalTracksHitRegions> {
     let accent_color = theme.primary;
     let selected = SOUNDSCAPES[app.selected_soundscape_idx].name;
     let is_local = selected == "Local Folder";
@@ -189,11 +197,12 @@ fn draw_audio_control_panel(
     );
     f.render_widget(deck, chunks[0]);
 
-    if is_local {
-        draw_local_files_panel(f, app, theme, chunks[1]);
+    let local_tracks = if is_local {
+        draw_local_files_panel(f, app, theme, chunks[1])
     } else {
         draw_source_detail_panel(f, theme, chunks[1], selected);
-    }
+        None
+    };
 
     let help_text = vec![
         Line::from(Span::styled(
@@ -266,6 +275,8 @@ fn draw_audio_control_panel(
             )),
     );
     f.render_widget(help, chunks[2]);
+
+    local_tracks
 }
 
 fn draw_source_detail_panel(f: &mut Frame, theme: &Theme, area: Rect, selected: &str) {
@@ -359,7 +370,12 @@ fn draw_source_detail_panel(f: &mut Frame, theme: &Theme, area: Rect, selected: 
     f.render_widget(panel, area);
 }
 
-fn draw_local_files_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+fn draw_local_files_panel(
+    f: &mut Frame,
+    app: &App,
+    theme: &Theme,
+    area: Rect,
+) -> Option<LocalTracksHitRegions> {
     let folder = app
         .db
         .get_setting("local_music_folder")
@@ -388,6 +404,7 @@ fn draw_local_files_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         Line::from(""),
     ];
 
+    let mut track_hit: Option<(usize, usize)> = None; // (row_start, track_count)
     if folder.trim().is_empty() {
         lines.push(Line::from(Span::styled(
             "  Press f to choose a folder with mp3, ogg, wav, or flac files.",
@@ -409,6 +426,7 @@ fn draw_local_files_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
         ]));
         lines.push(Line::from(""));
+        let row_start = lines.len(); // line index the "Random shuffle" row is about to land on
         let random_selected = app.selected_local_track_idx == 0;
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default()),
@@ -427,11 +445,8 @@ fn draw_local_files_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 },
             ),
         ]));
-        for (idx, path) in tracks
-            .iter()
-            .take(area.height.saturating_sub(8) as usize)
-            .enumerate()
-        {
+        let visible_track_count = tracks.len().min(area.height.saturating_sub(8) as usize);
+        for (idx, path) in tracks.iter().take(visible_track_count).enumerate() {
             let name = path
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -456,30 +471,34 @@ fn draw_local_files_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 ),
             ]));
         }
-        if tracks.len() > area.height.saturating_sub(8) as usize {
+        if tracks.len() > visible_track_count {
             lines.push(Line::from(Span::styled(
-                format!(
-                    "      ...and {} more",
-                    tracks.len() - area.height.saturating_sub(8) as usize
-                ),
+                format!("      ...and {} more", tracks.len() - visible_track_count),
                 Style::default().fg(theme.muted),
             )));
         }
+        track_hit = Some((row_start, visible_track_count));
     }
 
-    let panel = Paragraph::new(lines).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.primary))
-            .title(Span::styled(
-                " Local Library ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
+    let panel_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary))
+        .title(Span::styled(
+            " Local Library ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let inner = panel_block.inner(area);
+    let panel = Paragraph::new(lines).block(panel_block);
     f.render_widget(panel, area);
+
+    track_hit.map(|(row_start, track_count)| LocalTracksHitRegions {
+        area: inner,
+        row_start,
+        track_count,
+    })
 }
 
 fn draw_mpris_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
