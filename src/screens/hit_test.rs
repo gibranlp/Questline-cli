@@ -63,6 +63,22 @@ pub struct ModalHitRegions {
     /// Set for list-picker modals — clicking selects a row/item (mirrors
     /// Up/Down), never confirms/activates it.
     pub list: Option<ModalListRegion>,
+    /// Set for multi-field forms — clicking a field jumps keyboard focus
+    /// there (mirrors Tab), same select-only spirit as `list` above; it
+    /// never types into or edits the field. Position in the Vec is that
+    /// field's `focus_idx`.
+    pub focus_fields: Option<Vec<Rect>>,
+}
+
+/// Regions for the task calendar (`App::task_calendar`) — computed on
+/// demand the same way `ModalHitRegions` is, for the same reason (no
+/// single draw() to stash this from).
+#[derive(Debug, Clone)]
+pub struct CalendarHitRegions {
+    pub popup_area: Rect,
+    /// One entry per real (non-blank-padding) day cell in the 6x7 month
+    /// grid: its Rect and the date it represents.
+    pub days: Vec<(Rect, chrono::NaiveDate)>,
 }
 
 #[derive(Debug, Clone)]

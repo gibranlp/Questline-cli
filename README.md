@@ -680,17 +680,32 @@ If Questline helps you on your adventures, consider starring the repository and 
   Restore) only become clickable once they're actually done — clicking
   one mid-run does nothing, same as any key. Three list-pickers
   (`RefileTask`, `SelectProjectForAction`, `RefileScroll`) use ratatui's
-  auto-scrolling list widget; when the list is long enough to have
-  actually scrolled, clicking is a safe no-op rather than risk mapping to
-  the wrong row. Out of scope for this pass: clicking to focus or edit a
-  text field inside the ~27 multi-field forms (`NewTask`/`EditTask`,
-  `TreasuryEntry`, `InviteMember`, etc.) — those still only get "click
-  outside to cancel"; editing them stays keyboard-only. Implementation
-  note: unlike every other screen's click support, a modal's popup bounds
-  are recomputed fresh from the same layout math its own render code uses,
+  auto-scrolling list widget; clicking correctly accounts for that scroll
+  by replicating ratatui's own "keep the selection visible with minimal
+  scroll" formula, so a click still lands on the right row even once the
+  list has scrolled. Clicking a field inside the 9 multi-field forms that
+  have one (`NewProject`/`EditProject`, `NewTask`/`EditTask`,
+  `TreasuryEntry`, `TreasuryBudget`, `TaskFinancials`, `DailyReflection`,
+  `NewRitual`, `InviteMember`, `HydrationSettings`) now jumps keyboard
+  focus there, same as Tab — including disambiguating Priority/Due-Type/
+  Due-Value on `NewTask`/`EditTask`, which all share one row and need
+  their horizontal position, not just which row, to tell apart. Actually
+  typing into a field, or clicking to position the cursor mid-text, stays
+  keyboard-only — that's a separate, much larger feature (closer to
+  building a second copy of the Notes editor's cursor-placement logic)
+  that this pass deliberately didn't take on. Implementation note: unlike
+  every other screen's click support, a modal's popup bounds are
+  recomputed fresh from the same layout math its own render code uses,
   rather than captured during rendering — no existing render function
   needed to change to add this, at the cost of the two staying in sync by
   convention rather than by construction.
+- Added mouse support to the task calendar (the month-grid date picker
+  opened from a Quest's due-date field, or the campaign planner opened
+  with `C`): click a day to select it, same as the arrow keys; double-
+  click a day to confirm it, same as Enter/Space (opens a new Quest
+  seeded with that date in planner mode, or writes the date back into the
+  Quest modal that opened the picker); click outside the calendar to
+  cancel it, same as Esc.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
