@@ -3059,6 +3059,7 @@ impl App {
                 popup_area,
                 confirm_key: Some(key),
                 list: None,
+                focus_fields: None,
             })
         };
         let outside_only = |popup_area: Rect| {
@@ -3066,7 +3067,110 @@ impl App {
                 popup_area,
                 confirm_key: None,
                 list: None,
+                focus_fields: None,
             })
+        };
+        let fields = |popup_area: Rect, focus_fields: Vec<Rect>| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                list: None,
+                focus_fields: Some(focus_fields),
+            })
+        };
+        // Shared by NewTask/EditTask — replicates draw_task_modal's exact
+        // (state-dependent) vertical Layout, including the horizontal
+        // sub-split of the Priority/Due-Date row, which packs 2-3 focus
+        // stops onto one line. `hide_desc` is always false at every real
+        // call site, so it's hardcoded away here rather than threaded
+        // through as a parameter nothing ever varies.
+        let task_modal_fields = |term: Rect,
+                                  due_date_type: DueDateType,
+                                  show_recurrence: bool,
+                                  show_steps: bool,
+                                  steps_count: usize| {
+            let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
+            const DESC_BOX_HEIGHT: u16 = 12;
+            let steps_content_height = (steps_count as u16).clamp(2, 6);
+            let steps_box_height = steps_content_height + 2;
+            let content_height = 3
+                + DESC_BOX_HEIGHT
+                + 3
+                + if show_recurrence { 3 } else { 0 }
+                + if show_steps { steps_box_height } else { 0 }
+                + 2;
+            let modal_height = (content_height + 2).min(term.height);
+            let full_width = pct(65, 100, term);
+            let popup = Rect {
+                x: full_width.x,
+                y: term.height.saturating_sub(modal_height) / 2,
+                width: full_width.width,
+                height: modal_height,
+            };
+            let block_inner = inner(popup);
+
+            let mut constraints = vec![
+                Constraint::Length(3),
+                Constraint::Length(DESC_BOX_HEIGHT),
+                Constraint::Length(3),
+            ];
+            if show_recurrence {
+                constraints.push(Constraint::Length(3));
+            }
+            if show_steps {
+                constraints.push(Constraint::Length(steps_box_height));
+            }
+            constraints.push(Constraint::Length(2));
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(block_inner);
+
+            let row_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(chunks[2]);
+
+            let mut field_rects = vec![chunks[0], chunks[1], row_chunks[0]];
+            if has_due_value {
+                let due_sub = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .split(row_chunks[1]);
+                field_rects.push(due_sub[0]);
+                field_rects.push(due_sub[1]);
+            } else {
+                field_rects.push(row_chunks[1]);
+            }
+            if show_recurrence {
+                field_rects.push(chunks[3]);
+            }
+            if show_steps {
+                let steps_chunk_idx = if show_recurrence { 4 } else { 3 };
+                field_rects.push(chunks[steps_chunk_idx]);
+            }
+
+            Some(ModalHitRegions {
+                popup_area: popup,
+                confirm_key: None,
+                list: None,
+                focus_fields: Some(field_rects),
+            })
+        };
+        // Replicates ratatui's List widget auto-scroll for the few modals
+        // that render via a `ListState` — since each render starts from a
+        // fresh `ListState::default()` (offset 0) and only calls
+        // `.select(Some(selected_idx))`, the scroll ratatui settles on is a
+        // pure function of (selected_idx, visible_height): stay at 0 until
+        // the selection would run off the bottom, then scroll by exactly
+        // enough to keep it as the last visible row.
+        let list_state_offset = |selected_idx: usize, visible_height: u16| -> usize {
+            let visible_height = visible_height as usize;
+            if visible_height == 0 || selected_idx < visible_height {
+                0
+            } else {
+                selected_idx - visible_height + 1
+            }
         };
         let rows = |popup_area: Rect, header_lines: u16, count: usize, first_visible_index: usize| {
             let list_inner = inner(popup_area);
@@ -3083,6 +3187,7 @@ impl App {
                     count,
                     first_visible_index,
                 }),
+                focus_fields: None,
             })
         };
 
@@ -3136,31 +3241,167 @@ impl App {
             }
 
             // ── Click-outside-only form/text modals (editing fields is out of scope) ──
-            ModalType::NewProject { .. } | ModalType::EditProject { .. } => outside_only(pct(60, 40, term)),
-            ModalType::NewTask { .. } | ModalType::EditTask { .. } => {
-                // Real height depends on hide_desc/show_recurrence/step
-                // count — deliberately overestimated (full terminal height)
-                // so a click near the edge of the real, shorter popup is
-                // never misread as "outside" and accidentally saves/closes
-                // it; the only cost is a slightly oversized inert margin.
-                let full_width = pct(65, 100, term);
-                outside_only(Rect {
-                    x: full_width.x,
-                    y: 0,
-                    width: full_width.width,
-                    height: term.height,
-                })
+            ModalType::NewProject { .. } | ModalType::EditProject { .. } => {
+                let popup = pct(60, 40, term);
+                // draw_project_modal's own `Layout::margin(2)` insets
+                // further beyond the border `inner()` already accounts for.
+                let block_inner = inner(popup);
+                let content = Rect {
+                    x: block_inner.x + 2,
+                    y: block_inner.y + 2,
+                    width: block_inner.width.saturating_sub(4),
+                    height: block_inner.height.saturating_sub(4),
+                };
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(2)])
+                    .split(content);
+                fields(popup, vec![chunks[0], chunks[1]])
             }
-            ModalType::TreasuryEntry { .. } => outside_only(pct(62, 48, term)),
-            ModalType::TreasuryBudget { .. } => outside_only(pct(56, 34, term)),
-            ModalType::TaskFinancials { .. } => outside_only(pct(58, 42, term)),
-            ModalType::DailyReflection { .. } => outside_only(pct(55, 45, content_area)),
-            ModalType::NewRitual { .. } => outside_only(pct(55, 55, content_area)),
+            ModalType::NewTask {
+                due_date_type,
+                parent_task_id,
+                ..
+            } => {
+                let is_step = parent_task_id.is_some();
+                task_modal_fields(term, *due_date_type, !is_step, false, 0)
+            }
+            ModalType::EditTask {
+                id,
+                due_date_type,
+                is_step,
+                ..
+            } => {
+                let show_steps = !is_step;
+                let steps_count = if show_steps {
+                    self.all_tasks
+                        .iter()
+                        .filter(|t| t.parent_task_id == Some(*id))
+                        .count()
+                } else {
+                    0
+                };
+                task_modal_fields(term, *due_date_type, !is_step, show_steps, steps_count)
+            }
+            ModalType::TreasuryEntry { entry_id, .. } => {
+                let popup = pct(62, 48, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                // Title(0), Amount(2), Type(4), Status(5), Category(6),
+                // Date(8) — one blank spacer line between most fields; the
+                // extra "Owner/Steward only" line only appears while
+                // editing, but it isn't a focus stop either way.
+                let _ = entry_id;
+                fields(
+                    popup,
+                    vec![line(0), line(2), line(4), line(5), line(6), line(8)],
+                )
+            }
+            ModalType::TreasuryBudget { .. } => {
+                let popup = pct(56, 34, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                fields(popup, vec![line(0), line(2)])
+            }
+            ModalType::TaskFinancials { .. } => {
+                let popup = pct(58, 42, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                // Line 0 is a static "Amounts in {currency}" label, never
+                // focusable — Estimated(2), Actual(4), Billable(6),
+                // Payment Status(8).
+                fields(popup, vec![line(2), line(4), line(6), line(8)])
+            }
+            ModalType::DailyReflection { .. } => {
+                let popup = pct(55, 45, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(4),
+                        Constraint::Min(2),
+                    ])
+                    .split(block_inner);
+                fields(popup, vec![chunks[1], chunks[2]])
+            }
+            ModalType::NewRitual { .. } => {
+                let popup = pct(55, 55, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                    ])
+                    .split(block_inner);
+                fields(popup, vec![chunks[1], chunks[2], chunks[3], chunks[4]])
+            }
             ModalType::InviteMember { .. } => {
                 let modal_height = term.height.saturating_sub(2).min(26);
-                outside_only(fixed_h(68, modal_height, term))
+                let popup = fixed_h(68, modal_height, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(5),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(7),
+                        Constraint::Min(1),
+                    ])
+                    .split(block_inner);
+                // Project(0), Companion Key(1), Username(2), Role(3) — the
+                // permissions-description chunk after Role is informational
+                // only, never a focus stop.
+                fields(popup, vec![chunks[0], chunks[1], chunks[2], chunks[3]])
             }
-            ModalType::HydrationSettings { .. } => outside_only(pct(52, 55, content_area)),
+            ModalType::HydrationSettings { .. } => {
+                let popup = pct(52, 55, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+                // Interval(0)..Pause-checkbox(4) are the 5 real, bordered
+                // focus stops. Tab can also reach focus_idx 5, but nothing
+                // renders for it (a pre-existing dead Tab stop, not
+                // something to invent a click target for).
+                fields(
+                    popup,
+                    vec![chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]],
+                )
+            }
             ModalType::NewCodex { .. } | ModalType::RenameCodex { .. } => outside_only(Rect {
                 x: term.width / 4,
                 y: term.height / 3,
@@ -3207,6 +3448,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Rows {
                         area: Rect {
                             x: list_area.x,
@@ -3239,6 +3481,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![chunks[1], chunks[3], chunks[5]])),
                 })
             }
@@ -3259,6 +3502,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Items(chunks[..n].to_vec())),
                 })
             }
@@ -3282,6 +3526,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Rows {
                         area: chunks[1],
                         count,
@@ -3357,6 +3602,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Items(items)),
                 })
             }
@@ -3381,19 +3627,12 @@ impl App {
                     height,
                 };
                 let list_inner = inner(popup);
-                // Uses ListState, which auto-scrolls to keep `selected_idx`
-                // visible — only safe to reconstruct when everything fits
-                // in the rendered height already (the common case for a
-                // refile-target list); if it's actually scrolled, skip
-                // rather than risk mapping a click to the wrong row.
-                if count > list_inner.height as usize {
-                    return outside_only(popup);
-                }
-                // The list never scrolls once we've established the whole
-                // thing fits above, so the render's ListState offset is
-                // always 0 regardless of what's currently selected.
-                let _ = selected_idx;
-                rows(popup, 0, count, 0)
+                rows(
+                    popup,
+                    0,
+                    count,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
             }
             ModalType::RefileScroll {
                 destinations,
@@ -3409,20 +3648,18 @@ impl App {
                     height,
                 };
                 let list_inner = inner(popup);
-                if count > list_inner.height as usize {
-                    return outside_only(popup);
-                }
-                // The list never scrolls once we've established the whole
-                // thing fits above, so the render's ListState offset is
-                // always 0 regardless of what's currently selected.
-                let _ = selected_idx;
-                rows(popup, 0, count, 0)
+                rows(
+                    popup,
+                    0,
+                    count,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
             }
             ModalType::TaskExpenseCompletion { .. } => {
                 let popup = pct(58, 38, term);
                 rows(popup, 3, 3, 0)
             }
-            ModalType::SelectProjectForAction { .. } => {
+            ModalType::SelectProjectForAction { selected_idx, .. } => {
                 let popup = pct(55, 50, term);
                 let list_inner = inner(popup);
                 let active_len = self
@@ -3430,10 +3667,12 @@ impl App {
                     .iter()
                     .filter(|p| !p.archived && !p.completed)
                     .count();
-                if active_len > list_inner.height as usize {
-                    return outside_only(popup);
-                }
-                rows(popup, 0, active_len, 0)
+                rows(
+                    popup,
+                    0,
+                    active_len,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
             }
             ModalType::ShareNote { .. } => {
                 let popup = pct(50, 30, term);
@@ -3454,6 +3693,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![
                         Rect { x: row.x, y: row.y, width: third, height: row.height },
                         Rect { x: row.x + third, y: row.y, width: third, height: row.height },
@@ -3482,6 +3722,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![
                         Rect { x: row.x, y: row.y, width: third, height: row.height },
                         Rect { x: row.x + third, y: row.y, width: third, height: row.height },
@@ -3548,6 +3789,34 @@ impl App {
         }
     }
 
+    /// Writes `idx` into whatever multi-field form modal's `focus_idx`
+    /// currently has keyboard focus. Mirrors what clicking a field means
+    /// everywhere else in the app: focus only, same as Tab — never types
+    /// into or edits the field.
+    fn set_modal_focus_idx(&mut self, idx: usize) {
+        let modal = if self.overlay_modal != ModalType::None {
+            &mut self.overlay_modal
+        } else {
+            &mut self.modal_state
+        };
+        match modal {
+            ModalType::NewProject { focus_idx, .. }
+            | ModalType::EditProject { focus_idx, .. }
+            | ModalType::NewTask { focus_idx, .. }
+            | ModalType::EditTask { focus_idx, .. }
+            | ModalType::TreasuryEntry { focus_idx, .. }
+            | ModalType::TreasuryBudget { focus_idx, .. }
+            | ModalType::TaskFinancials { focus_idx, .. }
+            | ModalType::DailyReflection { focus_idx, .. }
+            | ModalType::NewRitual { focus_idx, .. }
+            | ModalType::InviteMember { focus_idx, .. }
+            | ModalType::HydrationSettings { focus_idx, .. } => {
+                *focus_idx = idx;
+            }
+            _ => {}
+        }
+    }
+
     /// Handles a mouse event while a modal (or overlay_modal) is open.
     /// Click outside the popup cancels it (synthesizes Esc); click a list
     /// row/item selects it; click anywhere else inside a confirm-style
@@ -3594,8 +3863,124 @@ impl App {
             }
             return Ok(());
         }
+        if let Some(fields) = &regions.focus_fields {
+            if let Some(idx) = fields
+                .iter()
+                .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+            {
+                self.set_modal_focus_idx(idx);
+            }
+            return Ok(());
+        }
         if let Some(confirm_key) = regions.confirm_key {
             return self.handle_key_event(KeyEvent::new(confirm_key, KeyModifiers::NONE));
+        }
+        Ok(())
+    }
+
+    /// Recomputes the task calendar's popup bounds and per-day cell Rects
+    /// fresh, mirroring `project_workspace::draw_task_calendar`'s exact
+    /// Layout calls — same recompute-on-demand approach as
+    /// compute_modal_hit_regions, and for the same reason (no draw() here
+    /// returns anything to stash this from).
+    fn compute_calendar_hit_regions(&self) -> Option<crate::screens::hit_test::CalendarHitRegions> {
+        use chrono::Datelike;
+        use crate::screens::hit_test::CalendarHitRegions;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        let calendar = self.task_calendar?;
+        let term = Rect {
+            x: 0,
+            y: 0,
+            width: self.terminal_width,
+            height: self.terminal_height,
+        };
+        let popup_area = crate::screens::intro::centered_rect(98, 94, term);
+        let inner = Rect {
+            x: popup_area.x + 1,
+            y: popup_area.y + 1,
+            width: popup_area.width.saturating_sub(2),
+            height: popup_area.height.saturating_sub(2),
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // header/status line
+                Constraint::Length(1), // weekday labels
+                Constraint::Min(12),   // the 6x7 day grid
+                Constraint::Length(1), // help line
+            ])
+            .split(inner);
+        let week_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 6); 6])
+            .split(rows[2]);
+
+        let selected = calendar.selected;
+        let first = chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month(), 1)?;
+        let leading = first.weekday().num_days_from_monday() as usize;
+        let next_month = if selected.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(selected.year() + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month() + 1, 1)
+        }?;
+        let days_in_month = next_month.pred_opt()?.day() as usize;
+
+        let mut days = Vec::new();
+        for week in 0..6 {
+            let day_cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 7); 7])
+                .split(week_rows[week]);
+            for weekday in 0..7 {
+                let slot = week * 7 + weekday;
+                let day_number = slot + 1;
+                if day_number <= leading || day_number > leading + days_in_month {
+                    continue; // blank padding cell
+                }
+                let number = (day_number - leading) as u32;
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month(), number) {
+                    days.push((day_cells[weekday], date));
+                }
+            }
+        }
+
+        Some(CalendarHitRegions { popup_area, days })
+    }
+
+    /// Handles a mouse event while the task calendar is open. Click outside
+    /// the popup cancels it, same as Esc. Click a day selects it, same as
+    /// the arrow keys (doesn't close the calendar). Double-click a day
+    /// confirms it, same as Enter/Space — reuses handle_key_event wholesale
+    /// for that so it can't drift from what Enter/Space actually do
+    /// (opening a new Quest seeded with that date in planner mode, or
+    /// writing the date back into the calling modal in date-picker mode).
+    fn handle_task_calendar_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        let Some(regions) = self.compute_calendar_hit_regions() else {
+            return Ok(());
+        };
+        if !HitRegions::contains(regions.popup_area, mouse.column, mouse.row) {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        let Some((_, date)) = regions
+            .days
+            .iter()
+            .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+        else {
+            return Ok(());
+        };
+        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+        if let Some(calendar) = self.task_calendar.as_mut() {
+            calendar.selected = *date;
+        }
+        if is_double_click {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         }
         Ok(())
     }
@@ -3607,11 +3992,8 @@ impl App {
     // scroll offset. Click-to-select for list/menu screens is a deferred
     // follow-up — see handle_generic_scroll_mouse for the extension point.
     pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
-        // The task calendar has its own future mouse-support gap — not part
-        // of this pass. Modals now get real hit-testing via
-        // handle_modal_mouse; task_calendar clicks still swallow.
         if self.task_calendar.is_some() {
-            return Ok(());
+            return self.handle_task_calendar_mouse(mouse);
         }
         if self.modal_state != ModalType::None || self.overlay_modal != ModalType::None {
             return self.handle_modal_mouse(mouse);
@@ -28746,11 +29128,11 @@ mod app_tests {
     }
 
     #[test]
-    fn modal_click_on_an_overscrolled_refile_list_is_a_safe_no_op() {
-        // RefileTask uses ListState's auto-scroll, which this feature can't
-        // safely reconstruct once the list no longer fits on screen —
-        // clicking should do nothing rather than risk selecting the wrong
-        // target, instead of guessing.
+    fn modal_click_on_a_scrolled_refile_list_selects_the_right_row() {
+        // RefileTask uses ListState's auto-scroll — once the list no
+        // longer fits on screen, ratatui scrolls just enough to keep
+        // `selected_idx` as the last visible row. A click still needs to
+        // map to the correct target despite that scroll.
         let db_file = Path::new("test_questline_modal_refile_overscrolled.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
         let project_id = Uuid::new_v4();
@@ -28799,21 +29181,248 @@ mod app_tests {
             task_id,
             selected_idx: 0,
         };
-        let regions = app.compute_modal_hit_regions().unwrap();
-        assert!(regions.list.is_none(), "an overscrolled list should fall back to outside-only");
-
-        let center = (
-            regions.popup_area.x + regions.popup_area.width / 2,
-            regions.popup_area.y + regions.popup_area.height / 2,
+        let count = match app.compute_modal_hit_regions().unwrap().list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows { count, .. } => count,
+            _ => panic!("RefileTask should be a Rows list"),
+        };
+        assert!(
+            (count as u16) > app.terminal_height,
+            "fixture needs more targets than fit on screen"
         );
-        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
 
+        // Select the last item — forces maximum scroll, so the visible
+        // window's first row is no longer item 0.
+        app.modal_state = ModalType::RefileTask {
+            task_id,
+            selected_idx: count - 1,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let (list_area, first_visible_index) = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows {
+                area,
+                first_visible_index,
+                ..
+            } => (area, first_visible_index),
+            _ => panic!("RefileTask should be a Rows list"),
+        };
+        assert!(first_visible_index > 0, "selecting the last item should have scrolled the list");
+
+        // Click the first visible row — should land on first_visible_index,
+        // not on row 0 of the underlying (unscrolled) list.
+        left_click(&mut app, list_area.x, list_area.y, KeyModifiers::empty());
         match &app.modal_state {
             ModalType::RefileTask { selected_idx, .. } => {
-                assert_eq!(*selected_idx, 0, "an inside click on an overscrolled list must not move selection")
+                assert_eq!(*selected_idx, first_visible_index)
             }
             other => panic!("expected RefileTask to remain open, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Task calendar mouse support ──────────────────────────────────────
+
+    #[test]
+    fn calendar_click_outside_cancels_it() {
+        let db_file = Path::new("test_questline_calendar_click_outside.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert!(app.task_calendar.is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn calendar_click_a_day_selects_it_without_closing() {
+        use chrono::Datelike;
+        let db_file = Path::new("test_questline_calendar_click_day.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+        let regions = app.compute_calendar_hit_regions().unwrap();
+        // Day 1 of the month — guaranteed to exist and differ from the 15th.
+        let (day1_rect, day1_date) = *regions.days.iter().find(|(_, d)| d.day() == 1).unwrap();
+
+        left_click(&mut app, day1_rect.x, day1_rect.y, KeyModifiers::empty());
+
+        assert_eq!(
+            app.task_calendar.map(|c| c.selected),
+            Some(day1_date),
+            "single click should move selection, same as an arrow key"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn calendar_double_click_a_day_confirms_it_in_date_picker_mode() {
+        use chrono::Datelike;
+        let db_file = Path::new("test_questline_calendar_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 4,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+        let regions = app.compute_calendar_hit_regions().unwrap();
+        let (day1_rect, day1_date) = *regions.days.iter().find(|(_, d)| d.day() == 1).unwrap();
+
+        double_click(&mut app, day1_rect.x, day1_rect.y, KeyModifiers::empty());
+
+        assert!(app.task_calendar.is_none(), "confirming should close the calendar");
+        match &app.modal_state {
+            ModalType::NewTask {
+                due_date_type,
+                due_date_val,
+                ..
+            } => {
+                assert_eq!(*due_date_type, DueDateType::Specific);
+                assert_eq!(due_date_val, &day1_date.format("%Y-%m-%d").to_string());
+            }
+            other => panic!("expected NewTask to still be open with the date applied, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Modal text-field click-to-focus ──────────────────────────────────
+
+    #[test]
+    fn modal_click_a_field_focuses_it_in_a_layout_based_form() {
+        let db_file = Path::new("test_questline_modal_field_click_layout.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "New Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+        let fields = match app.compute_modal_hit_regions().unwrap().focus_fields {
+            Some(fields) => fields,
+            None => panic!("NewProject should expose focus_fields"),
+        };
+        assert_eq!(fields.len(), 2, "Name and Description");
+        let desc_field = fields[1];
+
+        left_click(&mut app, desc_field.x, desc_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewProject { focus_idx, .. } => assert_eq!(*focus_idx, 1),
+            other => panic!("expected NewProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_field_focuses_it_in_a_paragraph_line_based_form() {
+        let db_file = Path::new("test_questline_modal_field_click_lines.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: String::new(),
+            title_cursor: 0,
+            amount: "0.00".to_string(),
+            amount_cursor: 0,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2026-03-15".to_string(),
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        assert_eq!(fields.len(), 6, "Title/Amount/Type/Status/Category/Date");
+        let amount_field = fields[1]; // second focus stop
+
+        left_click(&mut app, amount_field.x, amount_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::TreasuryEntry { focus_idx, .. } => assert_eq!(*focus_idx, 1),
+            other => panic!("expected TreasuryEntry, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_the_due_value_field_in_new_task_focuses_it_not_priority_or_due_type() {
+        // Priority, Due Type, and Due Value all share one Layout row —
+        // proves the horizontal sub-split correctly disambiguates them by
+        // X position, not just row/Y.
+        let db_file = Path::new("test_questline_modal_field_click_task_row.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::Specific,
+            due_date_val: "2026-03-15".to_string(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        // title(0), desc(1), priority(2), due_type(3), due_value(4) — a
+        // top-level NewTask always shows recurrence too, but that's field 5.
+        assert!(fields.len() >= 5, "expected at least 5 focus stops, got {}", fields.len());
+        let due_value_field = fields[4];
+        assert!(
+            due_value_field.x > fields[3].x,
+            "due_value should sit to the right of due_type on the same row"
+        );
+
+        left_click(&mut app, due_value_field.x, due_value_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewTask { focus_idx, .. } => assert_eq!(*focus_idx, 4),
+            other => panic!("expected NewTask, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_hydration_settings_exposes_only_the_five_real_fields() {
+        // Tab can reach focus_idx 5 on this modal, but nothing renders for
+        // it — a pre-existing dead Tab stop. Confirms click support doesn't
+        // invent a click target for it.
+        let db_file = Path::new("test_questline_modal_field_click_hydration.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::HydrationSettings {
+            interval_idx: 0,
+            from_hour: 8,
+            to_hour: 22,
+            target: 8,
+            pause_focus: false,
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        assert_eq!(fields.len(), 5, "only the 5 bordered fields should be clickable");
 
         let _ = std::fs::remove_file(db_file);
     }
