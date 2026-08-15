@@ -693,11 +693,18 @@ If Questline helps you on your adventures, consider starring the repository and 
   `NewRitual`, `InviteMember`, `HydrationSettings`) now jumps keyboard
   focus there, same as Tab — including disambiguating Priority/Due-Type/
   Due-Value on `NewTask`/`EditTask`, which all share one row and need
-  their horizontal position, not just which row, to tell apart. Actually
-  typing into a field, or clicking to position the cursor mid-text, stays
-  keyboard-only — that's a separate, much larger feature (closer to
-  building a second copy of the Notes editor's cursor-placement logic)
-  that this pass deliberately didn't take on. Implementation note: unlike
+  their horizontal position, not just which row, to tell apart. Of those
+  fields, the ones with real mid-string cursor state — Campaign Name/
+  Description, Quest Title, and Treasury Title/Amount — also move the
+  cursor to the exact character clicked, same as clicking mid-line already
+  does in the Notes editor, rather than only focusing the field. Quest
+  Description is the one holdout still click-to-focus-only: unlike every
+  other field here, it has two divergent rendering/scroll models of its
+  own (a soft-wrapped-and-scrolled plain-text fallback, and a separate
+  vim-style editor overlay once it matches the field's content), neither
+  of which is the simple shape every other cursor-capable field has, so
+  repositioning its cursor mid-text was left out of this pass. Actually
+  typing into a field stays keyboard-only. Implementation note: unlike
   every other screen's click support, a modal's popup bounds are
   recomputed fresh from the same layout math its own render code uses,
   rather than captured during rendering — no existing render function
