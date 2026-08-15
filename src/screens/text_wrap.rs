@@ -153,6 +153,19 @@ pub fn visual_row_count(line: &str, width: usize) -> usize {
 /// no se puede envolver su texto crudo: hay que cortar los spans. Se prefiere cortar
 /// después de un espacio y se parte cualquier palabra más larga que la caja.
 pub fn split_styled_line(line: &ratatui::text::Line<'_>, width: usize) -> Vec<ratatui::text::Line<'static>> {
+    split_styled_line_with_ranges(line, width).0
+}
+
+/// Igual que [`split_styled_line`], pero devuelve además el rango `[inicio, fin)` de
+/// caracteres de la línea original que cayó en cada fila visual.
+///
+/// Quien solo dibuja no necesita los rangos; los necesita quien tiene que volver de una
+/// celda de pantalla al texto que la produjo — el preview de scrolls los usa para saber
+/// qué columnas de qué fila ocupa cada enlace y poder hacerles click.
+pub fn split_styled_line_with_ranges(
+    line: &ratatui::text::Line<'_>,
+    width: usize,
+) -> (Vec<ratatui::text::Line<'static>>, Vec<(usize, usize)>) {
     use ratatui::text::{Line, Span};
 
     let width = width.max(1);
@@ -164,10 +177,11 @@ pub fn split_styled_line(line: &ratatui::text::Line<'_>, width: usize) -> Vec<ra
         .flat_map(|span| span.content.chars().map(move |character| (character, span.style)))
         .collect();
     if cells.is_empty() {
-        return vec![Line::from(String::new())];
+        return (vec![Line::from(String::new())], vec![(0, 0)]);
     }
 
     let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
     let mut start = 0usize;
     while start < cells.len() {
         let hard_end = (start + width).min(cells.len());
@@ -193,9 +207,10 @@ pub fn split_styled_line(line: &ratatui::text::Line<'_>, width: usize) -> Vec<ra
             }
         }
         rows.push(Line::from(spans));
+        ranges.push((start, end));
         start = end;
     }
-    rows
+    (rows, ranges)
 }
 
 /// Evita cortar un carácter multibyte por la mitad al indexar con el cursor.
