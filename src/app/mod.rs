@@ -3975,6 +3975,126 @@ impl App {
         }
     }
 
+    /// Converts a target character column (0-based, counted from the left
+    /// edge of a single line of text) into the UTF-8 byte offset it points
+    /// to — walking chars rather than assuming one byte each, the same
+    /// reasoning the button-label column math above already needs for
+    /// multi-byte text. A column at or past the end of the text clamps to
+    /// `text.len()` for free, since the walk simply runs out of chars.
+    fn byte_offset_for_col(text: &str, target_col: usize) -> usize {
+        let mut byte = 0;
+        let mut col = 0;
+        for ch in text.chars() {
+            if col >= target_col {
+                break;
+            }
+            byte += ch.len_utf8();
+            col += 1;
+        }
+        byte
+    }
+
+    /// Same as `byte_offset_for_col`, but for a field that's split across
+    /// several rows by literal `\n` only — no soft-wrap, no scroll — which
+    /// is exactly how `desc_lines_with_cursor` renders the Campaign
+    /// description field. A click past the last logical line clamps to the
+    /// end of the text, same as clicking past the last character of a
+    /// single-line field clamps to that field's end.
+    fn byte_offset_for_line_col(text: &str, target_line: usize, target_col: usize) -> usize {
+        let mut offset = 0;
+        for (i, line) in text.split('\n').enumerate() {
+            if i == target_line {
+                return offset + Self::byte_offset_for_col(line, target_col);
+            }
+            offset += line.len() + 1; // +1 for the '\n' this split() ate
+        }
+        text.len()
+    }
+
+    /// Click-to-position-cursor companion to `set_modal_focus_idx`: for the
+    /// handful of fields that carry real mid-string cursor state — as
+    /// opposed to the append-only fields click-to-focus already fully
+    /// serves — this also moves the cursor to the exact character the
+    /// click landed on, same as clicking mid-line already does in the
+    /// Notes editor. `field_rect` is the very Rect `handle_modal_mouse`
+    /// just hit-tested against `regions.focus_fields[idx]`.
+    ///
+    /// Deliberately not covered here: `NewTask`/`EditTask`'s Description
+    /// field. Unlike every other field, it has two divergent rendering/
+    /// scroll models of its own — a soft-wrapped-and-scrolled plain-text
+    /// fallback, and a separate vim-style `EditorState` overlay once it
+    /// matches the field's content — neither of which is the simple
+    /// "no-wrap" or "reuse `editor::screen_to_buffer_pos` verbatim" shape
+    /// every other field here has. Click-to-focus already works on it; only
+    /// repositioning the cursor mid-text is out of scope for this pass.
+    fn position_modal_field_cursor(
+        &mut self,
+        idx: usize,
+        field_rect: ratatui::layout::Rect,
+        mouse_col: u16,
+        mouse_row: u16,
+    ) {
+        let is_overlay = self.overlay_modal != ModalType::None;
+        let active = if is_overlay { &self.overlay_modal } else { &self.modal_state };
+
+        // Task title lives outside the ModalType enum entirely (in
+        // App::task_title_cursor/_editing rather than a field on the modal
+        // itself), so it's read here and written as plain self fields
+        // below — no mutable borrow of modal_state/overlay_modal needed.
+        if idx == 0 {
+            if let ModalType::NewTask { title, .. } | ModalType::EditTask { title, .. } = active {
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                self.task_title_cursor = Self::byte_offset_for_col(title, col);
+                self.task_title_editing = true;
+                return;
+            }
+        }
+
+        // TreasuryEntry's Title/Amount rows are plain unbordered lines with
+        // a `"{label:<12} "` prefix before the value — and Amount has a
+        // currency-symbol prefix after that, whose width varies by
+        // campaign currency, fetched the same way draw_treasury_entry_modal
+        // does. Both need `self` immutably, so resolved before taking any
+        // mutable borrow of modal_state/overlay_modal below.
+        let (treasury_title_prefix, treasury_amount_prefix) = if matches!(active, ModalType::TreasuryEntry { .. }) {
+            let currency = self
+                .active_project_id
+                .and_then(|id| crate::services::TreasuryService::new(&self.db).campaign_currency(id).ok())
+                .unwrap_or_default();
+            let title_label_len = "Title".chars().count().max(12) + 1;
+            let amount_label_len = format!("Amount ({})", currency.code()).chars().count().max(12) + 1;
+            (title_label_len, amount_label_len + currency.symbol().chars().count())
+        } else {
+            (0, 0)
+        };
+
+        let modal = if is_overlay { &mut self.overlay_modal } else { &mut self.modal_state };
+        match modal {
+            ModalType::NewProject { name, name_cursor, .. } | ModalType::EditProject { name, name_cursor, .. }
+                if idx == 0 =>
+            {
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                *name_cursor = Self::byte_offset_for_col(name, col);
+            }
+            ModalType::NewProject { desc, desc_cursor, .. } | ModalType::EditProject { desc, desc_cursor, .. }
+                if idx == 1 =>
+            {
+                let row = mouse_row.saturating_sub(field_rect.y + 1) as usize;
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                *desc_cursor = Self::byte_offset_for_line_col(desc, row, col);
+            }
+            ModalType::TreasuryEntry { title, title_cursor, .. } if idx == 0 => {
+                let col = mouse_col.saturating_sub(field_rect.x + treasury_title_prefix as u16) as usize;
+                *title_cursor = Self::byte_offset_for_col(title, col);
+            }
+            ModalType::TreasuryEntry { amount, amount_cursor, .. } if idx == 1 => {
+                let col = mouse_col.saturating_sub(field_rect.x + treasury_amount_prefix as u16) as usize;
+                *amount_cursor = Self::byte_offset_for_col(amount, col);
+            }
+            _ => {}
+        }
+    }
+
     /// Handles a mouse event while a modal (or overlay_modal) is open.
     /// Click outside the popup cancels it (synthesizes Esc); click a list
     /// row/item selects it; click anywhere else inside a confirm-style
@@ -4026,7 +4146,9 @@ impl App {
                 .iter()
                 .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
             {
+                let field_rect = fields[idx];
                 self.set_modal_focus_idx(idx);
+                self.position_modal_field_cursor(idx, field_rect, mouse.column, mouse.row);
             }
             return Ok(());
         }
@@ -29692,6 +29814,128 @@ mod app_tests {
         match &app.modal_state {
             ModalType::NewTask { focus_idx, .. } => assert_eq!(*focus_idx, 4),
             other => panic!("expected NewTask, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_project_name_field_positions_the_cursor_mid_string() {
+        let db_file = Path::new("test_questline_modal_cursor_name.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "New Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 1, // starts away from the name field on purpose
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let name_field = fields[0];
+        // "New Campaign" — click right after "New " (4 chars in).
+        left_click(&mut app, name_field.x + 1 + 4, name_field.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewProject { focus_idx, name_cursor, .. } => {
+                assert_eq!(*focus_idx, 0);
+                assert_eq!(*name_cursor, 4);
+            }
+            other => panic!("expected NewProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_project_desc_field_positions_the_cursor_on_the_clicked_line() {
+        let db_file = Path::new("test_questline_modal_cursor_desc.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::EditProject {
+            id: Uuid::new_v4(),
+            name: "Existing Campaign".to_string(),
+            name_cursor: 0,
+            desc: "Hello\nWorld".to_string(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let desc_field = fields[1];
+        // Second line ("World"), 2 chars in — lands between 'o' and 'r'.
+        left_click(&mut app, desc_field.x + 1 + 2, desc_field.y + 1 + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::EditProject { focus_idx, desc_cursor, .. } => {
+                assert_eq!(*focus_idx, 1);
+                assert_eq!(*desc_cursor, "Hello\n".len() + 2);
+            }
+            other => panic!("expected EditProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_task_title_field_positions_the_cursor_and_enables_editing() {
+        let db_file = Path::new("test_questline_modal_cursor_task_title.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        app.task_title_editing = false;
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let title_field = fields[0];
+        // "Forge the sword" — click right after "Forge " (6 chars in).
+        left_click(&mut app, title_field.x + 1 + 6, title_field.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewTask { focus_idx, .. } => assert_eq!(*focus_idx, 0),
+            other => panic!("expected NewTask, got {other:?}"),
+        }
+        assert!(app.task_title_editing, "clicking the title should enable cursor editing on it");
+        assert_eq!(app.task_title_cursor, 6);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_treasury_amount_field_positions_the_cursor_after_the_currency_symbol() {
+        let db_file = Path::new("test_questline_modal_cursor_treasury_amount.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        // No active_project_id, so the currency prefix falls back to the
+        // default (USD, symbol "US$") — deliberately exercising that path.
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: String::new(),
+            title_cursor: 0,
+            amount: "123.45".to_string(),
+            amount_cursor: 0,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2026-03-15".to_string(),
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let amount_field = fields[1];
+        // "Amount (USD) " is 13 chars, "US$" is 3 more — value starts at
+        // column 16. Click 3 chars into "123.45", right after "123".
+        left_click(&mut app, amount_field.x + 16 + 3, amount_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::TreasuryEntry { focus_idx, amount_cursor, .. } => {
+                assert_eq!(*focus_idx, 1);
+                assert_eq!(*amount_cursor, 3);
+            }
+            other => panic!("expected TreasuryEntry, got {other:?}"),
         }
 
         let _ = std::fs::remove_file(db_file);
