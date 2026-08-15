@@ -666,13 +666,17 @@ If Questline helps you on your adventures, consider starring the repository and 
   the draft on Esc; `EncryptionMigrationPrompt` and `UpdateAvailable` have
   their own Esc side effects) — clicking outside faithfully reproduces
   whichever of those a modal's own Esc keybinding already does, rather than
-  inventing new "cancel" behavior. Confirm-style dialogs (Quit, Archive/
-  Delete/Conquer a Campaign, remove a Companion, prune old Quests, clean up
-  local history, etc.) can be confirmed with a single click anywhere inside
-  the dialog — there's no separate Yes/No button widget today (both are
-  just text in one message), so this is "click the dialog to confirm,
-  click away from it to cancel" rather than two distinct click targets.
-  List-picker modals (Theme, Milestone Tier/Template, Assign Quest, Refile
+  inventing new "cancel" behavior. Confirm-style dialogs (Archive/Delete/
+  Conquer a Campaign, remove a Companion, prune old Quests, clean up local
+  history, and 5 more) now have real Yes/No button targets: clicking Yes
+  confirms and clicking No cancels, matching Enter/Esc exactly, and
+  clicking the dialog's message text (not a button) is an inert no-op
+  rather than an accidental confirm. `EncryptionMigrationPrompt` and
+  `HydrationReminder`, which offer three choices instead of two, get three
+  real buttons the same way. `QuitConfirm` is the one holdout still using a
+  single click-anywhere-inside zone, since its hint text ("Are you sure you
+  want to quit? [Y/N]") has no separate Yes/No substrings to split a
+  button out of. List-picker modals (Theme, Milestone Tier/Template, Assign Quest, Refile
   Codex/Quest/Scroll, Council Briefing, Share Scroll/Journal permissions,
   and more) support clicking a row or item to select it, same as Up/Down —
   never confirming/activating it, matching how click-to-select already
