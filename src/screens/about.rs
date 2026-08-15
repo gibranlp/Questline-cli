@@ -11,6 +11,13 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
+// Shared with app/mod.rs's compute_about_hit_regions, so the mouse click
+// zones for "[R] Send Report" and "[Support]" are always derived from the
+// exact same text this title actually renders — never a hand-copied guess
+// that could silently drift out of sync with it.
+pub(crate) const ABOUT_TITLE_TEXT: &str = " About Questline  [↑↓] scroll  [R] Send Report  ";
+pub(crate) const ABOUT_SUPPORT_LABEL: &str = "[Support] ";
+
 const FACTS: &[&[&str]] = &[
     &["• The Great Backlog grows stronger when ignored."],
     &["• Scope Dragons feed on \"just one more feature.\""],
@@ -759,13 +766,13 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                 .border_style(Style::default().fg(theme.border))
                 .title(Line::from(vec![
                     Span::styled(
-                        " About Questline  [↑↓] scroll  [R] Send Report  ",
+                        ABOUT_TITLE_TEXT,
                         Style::default()
                             .fg(theme.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "[Support] ",
+                        ABOUT_SUPPORT_LABEL,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),

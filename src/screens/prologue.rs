@@ -243,7 +243,7 @@ pub fn page_lines(page: u8) -> &'static [StoryLine] {
 }
 
 // detecta cuántas líneas al inicio son "header" — las que preceden al primer texto de cuerpo
-fn header_line_count(lines: &[StoryLine]) -> usize {
+pub(crate) fn header_line_count(lines: &[StoryLine]) -> usize {
     lines
         .iter()
         .take_while(|sl| {
@@ -329,7 +329,7 @@ fn style_line(text: String, kind: LineKind, class_color: Color) -> Line<'static>
 }
 
 // construye el header fijo — título de página visible desde el primer frame
-fn build_header_lines(lines: &[StoryLine], class_color: Color, n: usize) -> Vec<Line<'static>> {
+pub(crate) fn build_header_lines(lines: &[StoryLine], class_color: Color, n: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     for sl in &lines[..n] {
         match sl.kind {

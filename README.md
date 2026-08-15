@@ -717,6 +717,18 @@ If Questline helps you on your adventures, consider starring the repository and 
   seeded with that date in planner mode, or writes the date back into the
   Quest modal that opened the picker); click outside the calendar to
   cancel it, same as Esc.
+- Closed out the last two mouse-support gaps. The Prologue's final page
+  has a real "Don't show this again" checkbox (previously `x`-only) that's
+  now clickable too. The About screen's title bar visually reads `[R] Send
+  Report` like a button; it's now a real click target that opens the Bug
+  Report modal, same as pressing `r` — and the scroll wheel now also
+  scrolls its two panels, matching the arrow keys. Its `[Support]` label,
+  right next to it, deliberately stays unclickable: it isn't wired to any
+  key on this screen either, a pre-existing gap the mouse-support pass
+  didn't invent and isn't the place to fix. Every other screen was
+  reviewed and found to need nothing further: Intro is a splash screen any
+  key/click already dismisses identically, and Restore is a single
+  always-focused text field with nothing else to click.
 
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
