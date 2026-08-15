@@ -4392,6 +4392,12 @@ impl App {
     // scroll offset. Click-to-select for list/menu screens is a deferred
     // follow-up — see handle_generic_scroll_mouse for the extension point.
     pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        // Se invierte aquí arriba, una sola vez, y no en los ~27 sitios que miran ScrollUp/
+        // ScrollDown: así ninguna pantalla se queda fuera ni se va desincronizando conforme se
+        // agreguen más. Va antes de los guards de calendario y modal para que dentro de un modal
+        // con contenido largo se sienta igual que fuera.
+        let mouse = Self::with_natural_scroll(mouse);
+
         if self.task_calendar.is_some() {
             return self.handle_task_calendar_mouse(mouse);
         }
@@ -4462,6 +4468,23 @@ impl App {
         (ActiveScreen::SyncSettings, '8'),
         (ActiveScreen::Settings, '9'),
     ];
+
+    /// Invierte la rueda vertical: mover los dedos hacia abajo empuja el contenido hacia abajo,
+    /// como el "natural scrolling" de macOS, en vez de mover el cursor hacia abajo.
+    ///
+    /// Sólo toca el eje vertical. `ScrollLeft`/`ScrollRight` pasan intactos porque el swipe de
+    /// panel ya se lee en la dirección correcta, y el resto de eventos (clics, arrastres) no
+    /// tienen sentido de eje.
+    fn with_natural_scroll(mouse: crossterm::event::MouseEvent) -> crossterm::event::MouseEvent {
+        use crossterm::event::MouseEventKind;
+
+        let kind = match mouse.kind {
+            MouseEventKind::ScrollUp => MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollDown => MouseEventKind::ScrollUp,
+            other => other,
+        };
+        crossterm::event::MouseEvent { kind, ..mouse }
+    }
 
     /// El splash de arranque avanza con cualquier tecla, así que un clic hace lo mismo.
     ///
@@ -26900,6 +26923,56 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
     }
 
+    // El scroll vertical va invertido en un solo punto de entrada. Este test lo fija explícito:
+    // sin él, quitar la inversión sólo rompería los tests de cada pantalla y no quedaría claro
+    // que el cambio era a propósito.
+    #[test]
+    fn vertical_scroll_is_inverted_and_horizontal_is_left_alone() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let flip = |kind| App::with_natural_scroll(swipe(kind)).kind;
+
+        assert_eq!(flip(MouseEventKind::ScrollUp), MouseEventKind::ScrollDown);
+        assert_eq!(flip(MouseEventKind::ScrollDown), MouseEventKind::ScrollUp);
+
+        // El eje horizontal ya se lee bien: invertirlo también dejaría el swipe al revés.
+        assert_eq!(flip(MouseEventKind::ScrollLeft), MouseEventKind::ScrollLeft);
+        assert_eq!(flip(MouseEventKind::ScrollRight), MouseEventKind::ScrollRight);
+
+        // Clics y arrastres no tienen eje que invertir.
+        assert_eq!(
+            flip(MouseEventKind::Down(MouseButton::Left)),
+            MouseEventKind::Down(MouseButton::Left)
+        );
+
+        // Y la posición se conserva: los handlers hacen hit-test con ella.
+        let moved = App::with_natural_scroll(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 42,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!((moved.column, moved.row), (42, 7));
+    }
+
+    // De punta a punta sobre una pantalla real: bajar los dedos empuja el contenido hacia abajo,
+    // o sea que el offset baja, como en cualquier app con scroll natural.
+    #[test]
+    fn scrolling_down_moves_content_down_not_the_viewport() {
+        let db_file = Path::new("test_questline_natural_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(200);
+        app.about_scroll = 10;
+
+        scroll_mouse(&mut app, true); // rueda abajo (evento crudo del terminal)
+        assert!(
+            app.about_scroll < 10,
+            "con scroll natural, bajar los dedos debe retroceder el contenido, no avanzarlo"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
     // El splash de arranque avanza con cualquier tecla; un clic debe hacer lo mismo.
     #[test]
     fn click_on_the_intro_splash_continues_like_a_key() {
@@ -28046,6 +28119,25 @@ mod app_tests {
         scroll_mouse_at(app, 0, 0, down);
     }
 
+    // El scroll vertical va invertido (natural scrolling), así que el evento crudo y el
+    // movimiento resultante no coinciden: una rueda ARRIBA avanza. Estos wrappers nombran el
+    // efecto para que los tests no tengan que llevar la inversión en la cabeza.
+    fn scroll_forward(app: &mut App) {
+        scroll_mouse(app, false);
+    }
+
+    fn scroll_back(app: &mut App) {
+        scroll_mouse(app, true);
+    }
+
+    fn scroll_forward_at(app: &mut App, col: u16, row: u16) {
+        scroll_mouse_at(app, col, row, false);
+    }
+
+    fn scroll_back_at(app: &mut App, col: u16, row: u16) {
+        scroll_mouse_at(app, col, row, true);
+    }
+
     fn scroll_mouse_at(app: &mut App, col: u16, row: u16, down: bool) {
         use crossterm::event::{MouseEvent, MouseEventKind};
         app.handle_mouse_event(MouseEvent {
@@ -28145,13 +28237,13 @@ mod app_tests {
             item_count: 3,
         });
 
-        scroll_mouse(&mut app, true); // down
+        scroll_forward(&mut app);
         assert_eq!(app.selected_archive_idx, 1);
 
-        scroll_mouse(&mut app, false); // up, back to 0
+        scroll_back(&mut app); // back to 0
         assert_eq!(app.selected_archive_idx, 0);
 
-        scroll_mouse(&mut app, false); // up, wraps to the last item
+        scroll_back(&mut app); // wraps to the last item
         assert_eq!(app.selected_archive_idx, 2);
 
         let _ = std::fs::remove_file(db_file);
@@ -28184,14 +28276,14 @@ mod app_tests {
         });
         assert!(!app.chapter_panel_focused);
 
-        scroll_mouse(&mut app, true);
+        scroll_forward(&mut app);
         assert_eq!(app.great_chronicle_scroll, 3);
         assert_eq!(app.chapter_panel_scroll, 0);
 
         left_click(&mut app, 21, 1, KeyModifiers::empty()); // inside chapter_panel
         assert!(app.chapter_panel_focused);
 
-        scroll_mouse(&mut app, true);
+        scroll_forward(&mut app);
         assert_eq!(app.chapter_panel_scroll, 3);
         assert_eq!(app.great_chronicle_scroll, 3); // unchanged now that focus moved
 
@@ -28327,19 +28419,19 @@ mod app_tests {
         assert_eq!(app.selected_focus_field_idx, 0); // duration card, by default
         assert_eq!(app.selected_focus_duration_idx, 0);
 
-        scroll_mouse(&mut app, true); // down
+        scroll_forward(&mut app);
         assert_eq!(app.selected_focus_duration_idx, 1);
 
-        scroll_mouse(&mut app, false); // up, back to 0
+        scroll_back(&mut app); // back to 0
         assert_eq!(app.selected_focus_duration_idx, 0);
 
-        scroll_mouse(&mut app, false); // up, wraps to the last duration choice
+        scroll_back(&mut app); // wraps to the last duration choice
         assert_eq!(app.selected_focus_duration_idx, 5);
 
         // Switching cards changes which field the wheel cycles.
         left_click(&mut app, 32, 1, KeyModifiers::empty()); // soundscape card
         assert_eq!(app.selected_focus_field_idx, 3);
-        scroll_mouse(&mut app, true);
+        scroll_forward(&mut app);
         assert_eq!(app.selected_focus_soundscape_idx, 1);
         assert_eq!(app.selected_focus_duration_idx, 5); // untouched
 
@@ -28437,11 +28529,11 @@ mod app_tests {
             row_targets: vec![],
         });
 
-        scroll_mouse(&mut app, true); // down, from "All" into the first project
+        scroll_forward(&mut app); // from "All" into the first project
         assert!(!app.projects_all_selected);
         assert_eq!(app.selected_project_idx, 0);
 
-        scroll_mouse(&mut app, false); // up, back to "All"
+        scroll_back(&mut app); // back to "All"
         assert!(app.projects_all_selected);
 
         let _ = std::fs::remove_file(db_file);
@@ -28754,19 +28846,19 @@ mod app_tests {
             oath_row_count: 10,
         });
 
-        scroll_mouse(&mut app, true); // down, theme idx 0 -> 1
+        scroll_forward(&mut app); // theme idx 0 -> 1
         assert_eq!(app.selected_settings_theme_idx, 1);
 
-        scroll_mouse(&mut app, false); // up, back to 0
+        scroll_back(&mut app); // back to 0
         assert_eq!(app.selected_settings_theme_idx, 0);
 
         // Up/Down only cycles within the current block — moving into the
         // Alerts block itself is Tab's job, not the wheel's.
         app.selected_settings_focus_idx = 5; // last row of the Alerts block
-        scroll_mouse(&mut app, true); // down, wraps 5 -> 1
+        scroll_forward(&mut app); // wraps 5 -> 1
         assert_eq!(app.selected_settings_focus_idx, 1);
 
-        scroll_mouse(&mut app, false); // up, back to 5
+        scroll_back(&mut app); // back to 5
         assert_eq!(app.selected_settings_focus_idx, 5);
 
         let _ = std::fs::remove_file(db_file);
@@ -28864,12 +28956,12 @@ mod app_tests {
         // Scrolling over the adventure log moves focus there and cycles it,
         // regardless of which pane was previously focused.
         app.character_focus = 1;
-        scroll_mouse_at(&mut app, 2, 2, true); // over the adventure log
+        scroll_back_at(&mut app, 2, 2); // over the adventure log
         assert_eq!(app.character_focus, 0);
         assert_eq!(app.selected_chronicle_idx, 1);
 
         // Scrolling over the reflections list moves focus there instead.
-        scroll_mouse_at(&mut app, 52, 2, true);
+        scroll_back_at(&mut app, 52, 2);
         assert_eq!(app.character_focus, 1);
         assert_eq!(app.selected_reflection_idx, 1);
         assert_eq!(app.reflection_detail_scroll, 0);
@@ -29021,7 +29113,7 @@ mod app_tests {
             })),
         });
 
-        scroll_mouse_at(&mut app, 2, 0, true); // over the left Campaign list
+        scroll_back_at(&mut app, 2, 0); // over the left Campaign list
 
         assert_eq!(
             app.selected_fellowship_project_idx, 1,
@@ -29084,10 +29176,10 @@ mod app_tests {
             })),
         });
 
-        scroll_mouse_at(&mut app, 2, 2, false); // up, enters browsing at the last message
+        scroll_back_at(&mut app, 2, 2); // enters browsing at the last message
         assert_eq!(app.fellowship_selected_msg_idx, 1);
 
-        scroll_mouse_at(&mut app, 2, 2, true); // down, past the last message -> exits browsing
+        scroll_forward_at(&mut app, 2, 2); // past the last message -> exits browsing
         assert_eq!(app.fellowship_selected_msg_idx, usize::MAX);
 
         let _ = std::fs::remove_file(db_file);
@@ -29685,14 +29777,14 @@ mod app_tests {
             kanban: None,
         });
 
-        scroll_mouse_at(&mut app, 2, 0, true); // down: 3 -> 0
+        scroll_forward_at(&mut app, 2, 0); // 3 -> 0
         assert!(app.workspace_sidebar_focused);
         assert_eq!(app.workspace_tab_idx, 0);
 
-        scroll_mouse_at(&mut app, 2, 0, true); // down: 0 -> 1
+        scroll_forward_at(&mut app, 2, 0); // 0 -> 1
         assert_eq!(app.workspace_tab_idx, 1);
 
-        scroll_mouse_at(&mut app, 2, 0, false); // up: 1 -> 0
+        scroll_back_at(&mut app, 2, 0); // 1 -> 0
         assert_eq!(app.workspace_tab_idx, 0);
 
         let _ = std::fs::remove_file(db_file);
@@ -29724,15 +29816,15 @@ mod app_tests {
             kanban: None,
         });
 
-        scroll_mouse_at(&mut app, 32, 1, false); // up at scroll 0 — stays at 0
+        scroll_back_at(&mut app, 32, 1); //  at scroll 0 — stays at 0
         assert_eq!(app.note_preview_scroll, 0);
         assert!(app.note_preview_focused);
 
-        scroll_mouse_at(&mut app, 32, 1, true);
+        scroll_forward_at(&mut app, 32, 1);
         assert_eq!(app.note_preview_scroll, 1);
-        scroll_mouse_at(&mut app, 32, 1, true);
+        scroll_forward_at(&mut app, 32, 1);
         assert_eq!(app.note_preview_scroll, 2);
-        scroll_mouse_at(&mut app, 32, 1, true); // down past max — stays clamped at 2
+        scroll_forward_at(&mut app, 32, 1); //  past max — stays clamped at 2
         assert_eq!(app.note_preview_scroll, 2);
 
         let _ = std::fs::remove_file(db_file);
@@ -30355,7 +30447,7 @@ mod app_tests {
         app.about_content_lines.set(200);
         app.about_scroll = 10;
 
-        scroll_mouse(&mut app, true); // ScrollDown
+        scroll_forward(&mut app);
         assert!(app.about_scroll > 10, "scrolling down should increase the offset");
 
         let _ = std::fs::remove_file(db_file);
