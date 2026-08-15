@@ -2263,9 +2263,29 @@ impl Database {
         Ok(())
     }
 
+    // Devuelve TODAS las filas, de todos los días. Sólo para sync/full-state y tests: la UI y la
+    // lógica de progreso deben usar get_daily_adventures_for(today), porque esta tabla ya no se
+    // vacía en el rollover y ahora acumula historial.
     pub fn get_daily_adventures(&self) -> Result<Vec<DailyAdventure>> {
-        let mut stmt = self.conn.prepare("SELECT id, title, quest_type, target_count, current_count, completed, created_date FROM daily_adventures")?;
-        let rows = stmt.query_map([], |row| {
+        self.query_daily_adventures(None)
+    }
+
+    // Los quests de un día concreto. El rollover ya no borra los del día anterior: ese DELETE no
+    // se registraba en el sync_log, así que el otro PC los reenviaba como upsert y reaparecían
+    // junto a los de hoy — de ahí los "daily quests duplicados". Ahora se conserva el historial
+    // y se filtra por fecha al leer.
+    pub fn get_daily_adventures_for(&self, date: NaiveDate) -> Result<Vec<DailyAdventure>> {
+        self.query_daily_adventures(Some(date))
+    }
+
+    fn query_daily_adventures(&self, date: Option<NaiveDate>) -> Result<Vec<DailyAdventure>> {
+        let base = "SELECT id, title, quest_type, target_count, current_count, completed, created_date FROM daily_adventures";
+        let sql = match date {
+            Some(_) => format!("{} WHERE created_date = ?1", base),
+            None => base.to_string(),
+        };
+        let mut stmt = self.conn.prepare(&sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
             let id_str: String = row.get(0)?;
             let title: String = row.get(1)?;
             let quest_type: String = row.get(2)?;
@@ -2287,19 +2307,34 @@ impl Database {
                 completed: completed_int != 0,
                 created_date,
             })
-        })?;
+        };
 
         let mut adventures = Vec::new();
-        for r in rows {
-            adventures.push(r?);
+        match date {
+            Some(d) => {
+                let rows = stmt.query_map(params![d.format("%Y-%m-%d").to_string()], map_row)?;
+                for r in rows {
+                    adventures.push(r?);
+                }
+            }
+            None => {
+                let rows = stmt.query_map([], map_row)?;
+                for r in rows {
+                    adventures.push(r?);
+                }
+            }
         }
         Ok(adventures)
     }
 
     pub fn insert_daily_adventure(&self, adv: &DailyAdventure) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
+        // ON CONFLICT DO NOTHING y no un INSERT a secas: los ids son determinísticos por
+        // (fecha, tipo, meta), así que el sync puede haber traído ya el quest de hoy desde el otro
+        // PC antes de que check_new_day() lo genere. Sin esto, generarlo revienta por UNIQUE.
         tx.execute(
-            "INSERT INTO daily_adventures (id, title, quest_type, target_count, current_count, completed, created_date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO daily_adventures (id, title, quest_type, target_count, current_count, completed, created_date) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(id) DO NOTHING",
             params![
                 adv.id.to_string(),
                 adv.title,
@@ -2327,11 +2362,6 @@ impl Database {
         )?;
         Self::log_change_on(&tx, "daily_adventure", &adv.id.to_string(), "upsert")?;
         tx.commit()?;
-        Ok(())
-    }
-
-    pub fn clear_daily_adventures(&self) -> Result<()> {
-        self.conn.execute("DELETE FROM daily_adventures", [])?;
         Ok(())
     }
 
@@ -7778,3 +7808,4 @@ mod tests {
         let _ = std::fs::remove_file(db_file);
     }
 }
+
