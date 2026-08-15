@@ -5556,7 +5556,19 @@ mod tests {
         let (path_a, db_a) = treasury_test_db("hydration_sync_device_a");
         let (path_b, db_b) = treasury_test_db("hydration_sync_device_b");
 
-        let base = Utc::now();
+        // Anclado a las 08:00 LOCALES de hoy, no a Utc::now(): hydration_drink_at archiva por día
+        // local y hydration_get_today() lee el día local actual. Con Utc::now() como base, los
+        // +1h/+2h caían en el día local siguiente si el test corría después de las 22:00 locales
+        // (en CI, que corre en UTC, entre las 22:00 y medianoche UTC) y los 3 vasos dejaban de
+        // estar en el mismo día. Las 08:00 dejan margen de sobra por ambos lados.
+        let base = Local::now()
+            .date_naive()
+            .and_hms_opt(8, 0, 0)
+            .expect("08:00 es una hora válida")
+            .and_local_timezone(Local)
+            .earliest()
+            .expect("las 08:00 locales no caen en un salto de horario")
+            .with_timezone(&Utc);
         db_a.hydration_drink_at(base).unwrap();
         db_a.hydration_drink_at(base + chrono::Duration::hours(1))
             .unwrap();
