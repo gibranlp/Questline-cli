@@ -89,6 +89,14 @@ pub struct CalendarHitRegions {
     pub days: Vec<(Rect, chrono::NaiveDate)>,
 }
 
+/// The About screen's one real click target — computed on demand the same
+/// way `ModalHitRegions`/`CalendarHitRegions` are, since it's a single
+/// `Block` title rather than a stashed draw() output.
+#[derive(Debug, Clone)]
+pub struct AboutHitRegions {
+    pub report_button: Rect,
+}
+
 #[derive(Debug, Clone)]
 pub enum ModalListRegion {
     /// A uniform vertical list, one item per screen row.

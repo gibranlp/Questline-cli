@@ -4277,6 +4277,90 @@ impl App {
         Ok(())
     }
 
+    /// Recomputes the "Don't show this again" checkbox's Rect on the
+    /// Prologue's final page, mirroring `prologue::draw`'s own layout math
+    /// (header block + margin(1) split + bottom-anchored auto-scroll) —
+    /// same recompute-on-demand approach as the modal/calendar hit-testing
+    /// above, for the same reason (draw() here returns nothing to stash
+    /// this from). Returns None whenever the checkbox isn't actually on
+    /// screen: wrong screen/page, still typing, or (in an unusually short
+    /// terminal) scrolled out of the visible viewport. Like the render
+    /// code's own auto-scroll formula, this assumes no line soft-wraps —
+    /// true for every line in the story text at any reasonable terminal
+    /// width, and the same assumption `prologue::draw`'s scroll_y already
+    /// silently makes.
+    fn compute_prologue_checkbox_rect(&self) -> Option<ratatui::layout::Rect> {
+        use crate::screens::prologue::{self, LineKind};
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        if self.active_screen != ActiveScreen::Prologue || self.prologue_page != 1 {
+            return None;
+        }
+        let lines_def = prologue::page_lines(self.prologue_page);
+        if self.prologue_line_idx < lines_def.len() {
+            return None; // still typing — checkbox isn't rendered yet
+        }
+        let header_n = prologue::header_line_count(lines_def);
+        let body_def = &lines_def[header_n..];
+        let checkbox_row = body_def.iter().position(|sl| matches!(sl.kind, LineKind::Checkbox))?;
+
+        // Color doesn't affect how many lines the header wraps into — any
+        // placeholder works, since only .len() is used below.
+        let header_h = prologue::build_header_lines(lines_def, ratatui::style::Color::White, header_n).len() as u16;
+        let footer_h: u16 = 2;
+
+        let size = Rect { x: 0, y: 0, width: self.terminal_width, height: self.terminal_height };
+        let inner_area = Rect {
+            x: size.x + 1,
+            y: size.y + 1,
+            width: size.width.saturating_sub(2),
+            height: size.height.saturating_sub(2),
+        };
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(header_h),
+                Constraint::Min(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(inner_area);
+        let body = inner_chunks[1];
+
+        let viewport = body.height as usize;
+        let scroll_y = body_def.len().saturating_sub(viewport);
+        let visual_row = checkbox_row.checked_sub(scroll_y)?;
+        if visual_row >= viewport {
+            return None;
+        }
+
+        Some(Rect {
+            x: body.x,
+            y: body.y + visual_row as u16,
+            width: body.width,
+            height: 1,
+        })
+    }
+
+    /// Handles a mouse click on the Prologue screen. Its only real
+    /// interactive element beyond "any key/click advances the typewriter"
+    /// is the final page's "Don't show this again" checkbox, which this
+    /// mirrors the same way `x` already does — see
+    /// `compute_prologue_checkbox_rect` for how its Rect is found.
+    fn handle_prologue_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if let Some(rect) = self.compute_prologue_checkbox_rect() {
+            if HitRegions::contains(rect, mouse.column, mouse.row) {
+                self.prologue_skip_checked = !self.prologue_skip_checked;
+            }
+        }
+    }
+
     // ── Mouse ─────────────────────────────────────────────────────────────────
     //
     // Phase 1: full click/drag/scroll support in the Notes editor, plus
@@ -4308,6 +4392,8 @@ impl App {
             ActiveScreen::SyncSettings => self.handle_sync_mouse(mouse),
             ActiveScreen::Fellowship => self.handle_fellowship_mouse(mouse),
             ActiveScreen::Workspace => self.handle_workspace_mouse(mouse),
+            ActiveScreen::Prologue => self.handle_prologue_mouse(mouse),
+            ActiveScreen::About => self.handle_about_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
@@ -4315,24 +4401,86 @@ impl App {
 
     fn handle_generic_scroll_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crossterm::event::MouseEventKind;
-        let delta: i64 = match mouse.kind {
+        let _delta: i64 = match mouse.kind {
             MouseEventKind::ScrollUp => -1,
             MouseEventKind::ScrollDown => 1,
             _ => return,
         };
 
-        // About is the only screen left here — every other screen with
-        // scroll support (GreatChronicle, Library, ...) now gets its own
-        // dedicated handle_*_mouse so click and scroll share one dispatch
-        // arm; see handle_mouse_event. Add a screen back as a match arm
-        // (not an if) the moment a second one needs generic scroll-only
-        // support again.
-        if self.active_screen == ActiveScreen::About {
-            let content = self.about_content_lines.get();
-            let visible = self.terminal_height.saturating_sub(5);
-            let max_scroll = content.saturating_sub(visible);
-            self.about_scroll =
-                (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
+        // Intro and Restore are the only screens left here — both are
+        // effectively keyboard-only (Intro is a splash any key dismisses;
+        // Restore is a single always-focused text field), so there's
+        // nothing to scroll. Every other screen with scroll support now
+        // gets its own dedicated handle_*_mouse so click and scroll share
+        // one dispatch arm; see handle_mouse_event. Add a screen back as a
+        // match arm (not an if) the moment a second one needs generic
+        // scroll-only support again.
+    }
+
+    /// Recomputes the two clickable spots in About's title bar — mirrors
+    /// `about::draw`'s own `Block` title, which is a fixed single line on
+    /// the top border of the left (55%) column, starting right after its
+    /// left corner. `ABOUT_TITLE_TEXT`/`ABOUT_SUPPORT_LABEL` are the exact
+    /// same string constants that title renders, so this never drifts out
+    /// of sync with what's actually on screen.
+    fn compute_about_hit_regions(&self) -> Option<crate::screens::hit_test::AboutHitRegions> {
+        use crate::screens::about::ABOUT_TITLE_TEXT;
+        use crate::screens::hit_test::AboutHitRegions;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        if self.active_screen != ActiveScreen::About {
+            return None;
+        }
+        let term = Rect { x: 0, y: 0, width: self.terminal_width, height: self.terminal_height };
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(term)[0];
+        let left = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(content_area)[0];
+
+        let title_row = left.y;
+        let title_start_col = left.x + 1;
+        let r_offset = ABOUT_TITLE_TEXT.find("[R]")?;
+        let r_col = title_start_col + ABOUT_TITLE_TEXT[..r_offset].chars().count() as u16;
+        let r_width = (ABOUT_TITLE_TEXT.chars().count() - ABOUT_TITLE_TEXT[..r_offset].chars().count()) as u16;
+        let report_button = Rect { x: r_col, y: title_row, width: r_width, height: 1 };
+
+        // [Support], the label right after this one, isn't wired to any
+        // key on this screen today — that's a pre-existing gap independent
+        // of mouse support, not something to paper over by giving the
+        // mouse a power the keyboard doesn't have — so its Rect isn't
+        // exposed here at all.
+
+        Some(AboutHitRegions { report_button })
+    }
+
+    /// Handles a mouse event on the About screen: click "[R] Send Report"
+    /// in the title bar to open the Bug Report modal, same as pressing
+    /// `r`; otherwise, the scroll wheel moves both panels together, same
+    /// as the arrow keys already do.
+    fn handle_about_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(regions) = self.compute_about_hit_regions() {
+                    if HitRegions::contains(regions.report_button, mouse.column, mouse.row) {
+                        let _ = self.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+                let content = self.about_content_lines.get();
+                let visible = self.terminal_height.saturating_sub(5);
+                let max_scroll = content.saturating_sub(visible);
+                self.about_scroll = (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
+            }
+            _ => {}
         }
     }
 
@@ -29716,6 +29864,82 @@ mod app_tests {
             }
             other => panic!("expected NewTask to still be open with the date applied, got {other:?}"),
         }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Prologue checkbox / About Report button ──────────────────────────
+
+    #[test]
+    fn prologue_click_the_checkbox_toggles_dont_show_again() {
+        use crate::screens::prologue::CHAPTER_ONE;
+        let db_file = Path::new("test_questline_prologue_checkbox_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = CHAPTER_ONE.len(); // page fully typed out
+        app.prologue_skip_checked = false;
+
+        let rect = app.compute_prologue_checkbox_rect().expect("checkbox should be on screen");
+        left_click(&mut app, rect.x, rect.y, KeyModifiers::empty());
+        assert!(app.prologue_skip_checked, "click should check the box");
+
+        left_click(&mut app, rect.x, rect.y, KeyModifiers::empty());
+        assert!(!app.prologue_skip_checked, "clicking again should uncheck it");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn prologue_click_elsewhere_does_not_toggle_the_checkbox() {
+        use crate::screens::prologue::CHAPTER_ONE;
+        let db_file = Path::new("test_questline_prologue_checkbox_miss.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = CHAPTER_ONE.len();
+        app.prologue_skip_checked = false;
+
+        // The footer hint row, well below the checkbox — never the checkbox itself.
+        let footer_row = app.terminal_height - 2;
+        left_click(&mut app, 5, footer_row, KeyModifiers::empty());
+        assert!(!app.prologue_skip_checked, "clicking outside the checkbox must not toggle it");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn prologue_checkbox_has_no_hit_region_while_still_typing() {
+        let db_file = Path::new("test_questline_prologue_checkbox_not_yet.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = 0; // still typing — page not done yet
+        assert!(app.compute_prologue_checkbox_rect().is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn about_click_the_report_button_opens_the_bug_report_modal() {
+        let db_file = Path::new("test_questline_about_report_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        assert!(app.bug_report_modal.is_none());
+
+        let regions = app.compute_about_hit_regions().unwrap();
+        left_click(&mut app, regions.report_button.x, regions.report_button.y, KeyModifiers::empty());
+
+        assert!(app.bug_report_modal.is_some(), "clicking [R] Send Report should open the Bug Report modal, same as 'r'");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn about_scroll_wheel_scrolls_both_panels() {
+        let db_file = Path::new("test_questline_about_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(200);
+        app.about_scroll = 10;
+
+        scroll_mouse(&mut app, true); // ScrollDown
+        assert!(app.about_scroll > 10, "scrolling down should increase the offset");
 
         let _ = std::fs::remove_file(db_file);
     }
