@@ -709,6 +709,23 @@ pub struct Notification {
     pub unlocked_at: std::time::Instant,
 }
 
+/// Un swipe horizontal en curso, de los que cambian de panel.
+///
+/// El trackpad no manda "un swipe": manda una ráfaga de eventos que sigue corriendo sola por la
+/// inercia de macOS. Se acumulan aquí para que la ráfaga entera cuente como un solo gesto y mueva
+/// exactamente un panel. Ver `App::handle_pane_swipe`.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneSwipeGesture {
+    /// Último evento horizontal recibido; el hueco contra el siguiente decide si el gesto sigue.
+    pub last_event_at: std::time::Instant,
+    /// `true` = derecha (panel siguiente). Invertirla arranca un gesto nuevo.
+    pub forward: bool,
+    /// Eventos acumulados en esta dirección, contra `SWIPE_EVENTS_TO_FIRE`.
+    pub events: u8,
+    /// Si este gesto ya movió el panel. Lo que queda de ráfaga se descarta.
+    pub fired: bool,
+}
+
 type CouncilNotice = (String, String, String, String, Option<String>, bool, String);
 
 impl Notification {
@@ -1170,9 +1187,8 @@ pub struct App {
     pub last_pywal_modified: Option<std::time::SystemTime>,
     pub last_home_key_at: Option<std::time::Instant>,
     pub last_end_key_at: Option<std::time::Instant>,
-    // Un swipe horizontal de dos dedos emite una ráfaga de eventos ScrollLeft/ScrollRight, no uno
-    // solo. Sin este cooldown, un swipe cruzaría los 9 paneles de golpe. Ver PANE_SWIPE_COOLDOWN.
-    pub last_pane_swipe_at: Option<std::time::Instant>,
+    // Gesto horizontal en curso. Ver PaneSwipeGesture y handle_pane_swipe.
+    pub pane_swipe: Option<PaneSwipeGesture>,
 
     // El hilo de fondo escribe aquí cuando termina de checar la versión más reciente
     pub update_check: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -2573,7 +2589,7 @@ impl App {
             last_pywal_modified: None,
             last_home_key_at: None,
             last_end_key_at: None,
-            last_pane_swipe_at: None,
+            pane_swipe: None,
             update_check: std::sync::Arc::new(std::sync::Mutex::new(None)),
             update_check_done: false,
             run_installer_on_exit: false,
@@ -4409,10 +4425,29 @@ impl App {
             ActiveScreen::Workspace => self.handle_workspace_mouse(mouse),
             ActiveScreen::Prologue => self.handle_prologue_mouse(mouse),
             ActiveScreen::About => self.handle_about_mouse(mouse),
+            ActiveScreen::Intro => return self.handle_intro_mouse(mouse),
             _ => self.handle_generic_scroll_mouse(mouse),
         }
         Ok(())
     }
+
+    /// Ventana de silencio que da por terminado un gesto horizontal.
+    ///
+    /// macOS sigue mandando eventos de inercia después de que levantas los dedos, y esa cola dura
+    /// bastante más que cualquier cooldown fijo cómodo — por eso la primera versión se sentía
+    /// acelerada: la inercia del gesto anterior disparaba el siguiente panel sola. En vez de
+    /// contar desde que se cambió de panel, se mide el hueco entre eventos horizontales: mientras
+    /// sigan llegando seguidos es el mismo gesto (inercia incluida) y no cuenta de nuevo. Apoyar
+    /// los dedos en el trackpad corta la inercia en macOS, así que un swipe nuevo siempre empieza
+    /// después de un hueco real.
+    const SWIPE_GESTURE_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Eventos en la misma dirección antes de mover el panel.
+    ///
+    /// Un swipe horizontal de verdad manda decenas de eventos, así que 3 se siente inmediato. Lo
+    /// que filtra es la deriva lateral de un scroll vertical de dos dedos, que suelta uno o dos
+    /// eventos horizontales sueltos y antes bastaba para saltar de panel sin querer.
+    const SWIPE_EVENTS_TO_FIRE: u8 = 3;
 
     /// Los 9 paneles principales en el mismo orden que los atajos 1-9, que es el orden en que se
     /// dibujan las pestañas. `handle_pane_swipe` se mueve por esta lista.
@@ -4428,10 +4463,21 @@ impl App {
         (ActiveScreen::Settings, '9'),
     ];
 
-    /// Un trackpad manda una ráfaga de eventos por swipe, así que sin ventana muerta un solo
-    /// gesto recorrería los 9 paneles. 400ms es cómodo para swipes seguidos a propósito y corta
-    /// la cola de inercia del gesto anterior.
-    const PANE_SWIPE_COOLDOWN: std::time::Duration = std::time::Duration::from_millis(400);
+    /// El splash de arranque avanza con cualquier tecla, así que un clic hace lo mismo.
+    ///
+    /// Se sintetiza Enter en vez de repetir la lógica de destino: según haya usuario, y según la
+    /// preferencia `prologue_skip`, la pantalla siguiente es el Gateway, el Prólogo o el
+    /// Dashboard — y esa decisión debe vivir en un solo lugar (ver el brazo `Intro` de
+    /// `handle_key_event`).
+    fn handle_intro_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        // Sólo el clic: la rueda/el trackpad no deben saltarse el splash sin querer.
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        self.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
 
     /// Swipe horizontal de dos dedos (`ScrollLeft`/`ScrollRight`) para cambiar de panel.
     ///
@@ -4460,13 +4506,35 @@ impl App {
             return Ok(false);
         };
 
+        // Continúa el gesto en curso si el evento llega pegado al anterior y en la misma
+        // dirección; si no, empieza uno nuevo. Cambiar de dirección a media ráfaga cuenta como
+        // gesto nuevo: es el usuario devolviéndose.
         let now = std::time::Instant::now();
-        if let Some(last) = self.last_pane_swipe_at
-            && now.duration_since(last) < Self::PANE_SWIPE_COOLDOWN
-        {
-            // Cola del mismo gesto: se consume para que no caiga al handler de la pantalla.
+        let mut gesture = match self.pane_swipe {
+            Some(previous)
+                if previous.forward == forward
+                    && now.duration_since(previous.last_event_at) <= Self::SWIPE_GESTURE_GAP =>
+            {
+                previous
+            }
+            _ => PaneSwipeGesture {
+                last_event_at: now,
+                forward,
+                events: 0,
+                fired: false,
+            },
+        };
+        gesture.events = gesture.events.saturating_add(1);
+        gesture.last_event_at = now;
+
+        // Ya se movió el panel en este gesto (o todavía no junta suficientes eventos): se consume
+        // el evento sin hacer nada. Aquí es donde muere la cola de inercia.
+        if gesture.fired || gesture.events < Self::SWIPE_EVENTS_TO_FIRE {
+            self.pane_swipe = Some(gesture);
             return Ok(true);
         }
+        gesture.fired = true;
+        self.pane_swipe = Some(gesture);
 
         // Sin wrap: llegando a los extremos el swipe se queda ahí en vez de saltar de Settings a
         // Dashboard, igual que los atajos 1-9 tampoco ciclan.
@@ -4482,7 +4550,6 @@ impl App {
             return Ok(true);
         };
 
-        self.last_pane_swipe_at = Some(now);
         // Se sintetiza el atajo en vez de asignar active_screen a mano: cada panel arrastra sus
         // efectos (reload_data, pulls async, marcar Fellowship como visto) y duplicarlos aquí se
         // desincronizaría en cuanto alguno cambie.
@@ -26632,6 +26699,20 @@ mod app_tests {
         }
     }
 
+    // Un gesto completo: la ráfaga que manda el trackpad, no un evento suelto.
+    fn full_swipe(app: &mut App, kind: crossterm::event::MouseEventKind) {
+        for _ in 0..App::SWIPE_EVENTS_TO_FIRE {
+            app.handle_mouse_event(swipe(kind)).unwrap();
+        }
+    }
+
+    // Levantar los dedos y esperar: envejece el gesto más allá de la ventana de silencio.
+    fn let_gesture_settle(app: &mut App) {
+        if let Some(gesture) = app.pane_swipe.as_mut() {
+            gesture.last_event_at -= App::SWIPE_GESTURE_GAP + std::time::Duration::from_millis(50);
+        }
+    }
+
     #[test]
     fn two_finger_swipe_walks_the_nine_panes() {
         use crossterm::event::MouseEventKind;
@@ -26653,24 +26734,22 @@ mod app_tests {
         ];
 
         for expected in &order[1..] {
-            app.last_pane_swipe_at = None; // gesto nuevo, no la cola del anterior
-            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-                .unwrap();
+            full_swipe(&mut app, MouseEventKind::ScrollRight);
             assert_eq!(app.active_screen, *expected, "swipe derecha");
+            let_gesture_settle(&mut app);
         }
 
         for expected in order[..order.len() - 1].iter().rev() {
-            app.last_pane_swipe_at = None;
-            app.handle_mouse_event(swipe(MouseEventKind::ScrollLeft))
-                .unwrap();
+            full_swipe(&mut app, MouseEventKind::ScrollLeft);
             assert_eq!(app.active_screen, *expected, "swipe izquierda");
+            let_gesture_settle(&mut app);
         }
 
         let _ = std::fs::remove_file(db_file);
     }
 
-    // Lo que de verdad importa: el trackpad manda una ráfaga por gesto, no un evento. Sin el
-    // cooldown un solo swipe cruzaría los 9 paneles.
+    // Lo que de verdad importa: el trackpad manda una ráfaga por gesto, no un evento. Sin agrupar
+    // la ráfaga, un solo swipe cruzaría los 9 paneles.
     #[test]
     fn one_swipe_burst_advances_a_single_pane() {
         use crossterm::event::MouseEventKind;
@@ -26679,22 +26758,93 @@ mod app_tests {
         let mut app = App::new(db_file).unwrap();
         app.active_screen = ActiveScreen::Dashboard;
 
-        for _ in 0..12 {
+        for _ in 0..40 {
             app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
                 .unwrap();
         }
         assert_eq!(
             app.active_screen,
             ActiveScreen::Projects,
-            "una ráfaga de 12 eventos es UN gesto y debe avanzar un solo panel"
+            "una ráfaga de 40 eventos es UN gesto y debe avanzar un solo panel"
         );
 
-        // Pasado el cooldown, el siguiente gesto sí cuenta.
-        app.last_pane_swipe_at =
-            Some(std::time::Instant::now() - App::PANE_SWIPE_COOLDOWN - std::time::Duration::from_millis(50));
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-            .unwrap();
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La queja concreta de uso: se sentía acelerado. macOS sigue mandando eventos de inercia
+    // después de levantar los dedos, y con un cooldown fijo esa cola disparaba el panel siguiente
+    // sola. Mientras los eventos lleguen seguidos son el mismo gesto, dure lo que dure.
+    #[test]
+    fn momentum_tail_does_not_advance_a_second_pane() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_momentum.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        // Cola de inercia: mucho más larga que cualquier cooldown fijo cómodo, pero sin huecos.
+        for _ in 0..200 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Projects,
+            "la inercia del gesto anterior no debe seguir cambiando de panel"
+        );
+
+        // Un gesto nuevo de verdad (después de una pausa) sí cuenta.
+        let_gesture_settle(&mut app);
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.active_screen, ActiveScreen::Character);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La otra mitad de "hay que tener mucho cuidado": un scroll vertical de dos dedos que se va
+    // un poco de lado suelta uno o dos eventos horizontales, y eso no es un swipe.
+    #[test]
+    fn stray_horizontal_jitter_does_not_switch_panes() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_jitter.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        // El 2 va a propósito en duro, no derivado de SWIPE_EVENTS_TO_FIRE: si se calculara a
+        // partir de la constante, bajarla a 1 dejaría el bucle en cero vueltas y el test pasaría
+        // sin probar nada. Con literales, bajar el umbral rompe el test, que es la idea.
+        assert!(
+            App::SWIPE_EVENTS_TO_FIRE > 2,
+            "el umbral debe exigir más de dos eventos para que la deriva no cuente como swipe"
+        );
+
+        // Deriva suelta: eventos horizontales sueltos entre scroll vertical, cada uno su gesto.
+        for _ in 0..2 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+            let_gesture_settle(&mut app);
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Dashboard,
+            "eventos horizontales sueltos no deben cambiar de panel"
+        );
+
+        // Y un roce corto y continuo de dos eventos tampoco llega a swipe.
+        app.pane_swipe = None;
+        for _ in 0..2 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Dashboard,
+            "un roce lateral corto tampoco debe cambiar de panel"
+        );
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -26708,30 +26858,26 @@ mod app_tests {
 
         // Extremo izquierdo: no cicla hasta Settings.
         app.active_screen = ActiveScreen::Dashboard;
-        app.last_pane_swipe_at = None;
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollLeft))
-            .unwrap();
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollLeft);
         assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         // Extremo derecho: tampoco vuelve a Dashboard.
         app.active_screen = ActiveScreen::Settings;
-        app.last_pane_swipe_at = None;
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-            .unwrap();
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.active_screen, ActiveScreen::Settings);
 
         // Workspace queda fuera a propósito: ahí 1-4 son sub-tabs, igual que con el teclado.
         app.active_screen = ActiveScreen::Workspace;
-        app.last_pane_swipe_at = None;
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-            .unwrap();
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.active_screen, ActiveScreen::Workspace);
 
         // En el Editor se está escribiendo; un swipe no debe sacarte del texto.
         app.active_screen = ActiveScreen::Editor;
-        app.last_pane_swipe_at = None;
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-            .unwrap();
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.active_screen, ActiveScreen::Editor);
 
         let _ = std::fs::remove_file(db_file);
@@ -26746,11 +26892,49 @@ mod app_tests {
         let mut app = App::new(db_file).unwrap();
         app.active_screen = ActiveScreen::Dashboard;
         app.modal_state = ModalType::ChapterComplete;
-        app.last_pane_swipe_at = None;
+        app.pane_swipe = None;
 
-        app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
-            .unwrap();
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
         assert_eq!(app.active_screen, ActiveScreen::Dashboard);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // El splash de arranque avanza con cualquier tecla; un clic debe hacer lo mismo.
+    #[test]
+    fn click_on_the_intro_splash_continues_like_a_key() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let db_file = Path::new("test_questline_intro_click.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Intro;
+
+        app.handle_mouse_event(swipe(MouseEventKind::Down(MouseButton::Left)))
+            .unwrap();
+        assert_ne!(
+            app.active_screen,
+            ActiveScreen::Intro,
+            "un clic debe sacar del splash igual que una tecla"
+        );
+
+        // Sin usuario el destino es el Gateway, el mismo que elige el brazo de teclado.
+        assert_eq!(app.active_screen, ActiveScreen::Gateway);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La rueda no debe saltarse el splash: sólo el clic.
+    #[test]
+    fn scrolling_on_the_intro_splash_does_not_skip_it() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_intro_scroll.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Intro;
+
+        app.handle_mouse_event(swipe(MouseEventKind::ScrollDown))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Intro);
 
         let _ = std::fs::remove_file(db_file);
     }
