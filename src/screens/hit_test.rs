@@ -465,11 +465,21 @@ impl WorkspaceRowList {
 
 /// Notes/Scrolls tab — a list on the left and (when a note is selected and
 /// visible) a preview pane on the right; a click on the preview just moves
-/// focus there, mirroring Library/Character's detail panes.
+/// focus there, mirroring Library/Character's detail panes — unless it lands
+/// on a link, which opens it.
 #[derive(Debug, Clone)]
 pub struct WorkspaceNotesHitRegions {
     pub list: WorkspaceRowList,
     pub preview: Option<Rect>,
+    /// One entry per on-screen run of a rendered `http(s)` link in the
+    /// preview, with the URL to open. Built at draw time from the same
+    /// wrap the preview rendered with (a link split across two visual rows
+    /// contributes one entry per row), already offset by the preview's
+    /// scroll — so anything off-screen simply isn't in here. Non-http
+    /// schemes are deliberately absent: these URLs are handed to the OS
+    /// opener, and a shared scroll shouldn't be able to launch `file:` or
+    /// worse from a stray click.
+    pub preview_links: Vec<(Rect, String)>,
 }
 
 impl HitRegions {

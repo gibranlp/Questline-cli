@@ -6508,6 +6508,17 @@ impl App {
         Ok(())
     }
 
+    /// Abre en el navegador un enlace clickeado en el preview de un scroll.
+    ///
+    /// El spawn real se omite bajo `cfg(test)`: los tests de mouse hacen clicks de
+    /// verdad y no deberían abrir ventanas del navegador durante `cargo test`.
+    fn open_scroll_link(&mut self, url: &str) {
+        self.notifications
+            .push(Notification::info(format!("Opening {}", url)));
+        #[cfg(not(test))]
+        open_url(url);
+    }
+
     fn handle_workspace_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
         use crate::screens::hit_test::HitRegions;
         use crossterm::event::{MouseButton, MouseEventKind};
@@ -6618,6 +6629,17 @@ impl App {
                     {
                         self.workspace_sidebar_focused = false;
                         self.note_preview_focused = true;
+                        // Un link sí se activa con un solo click, a diferencia del
+                        // resto del pane: viene subrayado y con la URL al lado, así
+                        // que es un blanco explícito, no una fila más de una lista.
+                        if let Some((_, url)) = notes
+                            .preview_links
+                            .iter()
+                            .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+                        {
+                            let url = url.clone();
+                            self.open_scroll_link(&url);
+                        }
                     }
                 }
             }
@@ -29760,6 +29782,7 @@ mod app_tests {
                     row_targets: vec![Some(0), None, Some(1)],
                 },
                 preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: Vec::new(),
             }),
             tasks: None,
             kanban: None,
@@ -29774,6 +29797,51 @@ mod app_tests {
 
         left_click(&mut app, 32, 1, KeyModifiers::empty()); // preview pane — focus only
         assert!(app.note_preview_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_clicking_a_preview_link_opens_it() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_preview_link.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: vec![(
+                    ratatui::layout::Rect { x: 32, y: 4, width: 8, height: 1 },
+                    "https://questlinecli.com".to_string(),
+                )],
+            }),
+            tasks: None,
+            kanban: None,
+        });
+
+        // Preview pane but off the link — focus only, no browser.
+        left_click(&mut app, 32, 1, KeyModifiers::empty());
+        assert!(app.note_preview_focused);
+        assert!(!app.notifications.iter().any(|n| n.message.contains("Opening")));
+
+        // On the link — one click activates it, unlike the rest of the pane.
+        left_click(&mut app, 35, 4, KeyModifiers::empty());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message == "Opening https://questlinecli.com"),
+            "clicking a rendered link should open it"
+        );
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -29816,6 +29884,7 @@ mod app_tests {
                     row_targets: vec![Some(1)],
                 },
                 preview: None,
+                preview_links: Vec::new(),
             }),
             tasks: None,
             kanban: None,
@@ -29868,6 +29937,7 @@ mod app_tests {
                     row_targets: vec![Some(1)],
                 },
                 preview: None,
+                preview_links: Vec::new(),
             }),
             tasks: None,
             kanban: None,
@@ -29988,6 +30058,7 @@ mod app_tests {
                     row_targets: vec![Some(0)],
                 },
                 preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: Vec::new(),
             }),
             tasks: None,
             kanban: None,

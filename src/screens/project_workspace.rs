@@ -3530,9 +3530,41 @@ fn draw_quest_council_modal(
 
 // ── Markdown preview helpers ─────────────────────────────────────────────────
 
-// Parser de markdown inline — maneja bold, italic, code, links y URLs de a poco, caracter por caracter
-fn md_inline(text: &str, base: Style, accent: Color, muted: Color) -> Vec<Span<'static>> {
+/// Un enlace dentro de una línea ya renderizada: el rango `[start, end)` de caracteres
+/// que ocupa en esa línea, y la URL a la que apunta.
+///
+/// El preview de scrolls lo usa para convertir un click en pantalla de vuelta a una URL.
+/// Solo se emiten enlaces `http`/`https`: la URL termina pasándole a `open`/`xdg-open`/
+/// `start`, y un scroll compartido por otra persona no debería poder disparar un esquema
+/// arbitrario (`file:`, `javascript:`) desde un click.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkSpan {
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
+}
+
+fn is_openable_url(url: &str) -> bool {
+    url.starts_with("https://") || url.starts_with("http://")
+}
+
+// Parser de markdown inline — maneja bold, italic, code, links y URLs de a poco, caracter por
+// caracter. Junto con los spans devuelve los enlaces que encontró, ubicados en caracteres sobre
+// la concatenación de esos spans.
+fn md_inline_links(
+    text: &str,
+    base: Style,
+    accent: Color,
+    muted: Color,
+) -> (Vec<Span<'static>>, Vec<LinkSpan>) {
     let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut links: Vec<LinkSpan> = Vec::new();
+    // Cuántos caracteres llevan emitidos los spans — el ancla de los rangos de enlace.
+    // Se recuenta solo al encontrar un enlace (dos ramas de las nueve) en vez de llevar
+    // un contador que cada `push` tendría que acordarse de mover.
+    let column = |spans: &[Span<'static>]| -> usize {
+        spans.iter().map(|s| s.content.chars().count()).sum()
+    };
     let mut s = text;
 
     while !s.is_empty() {
@@ -3602,6 +3634,7 @@ fn md_inline(text: &str, base: Style, accent: Color, muted: Color) -> Vec<Span<'
                 if after.starts_with('(') {
                     if let Some(paren_end) = after[1..].find(')') {
                         let url = &after[1..paren_end + 1];
+                        let start = column(&spans);
                         spans.push(Span::styled(
                             link_text.to_string(),
                             base.fg(accent).add_modifier(Modifier::UNDERLINED),
@@ -3610,6 +3643,15 @@ fn md_inline(text: &str, base: Style, accent: Color, muted: Color) -> Vec<Span<'
                             format!(" ↗ {}", url),
                             Style::default().fg(muted),
                         ));
+                        // El texto y el " ↗ url" que lo sigue son un solo blanco de
+                        // click: separarlos dejaría un hueco muerto entre los dos.
+                        if is_openable_url(url) {
+                            links.push(LinkSpan {
+                                start,
+                                end: column(&spans),
+                                url: url.to_string(),
+                            });
+                        }
                         s = &after[paren_end + 2..];
                         continue;
                     }
@@ -3619,37 +3661,73 @@ fn md_inline(text: &str, base: Style, accent: Color, muted: Color) -> Vec<Span<'
         // bare URL
         if s.starts_with("https://") || s.starts_with("http://") {
             let end = s.find(char::is_whitespace).unwrap_or(s.len());
+            let start = column(&spans);
             spans.push(Span::styled(
                 s[..end].to_string(),
                 Style::default()
                     .fg(accent)
                     .add_modifier(Modifier::UNDERLINED),
             ));
+            links.push(LinkSpan {
+                start,
+                end: column(&spans),
+                url: s[..end].to_string(),
+            });
             s = &s[end..];
             continue;
         }
-        // Texto plano — avanzamos hasta el siguiente token de markdown potencial
-        let next = s
-            .find(|c: char| matches!(c, '*' | '`' | '[' | '_' | '~'))
-            .and_then(|p| {
-                // also check for URL starts
-                let url_pos = [s.find("https://"), s.find("http://")]
-                    .into_iter()
-                    .flatten()
-                    .min();
-                Some(url_pos.map_or(p, |u| p.min(u)))
-            })
-            .unwrap_or(s.len());
+        // Texto plano — avanzamos hasta el siguiente token de markdown potencial, o hasta el
+        // arranque de una URL suelta, lo que venga primero. Antes la URL solo se miraba si
+        // además había un token de markdown en la línea, así que un "ping http://x" sin
+        // ningún `*`/`[`/`_` se comía la URL como texto plano: ni subrayada ni clickeable.
+        let token = s.find(|c: char| matches!(c, '*' | '`' | '[' | '_' | '~'));
+        let url_pos = [s.find("https://"), s.find("http://")]
+            .into_iter()
+            .flatten()
+            .min();
+        let next = match (token, url_pos) {
+            (Some(token), Some(url)) => token.min(url),
+            (Some(token), None) => token,
+            (None, Some(url)) => url,
+            (None, None) => s.len(),
+        };
         let take = next.max(s.chars().next().map(|c| c.len_utf8()).unwrap_or(1));
         spans.push(Span::styled(s[..take].to_string(), base));
         s = &s[take..];
     }
 
-    spans
+    (spans, links)
 }
 
 // Convierte una línea de markdown a un Line de ratatui — detecta headers, bullets, blockquotes etc.
 fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
+    md_line_links(raw, theme).0
+}
+
+/// Pega el prefijo de la línea (viñeta, ☐, "│ "…) delante de los spans inline y corre los
+/// rangos de enlace esos mismos caracteres, que es lo que los deja alineados con lo que
+/// se ve en pantalla.
+fn compose_md_line(
+    prefix: Vec<Span<'static>>,
+    inline: (Vec<Span<'static>>, Vec<LinkSpan>),
+) -> (Line<'static>, Vec<LinkSpan>) {
+    let offset: usize = prefix.iter().map(|s| s.content.chars().count()).sum();
+    let (inline_spans, inline_links) = inline;
+    let links = inline_links
+        .into_iter()
+        .map(|link| LinkSpan {
+            start: link.start + offset,
+            end: link.end + offset,
+            url: link.url,
+        })
+        .collect();
+    let mut spans = prefix;
+    spans.extend(inline_spans);
+    (Line::from(spans), links)
+}
+
+/// Igual que [`md_line`], más los enlaces de la línea ubicados en caracteres de pantalla.
+fn md_line_links(raw: &str, theme: &Theme) -> (Line<'static>, Vec<LinkSpan>) {
     let trimmed = raw.trim_start();
     let leading = raw.len() - trimmed.len();
     let default_style = Style::default().fg(theme.text);
@@ -3658,7 +3736,7 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
 
     // Blank line
     if trimmed.is_empty() {
-        return Line::from("");
+        return (Line::from(""), Vec::new());
     }
 
     // Horizontal rule
@@ -3667,88 +3745,92 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
             || trimmed.chars().all(|c| c == '*')
             || trimmed.chars().all(|c| c == '='))
     {
-        return Line::from(Span::styled(
-            "  ──────────────────────────────────────",
-            Style::default().fg(theme.muted),
-        ));
+        return (
+            Line::from(Span::styled(
+                "  ──────────────────────────────────────",
+                Style::default().fg(theme.muted),
+            )),
+            Vec::new(),
+        );
     }
 
     // Task-list items (must come before plain bullet)
     if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
-        let mut spans = vec![Span::styled("  ☐ ".to_string(), Style::default().fg(muted))];
-        spans.extend(md_inline(rest, default_style, accent, muted));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  ☐ ".to_string(), Style::default().fg(muted))],
+            md_inline_links(rest, default_style, accent, muted),
+        );
     }
     if let Some(rest) = trimmed
         .strip_prefix("- [x] ")
         .or_else(|| trimmed.strip_prefix("- [X] "))
     {
-        let mut spans = vec![Span::styled(
-            "  ☑ ".to_string(),
-            Style::default().fg(theme.success),
-        )];
-        spans.extend(md_inline(
-            rest,
-            Style::default()
-                .fg(muted)
-                .add_modifier(Modifier::CROSSED_OUT),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled(
+                "  ☑ ".to_string(),
+                Style::default().fg(theme.success),
+            )],
+            md_inline_links(
+                rest,
+                Style::default()
+                    .fg(muted)
+                    .add_modifier(Modifier::CROSSED_OUT),
+                accent,
+                muted,
+            ),
+        );
     }
 
     // Headings
     if let Some(rest) = trimmed.strip_prefix("# ") {
-        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
-        spans.extend(md_inline(
-            rest,
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::UNDERLINED),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  ".to_string(), Style::default())],
+            md_inline_links(
+                rest,
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(Modifier::UNDERLINED),
+                accent,
+                muted,
+            ),
+        );
     }
     if let Some(rest) = trimmed.strip_prefix("## ") {
-        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
-        spans.extend(md_inline(
-            rest,
-            Style::default()
-                .fg(theme.primary)
-                .add_modifier(Modifier::BOLD),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  ".to_string(), Style::default())],
+            md_inline_links(
+                rest,
+                Style::default()
+                    .fg(theme.primary)
+                    .add_modifier(Modifier::BOLD),
+                accent,
+                muted,
+            ),
+        );
     }
     if let Some(rest) = trimmed.strip_prefix("### ") {
-        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
-        spans.extend(md_inline(
-            rest,
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  ".to_string(), Style::default())],
+            md_inline_links(
+                rest,
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+                accent,
+                muted,
+            ),
+        );
     }
     if let Some(rest) = trimmed
         .strip_prefix("#### ")
         .or_else(|| trimmed.strip_prefix("##### "))
         .or_else(|| trimmed.strip_prefix("###### "))
     {
-        let mut spans = vec![Span::styled("  ".to_string(), Style::default())];
-        spans.extend(md_inline(
-            rest,
-            Style::default().fg(theme.warning),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  ".to_string(), Style::default())],
+            md_inline_links(rest, Style::default().fg(theme.warning), accent, muted),
+        );
     }
 
     // Blockquote
@@ -3756,14 +3838,15 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
         .strip_prefix("> ")
         .or_else(|| trimmed.strip_prefix('>'))
     {
-        let mut spans = vec![Span::styled("  │ ".to_string(), Style::default().fg(muted))];
-        spans.extend(md_inline(
-            rest.trim(),
-            Style::default().fg(muted).add_modifier(Modifier::ITALIC),
-            accent,
-            muted,
-        ));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled("  │ ".to_string(), Style::default().fg(muted))],
+            md_inline_links(
+                rest.trim(),
+                Style::default().fg(muted).add_modifier(Modifier::ITALIC),
+                accent,
+                muted,
+            ),
+        );
     }
 
     // Unordered bullets (- * +), with indent awareness
@@ -3780,9 +3863,10 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
         } else {
             "  • "
         };
-        let mut spans = vec![Span::styled(prefix.to_string(), bullet_style)];
-        spans.extend(md_inline(rest, default_style, accent, muted));
-        return Line::from(spans);
+        return compose_md_line(
+            vec![Span::styled(prefix.to_string(), bullet_style)],
+            md_inline_links(rest, default_style, accent, muted),
+        );
     }
 
     // Numbered list "N. text"
@@ -3791,20 +3875,22 @@ fn md_line<'a>(raw: &str, theme: &Theme) -> Line<'a> {
         if !maybe_num.is_empty() && maybe_num.chars().all(|c| c.is_ascii_digit()) {
             let rest = &trimmed[dot + 2..];
             let prefix = format!("  {}. ", maybe_num);
-            let mut spans = vec![Span::styled(
-                prefix,
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            )];
-            spans.extend(md_inline(rest, default_style, accent, muted));
-            return Line::from(spans);
+            return compose_md_line(
+                vec![Span::styled(
+                    prefix,
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )],
+                md_inline_links(rest, default_style, accent, muted),
+            );
         }
     }
 
     // Regular paragraph — preserve leading indentation up to 8 spaces, then inline parse
     let pad = " ".repeat(leading.min(8) + 2);
-    let mut spans = vec![Span::raw(pad)];
-    spans.extend(md_inline(trimmed, default_style, accent, muted));
-    Line::from(spans)
+    compose_md_line(
+        vec![Span::raw(pad)],
+        md_inline_links(trimmed, default_style, accent, muted),
+    )
 }
 
 // Append one level of the DFS tree into flat_list (text, note_idx, is_header)
@@ -4030,6 +4116,9 @@ fn draw_notes_tab(
     } else {
         " Document Preview "
     };
+    // Rects en pantalla de los enlaces visibles del scroll — se llenan abajo, junto con el
+    // envuelto de las líneas, porque es ahí donde se sabe en qué fila y columna terminó cada uno.
+    let mut preview_links: Vec<(Rect, String)> = Vec::new();
     let preview_widget = if notes.is_empty() || selected_note_idx.map_or(true, |i| i >= notes.len())
     {
         Paragraph::new("\n  No scroll selected.").block(
@@ -4067,6 +4156,8 @@ fn draw_notes_tab(
             )),
             Line::from(""),
         ];
+        // Enlaces por línea lógica, en lockstep con `lines` — el encabezado no tiene.
+        let mut line_links: Vec<Vec<LinkSpan>> = vec![Vec::new(); lines.len()];
 
         // Renderizamos el markdown — los code blocks van amarillos, el resto pasa por md_line
         if n.markdown_content.is_empty() {
@@ -4076,6 +4167,7 @@ fn draw_notes_tab(
                     .fg(theme.muted)
                     .add_modifier(Modifier::ITALIC),
             )));
+            line_links.push(Vec::new());
         } else {
             let mut in_code_block = false;
             for raw_line in n.markdown_content.lines() {
@@ -4085,33 +4177,76 @@ fn draw_notes_tab(
                         "  ─── code ─────────────────────────",
                         Style::default().fg(theme.muted),
                     )));
+                    line_links.push(Vec::new());
                 } else if in_code_block {
                     lines.push(Line::from(vec![
                         Span::raw("  "),
                         Span::styled(raw_line.to_string(), Style::default().fg(theme.warning)),
                     ]));
+                    line_links.push(Vec::new());
                 } else {
-                    lines.push(md_line(raw_line, theme));
+                    let (line, links) = md_line_links(raw_line, theme);
+                    lines.push(line);
+                    line_links.push(links);
                 }
             }
         }
 
-        let preview_width = sub_chunks[1].width.saturating_sub(2) as usize;
-        let preview_height = sub_chunks[1].height.saturating_sub(2) as usize;
-        let visual_rows: usize = lines
-            .iter()
-            .map(|line| {
-                if preview_width == 0 {
-                    1
-                } else {
-                    line.width().max(1).div_ceil(preview_width)
-                }
-            })
-            .sum();
-        let max_scroll = visual_rows.saturating_sub(preview_height);
-        preview_max_scroll.set(max_scroll);
+        let preview_inner = Block::default().borders(Borders::ALL).inner(sub_chunks[1]);
+        let preview_width = preview_inner.width as usize;
+        let preview_height = preview_inner.height as usize;
 
-        Paragraph::new(lines)
+        // Envolvemos nosotros en vez de dejárselo a Wrap{trim:false}: hace falta saber en qué
+        // fila visual y en qué columnas cayó cada enlace para poder hacerle click, y eso
+        // ratatui no lo devuelve. De paso el max_scroll deja de ser la estimación por
+        // div_ceil de antes y pasa a ser el conteo real de filas.
+        let mut rows: Vec<Line> = Vec::new();
+        // (fila visual antes del scroll, columna, ancho, url)
+        let mut link_cells: Vec<(usize, u16, u16, String)> = Vec::new();
+        for (line, links) in lines.iter().zip(line_links.iter()) {
+            let (wrapped, ranges) =
+                crate::screens::text_wrap::split_styled_line_with_ranges(line, preview_width);
+            for (row_offset, (row_start, row_end)) in ranges.iter().enumerate() {
+                for link in links {
+                    // Un enlace largo se parte entre dos filas: cada trozo es su propio blanco.
+                    let start = link.start.max(*row_start);
+                    let end = link.end.min(*row_end);
+                    if start < end {
+                        link_cells.push((
+                            rows.len() + row_offset,
+                            (start - row_start) as u16,
+                            (end - start) as u16,
+                            link.url.clone(),
+                        ));
+                    }
+                }
+            }
+            rows.extend(wrapped);
+        }
+
+        let max_scroll = rows.len().saturating_sub(preview_height);
+        preview_max_scroll.set(max_scroll);
+        let scroll = preview_scroll.min(max_scroll);
+
+        preview_links = link_cells
+            .into_iter()
+            .filter_map(|(visual_row, col, width, url)| {
+                let on_screen = visual_row.checked_sub(scroll)?;
+                (on_screen < preview_height).then(|| {
+                    (
+                        Rect {
+                            x: preview_inner.x + col,
+                            y: preview_inner.y + on_screen as u16,
+                            width,
+                            height: 1,
+                        },
+                        url,
+                    )
+                })
+            })
+            .collect();
+
+        Paragraph::new(rows)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
@@ -4119,11 +4254,7 @@ fn draw_notes_tab(
                     .border_style(Style::default().fg(preview_border))
                     .title(preview_title),
             )
-            .wrap(ratatui::widgets::Wrap { trim: false })
-            .scroll((
-                preview_scroll.min(max_scroll).min(u16::MAX as usize) as u16,
-                0,
-            ))
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
     };
     f.render_widget(preview_widget, sub_chunks[1]);
 
@@ -4138,6 +4269,7 @@ fn draw_notes_tab(
         // Full pane, border included — a click there just moves focus,
         // there's no sub-selection inside the preview.
         preview: Some(sub_chunks[1]),
+        preview_links,
     })
 }
 
@@ -5963,6 +6095,109 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use ratatui::{Terminal, backend::TestBackend};
+
+    // ── Clickable links in the scroll preview ────────────────────────────
+
+    /// Los caracteres `[start, end)` que reporta un LinkSpan, leídos de la línea que
+    /// se dibujó — si no coinciden con lo que se ve, el click cae en otro lado.
+    fn chars_at(line: &Line, link: &LinkSpan) -> String {
+        line.spans
+            .iter()
+            .flat_map(|span| span.content.chars())
+            .skip(link.start)
+            .take(link.end - link.start)
+            .collect()
+    }
+
+    #[test]
+    fn md_line_reports_where_each_link_actually_renders() {
+        let theme = Theme::default_theme();
+
+        let (line, links) = md_line_links("- see [the docs](https://questlinecli.com/docs) ok", &theme);
+        assert_eq!(links.len(), 1);
+        // El texto del link y el " ↗ url" que lo sigue son un solo blanco contiguo.
+        assert_eq!(
+            chars_at(&line, &links[0]),
+            "the docs ↗ https://questlinecli.com/docs"
+        );
+        assert_eq!(links[0].url, "https://questlinecli.com/docs");
+
+        // URL suelta dentro de una cita, que además lleva prefijo "  │ ".
+        let (line, links) = md_line_links("> ping http://example.com now", &theme);
+        assert_eq!(links.len(), 1);
+        assert_eq!(chars_at(&line, &links[0]), "http://example.com");
+
+        // Dos links en la misma línea, cada uno con su rango.
+        let (line, links) = md_line_links("https://a.example https://b.example", &theme);
+        assert_eq!(links.len(), 2);
+        assert_eq!(chars_at(&line, &links[0]), "https://a.example");
+        assert_eq!(chars_at(&line, &links[1]), "https://b.example");
+    }
+
+    #[test]
+    fn md_line_does_not_offer_non_http_links_to_the_os_opener() {
+        let theme = Theme::default_theme();
+        for raw in [
+            "[local](file:///etc/passwd)",
+            "[click](javascript:alert(1))",
+            "[mail](mailto:someone@example.com)",
+        ] {
+            let (_, links) = md_line_links(raw, &theme);
+            assert!(links.is_empty(), "{} should not be clickable", raw);
+        }
+    }
+
+    #[test]
+    fn preview_links_land_on_the_cells_the_link_was_drawn_in() {
+        let note = Note {
+            id: uuid::Uuid::new_v4(),
+            project_id: None,
+            title: "Runes".into(),
+            markdown_content: "intro\nvisit https://questlinecli.com today".into(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            sharing_permission: "editable".into(),
+            codex_id: None,
+            owner_identity: None,
+        };
+        let theme = Theme::default_theme();
+        let max_scroll = std::cell::Cell::new(0);
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+
+        let mut regions = None;
+        terminal
+            .draw(|f| {
+                regions = draw_notes_tab(
+                    f,
+                    f.size(),
+                    &[&note],
+                    1,
+                    &theme,
+                    false,
+                    &[],
+                    false,
+                    0,
+                    &max_scroll,
+                );
+            })
+            .unwrap();
+
+        let links = regions
+            .expect("a note is selected, so there are hit regions")
+            .preview_links;
+        assert_eq!(links.len(), 1, "the bare URL should be one click target");
+        let (rect, url) = &links[0];
+        assert_eq!(url, "https://questlinecli.com");
+        assert_eq!(rect.width as usize, url.chars().count());
+
+        // El texto de esas celdas en el buffer real tiene que ser la URL: es la única
+        // prueba de que la envoltura, el scroll y el borde quedaron alineados.
+        let buffer = terminal.backend().buffer();
+        let drawn: String = (rect.x..rect.x + rect.width)
+            .map(|x| buffer.get(x, rect.y).symbol().to_string())
+            .collect();
+        assert_eq!(drawn, *url);
+    }
 
     #[test]
     fn workload_bands_include_urgent_work_not_only_raw_count() {
