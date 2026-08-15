@@ -3058,6 +3058,7 @@ impl App {
             Some(ModalHitRegions {
                 popup_area,
                 confirm_key: Some(key),
+                buttons: None,
                 list: None,
                 focus_fields: None,
             })
@@ -3066,6 +3067,69 @@ impl App {
             Some(ModalHitRegions {
                 popup_area,
                 confirm_key: None,
+                buttons: None,
+                list: None,
+                focus_fields: None,
+            })
+        };
+        // Splits one line of button/key-hint text (e.g. "  Archive this
+        // realm?  [Y] Yes   [N] No / Esc") into N clickable button Rects,
+        // given the BYTE offset within `text` where each button after the
+        // first begins (e.g. the offset of "[N]"). Column positions count
+        // chars, not bytes, so multi-byte text (UpdateAvailable's em dash)
+        // still lines up — terminal columns are char cells, not bytes.
+        let button_line = |line_rect: Rect, text: &str, centered: bool, split_bytes: &[usize], keys: &[KeyCode]| {
+            let text_cols = text.chars().count() as u16;
+            let start_col = if centered {
+                line_rect.x + line_rect.width.saturating_sub(text_cols) / 2
+            } else {
+                line_rect.x
+            };
+            let mut bounds: Vec<u16> = split_bytes
+                .iter()
+                .map(|&b| text[..b].chars().count() as u16)
+                .collect();
+            bounds.push(text_cols);
+            let mut result = Vec::new();
+            let mut prev = 0u16;
+            for (&end, &key) in bounds.iter().zip(keys.iter()) {
+                result.push((
+                    Rect {
+                        x: start_col + prev,
+                        y: line_rect.y,
+                        width: end.saturating_sub(prev),
+                        height: 1,
+                    },
+                    key,
+                ));
+                prev = end;
+            }
+            result
+        };
+        // The common shape shared by every left-aligned "[Y] Yes  [N] No /
+        // Esc" confirm dialog: one line of text at a known row inside the
+        // popup's bordered interior, split into a Yes button ('y') and a
+        // No button ('n') at the literal "[N]" marker.
+        let yes_no_dialog = |popup_area: Rect, line: u16, text: &str| {
+            let popup_inner = inner(popup_area);
+            let line_rect = Rect {
+                x: popup_inner.x,
+                y: popup_inner.y + line,
+                width: popup_inner.width,
+                height: 1,
+            };
+            let split = text.find("[N]").expect("yes/no dialog text must contain a literal \"[N]\"");
+            let buttons = button_line(
+                line_rect,
+                text,
+                false,
+                &[split],
+                &[KeyCode::Char('y'), KeyCode::Char('n')],
+            );
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                buttons: Some(buttons),
                 list: None,
                 focus_fields: None,
             })
@@ -3076,6 +3140,7 @@ impl App {
                 confirm_key: None,
                 list: None,
                 focus_fields: Some(focus_fields),
+            buttons: None,
             })
         };
         // Shared by NewTask/EditTask — replicates draw_task_modal's exact
@@ -3155,6 +3220,7 @@ impl App {
                 confirm_key: None,
                 list: None,
                 focus_fields: Some(field_rects),
+            buttons: None,
             })
         };
         // Replicates ratatui's List widget auto-scroll for the few modals
@@ -3188,6 +3254,7 @@ impl App {
                     first_visible_index,
                 }),
                 focus_fields: None,
+            buttons: None,
             })
         };
 
@@ -3209,20 +3276,104 @@ impl App {
             }
             ModalType::SupportRealm => confirm(fixed_h(58, 14, term), KeyCode::Enter),
             ModalType::KeyboardHelp => confirm(pct(75, 35, term), KeyCode::Enter),
-            ModalType::EncryptionMigrationPrompt => confirm(fixed_h(68, 15, term), KeyCode::Char('m')),
-            // ui::draw_hydration_reminder_modal's own centered_rect(40, 35, area)
-            ModalType::HydrationReminder => confirm(pct(40, 35, term), KeyCode::Char('d')),
-            ModalType::QuitConfirm { .. } => confirm(fixed_h(64, 17, term), KeyCode::Char('y')),
-            ModalType::ConfirmArchiveProject { .. } => confirm(fixed_h(55, 9, term), KeyCode::Char('y')),
-            ModalType::ConfirmDeleteProject { .. } => confirm(fixed_h(55, 10, term), KeyCode::Char('y')),
-            ModalType::ConfirmRemoveFellowshipMember { .. } => {
-                confirm(fixed_h(62, 11, term), KeyCode::Char('y'))
+            // EncryptionMigrationPrompt is a 3-way choice already laid out
+            // as 3 separate, full-width Lines (not one string to split) —
+            // one Rect per choice, centered like the render code.
+            ModalType::EncryptionMigrationPrompt => {
+                let popup = fixed_h(68, 15, term);
+                let popup_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: popup_inner.x,
+                    y: popup_inner.y + n,
+                    width: popup_inner.width,
+                    height: 1,
+                };
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: Some(vec![
+                        (line(7), KeyCode::Char('m')),
+                        (line(8), KeyCode::Char('l')),
+                        (line(9), KeyCode::Esc),
+                    ]),
+                    list: None,
+                    focus_fields: None,
+                })
             }
-            ModalType::ConfirmConquerProject { .. } => confirm(fixed_h(58, 11, term), KeyCode::Char('y')),
-            ModalType::ConfirmDeleteCodex { .. } => confirm(fixed_h(55, 9, term), KeyCode::Char('y')),
-            ModalType::ConfirmPruneTasks { .. } => confirm(fixed_h(55, 10, term), KeyCode::Char('y')),
-            ModalType::ConfirmCleanupLocalHistory { .. } => confirm(fixed_h(62, 12, term), KeyCode::Char('y')),
-            ModalType::UpdateAvailable { .. } => confirm(fixed_h(62, 12, term), KeyCode::Char('y')),
+            // ui::draw_hydration_reminder_modal's own centered_rect(40, 35, area).
+            // Its button row is Layout-split (content[5]), bottom-anchored
+            // by a Min(1) spacer above it rather than a fixed line count —
+            // approximated here as the last row of the popup interior,
+            // which is where that Min(1) spacer settles in practice.
+            ModalType::HydrationReminder => {
+                let popup = pct(40, 35, term);
+                let popup_inner = inner(popup);
+                let text = " [d] Drink  [s] Snooze 15m  [x] Dismiss ";
+                let line_rect = Rect {
+                    x: popup_inner.x,
+                    y: popup_inner.y + popup_inner.height.saturating_sub(1),
+                    width: popup_inner.width,
+                    height: 1,
+                };
+                let buttons = button_line(
+                    line_rect,
+                    text,
+                    true,
+                    &[text.find("[s]").unwrap(), text.find("[x]").unwrap()],
+                    &[KeyCode::Char('d'), KeyCode::Char('s'), KeyCode::Char('x')],
+                );
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: Some(buttons),
+                    list: None,
+                    focus_fields: None,
+                })
+            }
+            // QuitConfirm's hint is a compact "[Y/N]" with no separate Yes/
+            // No text to split on — kept as the original single confirm
+            // zone rather than an arbitrary, unanchored split.
+            ModalType::QuitConfirm { .. } => confirm(fixed_h(64, 17, term), KeyCode::Char('y')),
+            ModalType::ConfirmArchiveProject { .. } => yes_no_dialog(
+                fixed_h(55, 9, term),
+                5,
+                "  Archive this realm?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmDeleteProject { .. } => yes_no_dialog(
+                fixed_h(55, 10, term),
+                6,
+                "  Slay this realm forever?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmRemoveFellowshipMember { .. } => yes_no_dialog(
+                fixed_h(62, 11, term),
+                7,
+                "  Continue?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmConquerProject { .. } => yes_no_dialog(
+                fixed_h(58, 11, term),
+                6,
+                "  Conquer this campaign?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmDeleteCodex { .. } => yes_no_dialog(
+                fixed_h(55, 9, term),
+                5,
+                "  Delete this codex?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmPruneTasks { .. } => yes_no_dialog(
+                fixed_h(55, 10, term),
+                5,
+                "  Prune completed tasks?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmCleanupLocalHistory { .. } => yes_no_dialog(
+                fixed_h(62, 12, term),
+                9,
+                "  Clean local history?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::UpdateAvailable { .. } => yes_no_dialog(
+                fixed_h(62, 12, term),
+                4,
+                "  Install now? [Y] Yes \u{2014} exit & update    [N] Skip",
+            ),
             ModalType::Celebration { .. } => confirm(pct(68, 52, term), KeyCode::Enter),
             ModalType::CloudBackupProgress { step, .. }
             | ModalType::SyncProgress { step, .. }
@@ -3448,6 +3599,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Rows {
                         area: Rect {
@@ -3481,6 +3633,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![chunks[1], chunks[3], chunks[5]])),
                 })
@@ -3502,6 +3655,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Items(chunks[..n].to_vec())),
                 })
@@ -3526,6 +3680,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Rows {
                         area: chunks[1],
@@ -3602,6 +3757,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Items(items)),
                 })
@@ -3693,6 +3849,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![
                         Rect { x: row.x, y: row.y, width: third, height: row.height },
@@ -3722,6 +3879,7 @@ impl App {
                 Some(ModalHitRegions {
                     popup_area: popup,
                     confirm_key: None,
+                    buttons: None,
                     focus_fields: None,
                     list: Some(ModalListRegion::Items(vec![
                         Rect { x: row.x, y: row.y, width: third, height: row.height },
@@ -3869,6 +4027,18 @@ impl App {
                 .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
             {
                 self.set_modal_focus_idx(idx);
+            }
+            return Ok(());
+        }
+        if let Some(buttons) = &regions.buttons {
+            // Real, distinct button regions — unlike the single-zone
+            // confirm_key case below, a click that misses every button
+            // (e.g. on the dialog's message text) does nothing.
+            if let Some((_, key)) = buttons
+                .iter()
+                .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+            {
+                return self.handle_key_event(KeyEvent::new(*key, KeyModifiers::NONE));
             }
             return Ok(());
         }
@@ -28909,7 +29079,7 @@ mod app_tests {
     }
 
     #[test]
-    fn modal_click_inside_a_confirm_dialog_confirms_it() {
+    fn modal_click_the_yes_button_confirms_a_confirm_dialog() {
         let db_file = Path::new("test_questline_modal_confirm_click.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
         let project_id = Uuid::new_v4();
@@ -28947,12 +29117,12 @@ mod app_tests {
             project_name: "Doomed Campaign".to_string(),
         };
         let regions = app.compute_modal_hit_regions().unwrap();
-        let center = (
-            regions.popup_area.x + regions.popup_area.width / 2,
-            regions.popup_area.y + regions.popup_area.height / 2,
-        );
+        let buttons = regions.buttons.expect("ConfirmArchiveProject should expose real Yes/No buttons");
+        assert_eq!(buttons.len(), 2, "Yes and No");
+        let (yes_rect, yes_key) = buttons[0];
+        assert_eq!(yes_key, KeyCode::Char('y'));
 
-        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+        left_click(&mut app, yes_rect.x, yes_rect.y, KeyModifiers::empty());
 
         assert_eq!(app.modal_state, ModalType::None);
         let archived = app
@@ -28962,7 +29132,128 @@ mod app_tests {
             .into_iter()
             .find(|p| p.id == project_id)
             .unwrap();
-        assert!(archived.archived, "click inside should confirm, same as 'y'");
+        assert!(archived.archived, "clicking the Yes button should confirm, same as 'y'");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_the_no_button_cancels_a_confirm_dialog_without_confirming() {
+        let db_file = Path::new("test_questline_modal_confirm_no_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Spared Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Spared Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let buttons = regions.buttons.unwrap();
+        let (no_rect, no_key) = buttons[1];
+        assert_eq!(no_key, KeyCode::Char('n'));
+
+        left_click(&mut app, no_rect.x, no_rect.y, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let untouched = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(!untouched.archived, "clicking No must not archive the project");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_a_confirm_dialog_but_off_the_buttons_does_nothing() {
+        // With real distinct buttons, clicking the dialog's message text
+        // (rather than a button) is no longer a "click anywhere confirms"
+        // zone — it should be an inert no-op, not an accidental confirm.
+        let db_file = Path::new("test_questline_modal_confirm_off_button.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Untouched Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Untouched Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let popup_inner = ratatui::layout::Rect {
+            x: regions.popup_area.x + 1,
+            y: regions.popup_area.y + 1,
+            width: regions.popup_area.width.saturating_sub(2),
+            height: regions.popup_area.height.saturating_sub(2),
+        };
+        // Row 1 of the interior is the "Realm: {name}" message line, not
+        // the button row.
+        left_click(&mut app, popup_inner.x, popup_inner.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ConfirmArchiveProject { .. } => {}
+            other => panic!("expected the dialog to stay open, got {other:?}"),
+        }
+        let untouched = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(!untouched.archived);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_encryption_migration_prompt_exposes_its_three_choices_as_distinct_buttons() {
+        // Deliberately checks the geometry/key-mapping only, without
+        // actually clicking — every one of this dialog's 3 real key
+        // handlers (m/l/Esc) writes to the user's real on-disk config or
+        // spawns a background sync thread, neither of which a unit test
+        // should trigger for real.
+        let db_file = Path::new("test_questline_modal_encryption_migration.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::EncryptionMigrationPrompt;
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let buttons = regions.buttons.unwrap();
+        assert_eq!(buttons.len(), 3, "Migrate / Local-only / Decide later");
+        assert_eq!(buttons[0].1, KeyCode::Char('m'));
+        assert_eq!(buttons[1].1, KeyCode::Char('l'));
+        assert_eq!(buttons[2].1, KeyCode::Esc);
+        // Each choice occupies its own full-width row, top to bottom.
+        assert!(buttons[1].0.y > buttons[0].0.y);
+        assert!(buttons[2].0.y > buttons[1].0.y);
 
         let _ = std::fs::remove_file(db_file);
     }

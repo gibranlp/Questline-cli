@@ -60,6 +60,14 @@ pub struct ModalHitRegions {
     /// across dialogs (mostly 'y'/'Y', but Enter for a few, and None for
     /// progress modals that aren't dismissible yet).
     pub confirm_key: Option<crossterm::event::KeyCode>,
+    /// Set for dialogs upgraded to real, distinct clickable buttons instead
+    /// of one whole-popup confirm zone — one entry per button, each
+    /// carrying the key it mirrors. Takes priority over `confirm_key` when
+    /// present: a click inside the popup that lands on a button fires that
+    /// button's key; a click inside the popup that misses every button
+    /// does nothing (unlike the single-zone `confirm_key` case, where any
+    /// click inside confirms).
+    pub buttons: Option<Vec<(Rect, crossterm::event::KeyCode)>>,
     /// Set for list-picker modals — clicking selects a row/item (mirrors
     /// Up/Down), never confirms/activates it.
     pub list: Option<ModalListRegion>,
