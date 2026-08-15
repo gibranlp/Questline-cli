@@ -1684,7 +1684,11 @@ impl App {
             self.db.get_focus_sessions().map(|s| s.len()).unwrap_or(0) as i64;
         self.stats_cache.daily_adventures_completed =
             self.db.get_daily_adventures_completed_count().unwrap_or(0);
-        let daily_adventures = self.db.get_daily_adventures().unwrap_or_default();
+        // todays_* de verdad: la tabla conserva historial, así que hay que filtrar por fecha.
+        let daily_adventures = self
+            .db
+            .get_daily_adventures_for(chrono::Local::now().date_naive())
+            .unwrap_or_default();
         self.stats_cache.todays_daily_adventures_completed =
             daily_adventures.iter().filter(|a| a.completed).count();
         self.stats_cache.todays_daily_adventures_total = daily_adventures.len();
@@ -17539,12 +17543,13 @@ impl App {
 
         let mut streak = self.db.get_streak()?;
 
-        let existing_adventures = self.db.get_daily_adventures()?;
-        let needs_regeneration =
-            existing_adventures.is_empty() || existing_adventures[0].created_date != today;
+        // Sólo los de HOY. Antes se leía la tabla entera y se miraba existing_adventures[0], que
+        // sale de un SELECT sin ORDER BY: en cuanto la tabla tenía varios días mezclados,
+        // regenerar o no dependía del orden arbitrario que devolviera SQLite.
+        let existing_adventures = self.db.get_daily_adventures_for(today)?;
+        let needs_regeneration = existing_adventures.is_empty();
 
         if needs_regeneration {
-            self.db.clear_daily_adventures()?;
             let new_quests = DailyAdventure::generate_daily_quests(today);
             for q in new_quests {
                 self.db.insert_daily_adventure(&q)?;
@@ -18030,7 +18035,10 @@ impl App {
     }
 
     pub fn update_daily_adventure_progress(&mut self, quest_type: &str, amount: i32) -> Result<()> {
-        let mut advs = self.db.get_daily_adventures()?;
+        // Acotado a hoy: con historial en la tabla, iterar todas las filas hacía que completar una
+        // tarea avanzara además el "Complete 5 Tasks" de días pasados y regalara 75 XP por cada uno.
+        let today = chrono::Local::now().date_naive();
+        let mut advs = self.db.get_daily_adventures_for(today)?;
         let mut completed_any = false;
         let was_all_completed = advs.iter().all(|a| a.completed);
 
@@ -18077,7 +18085,7 @@ impl App {
 
         if completed_any {
             self.trigger_task_completion_particles();
-            let new_advs = self.db.get_daily_adventures()?;
+            let new_advs = self.db.get_daily_adventures_for(today)?;
             let is_all_completed = new_advs.iter().all(|a| a.completed);
             if is_all_completed && !was_all_completed {
                 self.notifications.push(Notification::info(

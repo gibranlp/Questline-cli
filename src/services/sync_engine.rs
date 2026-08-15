@@ -5452,6 +5452,102 @@ mod tests {
         let _ = std::fs::remove_file(&path_b);
     }
 
+    // Regresión: "daily quests duplicados después de sync".
+    // Device A ya cruzó la medianoche y tiene los quests de ayer + los de hoy; device B sólo los
+    // de ayer. Al sincronizar, B recibe los de hoy y acaba con 10 filas en la tabla — eso es
+    // correcto ahora que se guarda historial —, pero la vista de "hoy" debe seguir siendo de 5.
+    // Antes se leía sin filtro de fecha y la UI listaba las 10.
+    #[test]
+    fn daily_quests_from_previous_days_do_not_leak_into_today() {
+        let identity = test_identity();
+        let (path_a, db_a) = treasury_test_db("daily_quest_rollover_device_a");
+        let (path_b, db_b) = treasury_test_db("daily_quest_rollover_device_b");
+
+        let yesterday = chrono::NaiveDate::from_ymd_opt(2026, 8, 13).unwrap();
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 14).unwrap();
+
+        for q in &crate::models::DailyAdventure::generate_daily_quests(yesterday) {
+            db_a.insert_daily_adventure(q).unwrap();
+            db_b.insert_daily_adventure(q).unwrap();
+        }
+        for q in &crate::models::DailyAdventure::generate_daily_quests(today) {
+            db_a.insert_daily_adventure(q).unwrap();
+        }
+
+        let server = SharedEventLog::default();
+        SyncEngine {
+            db: &db_a,
+            identity: &identity,
+            device_id: "device-a",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: false,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+        SyncEngine {
+            db: &db_b,
+            identity: &identity,
+            device_id: "device-b",
+            provider: Box::new(RecordingProvider {
+                events: server.clone(),
+                serve: true,
+                project_scope_only: false,
+                withhold: None,
+            }),
+        }
+        .sync()
+        .unwrap();
+
+        // El historial completo llega...
+        assert_eq!(db_b.get_daily_adventures().unwrap().len(), 10);
+        // ...pero cada día por separado sigue teniendo exactamente sus 5.
+        let b_today = db_b.get_daily_adventures_for(today).unwrap();
+        assert_eq!(b_today.len(), 5);
+        assert!(b_today.iter().all(|q| q.created_date == today));
+        assert_eq!(db_b.get_daily_adventures_for(yesterday).unwrap().len(), 5);
+
+        drop(db_a);
+        drop(db_b);
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // Los ids son determinísticos, así que el sync puede traer el quest de hoy antes de que
+    // check_new_day() lo genere localmente. Generarlo entonces no debe reventar por UNIQUE ni
+    // pisar el progreso que ya llegó del otro PC.
+    #[test]
+    fn regenerating_todays_quests_after_sync_is_idempotent() {
+        let (path, db) = treasury_test_db("daily_quest_regen_idempotent");
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 8, 14).unwrap();
+        let quests = crate::models::DailyAdventure::generate_daily_quests(today);
+
+        for q in &quests {
+            db.insert_daily_adventure(q).unwrap();
+        }
+        let mut progressed = quests[0].clone();
+        progressed.current_count = progressed.target_count;
+        progressed.completed = true;
+        db.update_daily_adventure(&progressed).unwrap();
+
+        // Segunda pasada de generación sobre el mismo día.
+        for q in &crate::models::DailyAdventure::generate_daily_quests(today) {
+            db.insert_daily_adventure(q).unwrap();
+        }
+
+        let after = db.get_daily_adventures_for(today).unwrap();
+        assert_eq!(after.len(), 5);
+        let kept = after.iter().find(|a| a.id == quests[0].id).unwrap();
+        assert!(kept.completed, "el progreso no debe resetearse al regenerar");
+        assert_eq!(kept.current_count, quests[0].target_count);
+
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
     // Hidratación: el conteo más alto gana y se conserva el last_drink_at más reciente —
     // ninguno de los dos lados debe poder regresar el progreso del otro.
     #[test]
