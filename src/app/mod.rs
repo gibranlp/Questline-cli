@@ -709,6 +709,21 @@ pub struct Notification {
     pub unlocked_at: std::time::Instant,
 }
 
+/// Racha de scroll vertical en curso, para dosificar el trackpad sin castigar la rueda.
+///
+/// Un notch de rueda llega solo y espaciado; el trackpad manda decenas de eventos seguidos por
+/// gesto. Tratar los dos igual es lo que hacía que el contenido volara. Ver
+/// `App::throttle_vertical_scroll`.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollBurst {
+    /// Último evento vertical; el hueco contra el siguiente distingue rueda de trackpad.
+    pub last_event_at: std::time::Instant,
+    /// `true` = hacia abajo. Cambiar de sentido corta la racha.
+    pub down: bool,
+    /// Eventos tragados desde el último que sí pasó.
+    pub pending: u8,
+}
+
 /// Un swipe horizontal en curso, de los que cambian de panel.
 ///
 /// El trackpad no manda "un swipe": manda una ráfaga de eventos que sigue corriendo sola por la
@@ -1189,6 +1204,8 @@ pub struct App {
     pub last_end_key_at: Option<std::time::Instant>,
     // Gesto horizontal en curso. Ver PaneSwipeGesture y handle_pane_swipe.
     pub pane_swipe: Option<PaneSwipeGesture>,
+    // Racha de scroll vertical en curso. Ver ScrollBurst y throttle_vertical_scroll.
+    pub scroll_burst: Option<ScrollBurst>,
 
     // El hilo de fondo escribe aquí cuando termina de checar la versión más reciente
     pub update_check: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -2590,6 +2607,7 @@ impl App {
             last_home_key_at: None,
             last_end_key_at: None,
             pane_swipe: None,
+            scroll_burst: None,
             update_check: std::sync::Arc::new(std::sync::Mutex::new(None)),
             update_check_done: false,
             run_installer_on_exit: false,
@@ -4398,6 +4416,12 @@ impl App {
         // con contenido largo se sienta igual que fuera.
         let mouse = Self::with_natural_scroll(mouse);
 
+        // Dosifica la ráfaga del trackpad antes de repartir, por el mismo motivo que la
+        // inversión: que valga para toda la app y no pantalla por pantalla.
+        if self.throttle_vertical_scroll(&mouse) {
+            return Ok(());
+        }
+
         if self.task_calendar.is_some() {
             return self.handle_task_calendar_mouse(mouse);
         }
@@ -4468,6 +4492,61 @@ impl App {
         (ActiveScreen::SyncSettings, '8'),
         (ActiveScreen::Settings, '9'),
     ];
+
+    /// Hueco a partir del cual un evento vertical cuenta como "notch suelto" y no como parte de
+    /// una racha. Por debajo de esto sólo puede venir de un trackpad: una rueda física no dispara
+    /// tan seguido, y un arrastre lento de dos dedos tampoco.
+    const SCROLL_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+    /// Dentro de una racha sólo pasa uno de cada N eventos. Es la perilla de velocidad: subirlo
+    /// hace el scroll más lento, bajarlo más rápido. No toca a la rueda, que al llegar espaciada
+    /// nunca entra en racha y sigue moviendo un paso por notch.
+    const SCROLL_BURST_DIVISOR: u8 = 3;
+
+    /// Dosifica el scroll vertical del trackpad dejando la rueda intacta.
+    ///
+    /// El trackpad manda una ráfaga densa por gesto y cada evento valía un paso entero, así que
+    /// un flick recorría el contenido de golpe. Aquí se mide el ritmo: eventos espaciados (una
+    /// rueda, o un arrastre lento y deliberado) pasan siempre, y sólo cuando llegan pegados —que
+    /// es justo el flick de trackpad— se deja pasar uno de cada `SCROLL_BURST_DIVISOR`.
+    ///
+    /// Así la velocidad se ajusta sola: despacio responde uno a uno, y rápido avanza suave en vez
+    /// de saltar. Devuelve `true` si el evento se traga.
+    fn throttle_vertical_scroll(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::MouseEventKind;
+
+        let down = match mouse.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
+            // El eje horizontal ya lo agrupa handle_pane_swipe; el resto no se dosifica.
+            _ => return false,
+        };
+
+        let now = std::time::Instant::now();
+        let continuing = self.scroll_burst.filter(|burst| {
+            burst.down == down && now.duration_since(burst.last_event_at) <= Self::SCROLL_BURST_GAP
+        });
+
+        let Some(mut burst) = continuing else {
+            // Primer evento (o cambio de sentido): pasa entero, para que un notch suelto y el
+            // arranque del gesto respondan al instante.
+            self.scroll_burst = Some(ScrollBurst {
+                last_event_at: now,
+                down,
+                pending: 0,
+            });
+            return false;
+        };
+
+        burst.last_event_at = now;
+        burst.pending = burst.pending.saturating_add(1);
+        let swallow = burst.pending < Self::SCROLL_BURST_DIVISOR;
+        if !swallow {
+            burst.pending = 0;
+        }
+        self.scroll_burst = Some(burst);
+        swallow
+    }
 
     /// Invierte la rueda vertical: mover los dedos hacia abajo empuja el contenido hacia abajo,
     /// como el "natural scrolling" de macOS, en vez de mover el cursor hacia abajo.
@@ -26964,10 +27043,93 @@ mod app_tests {
         app.about_content_lines.set(200);
         app.about_scroll = 10;
 
-        scroll_mouse(&mut app, true); // rueda abajo (evento crudo del terminal)
+        scroll_notch(&mut app, true); // un notch hacia abajo (evento crudo del terminal)
         assert!(
             app.about_scroll < 10,
             "con scroll natural, bajar los dedos debe retroceder el contenido, no avanzarlo"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La ráfaga del trackpad se dosifica: sólo pasa uno de cada SCROLL_BURST_DIVISOR. Antes cada
+    // evento valía un paso entero y un flick recorría la lista de golpe.
+    #[test]
+    fn a_trackpad_burst_is_rationed_instead_of_flying() {
+        let db_file = Path::new("test_questline_scroll_burst.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        // 30 eventos pegados = un flick. El primero pasa siempre, y luego uno de cada N.
+        let events = 30u32;
+        for _ in 0..events {
+            scroll_mouse(&mut app, false); // rueda arriba -> avanza el contenido
+        }
+
+        let divisor = u32::from(App::SCROLL_BURST_DIVISOR);
+        let steps_allowed = 1 + (events - 1) / divisor;
+        let per_step = 2u32; // About avanza de dos en dos líneas por paso
+        assert_eq!(
+            u32::from(app.about_scroll),
+            steps_allowed * per_step,
+            "una ráfaga de {events} eventos debe dejar pasar {steps_allowed} pasos, no {events}"
+        );
+        assert!(
+            u32::from(app.about_scroll) < events * per_step,
+            "la ráfaga sin dosificar habría avanzado {} líneas",
+            events * per_step
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La otra mitad: una rueda física manda notches sueltos y espaciados, y esos no deben
+    // dosificarse — si no, el mouse se sentiría pesado en Linux/Windows.
+    #[test]
+    fn spaced_out_wheel_notches_are_never_rationed() {
+        let db_file = Path::new("test_questline_scroll_notches.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        // Cada notch llega después del hueco, como una rueda de verdad.
+        for _ in 0..5 {
+            scroll_mouse(&mut app, false);
+            if let Some(burst) = app.scroll_burst.as_mut() {
+                burst.last_event_at -= App::SCROLL_BURST_GAP + std::time::Duration::from_millis(20);
+            }
+        }
+        assert_eq!(
+            app.about_scroll, 10,
+            "cinco notches sueltos deben mover cinco pasos completos"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Cambiar de sentido corta la racha: al devolverte, el primer evento debe responder ya.
+    #[test]
+    fn reversing_direction_responds_immediately() {
+        let db_file = Path::new("test_questline_scroll_reverse.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        for _ in 0..10 {
+            scroll_mouse(&mut app, false);
+        }
+        let after_burst = app.about_scroll;
+        assert!(after_burst > 0);
+
+        // Sin pausa, pero en sentido contrario: cuenta como gesto nuevo.
+        scroll_mouse(&mut app, true);
+        assert!(
+            app.about_scroll < after_burst,
+            "invertir el sentido debe responder al primer evento, no tragárselo"
         );
 
         let _ = std::fs::remove_file(db_file);
@@ -28122,20 +28284,35 @@ mod app_tests {
     // El scroll vertical va invertido (natural scrolling), así que el evento crudo y el
     // movimiento resultante no coinciden: una rueda ARRIBA avanza. Estos wrappers nombran el
     // efecto para que los tests no tengan que llevar la inversión en la cabeza.
+    //
+    // Cada uno es UN notch suelto, no parte de una ráfaga: se corta la racha antes de mandarlo.
+    // Sin esto, un bucle de test dispara los eventos con microsegundos de diferencia y
+    // throttle_vertical_scroll los lee —con razón— como el flick de un trackpad y se los traga.
+    // Las ráfagas de verdad se prueban aparte, en los tests de throttle.
+    fn scroll_notch(app: &mut App, down: bool) {
+        app.scroll_burst = None;
+        scroll_mouse(app, down);
+    }
+
+    fn scroll_notch_at(app: &mut App, col: u16, row: u16, down: bool) {
+        app.scroll_burst = None;
+        scroll_mouse_at(app, col, row, down);
+    }
+
     fn scroll_forward(app: &mut App) {
-        scroll_mouse(app, false);
+        scroll_notch(app, false);
     }
 
     fn scroll_back(app: &mut App) {
-        scroll_mouse(app, true);
+        scroll_notch(app, true);
     }
 
     fn scroll_forward_at(app: &mut App, col: u16, row: u16) {
-        scroll_mouse_at(app, col, row, false);
+        scroll_notch_at(app, col, row, false);
     }
 
     fn scroll_back_at(app: &mut App, col: u16, row: u16) {
-        scroll_mouse_at(app, col, row, true);
+        scroll_notch_at(app, col, row, true);
     }
 
     fn scroll_mouse_at(app: &mut App, col: u16, row: u16, down: bool) {
