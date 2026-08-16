@@ -1229,7 +1229,10 @@ fn group_thousands(value: u64) -> String {
 
 pub fn parse_minor(value: &str) -> Result<i64> {
     let value = value.trim().replace(',', "");
-    if value.is_empty() || value.starts_with('-') {
+    if value.is_empty() {
+        bail!("Enter an amount such as 1250.00");
+    }
+    if value.starts_with('-') {
         bail!("Amount must be zero or greater");
     }
     let mut parts = value.split('.');
