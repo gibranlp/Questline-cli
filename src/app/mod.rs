@@ -15111,16 +15111,15 @@ impl App {
                     ) {
                         return Ok(());
                     }
-                    let default_amount = crate::services::treasury::format_minor(0);
                     self.modal_state = ModalType::TreasuryEntry {
                         entry_id: None,
                         title: String::new(),
                         title_cursor: 0,
-                        // "0.00" es un relleno, no un valor tecleado — el cursor nace sobre
-                        // el primer "0" para que escribir el monto lo reemplace de inmediato,
-                        // en vez de aterrizar después del ".00" donde no hay nada que borrar.
+                        // Amount nace vacío: prellenarlo con "0.00" obligaba a borrar el
+                        // relleno antes de teclear (escribir "321" dejaba "3210.00"). Al
+                        // guardar, una parte decimal ausente ya vale cero centavos.
                         amount_cursor: 0,
-                        amount: default_amount,
+                        amount: String::new(),
                         entry_type_idx: 1,
                         status_idx: 0,
                         category_idx: 0,
@@ -27372,7 +27371,7 @@ mod app_tests {
     }
 
     #[test]
-    fn new_treasury_entry_defaults_to_today_and_a_formatted_zero_amount() {
+    fn new_treasury_entry_defaults_to_today_and_an_empty_amount() {
         let db_file = Path::new("test_questline_treasury_new_entry_defaults.db");
         let (mut app, _, _) = treasury_role_app(db_file, "Companion");
 
@@ -27384,7 +27383,10 @@ mod app_tests {
                 ref date_val,
                 ..
             } => {
-                assert_eq!(amount, "0.00", "the amount field should start pre-formatted");
+                assert_eq!(
+                    amount, "",
+                    "the amount field must start empty so typing 321 yields 321.00, not 3210.00"
+                );
                 assert_eq!(
                     date_val,
                     &Local::now().date_naive().format("%Y-%m-%d").to_string(),
@@ -27393,6 +27395,54 @@ mod app_tests {
             }
             ref other => panic!("expected the entry modal to open, got {other:?}"),
         }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn typing_an_amount_into_a_new_entry_does_not_trail_a_leftover_zero() {
+        // Regresión: con "0.00" precargado y el cursor en el primer 0, teclear
+        // "321" dejaba "3210.00" ($3,210.00) en vez de $321.00.
+        let db_file = Path::new("test_questline_treasury_new_entry_typed_amount.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        for character in "Rope".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()))
+                .unwrap();
+        }
+        // Enter salta de Title a Amount; ahí se teclea el monto tal cual.
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        for character in "321".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()))
+                .unwrap();
+        }
+        match app.modal_state {
+            ModalType::TreasuryEntry { ref amount, .. } => assert_eq!(amount, "321"),
+            ref other => panic!("expected the entry modal to stay open, got {other:?}"),
+        }
+        // Los Enter restantes recorren Type/Status/Category/Date y guardan.
+        for _ in 0..5 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+                .unwrap();
+        }
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid new entry must save");
+        let entries = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter::default(),
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap();
+        let created = entries
+            .iter()
+            .find(|entry| entry.title == "Rope")
+            .expect("the new entry must have been recorded");
+        assert_eq!(created.amount_minor, 32_100, "321 must land as $321.00");
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
