@@ -451,6 +451,9 @@ If Questline helps you on your adventures, consider starring the repository and 
   export-isolation security checks are complete.
 - Somewhere beyond the usual menus, a class-specific terminal Easter egg now
   waits for heroes who uncover the Forgotten Archive.
+- Heroes who carry a record out of the Archive find an unsigned note describing
+  a floor below it. The floor is not catalogued. It answers to its own name, it
+  is windowless, and it opens only for those who type the right thing.
 
 **Campaign Treasury:**
 

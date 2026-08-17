@@ -483,7 +483,43 @@ async fn main() -> Result<()> {
                     )
                 })?;
                 let seed = questline::archive_game::random_seed();
-                questline::archive_game::run(user.class, &user.username, user.level, seed)?;
+                let outcome =
+                    questline::archive_game::run(user.class, &user.username, user.level, seed)?;
+                // Escaping the Archive is the only thing that teaches the Backlog
+                // your name. Flag only — no XP, no productivity state.
+                if outcome == questline::archive_game::ArchiveStatus::Won {
+                    db.set_setting("archive_escaped", "1")?;
+                }
+                return Ok(());
+            }
+            "backlog" => {
+                let db_path = storage::get_storage_dir()?.join("questline.db");
+                if !db_path.exists() {
+                    return Err(anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    ));
+                }
+                let db = database::Database::new(&db_path)?;
+                let user = db.get_user()?.ok_or_else(|| {
+                    anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    )
+                })?;
+                if db.get_setting("archive_escaped")?.as_deref() != Some("1") {
+                    return Err(anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    ));
+                }
+                let escaped_before = db.get_setting("backlog_escaped")?.as_deref() == Some("1");
+                let outcome = questline::backlog_game::run(
+                    user.class,
+                    &user.username,
+                    user.level,
+                    escaped_before,
+                )?;
+                if outcome == questline::backlog_game::BacklogStatus::Escaped {
+                    db.set_setting("backlog_escaped", "1")?;
+                }
                 return Ok(());
             }
             "export" => {
@@ -3073,6 +3109,7 @@ mod cli_tests {
         assert!(parse_cli_options(["export", "backup"].map(String::from)).is_err());
         assert!(parse_cli_options(["campaign-import"].map(String::from)).is_err());
         assert!(parse_cli_options(["archive", "open"].map(String::from)).is_err());
+        assert!(parse_cli_options(["backlog", "descend"].map(String::from)).is_err());
         assert!(
             parse_cli_options(["campaign-import", "file.json", "--force"].map(String::from))
                 .is_err()
@@ -3090,5 +3127,16 @@ mod cli_tests {
             )
             .is_err()
         );
+    }
+
+    // Los dos easter eggs parsean como cualquier subcomando pero nunca salen en
+    // --help. Si alguien los agrega ahí, este test no lo atrapa; el de abajo sí.
+    #[test]
+    fn hidden_games_parse_as_bare_subcommands() {
+        for command in ["archive", "backlog"] {
+            let parsed = parse_cli_options([command].map(String::from)).unwrap();
+            assert_eq!(parsed.command.as_deref(), Some(command));
+            assert!(parsed.command_args.is_empty());
+        }
     }
 }
