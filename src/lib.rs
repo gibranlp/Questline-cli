@@ -14,6 +14,8 @@
 pub mod app;
 pub mod archive_game;
 pub mod audio;
+pub mod backlog_game;
+pub mod backlog_rooms;
 pub mod build_info;
 pub mod calendar_import;
 pub mod campaign_templates;

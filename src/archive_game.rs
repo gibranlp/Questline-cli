@@ -1148,37 +1148,60 @@ fn draw_help(frame: &mut Frame, area: Rect, game: &ArchiveGame) {
 }
 
 fn draw_result(frame: &mut Frame, area: Rect, game: &ArchiveGame) {
-    let popup = centered_rect(54, 11, area);
+    let won = game.status == ArchiveStatus::Won;
+    let popup = centered_rect(56, if won { 15 } else { 11 }, area);
     frame.render_widget(Clear, popup);
-    let (title, color) = if game.status == ArchiveStatus::Won {
+    let (title, color) = if won {
         (" THE RECORD SURVIVES ", Color::Green)
     } else {
         (" THE ARCHIVE CLOSES ", Color::Red)
     };
+    let mut text = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            if won {
+                "You carry the recovered words into daylight."
+            } else {
+                "The shelves close around the unfinished record."
+            },
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "{} · {} fragments · {} turns",
+            game.class.name(),
+            game.fragments,
+            game.turns
+        )),
+        Line::from(""),
+    ];
+    // The only hint in the entire application that a second floor exists. It
+    // never names the command; the Archive does not do that sort of thing.
+    if won {
+        text.push(Line::from(Span::styled(
+            "One recovered fragment is not a record at all.",
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        )));
+        text.push(Line::from(Span::styled(
+            "It is a note, unsigned: \"There is a floor below",
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        )));
+        text.push(Line::from(Span::styled(
+            "this one. It is not catalogued. Ask the",
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        )));
+        text.push(Line::from(Span::styled(
+            "Backlog for it directly. It answers to its name.\"",
+            Style::default().fg(Color::Rgb(148, 163, 184)),
+        )));
+        text.push(Line::from(""));
+    }
+    text.push(Line::from("[r] enter a newly shifted Archive"));
+    text.push(Line::from("[Enter / q / Esc] return to the terminal"));
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                if game.status == ArchiveStatus::Won {
-                    "You carry the recovered words into daylight."
-                } else {
-                    "The shelves close around the unfinished record."
-                },
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            )),
-            Line::from(""),
-            Line::from(format!(
-                "{} · {} fragments · {} turns",
-                game.class.name(),
-                game.fragments,
-                game.turns
-            )),
-            Line::from(""),
-            Line::from("[r] enter a newly shifted Archive"),
-            Line::from("[Enter / q / Esc] return to the terminal"),
-        ])
-        .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title(title)),
+        Paragraph::new(text)
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title(title)),
         popup,
     );
 }
@@ -1192,7 +1215,7 @@ pub fn random_seed() -> [u8; 32] {
 /// Runs an isolated alternate-screen game. It receives character display data
 /// only and has no database or sync handle, so Archive actions cannot mutate
 /// productivity state or award XP.
-pub fn run(class: ClassType, username: &str, level: i32, seed: [u8; 32]) -> Result<()> {
+pub fn run(class: ClassType, username: &str, level: i32, seed: [u8; 32]) -> Result<ArchiveStatus> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(error) = execute!(stdout, EnterAlternateScreen) {
@@ -1210,13 +1233,22 @@ pub fn run(class: ClassType, username: &str, level: i32, seed: [u8; 32]) -> Resu
     };
 
     let mut game = ArchiveGame::new(class, seed);
+    // `r` starts a fresh Archive, so the final status is not enough to tell the
+    // caller whether this session ever produced a win. Remember it separately.
+    let mut ever_won = false;
     let result = (|| -> Result<()> {
         loop {
             terminal.draw(|frame| draw_archive(frame, &game, username, level))?;
+            if game.status() == ArchiveStatus::Won {
+                ever_won = true;
+            }
             match event::read()? {
                 Event::Key(key) if game.handle_key(key) => break,
                 _ => {}
             }
+        }
+        if game.status() == ArchiveStatus::Won {
+            ever_won = true;
         }
         Ok(())
     })();
@@ -1228,7 +1260,10 @@ pub fn run(class: ClassType, username: &str, level: i32, seed: [u8; 32]) -> Resu
     raw_result?;
     screen_result?;
     cursor_result?;
-    Ok(())
+    if ever_won {
+        return Ok(ArchiveStatus::Won);
+    }
+    Ok(game.status())
 }
 
 #[cfg(test)]
