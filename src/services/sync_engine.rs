@@ -2078,29 +2078,49 @@ impl<'a> SyncEngine<'a> {
                                     u.level = local.level;
                                     u.xp = local.xp;
                                 }
-                                let _ = self.db.conn.execute(
-                                    "DELETE FROM users WHERE id != ?1",
-                                    params![u.id.to_string()],
-                                );
-                                let _ = self.db.conn.execute(
-                                    "INSERT INTO users (id, username, class, level, xp, created_at, specialization)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                                     ON CONFLICT(id) DO UPDATE SET
-                                         username=excluded.username, class=excluded.class,
-                                         level=excluded.level, xp=excluded.xp,
-                                         created_at=excluded.created_at,
-                                         specialization=excluded.specialization",
-                                    params![
-                                        u.id.to_string(),
-                                        u.username,
-                                        u.class.name(),
-                                        u.level,
-                                        u.xp,
-                                        u.created_at.to_rfc3339(),
-                                        u.specialization
-                                    ],
-                                );
-                                pulled_count += 1;
+                                // DELETE-then-INSERT as one transaction: if the
+                                // INSERT fails for any reason (constraint,
+                                // lock, malformed row), the DELETE rolls back
+                                // with it instead of leaving the `users`
+                                // table empty — which would panic the next
+                                // render that unwraps app.user (e.g. the
+                                // Character screen).
+                                let applied = (|| -> rusqlite::Result<()> {
+                                    let tx = self.db.conn.unchecked_transaction()?;
+                                    tx.execute(
+                                        "DELETE FROM users WHERE id != ?1",
+                                        params![u.id.to_string()],
+                                    )?;
+                                    tx.execute(
+                                        "INSERT INTO users (id, username, class, level, xp, created_at, specialization)
+                                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                         ON CONFLICT(id) DO UPDATE SET
+                                             username=excluded.username, class=excluded.class,
+                                             level=excluded.level, xp=excluded.xp,
+                                             created_at=excluded.created_at,
+                                             specialization=excluded.specialization",
+                                        params![
+                                            u.id.to_string(),
+                                            u.username,
+                                            u.class.name(),
+                                            u.level,
+                                            u.xp,
+                                            u.created_at.to_rfc3339(),
+                                            u.specialization
+                                        ],
+                                    )?;
+                                    tx.commit()
+                                })();
+                                if let Err(e) = applied {
+                                    crate::services::logger::log_structured(
+                                        "warn",
+                                        "sync",
+                                        "failed to apply remote user snapshot, local user row left untouched",
+                                        Some(&e.to_string()),
+                                    );
+                                } else {
+                                    pulled_count += 1;
+                                }
                             }
                         }
                         "task" => {
