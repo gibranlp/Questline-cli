@@ -458,6 +458,10 @@ pub enum ModalType {
         recurrence: Option<RecurrenceType>,
     },
     NewJournalEntry {
+        // None while composing a brand-new entry; Some(id) while editing an
+        // existing one — handle_journal_modal_key branches on this to call
+        // update_journal_entry instead of insert_journal_entry on Enter.
+        entry_id: Option<Uuid>,
         content: String,
     },
     TreasuryEntry {
@@ -1051,6 +1055,12 @@ pub struct App {
     pub workspace_sidebar_focused: bool,
     pub workspace_help_open: bool,
     pub quest_board_open: bool,
+    /// Which step of the card at `selected_task_idx` is focused in the Kanban
+    /// board — `None` means the card's header itself is focused. Only
+    /// meaningful while `quest_board_open && viewing_step_for_task.is_none()`;
+    /// stale/out-of-range values are treated as `None` wherever this is read
+    /// rather than proactively reset on every task-changing action.
+    pub kanban_step_idx: Option<usize>,
     pub selected_task_idx: usize,
     pub selected_note_idx: usize,
     pub selected_journal_idx: usize,
@@ -1082,6 +1092,7 @@ pub struct App {
 
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
+    pub dashboard_layout: crate::screens::dashboard::DashboardLayout,
 
     pub searching: bool,
     pub search_query: String,
@@ -1218,6 +1229,12 @@ pub struct App {
     pub note_preview_scroll: usize,
     pub note_preview_max_scroll: Cell<usize>,
     pub note_preview_focused: bool,
+    // Scroll del panel de detalles (Quest Ledger) del tab de Tareas — mismo patrón
+    // que note_preview_* de arriba, pero para la descripción/steps/comentarios de
+    // la quest seleccionada.
+    pub quest_ledger_scroll: usize,
+    pub quest_ledger_max_scroll: Cell<usize>,
+    pub quest_ledger_focused: bool,
 
     // Cachés de performance — se llenan en reload_data() para no golpear la DB en cada frame
     pub all_tasks: Vec<Task>,
@@ -1256,6 +1273,11 @@ pub struct App {
     pub last_sprite_notification_time: Option<std::time::Instant>,
     pub last_sprite_check_time: Option<std::time::Instant>,
     pub last_task_notification_tick: Option<std::time::Instant>,
+    // Cooldown gates so tick_hydration/tick_auto_sync don't hit the DB on
+    // every ~50ms render tick just to check a once-a-day condition — mirrors
+    // last_task_notification_tick above.
+    pub last_hydration_day_check: Option<std::time::Instant>,
+    pub last_sync_cleanup_check: Option<std::time::Instant>,
 
     // Prologue — pantallas de historia con efecto typewriter que se muestran después del login
     pub prologue_page: u8,            // 0 = The Story So Far, 1 = Chapter One
@@ -1294,26 +1316,55 @@ pub fn extract_url(content: &str) -> Option<&str> {
     })
 }
 
-pub fn open_url(url: &str) {
+/// Tries to launch `url` in the user's browser, returning whether some
+/// launcher command actually spawned. Every platform has more than one
+/// plausible launcher — most notably WSL, which usually ships without
+/// `xdg-open` (or a portal for it to talk to) but can hand the URL to
+/// Windows itself — so we walk a fallback chain instead of trusting the
+/// first candidate.
+pub fn open_url(url: &str) -> bool {
     use std::process::Stdio;
+
+    fn try_spawn(cmd: &str, args: &[&str]) -> bool {
+        std::process::Command::new(cmd)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::fs::read_to_string("/proc/version")
+                .map(|v| v.to_lowercase().contains("microsoft"))
+                .unwrap_or(false);
+        if is_wsl {
+            // `xdg-open` is rarely installed on WSL, and even when it is
+            // there's usually no desktop portal behind it. Hand off to the
+            // Windows interop binaries instead, which open the URL in the
+            // Windows default browser.
+            return try_spawn("wslview", &[url])
+                || try_spawn("explorer.exe", &[url])
+                || try_spawn("cmd.exe", &["/c", "start", "", url]);
+        }
+        try_spawn("xdg-open", &[url])
+            || try_spawn("gio", &["open", url])
+            || try_spawn("sensible-browser", &[url])
+    }
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        try_spawn("open", &[url])
+    }
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        try_spawn("cmd", &["/c", "start", "", url])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2450,6 +2501,12 @@ impl App {
             let choice = crate::theme::Theme::choice_from_key(&theme_choice_str);
             theme_service.set_theme_choice(choice);
         }
+        let dashboard_layout = db
+            .get_setting("dashboard_layout")
+            .ok()
+            .flatten()
+            .map(|key| crate::screens::dashboard::DashboardLayout::from_key(&key))
+            .unwrap_or(crate::screens::dashboard::DashboardLayout::Default);
 
         let (quote, quote_author, class_quote_opt) = Self::choose_dynamic_quote(&user, &db);
         let class_quote = class_quote_opt.as_ref().map(|q| q.0.clone());
@@ -2492,6 +2549,7 @@ impl App {
             workspace_sidebar_focused: true,
             workspace_help_open: false,
             quest_board_open: false,
+            kanban_step_idx: None,
             selected_task_idx: 0,
             selected_note_idx: 0,
             selected_journal_idx: 0,
@@ -2512,6 +2570,7 @@ impl App {
             mouse_drag_anchor: None,
             dashboard_task_focus: true,
             selected_dashboard_task_idx: 0,
+            dashboard_layout,
             searching: false,
             search_query: String::new(),
             task_filter: "All".to_string(),
@@ -2617,6 +2676,9 @@ impl App {
             note_preview_scroll: 0,
             note_preview_max_scroll: Cell::new(0),
             note_preview_focused: false,
+            quest_ledger_scroll: 0,
+            quest_ledger_max_scroll: Cell::new(0),
+            quest_ledger_focused: false,
             all_tasks: Vec::new(),
             all_notes: Vec::new(),
             all_journals: Vec::new(),
@@ -2653,6 +2715,8 @@ impl App {
             last_sprite_notification_time: None,
             last_sprite_check_time: None,
             last_task_notification_tick: None,
+            last_hydration_day_check: None,
+            last_sync_cleanup_check: None,
             prologue_page: 0,
             prologue_line_idx: 0,
             prologue_char_in_line: 0,
@@ -2786,167 +2850,6 @@ impl App {
         }
 
         Ok(app)
-    }
-
-    // Simula eventos de Fellowship para pruebas offline — no manches, no llamar en producción
-    pub fn simulate_fellowship_sync(&self) -> Result<()> {
-        let my_identity = self.identity.public_key.clone();
-        let my_username = self
-            .user
-            .as_ref()
-            .map(|u| u.username.clone())
-            .unwrap_or_else(|| "Gibranlp".to_string());
-
-        self.db.update_presence(
-            "alex_key",
-            "Alex",
-            true,
-            "Just now",
-            Some("Fellowship Adventure"),
-            "Visible",
-        )?;
-        self.db.update_presence(
-            "fiona_key",
-            "Fiona",
-            true,
-            "2 mins ago",
-            Some("Zen Garden Maintenance"),
-            "Visible",
-        )?;
-        self.db
-            .update_presence("diana_key", "Diana", false, "2 hours ago", None, "Offline")?;
-
-        let invites = self.db.get_invitations()?;
-        if invites.is_empty() {
-            let sim_proj_id = "fellowship_adv_proj_id";
-            self.db.create_invitation(
-                sim_proj_id,
-                "Fellowship Adventure",
-                "alex_key",
-                "Alex",
-                &my_identity,
-                "Companion",
-            )?;
-            self.db.create_notification(
-                "invitation",
-                "Fellowship Invitation",
-                "Alex has invited you to join Fellowship Adventure as a Companion.",
-                Some(sim_proj_id),
-            )?;
-        }
-
-        let projects = self.db.get_projects()?;
-        if let Some(proj) = projects
-            .iter()
-            .find(|p| p.id.to_string() == "fellowship_adv_proj_id")
-        {
-            let msgs = self.db.get_chronicle_messages("fellowship_adv_proj_id")?;
-            if msgs.is_empty() {
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "alex_key",
-                    "Alex",
-                    "Greetings companions! Ready for our quest? ⚔️",
-                    "text",
-                )?;
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "system",
-                    "System",
-                    "Alex invited Gibranlp to the project.",
-                    "system",
-                )?;
-                self.db.log_activity(
-                    Some("fellowship_adv_proj_id"),
-                    "member_joined",
-                    "Gibranlp joined the fellowship.",
-                    &my_identity,
-                    &my_username,
-                )?;
-                self.db.log_activity(
-                    Some("fellowship_adv_proj_id"),
-                    "note_created",
-                    "Alex created shared note: Fellowship Codex.",
-                    "alex_key",
-                    "Alex",
-                )?;
-            }
-
-            let user_msg_count = msgs.iter().filter(|m| m.2 == my_identity).count();
-            let alex_reply_count = msgs
-                .iter()
-                .filter(|m| m.2 == "alex_key" && m.4.contains("Outstanding"))
-                .count();
-            if user_msg_count > alex_reply_count {
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "alex_key",
-                    "Alex",
-                    "Outstanding work! Let's keep pushing!",
-                    "text",
-                )?;
-                if let Some(last_user_msg) = msgs.iter().rfind(|m| m.2 == my_identity) {
-                    self.db
-                        .add_message_reaction(&last_user_msg.0, "alex_key", "⚔️")?;
-                }
-            }
-
-            let tasks = self.db.get_tasks()?;
-            let proj_tasks: Vec<_> = tasks
-                .into_iter()
-                .filter(|t| {
-                    t.project_id.map(|pid| pid.to_string())
-                        == Some("fellowship_adv_proj_id".to_string())
-                })
-                .collect();
-            if proj_tasks.is_empty() {
-                let t1 = Task {
-                    id: Uuid::new_v4(),
-                    project_id: Some(proj.id),
-                    title: "Design Fellowship Database Schema".to_string(),
-                    description: Some("Alex handles database schemas".to_string()),
-                    due_date: None,
-                    set_date: None,
-                    completed: true,
-                    priority: crate::models::TaskPriority::High,
-                    created_at: Utc::now() - chrono::Duration::hours(2),
-                    updated_at: Utc::now(),
-                    owner_identity: Some("alex_key".to_string()),
-                    owner_username: Some("Alex".to_string()),
-                    parent_task_id: None,
-                    xp_awarded: true,
-                    recurrence: None,
-                };
-                self.db.insert_task(&t1)?;
-                self.db
-                    .assign_task(&t1.id.to_string(), "alex_key", "Alex")?;
-                self.db
-                    .assign_task(&t1.id.to_string(), &my_identity, &my_username)?;
-
-                let t2 = Task {
-                    id: Uuid::new_v4(),
-                    project_id: Some(proj.id),
-                    title: "Build Fellowship TUI Dashboard".to_string(),
-                    description: Some("Implement Fellowship Tab 9".to_string()),
-                    due_date: Some(Utc::now() + chrono::Duration::days(3)),
-                    set_date: None,
-                    completed: false,
-                    priority: crate::models::TaskPriority::Medium,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    owner_identity: Some("alex_key".to_string()),
-                    owner_username: Some("Alex".to_string()),
-                    parent_task_id: None,
-                    xp_awarded: false,
-                    recurrence: None,
-                };
-                self.db.insert_task(&t2)?;
-                self.db
-                    .assign_task(&t2.id.to_string(), &my_identity, &my_username)?;
-            }
-        }
-
-        Ok(())
     }
 
     pub fn reload_data(&mut self) -> Result<()> {
@@ -5251,7 +5154,8 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                let list = regions.list();
+                if !HitRegions::contains(list, mouse.column, mouse.row) {
                     return;
                 }
                 let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
@@ -5259,8 +5163,8 @@ impl App {
                 // logical row is the visible offset stashed at render time
                 // plus the on-screen offset — not just the on-screen offset
                 // by itself.
-                let row = regions.visible_start + (mouse.row - regions.list.y) as usize;
-                let Some(Some(action_idx)) = regions.row_targets.get(row) else {
+                let row = regions.visible_start() + (mouse.row - list.y) as usize;
+                let Some(Some(action_idx)) = regions.row_targets().get(row) else {
                     return;
                 };
                 // action_idx came straight out of this exact frame's render,
@@ -6361,7 +6265,23 @@ impl App {
         if proj_tasks.is_empty() || self.selected_task_idx >= proj_tasks.len() {
             return Ok(());
         }
-        let t = &proj_tasks[self.selected_task_idx];
+        // A step focused inline on a Kanban card (`kanban_step_idx`) has
+        // nothing further to drill into — Enter opens its edit modal
+        // directly, same as Enter on any step in the Ledger list view.
+        let focused_step = if self.quest_board_open && self.viewing_step_for_task.is_none() {
+            self.kanban_step_idx.and_then(|idx| {
+                self.all_tasks
+                    .iter()
+                    .filter(|task| task.parent_task_id == Some(proj_tasks[self.selected_task_idx].id))
+                    .nth(idx)
+                    .cloned()
+            })
+        } else {
+            None
+        };
+        let t = focused_step
+            .as_ref()
+            .unwrap_or(&proj_tasks[self.selected_task_idx]);
         if allow_drill
             && self.quest_board_open
             && self.viewing_step_for_task.is_none()
@@ -6369,6 +6289,7 @@ impl App {
         {
             self.viewing_step_for_task = Some(t.id);
             self.selected_task_idx = 0;
+            self.kanban_step_idx = None;
         } else {
             self.modal_state = edit_task_modal_from_task(t);
         }
@@ -6448,6 +6369,50 @@ impl App {
         Ok(())
     }
 
+    /// Opens the selected Chronicle-tab (journal) entry's edit modal — 'e'
+    /// is this tab's only keyboard "open" key, plain Enter does nothing here,
+    /// same convention as Treasury below. Only the entry's own author may
+    /// edit it (there's no owner_identity on JournalEntry, only
+    /// author_username, since shared-project collaborators can each write
+    /// their own entries) — anyone else gets a warning and the modal stays
+    /// closed, mirroring the read_only Notes guard in
+    /// open_selected_workspace_scroll above.
+    fn open_selected_journal_entry(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let proj_journals: Vec<JournalEntry> = self
+            .all_journals
+            .iter()
+            .filter(|j| j.project_id == p_id)
+            .filter(|j| {
+                if !self.search_query.is_empty() {
+                    j.content
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let Some(entry) = proj_journals.get(self.selected_journal_idx) else {
+            return Ok(());
+        };
+        let my_username = self.user.as_ref().map(|u| u.username.as_str()).unwrap_or("");
+        if entry.author_username != my_username {
+            self.notifications.push(Notification::warning(
+                "This chronicle entry isn't yours to rewrite.".to_string(),
+            ));
+            return Ok(());
+        }
+        self.modal_state = ModalType::NewJournalEntry {
+            entry_id: Some(entry.id),
+            content: entry.content.clone(),
+        };
+        Ok(())
+    }
+
     /// Opens the selected Treasury-tab ledger entry's edit modal, subject to
     /// the same permission check as the keyboard path. Mirrors the
     /// KeyCode::Char('e') arm's tab-4 branch in handle_workspace_key — 'e'
@@ -6511,12 +6476,26 @@ impl App {
     /// Abre en el navegador un enlace clickeado en el preview de un scroll.
     ///
     /// El spawn real se omite bajo `cfg(test)`: los tests de mouse hacen clicks de
-    /// verdad y no deberían abrir ventanas del navegador durante `cargo test`.
+    /// verdad y no deberían abrir ventanas del navegador durante `cargo test`. Fuera
+    /// de test, el toast refleja si algún lanzador realmente se pudo ejecutar en vez
+    /// de asumir éxito — `open_url` puede fallar silenciosamente (p. ej. WSL sin
+    /// `xdg-open`) y antes eso quedaba invisible para el usuario.
     fn open_scroll_link(&mut self, url: &str) {
+        #[cfg(not(test))]
+        {
+            if open_url(url) {
+                self.notifications
+                    .push(Notification::info(format!("Opening {}", url)));
+            } else {
+                self.notifications.push(Notification::warning(format!(
+                    "Couldn't open {} — no browser launcher found",
+                    url
+                )));
+            }
+        }
+        #[cfg(test)]
         self.notifications
             .push(Notification::info(format!("Opening {}", url)));
-        #[cfg(not(test))]
-        open_url(url);
     }
 
     fn handle_workspace_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
@@ -6557,8 +6536,16 @@ impl App {
                 self.cycle_workspace_selection(forward);
                 return;
             }
+            if let Some(ledger) = regions.ledger
+                && HitRegions::contains(ledger, mouse.column, mouse.row)
+            {
+                self.quest_ledger_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
             self.workspace_sidebar_focused = false;
             self.note_preview_focused = false;
+            self.quest_ledger_focused = false;
             self.cycle_workspace_selection(forward);
             return;
         }
@@ -6583,14 +6570,21 @@ impl App {
             // exclusive per frame — at most one of the two fields is Some.
             0 => {
                 if let Some(kanban) = &regions.kanban
-                    && let Some(idx) = kanban
+                    && let Some(row) = kanban
                         .columns
                         .iter()
-                        .find_map(|col| col.row_index(mouse.column, mouse.row))
+                        .find_map(|col| col.row_at(mouse.column, mouse.row))
                 {
                     let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
-                    self.selected_task_idx = idx;
+                    self.selected_task_idx = row.task_idx;
                     self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = false;
+                    self.quest_ledger_scroll = 0;
+                    // A click lands on either the card's header or one of
+                    // its step rows — `row.step_idx` already carries exactly
+                    // what `kanban_step_idx` means, so assign it straight
+                    // through instead of always focusing the header.
+                    self.kanban_step_idx = row.step_idx;
                     if is_double_click {
                         if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
                             self.notifications
@@ -6603,12 +6597,19 @@ impl App {
                     let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
                     self.selected_task_idx = idx;
                     self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = false;
+                    self.quest_ledger_scroll = 0;
                     if is_double_click {
                         if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
                             self.notifications
                                 .push(Notification::warning(format!("Couldn't open: {}", e)));
                         }
                     }
+                } else if let Some(ledger) = regions.ledger
+                    && HitRegions::contains(ledger, mouse.column, mouse.row)
+                {
+                    self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = true;
                 }
             }
             1 => {
@@ -6754,12 +6755,7 @@ impl App {
             }
         }
 
-        let in_text_entry = self.searching
-            || self.modal_state != ModalType::None
-            || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding
-            || self.active_screen == ActiveScreen::Gateway
-            || self.active_screen == ActiveScreen::Restore;
+        let in_text_entry = self.is_in_text_entry();
 
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
@@ -6854,12 +6850,7 @@ impl App {
             return Ok(());
         }
 
-        let in_text_entry = self.searching
-            || self.modal_state != ModalType::None
-            || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding
-            || self.active_screen == ActiveScreen::Gateway
-            || self.active_screen == ActiveScreen::Restore;
+        let in_text_entry = self.is_in_text_entry();
 
         if !in_text_entry {
             match key.code {
@@ -6928,6 +6919,12 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
+                    // 'm' en el Dashboard cicla el layout en vez de cambiar de pantalla —
+                    // mismo patrón que 'p' unas líneas más abajo.
+                    if self.active_screen == ActiveScreen::Dashboard {
+                        self.cycle_dashboard_layout();
+                        return Ok(());
+                    }
                     // 'm' en Workspace quests/milestones y Fellowship ya está tomado — no cambiar pantalla
                     if !(self.active_screen == ActiveScreen::Workspace
                         && (self.workspace_tab_idx == 0 || self.workspace_tab_idx == 3))
@@ -10195,9 +10192,15 @@ impl App {
                     let _ = self.refresh_companions(&client);
                     self.submit_chapter_contribution(&client);
                     self.refresh_chapter_progress_sync(&client);
-                } else {
-                    let _ = self.simulate_fellowship_sync();
                 }
+                // Local-only mode (sync_enabled == false) has nothing to
+                // contact and used to fall back to simulate_fellowship_sync()
+                // here — a demo fixture that wrote fake companions ("Alex",
+                // "Fiona", "Diana"), a fake invitation, and fake chronicle
+                // messages straight into the real database on every manual
+                // sync trigger (Ctrl+Y / the command palette's "sync"
+                // action). Removed: local-only mode simply has nothing to do
+                // once sync_engine.sync()'s local bookkeeping above is done.
 
                 let sync_count = self
                     .db
@@ -11392,6 +11395,13 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
             KeyCode::Home | KeyCode::End => {
                 Self::apply_editor_home_end(state, key.code, home_end_whole_text.unwrap_or(false));
+            }
+            KeyCode::BackTab => {
+                if state.quick_note {
+                    state.editing_project = true;
+                } else {
+                    state.editing_title = true;
+                }
             }
 
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -13151,6 +13161,10 @@ impl App {
                     };
                 }
             }
+            // 'm' on Dashboard is handled earlier, in the global preamble's
+            // KeyCode::Char('m') arm (next to 'p') — it returns before
+            // reaching here, so this arm is unreachable for Dashboard and
+            // stays a no-op for every other screen.
             KeyCode::Char('m') => {}
             KeyCode::Delete => {
                 if self.active_screen == ActiveScreen::Archive {
@@ -13845,6 +13859,7 @@ impl App {
     fn reset_workspace_pane_focus(&mut self) {
         self.workspace_sidebar_focused = false;
         self.note_preview_focused = false;
+        self.quest_ledger_focused = false;
     }
 
     /// Jumps straight to workspace tab `idx` and focuses its content —
@@ -13857,7 +13872,30 @@ impl App {
 
     fn cycle_workspace_pane_focus(&mut self, reverse: bool) {
         match self.workspace_tab_idx {
-            // Quests and Overview have two focusable panes: workspace menu and content.
+            // Quests has three focusable panes in the list view — workspace menu,
+            // quest list, and the Quest Ledger details pane — same shape as Scrolls
+            // below. Kanban mode has no ledger pane, so it falls through to the
+            // two-pane arm underneath instead.
+            0 if !self.quest_board_open => {
+                let current = if self.workspace_sidebar_focused {
+                    0
+                } else if self.quest_ledger_focused {
+                    2
+                } else {
+                    1
+                };
+                let next = if reverse {
+                    if current == 0 { 2 } else { current - 1 }
+                } else {
+                    (current + 1) % 3
+                };
+                self.workspace_sidebar_focused = next == 0;
+                self.quest_ledger_focused = next == 2;
+                if self.quest_ledger_focused {
+                    self.quest_ledger_scroll = 0;
+                }
+            }
+            // Quests-in-Kanban and Overview have two focusable panes: workspace menu and content.
             0 | 3 | 4 => {
                 self.note_preview_focused = false;
                 self.workspace_sidebar_focused = !self.workspace_sidebar_focused;
@@ -13916,6 +13954,7 @@ impl App {
                 }
             };
             self.note_preview_focused = false;
+            self.quest_ledger_focused = false;
             return;
         }
         if self.note_preview_focused {
@@ -13926,6 +13965,17 @@ impl App {
                     .min(self.note_preview_max_scroll.get());
             } else {
                 self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
+            }
+            return;
+        }
+        if self.quest_ledger_focused {
+            if forward {
+                self.quest_ledger_scroll = self
+                    .quest_ledger_scroll
+                    .saturating_add(1)
+                    .min(self.quest_ledger_max_scroll.get());
+            } else {
+                self.quest_ledger_scroll = self.quest_ledger_scroll.saturating_sub(1);
             }
             return;
         }
@@ -13959,12 +14009,75 @@ impl App {
                                 .unwrap_or(QuestStatus::Backlog)
                         })
                         .collect::<Vec<_>>();
-                    self.selected_task_idx = move_quest_board_selection(
-                        &statuses,
-                        self.selected_task_idx,
-                        0,
-                        if forward { 1 } else { -1 },
-                    );
+                    // Steps render nested under their card in the board now,
+                    // so Up/Down walk through them too — card header, then
+                    // each of its steps in order, then on to the next/prev
+                    // card's header — instead of jumping straight card to
+                    // card. Only meaningful in the board itself: a step never
+                    // has steps of its own, so this is a no-op while drilled
+                    // into a parent's step list (`viewing_step_for_task`).
+                    let step_count = if self.viewing_step_for_task.is_none() {
+                        proj_tasks
+                            .get(self.selected_task_idx)
+                            .map(|task| {
+                                self.all_tasks
+                                    .iter()
+                                    .filter(|step| step.parent_task_id == Some(task.id))
+                                    .count()
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if forward {
+                        match self.kanban_step_idx {
+                            None if step_count > 0 => self.kanban_step_idx = Some(0),
+                            Some(i) if i + 1 < step_count => self.kanban_step_idx = Some(i + 1),
+                            _ => {
+                                self.selected_task_idx = move_quest_board_selection(
+                                    &statuses,
+                                    self.selected_task_idx,
+                                    0,
+                                    1,
+                                );
+                                self.kanban_step_idx = None;
+                            }
+                        }
+                    } else {
+                        match self.kanban_step_idx {
+                            Some(0) => self.kanban_step_idx = None,
+                            Some(i) => self.kanban_step_idx = Some(i - 1),
+                            None => {
+                                self.selected_task_idx = move_quest_board_selection(
+                                    &statuses,
+                                    self.selected_task_idx,
+                                    0,
+                                    -1,
+                                );
+                                // Land on the newly-selected card's last step
+                                // (if it has any) so Up walks up off the top
+                                // of a card the same way Down walks off the
+                                // bottom, instead of always landing on a
+                                // header.
+                                self.kanban_step_idx = if self.viewing_step_for_task.is_none() {
+                                    proj_tasks
+                                        .get(self.selected_task_idx)
+                                        .map(|task| {
+                                            self.all_tasks
+                                                .iter()
+                                                .filter(|step| {
+                                                    step.parent_task_id == Some(task.id)
+                                                })
+                                                .count()
+                                        })
+                                        .filter(|count| *count > 0)
+                                        .map(|count| count - 1)
+                                } else {
+                                    None
+                                };
+                            }
+                        }
+                    }
                 } else if !proj_tasks.is_empty() {
                     self.selected_task_idx = if forward {
                         if self.selected_task_idx < proj_tasks.len() - 1 {
@@ -13978,6 +14091,7 @@ impl App {
                         proj_tasks.len() - 1
                     };
                 }
+                self.quest_ledger_scroll = 0;
             }
             1 => {
                 let proj_notes: Vec<Note> = self
@@ -14227,6 +14341,17 @@ impl App {
         );
     }
 
+    /// Advances the Dashboard to its next layout (Default → Journey Map →
+    /// Today's Agenda → Deadline Timeline → Default …) and persists the
+    /// choice — a global preference, unlike `campaign_view_mode:{project_id}`
+    /// above, since the dashboard isn't project-scoped.
+    fn cycle_dashboard_layout(&mut self) {
+        self.dashboard_layout = self.dashboard_layout.next();
+        let _ = self
+            .db
+            .set_setting("dashboard_layout", self.dashboard_layout.key());
+    }
+
     fn project_is_shared(&self, project_id: Uuid) -> bool {
         self.projects
             .iter()
@@ -14405,6 +14530,8 @@ impl App {
             KeyCode::Esc => {
                 if self.note_preview_focused {
                     self.note_preview_focused = false;
+                } else if self.quest_ledger_focused {
+                    self.quest_ledger_focused = false;
                 } else if self.viewing_step_for_task.is_some() {
                     self.viewing_step_for_task = None;
                     self.selected_task_idx = 0;
@@ -14459,6 +14586,7 @@ impl App {
                 self.quest_board_open = !self.quest_board_open;
                 self.save_quest_board_preference(p_id);
                 self.viewing_step_for_task = None;
+                self.kanban_step_idx = None;
                 let mut next_tasks = visible_workspace_tasks(
                     &all_tasks,
                     p_id,
@@ -14556,6 +14684,9 @@ impl App {
                     .collect::<Vec<_>>();
                 self.selected_task_idx =
                     move_quest_board_selection(&statuses, self.selected_task_idx, -1, 0);
+                // A different column always lands on that card's header —
+                // `move_quest_board_selection` has no notion of steps.
+                self.kanban_step_idx = None;
             }
             KeyCode::Right
                 if self.quest_board_open
@@ -14572,6 +14703,7 @@ impl App {
                     .collect::<Vec<_>>();
                 self.selected_task_idx =
                     move_quest_board_selection(&statuses, self.selected_task_idx, 1, 0);
+                self.kanban_step_idx = None;
             }
             KeyCode::Left
                 if self.viewing_step_for_task.is_some()
@@ -14580,6 +14712,7 @@ impl App {
             {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
+                self.kanban_step_idx = None;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right
@@ -14593,6 +14726,7 @@ impl App {
                         let task_id = task.id;
                         self.viewing_step_for_task = Some(task_id);
                         self.selected_task_idx = 0;
+                        self.kanban_step_idx = None;
                     }
                 }
             }
@@ -14661,7 +14795,23 @@ impl App {
                     && !proj_tasks.is_empty()
                     && self.selected_task_idx < proj_tasks.len()
                 {
-                    let task = proj_tasks[self.selected_task_idx].clone();
+                    let card = &proj_tasks[self.selected_task_idx];
+                    // A step focused inline on a Kanban card (`kanban_step_idx`)
+                    // is what Space should toggle, not the card itself.
+                    let kanban_step = if self.quest_board_open
+                        && self.viewing_step_for_task.is_none()
+                    {
+                        self.kanban_step_idx.and_then(|idx| {
+                            self.all_tasks
+                                .iter()
+                                .filter(|t| t.parent_task_id == Some(card.id))
+                                .nth(idx)
+                                .cloned()
+                        })
+                    } else {
+                        None
+                    };
+                    let task = kanban_step.unwrap_or_else(|| card.clone());
                     let is_step = task.parent_task_id.is_some();
 
                     if is_step {
@@ -15097,6 +15247,7 @@ impl App {
                     self.active_screen = ActiveScreen::Editor;
                 } else if self.workspace_tab_idx == 2 && key.code == KeyCode::Char('n') {
                     self.modal_state = ModalType::NewJournalEntry {
+                        entry_id: None,
                         content: String::new(),
                     };
                 } else if self.workspace_tab_idx == 3 {
@@ -15152,6 +15303,8 @@ impl App {
                         }
                         _ => self.open_selected_workspace_scroll()?,
                     }
+                } else if self.workspace_tab_idx == 2 && key.code == KeyCode::Char('e') {
+                    self.open_selected_journal_entry()?;
                 } else if self.workspace_tab_idx == 4 && key.code == KeyCode::Char('e') {
                     self.open_selected_treasury_entry()?;
                 }
@@ -15649,8 +15802,8 @@ impl App {
                     recurrence,
                 )?;
             }
-            ModalType::NewJournalEntry { ref content } => {
-                self.handle_journal_modal_key(key, project_id, content.clone())?;
+            ModalType::NewJournalEntry { entry_id, ref content } => {
+                self.handle_journal_modal_key(key, project_id, entry_id, content.clone())?;
             }
             ModalType::TreasuryEntry {
                 entry_id,
@@ -17219,6 +17372,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project_id: Uuid,
+        entry_id: Option<Uuid>,
         mut content: String,
     ) -> Result<()> {
         match key.code {
@@ -17229,7 +17383,7 @@ impl App {
                 if content.chars().count() < JOURNAL_ENTRY_CHAR_LIMIT {
                     content.push(c);
                 }
-                self.modal_state = ModalType::NewJournalEntry { content };
+                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
             }
             KeyCode::Backspace => {
                 if is_ctrl_backspace(key) {
@@ -17237,7 +17391,17 @@ impl App {
                 } else {
                     content.pop();
                 }
-                self.modal_state = ModalType::NewJournalEntry { content };
+                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
+            }
+            // Editing an existing entry only rewrites its content — no XP/
+            // achievement/daily-adventure credit a second time for the same
+            // entry, unlike the brand-new-entry branch below.
+            KeyCode::Enter if !content.trim().is_empty() && entry_id.is_some() => {
+                let id = entry_id.unwrap();
+                self.db.update_journal_entry(id, content.trim())?;
+                self.mark_dirty();
+                self.reload_data()?;
+                self.modal_state = ModalType::None;
             }
             KeyCode::Enter if !content.trim().is_empty() => {
                 let author = self
@@ -21149,22 +21313,33 @@ impl App {
             .map(|t| t.elapsed() >= debounce)
             .unwrap_or(false);
 
-        // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días
-        let last_cleanup = self
-            .db
-            .get_setting("last_sync_cleanup")
-            .ok()
-            .flatten()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&chrono::Utc));
-        let cleanup_due = last_cleanup
-            .map(|d| (chrono::Utc::now() - d).num_seconds() > 86400)
+        // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días.
+        // Checking "is it due yet" only actually needs to happen a few times
+        // an hour, not on every ~50ms render tick — gate the settings read +
+        // date parse behind an in-memory cooldown first, same idea as
+        // last_task_notification_tick elsewhere in this file.
+        let cleanup_check_due = self
+            .last_sync_cleanup_check
+            .map(|t| t.elapsed().as_secs() >= 300)
             .unwrap_or(true);
-        if cleanup_due {
-            let _ = self.db.cleanup_old_sync_logs(30);
-            let _ = self
+        if cleanup_check_due {
+            self.last_sync_cleanup_check = Some(std::time::Instant::now());
+            let last_cleanup = self
                 .db
-                .set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+                .get_setting("last_sync_cleanup")
+                .ok()
+                .flatten()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let cleanup_due = last_cleanup
+                .map(|d| (chrono::Utc::now() - d).num_seconds() > 86400)
+                .unwrap_or(true);
+            if cleanup_due {
+                let _ = self.db.cleanup_old_sync_logs(30);
+                let _ = self
+                    .db
+                    .set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+            }
         }
 
         if mutation_ready || self.last_auto_sync.elapsed() >= interval {
@@ -24030,14 +24205,38 @@ impl App {
         }
     }
 
+    /// True while the user is actively typing somewhere outside a modal —
+    /// searching, the Editor screen (writing/editing a Scroll/Note), or one
+    /// of the pre-gameplay text-entry screens. `handle_key_event` uses this
+    /// to gate a few global shortcuts that would otherwise steal keystrokes
+    /// meant as literal text; `tick_hydration` below uses the same check so
+    /// the reminder can't pop up (and then swallow keystrokes) mid-typing.
+    fn is_in_text_entry(&self) -> bool {
+        self.searching
+            || self.modal_state != ModalType::None
+            || self.active_screen == ActiveScreen::Editor
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore
+    }
+
     pub fn tick_hydration(&mut self) -> Result<()> {
         if !self.hydration_enabled {
             return Ok(());
         }
 
-        // Refresh today's count (handles midnight rollover)
-        if let Ok((count, _)) = self.db.hydration_get_today() {
-            self.hydration_glasses = count;
+        // Refresh today's count (handles midnight rollover) — only needs to
+        // notice a day boundary, not run on every ~50ms render tick, so gate
+        // it the same way tick_task_notifications gates its own DB work.
+        let day_check_due = self
+            .last_hydration_day_check
+            .map(|t| t.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
+        if day_check_due {
+            self.last_hydration_day_check = Some(std::time::Instant::now());
+            if let Ok((count, _)) = self.db.hydration_get_today() {
+                self.hydration_glasses = count;
+            }
         }
 
         let now = chrono::Local::now();
@@ -24068,11 +24267,18 @@ impl App {
             return Ok(());
         }
 
-        // Fire popup if timer elapsed
+        // Fire popup if timer elapsed — but not while the user is typing
+        // somewhere (a modal, the Editor, search, ...): is_in_text_entry()
+        // covers all of that, not just modal_state, so a reminder can't pop
+        // up over a Scroll/Note mid-edit and swallow the next keystroke.
+        // Clearing the timer here (rather than nudging it a few minutes)
+        // means it rearms for a full fresh interval once the user is free —
+        // same "quietly defer" behavior this already had for other modals,
+        // now covering Editor too.
         if let Some(at) = self.hydration_next_reminder_at {
             if std::time::Instant::now() >= at {
                 self.hydration_next_reminder_at = None; // cleared until dismissed
-                if matches!(self.modal_state, ModalType::None) {
+                if !self.is_in_text_entry() {
                     self.audio_player.play_water_alert();
                     if self.external_notifications {
                         crate::services::notifications::send_system_notification_with_icon(
@@ -24680,6 +24886,26 @@ mod app_tests {
     fn double_click(app: &mut App, col: u16, row: u16, modifiers: KeyModifiers) {
         left_click(app, col, row, modifiers);
         left_click(app, col, row, modifiers);
+    }
+
+    #[test]
+    fn shift_tab_in_normal_mode_returns_to_the_scroll_title() {
+        // Existing scrolls open with the body in Normal mode (see
+        // EditorState::new), so Shift+Tab must work from Normal mode too —
+        // not just from Insert — or the title becomes unreachable.
+        let db_file = Path::new("test_questline_shift_tab_normal_mode.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+        assert_eq!(
+            app.editor_state.as_ref().unwrap().mode,
+            crate::screens::editor::EditorMode::Normal
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert!(app.editor_state.as_ref().unwrap().editing_title);
+
+        let _ = std::fs::remove_file(db_file);
     }
 
     #[test]
@@ -28007,11 +28233,205 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
     }
 
+    /// Up/Down in the Kanban board walk through a card's nested steps
+    /// (rendered inline since a recent change) before moving on to the
+    /// next/previous card, and back out again in reverse — without ever
+    /// drilling into the flat Ledger list view.
+    #[test]
+    fn kanban_up_down_navigate_a_cards_steps_before_moving_cards() {
+        let db_file = Path::new("test_questline_kanban_step_nav.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step_a = make_task(Uuid::new_v4(), "Lay the first stone", Some(parent_id));
+        let step_b = make_task(Uuid::new_v4(), "Lay the second stone", Some(parent_id));
+        app.db
+            .insert_task_tree(&parent, &[step_a.clone(), step_b.clone()])
+            .unwrap();
+        app.all_tasks = vec![parent, step_a, step_b];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+        app.kanban_step_idx = None;
+
+        // Down: header -> step 0 -> step 1 -> (no more cards, wraps back to
+        // the same single card's header).
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.selected_task_idx, 0);
+        assert_eq!(app.kanban_step_idx, Some(0));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(1));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            app.kanban_step_idx, None,
+            "walking past the last step lands back on a card header, not stuck past the end"
+        );
+
+        // Up should mirror it exactly: from the header, land on the last step.
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(1));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(0));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, None);
+
+        // Never left the board while doing any of this.
+        assert!(app.quest_board_open);
+        assert_eq!(app.viewing_step_for_task, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Space toggles the completion of whichever step is focused
+    /// (`kanban_step_idx`) inline on a Kanban card, without drilling into
+    /// the Ledger list view the way Enter does.
+    #[test]
+    fn kanban_space_completes_the_focused_step_in_place() {
+        let db_file = Path::new("test_questline_kanban_step_complete.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        // Completing a task can grant XP / check achievement unlocks, both
+        // of which need a hero on record.
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Bridge Builder".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: now,
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+        app.kanban_step_idx = Some(0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()))
+            .unwrap();
+
+        let reloaded_step = app
+            .all_tasks
+            .iter()
+            .find(|t| t.id == step_id)
+            .expect("step still exists after completing it");
+        assert!(reloaded_step.completed, "Space should complete the focused step");
+        let parent_task = app
+            .all_tasks
+            .iter()
+            .find(|t| t.id == parent_id)
+            .expect("parent still exists");
+        assert!(
+            !parent_task.completed,
+            "completing a step must not also complete its parent card"
+        );
+        // Stayed in the board the whole time — no drill, board still open.
+        assert!(app.quest_board_open);
+        assert_eq!(app.viewing_step_for_task, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
     /// Same fixture as `kanban_enter_opens_selected_quest_steps`, but driven
     /// through a mouse double-click on the Kanban card instead of Enter.
     #[test]
     fn workspace_kanban_double_click_drills_into_a_parent_tasks_steps() {
-        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceKanbanHitRegions, WorkspaceRowList};
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
 
         let db_file = Path::new("test_questline_mouse_kanban_double_click_drill.db");
         let _ = std::fs::remove_file(db_file);
@@ -28077,7 +28497,7 @@ mod app_tests {
         app.quest_board_open = true;
         app.selected_task_idx = 0;
 
-        let empty_col = || WorkspaceRowList {
+        let empty_col = || WorkspaceKanbanColumn {
             area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
             row_targets: vec![],
         };
@@ -28091,9 +28511,9 @@ mod app_tests {
             tasks: None,
             kanban: Some(WorkspaceKanbanHitRegions {
                 columns: [
-                    WorkspaceRowList {
+                    WorkspaceKanbanColumn {
                         area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
-                        row_targets: vec![Some(0)],
+                        row_targets: vec![Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None })],
                     },
                     empty_col(),
                     empty_col(),
@@ -28102,12 +28522,121 @@ mod app_tests {
                     empty_col(),
                 ],
             }),
+            ledger: None,
         });
 
         double_click(&mut app, 2, 0, KeyModifiers::empty());
 
         assert_eq!(app.viewing_step_for_task, Some(parent_id));
         assert!(app.quest_board_open);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Same fixture as `workspace_kanban_double_click_drills_into_a_parent_tasks_steps`,
+    /// but the click lands on the card's step row instead of its header —
+    /// a step has nothing to drill into, so this should open its edit modal
+    /// directly and leave the board exactly as it was (no drill, no scoping
+    /// into `viewing_step_for_task`).
+    #[test]
+    fn workspace_kanban_double_click_on_a_step_row_opens_its_edit_modal() {
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
+
+        let db_file = Path::new("test_questline_mouse_kanban_double_click_step.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+
+        let empty_col = || WorkspaceKanbanColumn {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceKanbanColumn {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None }),
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: Some(0) }),
+                        ],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                ],
+            }),
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty()); // the step row
+
+        assert_eq!(
+            app.viewing_step_for_task, None,
+            "a step can't be drilled into — no scoping should happen"
+        );
+        assert!(app.quest_board_open, "double-clicking a step must not leave the board");
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == step_id
+        ));
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
@@ -28192,6 +28721,7 @@ mod app_tests {
                 row_targets: vec![Some(0), Some(1)],
             }),
             kanban: None,
+            ledger: None,
         });
 
         double_click(&mut app, 2, 1, KeyModifiers::empty());
@@ -28790,7 +29320,7 @@ mod app_tests {
 
     #[test]
     fn dashboard_click_maps_through_visible_start_and_skips_separators() {
-        use crate::screens::hit_test::DashboardHitRegions;
+        use crate::screens::hit_test::{DashboardHitRegions, DefaultHitRegions};
 
         let db_file = Path::new("test_questline_mouse_dashboard.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
@@ -28798,11 +29328,11 @@ mod app_tests {
         // Logical rows: Main(0), Next(1), 2 separator rows, QuickWin(2). The
         // list has auto-scrolled 2 rows down (visible_start = 2), so on-screen
         // row 0 is logical row 2 (a separator), not Main.
-        app.hit_regions.dashboard = Some(DashboardHitRegions {
+        app.hit_regions.dashboard = Some(DashboardHitRegions::Default(DefaultHitRegions {
             list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
             row_targets: vec![Some(0), Some(1), None, None, Some(2)],
             visible_start: 2,
-        });
+        }));
 
         left_click(&mut app, 2, 0, KeyModifiers::empty()); // logical row 2 — separator
         assert!(!app.dashboard_task_focus);
@@ -28817,7 +29347,7 @@ mod app_tests {
 
     #[test]
     fn dashboard_double_click_opens_the_selected_task_edit_modal() {
-        use crate::screens::hit_test::DashboardHitRegions;
+        use crate::screens::hit_test::{DashboardHitRegions, DefaultHitRegions};
 
         let db_file = Path::new("test_questline_mouse_dashboard_double_click.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
@@ -28860,11 +29390,11 @@ mod app_tests {
         app.db.insert_task(&task).unwrap();
         app.projects = vec![project];
 
-        app.hit_regions.dashboard = Some(DashboardHitRegions {
+        app.hit_regions.dashboard = Some(DashboardHitRegions::Default(DefaultHitRegions {
             list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
             row_targets: vec![Some(0)],
             visible_start: 0,
-        });
+        }));
 
         double_click(&mut app, 2, 0, KeyModifiers::empty());
 
@@ -29639,6 +30169,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         left_click(&mut app, 2, 3, KeyModifiers::empty()); // row 3 = "Treasury" = tab 4
@@ -29674,6 +30205,7 @@ mod app_tests {
                 row_targets: vec![Some(0), Some(1), Some(2)],
             }),
             kanban: None,
+            ledger: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty());
@@ -29703,6 +30235,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         left_click(&mut app, 2, 2, KeyModifiers::empty()); // milestone 0's 3rd row
@@ -29735,6 +30268,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         app.selected_treasury_idx = 99; // sentinel — proves the next click is a genuine no-op
@@ -29767,6 +30301,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         double_click(&mut app, 2, 0, KeyModifiers::empty());
@@ -29800,6 +30335,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty());
@@ -29836,6 +30372,7 @@ mod app_tests {
             }),
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         left_click(&mut app, 2, 1, KeyModifiers::empty()); // divider row — no-op
@@ -29877,6 +30414,7 @@ mod app_tests {
             }),
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         // Preview pane but off the link — focus only, no browser.
@@ -29938,6 +30476,7 @@ mod app_tests {
             }),
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         double_click(&mut app, 2, 0, KeyModifiers::empty());
@@ -29991,6 +30530,7 @@ mod app_tests {
             }),
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         double_click(&mut app, 2, 0, KeyModifiers::empty());
@@ -30007,15 +30547,20 @@ mod app_tests {
 
     #[test]
     fn workspace_kanban_click_selects_a_card_in_any_column() {
-        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceKanbanHitRegions, WorkspaceRowList};
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
 
         let db_file = Path::new("test_questline_mouse_workspace_kanban.db");
         let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
         app.workspace_tab_idx = 0;
-        // Column 0 (Backlog) has tasks 0 and 1; column 4 (Review) has task 2.
-        // Kanban and the list view are mutually exclusive, so `tasks` stays
-        // None here — this proves the handler doesn't fall through to it.
-        let empty_col = || WorkspaceRowList {
+        // Column 0 (Backlog) has task 0's header at row 0, one of its steps
+        // at row 1, and task 1's header at row 2; column 4 (Review) has task
+        // 2. Kanban and the list view are mutually exclusive, so `tasks`
+        // stays None here — this proves the handler doesn't fall through to
+        // it.
+        let empty_col = || WorkspaceKanbanColumn {
             area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
             row_targets: vec![],
         };
@@ -30029,25 +30574,42 @@ mod app_tests {
             tasks: None,
             kanban: Some(WorkspaceKanbanHitRegions {
                 columns: [
-                    WorkspaceRowList {
+                    WorkspaceKanbanColumn {
                         area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
-                        row_targets: vec![Some(0), Some(1)],
+                        row_targets: vec![
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None }),
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: Some(0) }),
+                            Some(WorkspaceKanbanRow { task_idx: 1, step_idx: None }),
+                        ],
                     },
                     empty_col(),
                     empty_col(),
                     empty_col(),
-                    WorkspaceRowList {
+                    WorkspaceKanbanColumn {
                         area: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 5 },
-                        row_targets: vec![Some(2)],
+                        row_targets: vec![Some(WorkspaceKanbanRow { task_idx: 2, step_idx: None })],
                     },
                     empty_col(),
                 ],
             }),
+            ledger: None,
         });
 
-        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Backlog column, row 1
-        assert_eq!(app.selected_task_idx, 1);
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Backlog column, task 0's step row
+        assert_eq!(app.selected_task_idx, 0);
+        assert_eq!(
+            app.kanban_step_idx,
+            Some(0),
+            "clicking a step row should focus that step, not just its card"
+        );
         assert!(!app.workspace_sidebar_focused);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // Backlog column, task 1's header
+        assert_eq!(app.selected_task_idx, 1);
+        assert_eq!(
+            app.kanban_step_idx, None,
+            "clicking a card's header should focus the card, not carry over a stale step"
+        );
 
         left_click(&mut app, 22, 0, KeyModifiers::empty()); // Review column, row 0
         assert_eq!(app.selected_task_idx, 2);
@@ -30072,6 +30634,7 @@ mod app_tests {
             notes: None,
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         scroll_forward_at(&mut app, 2, 0); // 3 -> 0
@@ -30083,6 +30646,174 @@ mod app_tests {
 
         scroll_back_at(&mut app, 2, 0); // 1 -> 0
         assert_eq!(app.workspace_tab_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_scroll_wheel_cycles_the_selected_quest() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace_quest_ledger_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0; // Quests
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.all_tasks = vec![
+            Task {
+                id: Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "First Quest".to_string(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: crate::models::TaskPriority::Medium,
+                created_at: Utc::now() - chrono::Duration::hours(2),
+                updated_at: Utc::now(),
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            },
+            Task {
+                id: Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "Second Quest".to_string(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: crate::models::TaskPriority::Medium,
+                created_at: Utc::now() - chrono::Duration::hours(1),
+                updated_at: Utc::now(),
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            },
+        ];
+        // No ledger region — mouse lands somewhere else on the tab (e.g. the
+        // status bar), so this exercises the generic "anywhere else" scroll
+        // fallback, which still cycles the selected quest.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        scroll_forward_at(&mut app, 60, 5);
+        assert_eq!(app.selected_task_idx, 1);
+
+        scroll_back_at(&mut app, 60, 5);
+        assert_eq!(app.selected_task_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_scroll_wheel_scrolls_the_details_pane_instead() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        // Once the mouse is actually over the Quest Ledger pane, scrolling
+        // should scroll that pane's own content — not cycle the selected
+        // quest, which is what the generic fallback (tested above) would do.
+        let db_file = Path::new("test_questline_mouse_workspace_quest_ledger_pane_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.quest_ledger_max_scroll.set(2);
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+        });
+
+        scroll_forward_at(&mut app, 32, 1);
+        assert!(app.quest_ledger_focused);
+        assert_eq!(app.quest_ledger_scroll, 1);
+        assert_eq!(app.selected_task_idx, 0); // unchanged — the ledger scrolled, not the list
+
+        scroll_forward_at(&mut app, 32, 1);
+        assert_eq!(app.quest_ledger_scroll, 2);
+        scroll_forward_at(&mut app, 32, 1); // past max — stays clamped at 2
+        assert_eq!(app.quest_ledger_scroll, 2);
+
+        scroll_back_at(&mut app, 32, 1);
+        assert_eq!(app.quest_ledger_scroll, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_arrow_keys_scroll_once_focused() {
+        // Once the ledger is focused (mirroring what a click or scroll there
+        // does), Up/Down should scroll its content — same wiring as the
+        // Notes preview — not move the quest selection.
+        let db_file = Path::new("test_questline_workspace_quest_ledger_arrow_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.quest_ledger_focused = true;
+        app.quest_ledger_max_scroll.set(5);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.quest_ledger_scroll, 1);
+        assert_eq!(app.selected_task_idx, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.quest_ledger_scroll, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn tab_cycles_through_quest_list_and_ledger_panes() {
+        // Quests' list view has three focusable panes now — sidebar, quest
+        // list, and the Quest Ledger — same shape as Scrolls' menu/list/preview.
+        let db_file = Path::new("test_questline_workspace_quest_pane_tab_cycle.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 0;
+        app.quest_board_open = false;
+        app.workspace_sidebar_focused = false;
+        app.quest_ledger_focused = false;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // list -> ledger
+        assert!(!app.workspace_sidebar_focused);
+        assert!(app.quest_ledger_focused);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // ledger -> sidebar
+        assert!(app.workspace_sidebar_focused);
+        assert!(!app.quest_ledger_focused);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // sidebar -> list
+        assert!(!app.workspace_sidebar_focused);
+        assert!(!app.quest_ledger_focused);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -30112,6 +30843,7 @@ mod app_tests {
             }),
             tasks: None,
             kanban: None,
+            ledger: None,
         });
 
         scroll_back_at(&mut app, 32, 1); //  at scroll 0 — stays at 0
@@ -30989,6 +31721,57 @@ mod app_tests {
         };
         let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
         assert_eq!(fields.len(), 5, "only the 5 bordered fields should be clickable");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn hydration_reminder_does_not_interrupt_the_editor_screen() {
+        let db_file = Path::new("test_questline_hydration_editor_guard.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Editor);
+        app.hydration_enabled = true;
+        app.hydration_active_from = 0;
+        app.hydration_active_to = 0; // from == to means "always active" (see hydration_is_active_at_hour)
+        app.hydration_next_reminder_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        app.tick_hydration().unwrap();
+
+        assert_eq!(
+            app.modal_state,
+            ModalType::None,
+            "typing in the Editor must not get interrupted by the hydration reminder"
+        );
+        // The elapsed timer is cleared either way — it rearms for a fresh
+        // interval on the next tick rather than firing instantly the moment
+        // the user leaves the Editor.
+        assert!(app.hydration_next_reminder_at.is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn hydration_reminder_still_fires_on_a_screen_thats_not_text_entry() {
+        // Control for the test above: confirms the Editor guard is actually
+        // doing something, not just vacuously passing because the reminder
+        // never fires at all in tests.
+        let db_file = Path::new("test_questline_hydration_dashboard_fires.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.hydration_enabled = true;
+        app.hydration_active_from = 0;
+        app.hydration_active_to = 0;
+        app.hydration_next_reminder_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        app.tick_hydration().unwrap();
+
+        assert_eq!(app.modal_state, ModalType::HydrationReminder);
 
         let _ = std::fs::remove_file(db_file);
     }

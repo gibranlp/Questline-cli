@@ -1269,11 +1269,15 @@ pub(crate) fn render_body_line<'a>(
                     .add_modifier(Modifier::BOLD),
             )
         } else {
+            // A background-filled glyph, not a bare fg/BOLD one — plenty of
+            // terminals render BOLD as weight only, no brightness change, so
+            // a foreground-only cursor on an empty line was easy to miss.
             (
                 "│".to_string(),
                 "",
                 Style::default()
-                    .fg(theme.success)
+                    .fg(Color::Black)
+                    .bg(theme.success)
                     .add_modifier(Modifier::BOLD),
             )
         };
@@ -1299,8 +1303,11 @@ pub(crate) fn render_body_line<'a>(
         let cur_style = if x < line.len() {
             Style::default().fg(Color::Black).bg(theme.selection)
         } else {
+            // Same reasoning as the Insert-mode branch above — keep the
+            // background fill so the cursor doesn't vanish on an empty line.
             Style::default()
-                .fg(theme.selection)
+                .fg(Color::Black)
+                .bg(theme.selection)
                 .add_modifier(Modifier::BOLD)
         };
         let mut spans: Vec<Span<'a>> = Vec::new();
@@ -1988,6 +1995,16 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(empty_text, "│");
+        // Regression check for a bug where this glyph lost its background
+        // fill and became nearly invisible on an empty line (e.g. right
+        // after pressing Enter/o/O) — fg/BOLD alone isn't reliably visible
+        // across terminals, so the empty-line cursor needs a bg fill too,
+        // same as the mid-line cursor above.
+        assert_eq!(
+            empty_cursor.spans[0].style.bg,
+            Some(theme.success),
+            "cursor on an empty line must keep a background fill to stay visible"
+        );
 
         editor.lines[0] = "pasted text".to_string();
         editor.cursor_x = "pasted ".len();
@@ -2000,6 +2017,31 @@ mod tests {
         assert_eq!(rendered, "pasted text");
         assert_eq!(text_cursor.spans[1].content.as_ref(), "t");
         assert_eq!(text_cursor.spans[1].style.bg, Some(theme.success));
+    }
+
+    #[test]
+    fn normal_cursor_is_visible_on_empty_lines() {
+        // Same regression as insert_cursor_is_visible_on_empty_lines_and_between_text,
+        // but for the Normal-mode block cursor ("█") — it lost its background
+        // fill in the same commit and became just as hard to see.
+        let project_id = Uuid::new_v4();
+        let mut editor = EditorState::new(project_id, None, String::new(), String::new());
+        editor.editing_title = false;
+        editor.mode = EditorMode::Normal;
+        let theme = Theme::default_theme();
+
+        let empty_cursor = render_body_line("", 0, &editor, &theme);
+        let empty_text: String = empty_cursor
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(empty_text, "█");
+        assert_eq!(
+            empty_cursor.spans[0].style.bg,
+            Some(theme.selection),
+            "cursor on an empty line must keep a background fill to stay visible"
+        );
     }
 
     #[test]

@@ -198,7 +198,7 @@ pub struct ProjectsHitRegions {
     pub row_targets: Vec<Option<ProjectsRowTarget>>,
 }
 
-/// `screens::dashboard::draw_today_command_center` — the Command Center list
+/// `screens::dashboard::default_layout::draw` — the Command Center list
 /// interleaves non-selectable separator rows ("-- Quick Wins --" etc.)
 /// between the real Main/Next/Quick-Win/Sidequest/Daily entries, so
 /// `row_targets` maps each *rendered* row to the logical action index
@@ -209,11 +209,88 @@ pub struct ProjectsHitRegions {
 /// visible logical row — rather than trying to recompute ratatui's
 /// scroll-into-view algorithm ourselves.
 #[derive(Debug, Clone)]
-pub struct DashboardHitRegions {
+pub struct DefaultHitRegions {
     /// Inner list area — borders already excluded.
     pub list: Rect,
     pub row_targets: Vec<Option<usize>>,
     pub visible_start: usize,
+}
+
+/// `screens::dashboard::journey_map::draw` — same "one clickable list,
+/// possibly with non-selectable rows" shape as `DefaultHitRegions` (the
+/// trail's waypoint rows map to the same `dashboard_command_targets()`
+/// action-index space as every other dashboard layout), just a distinct
+/// type so each layout's hit-region shape is free to diverge later.
+#[derive(Debug, Clone)]
+pub struct JourneyMapHitRegions {
+    pub list: Rect,
+    pub row_targets: Vec<Option<usize>>,
+    pub visible_start: usize,
+}
+
+/// `screens::dashboard::todays_agenda::draw` — the urgency-banded list,
+/// same shape as `DefaultHitRegions` for the same reason.
+#[derive(Debug, Clone)]
+pub struct TodaysAgendaHitRegions {
+    pub list: Rect,
+    pub row_targets: Vec<Option<usize>>,
+    pub visible_start: usize,
+}
+
+/// `screens::dashboard::deadline_timeline::draw` — the selected day's detail
+/// list below the calendar strip. Which *day* is selected is tracked as a
+/// plain `App` field (`selected_timeline_day_idx`), not part of this hit-test
+/// struct, since day selection is mostly a keyboard (Left/Right) affordance;
+/// `list`/`row_targets`/`visible_start` cover that day's task rows exactly
+/// like every other dashboard layout's list.
+#[derive(Debug, Clone)]
+pub struct DeadlineTimelineHitRegions {
+    pub list: Rect,
+    pub row_targets: Vec<Option<usize>>,
+    pub visible_start: usize,
+}
+
+/// One dashboard layout's hit regions — exactly one variant is ever active
+/// at a time (mirrors `App.dashboard_layout`), so this is an enum rather
+/// than a struct of `Option`s: the "only one can be populated" invariant is
+/// a compiler fact instead of a convention every reader has to remember.
+#[derive(Debug, Clone)]
+pub enum DashboardHitRegions {
+    Default(DefaultHitRegions),
+    JourneyMap(JourneyMapHitRegions),
+    TodaysAgenda(TodaysAgendaHitRegions),
+    DeadlineTimeline(DeadlineTimelineHitRegions),
+}
+
+impl DashboardHitRegions {
+    /// Inner list area for whichever layout is active — borders already
+    /// excluded, same convention as every variant's own `list` field.
+    pub fn list(&self) -> Rect {
+        match self {
+            Self::Default(r) => r.list,
+            Self::JourneyMap(r) => r.list,
+            Self::TodaysAgenda(r) => r.list,
+            Self::DeadlineTimeline(r) => r.list,
+        }
+    }
+
+    pub fn row_targets(&self) -> &[Option<usize>] {
+        match self {
+            Self::Default(r) => &r.row_targets,
+            Self::JourneyMap(r) => &r.row_targets,
+            Self::TodaysAgenda(r) => &r.row_targets,
+            Self::DeadlineTimeline(r) => &r.row_targets,
+        }
+    }
+
+    pub fn visible_start(&self) -> usize {
+        match self {
+            Self::Default(r) => r.visible_start,
+            Self::JourneyMap(r) => r.visible_start,
+            Self::TodaysAgenda(r) => r.visible_start,
+            Self::DeadlineTimeline(r) => r.visible_start,
+        }
+    }
 }
 
 /// `screens::soundscapes::draw_local_files_panel` — the nested track list
@@ -424,19 +501,60 @@ pub struct WorkspaceHitRegions {
     /// of the two is ever Some for tab 0), so it gets its own field rather
     /// than overloading that one.
     pub kanban: Option<WorkspaceKanbanHitRegions>,
+    /// Tasks tab's right-hand "Quest Ledger" details pane — full pane,
+    /// border included, same shape as `notes.preview`. Set whenever tab 0
+    /// renders the list view (list and Kanban are mutually exclusive, but
+    /// the ledger is only ever drawn alongside the list). A scroll or click
+    /// there focuses it, same as the Notes preview, so its own long
+    /// description/steps/comments can be scrolled independently of which
+    /// quest is selected.
+    pub ledger: Option<Rect>,
 }
 
 /// `screens::project_workspace::draw_quest_board` — 6 status columns (2 rows
-/// of 3), each a plain unscrolled `List` of single-line cards, same shape
-/// as every other row_targets user here. `columns[i]` corresponds to
+/// of 3), each a `ListState`-scrolled list of cards, where a card spans one
+/// header row plus one row per step. `columns[i]` corresponds to
 /// `statuses[i]` in `[Backlog, Ready, InProgress, Blocked, Review, Done]`
 /// order (row-major: row 0 is the first 3, row 1 the last 3) — the click
-/// handler doesn't need to know the status itself, just that a card's
-/// `row_targets` value is an index into the *same* task slice
-/// `selected_task_idx` already indexes.
+/// handler doesn't need to know the status itself, just that a row's
+/// `task_idx` is an index into the *same* task slice `selected_task_idx`
+/// already indexes, and its `step_idx` (if any) is a position into that
+/// task's steps — matching `App.kanban_step_idx`'s meaning exactly, so a
+/// click can just assign both fields straight through.
 #[derive(Debug, Clone)]
 pub struct WorkspaceKanbanHitRegions {
-    pub columns: [WorkspaceRowList; 6],
+    pub columns: [WorkspaceKanbanColumn; 6],
+}
+
+/// One rendered row of a Kanban column: which task's card it belongs to, and
+/// — for a step row nested under that card — which of the task's steps.
+/// `None` for the card's own header row.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceKanbanRow {
+    pub task_idx: usize,
+    pub step_idx: Option<usize>,
+}
+
+/// A `WorkspaceRowList`-shaped hit map, but one `WorkspaceKanbanRow` per
+/// visible row instead of a plain `Option<usize>` — same "one vec entry per
+/// rendered screen row" convention (see `WorkspaceRowList`), just carrying
+/// enough to tell a card's header apart from one of its step rows.
+#[derive(Debug, Clone)]
+pub struct WorkspaceKanbanColumn {
+    pub area: Rect,
+    pub row_targets: Vec<Option<WorkspaceKanbanRow>>,
+}
+
+impl WorkspaceKanbanColumn {
+    /// (col, row) -> the row clicked, or None if the click missed the area
+    /// or landed past the last rendered row.
+    pub fn row_at(&self, col: u16, row: u16) -> Option<WorkspaceKanbanRow> {
+        if !HitRegions::contains(self.area, col, row) {
+            return None;
+        }
+        let offset = (row - self.area.y) as usize;
+        self.row_targets.get(offset).copied().flatten()
+    }
 }
 
 /// A rendered row -> item-index map, built once at draw time — the same

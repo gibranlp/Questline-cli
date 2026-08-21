@@ -877,31 +877,65 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Escanea los backups del directorio actual y avisa si alguno está cagado
+    // Escanea los backups del directorio actual y avisa si alguno está cagado.
+    // Backups are written once and never modified again, so a file that
+    // already passed this exact scan doesn't need a fresh full integrity
+    // scan + foreign-key scan every single launch forever — cache the
+    // "verified OK" result per filename+size+mtime and skip the rescan
+    // whenever none of those three have changed since.
     let mut corrupted_backups = Vec::new();
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if filename.starts_with("questline_backup_") && filename.ends_with(".db") {
-                    match questline::database::Database::verify_db_backup(&path) {
-                        Ok(true) => {
-                            questline::services::log_structured(
-                                "INFO",
-                                "backup_verification",
-                                &format!("Backup validated successfully: {}", filename),
-                                None,
-                            );
+                    let fingerprint = std::fs::metadata(&path)
+                        .ok()
+                        .map(|m| {
+                            let mtime = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            format!("{}:{}", m.len(), mtime)
+                        })
+                        .unwrap_or_default();
+                    let cache_key = format!("backup_verified:{}", filename);
+                    let already_verified = app
+                        .db
+                        .get_setting(&cache_key)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|cached| cached == fingerprint);
+
+                    let is_ok = if already_verified {
+                        true
+                    } else {
+                        match questline::database::Database::verify_db_backup(&path) {
+                            Ok(true) => {
+                                let _ = app.db.set_setting(&cache_key, &fingerprint);
+                                true
+                            }
+                            _ => false,
                         }
-                        _ => {
-                            questline::services::log_structured(
-                                "WARNING",
-                                "backup_verification",
-                                &format!("Corrupted backup detected: {}", filename),
-                                Some(&format!("Path: {:?}", path)),
-                            );
-                            corrupted_backups.push(filename.to_string());
-                        }
+                    };
+
+                    if is_ok {
+                        questline::services::log_structured(
+                            "INFO",
+                            "backup_verification",
+                            &format!("Backup validated successfully: {}", filename),
+                            None,
+                        );
+                    } else {
+                        questline::services::log_structured(
+                            "WARNING",
+                            "backup_verification",
+                            &format!("Corrupted backup detected: {}", filename),
+                            Some(&format!("Path: {:?}", path)),
+                        );
+                        corrupted_backups.push(filename.to_string());
                     }
                 }
             }
@@ -1060,8 +1094,23 @@ async fn main() -> Result<()> {
                     }
                 }
                 ActiveScreen::Workspace => {
-                    let regions = screens::project_workspace::draw(f, &app, &theme);
-                    app.hit_regions.workspace = Some(regions);
+                    // project_workspace::draw() unwraps active_project_id and
+                    // its matching Project every frame — re-check here first
+                    // (mirrors the same fallback handle_workspace_key already
+                    // uses) so a project that vanished mid-session (removed
+                    // by its owner, or dropped by a sync) bounces back to
+                    // Projects instead of panicking the whole app.
+                    let project_still_exists = app
+                        .active_project_id
+                        .is_some_and(|p_id| app.projects.iter().any(|p| p.id == p_id));
+                    if project_still_exists {
+                        let regions = screens::project_workspace::draw(f, &app, &theme);
+                        app.hit_regions.workspace = Some(regions);
+                    } else {
+                        app.active_project_id = None;
+                        app.active_screen = ActiveScreen::Projects;
+                        app.projects_all_selected = true;
+                    }
                 }
 
                 _ => {
@@ -1101,39 +1150,47 @@ async fn main() -> Result<()> {
                         }
 
                         ActiveScreen::Character => {
-                            let achievements_count = app
-                                .stats_cache
-                                .achievements
-                                .iter()
-                                .filter(|a| a.unlocked_at.is_some())
-                                .count() as i32;
-                            let tree = &app.stats_cache.zen_tree;
-                            let streak_obj = &app.stats_cache.streak;
+                            if app.user.is_some() {
+                                let achievements_count = app
+                                    .stats_cache
+                                    .achievements
+                                    .iter()
+                                    .filter(|a| a.unlocked_at.is_some())
+                                    .count() as i32;
+                                let tree = &app.stats_cache.zen_tree;
+                                let streak_obj = &app.stats_cache.streak;
 
-                            let regions = screens::character::draw(
-                                f,
-                                app.user.as_ref().unwrap(),
-                                achievements_count,
-                                app.stats_cache.achievements.len(),
-                                tree.stage_name(),
-                                tree.growth,
-                                tree.health,
-                                streak_obj.current_streak,
-                                streak_obj.best_streak,
-                                &app.stats_cache.xp_history,
-                                &app.stats_cache.most_productive_project,
-                                &app.stats_cache.reflections,
-                                app.selected_reflection_idx,
-                                &app.modal_state,
-                                &app.stats_cache.devices,
-                                &app.stats_cache.chronicle_entries,
-                                app.selected_chronicle_idx,
-                                app.character_focus,
-                                app.reflection_detail_scroll,
-                                &theme,
-                                chunks[0],
-                            );
-                            app.hit_regions.character = Some(regions);
+                                let regions = screens::character::draw(
+                                    f,
+                                    app.user.as_ref().unwrap(),
+                                    achievements_count,
+                                    app.stats_cache.achievements.len(),
+                                    tree.stage_name(),
+                                    tree.growth,
+                                    tree.health,
+                                    streak_obj.current_streak,
+                                    streak_obj.best_streak,
+                                    &app.stats_cache.xp_history,
+                                    &app.stats_cache.most_productive_project,
+                                    &app.stats_cache.reflections,
+                                    app.selected_reflection_idx,
+                                    &app.modal_state,
+                                    &app.stats_cache.devices,
+                                    &app.stats_cache.chronicle_entries,
+                                    app.selected_chronicle_idx,
+                                    app.character_focus,
+                                    app.reflection_detail_scroll,
+                                    &theme,
+                                    chunks[0],
+                                );
+                                app.hit_regions.character = Some(regions);
+                            } else {
+                                // The local user record vanished unexpectedly
+                                // (e.g. a sync hiccup) — bounce back to the
+                                // Dashboard instead of unwrapping None and
+                                // panicking the whole app on this render.
+                                app.active_screen = ActiveScreen::Dashboard;
+                            }
                         }
                         ActiveScreen::Archive => {
                             let regions =
@@ -1271,6 +1328,10 @@ async fn main() -> Result<()> {
                     tab_spans.push(Span::styled("| ", Style::default().fg(muted)));
                     tab_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
                     tab_spans.push(Span::styled(" palette  ", Style::default().fg(muted)));
+                    if app.active_screen == ActiveScreen::Dashboard {
+                        tab_spans.push(Span::styled("m", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+                        tab_spans.push(Span::styled(" layout  ", Style::default().fg(muted)));
+                    }
                     tab_spans.push(Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
                     tab_spans.push(Span::styled(" quit", Style::default().fg(muted)));
 
@@ -1373,7 +1434,11 @@ async fn main() -> Result<()> {
                     let popup_w = (size.width * 60 / 100).max(30);
                     let inner_w = popup_w.saturating_sub(4).max(1); // subtract borders + padding
                     let msg_lines = (notif.message.chars().count() as u16).div_ceil(inner_w) + 1;
-                    let popup_h = (msg_lines + 4).clamp(6, size.height.saturating_sub(4));
+                    // clamp(min, max) panics if min > max, which a terminal
+                    // shorter than 10 rows would trigger here — widen the
+                    // upper bound to never fall below the lower one instead.
+                    let popup_h_max = size.height.saturating_sub(4).max(6);
+                    let popup_h = (msg_lines + 4).clamp(6, popup_h_max);
                     let overlay_area = ratatui::layout::Rect {
                         x: size.x + (size.width.saturating_sub(popup_w)) / 2,
                         y: size.y + (size.height.saturating_sub(popup_h)) / 2,
@@ -2852,7 +2917,7 @@ async fn main() -> Result<()> {
                         lines.push(Line::from("  Ctrl+N       Write a Quick Note"));
                         lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
                         lines.push(Line::from("  f            Quick start Focus Session"));
-                        lines.push(Line::from("  m            Go to Music Screen"));
+                        lines.push(Line::from("  m            Cycle Dashboard Layout"));
                     }
                     ActiveScreen::Projects => {
                         lines.push(Line::from("  n            Create a New Project"));

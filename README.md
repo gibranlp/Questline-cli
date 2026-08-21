@@ -733,6 +733,17 @@ If Questline helps you on your adventures, consider starring the repository and 
   key/click already dismisses identically, and Restore is a single
   always-focused text field with nothing else to click.
 
+**Dashboard Layouts, Chronicle Editing, and a Bug-Fix Pass:**
+
+- **New Dashboard looks:** Press `m` on the Dashboard to switch between 4 views — the classic layout, a Journey Map (your tasks shown as a trail), Today's Agenda (tasks grouped by how urgent they are), and a Deadline Timeline (a calendar strip of what's coming up). Whichever one you pick is remembered the next time you open Questline.
+- **Edit Chronicle entries:** Press `e` on a Chronicle entry to fix or change what you wrote, instead of only being able to add new ones.
+- **Water reminders no longer interrupt you:** The hydration reminder used to be able to pop up while you were writing a note, editing a task, or typing anything else — and typing would then accidentally hit its buttons instead of your text. It now waits until you're free.
+- **Fixed a few crashes:** The app could close unexpectedly if the terminal window was too small, if a shared project got deleted while you were looking at it, or if your profile briefly went missing during a sync hiccup. All three are now handled safely.
+- **Fixed search sometimes acting on the wrong task:** Searching for a task and pressing Enter could leave the list showing everything again while your next keypress (like Space or Delete) still acted on the filtered list underneath — meaning it could hit a different task than the one you saw on screen. This is fixed.
+- **Removed leftover test data:** Users with cloud sync turned off could occasionally see fake companions and chat messages appear from an old internal testing feature that should never have run for real users. It's now removed for good.
+- **Faster startup, smoother screens:** Questline now starts faster, and screens with lots of tasks or money entries (like the Task board and Treasury) respond more smoothly instead of slowing down.
+- **Tidied up old code:** Removed a half-finished, never-activated Spotify feature left over from an old version, keeping the codebase cleaner.
+
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
 

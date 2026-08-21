@@ -375,6 +375,12 @@ impl StreakSchedule {
 }
 
 impl Database {
+    /// Bump this whenever a migration is added to `Database::new`'s
+    /// column-existence-check block below, so upgraded installs re-run that
+    /// whole block once (idempotent either way) instead of it silently
+    /// staying skipped forever via a stale `PRAGMA user_version`.
+    const SCHEMA_VERSION: i64 = 1;
+
     pub fn database_size_bytes(&self) -> Result<u64> {
         let page_count: u64 = self
             .conn
@@ -396,6 +402,16 @@ impl Database {
 
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
 
+        // The column-existence-check migrations below are all idempotent —
+        // safe to rerun — but there are ~80 of them, each its own round trip
+        // to SQLite, run sequentially on every single launch forever. Gate
+        // the whole batch behind a schema-version stamp so a launch where
+        // nothing changed does one PRAGMA read instead of eighty queries;
+        // an upgrade (stored version behind Self::SCHEMA_VERSION) still runs
+        // every check, same as before.
+        let schema_version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if schema_version < Self::SCHEMA_VERSION {
         // Encrypted invitation envelopes were added after the original local schema.
         // SQLite has no portable ADD COLUMN IF NOT EXISTS, so inspect the schema first
         // and keep genuine migration failures fatal.
@@ -1073,6 +1089,12 @@ impl Database {
                     params![id, name, desc],
                 )?;
             }
+        }
+
+            conn.execute(
+                &format!("PRAGMA user_version = {}", Self::SCHEMA_VERSION),
+                [],
+            )?;
         }
 
         Ok(Self { conn })
@@ -2060,6 +2082,17 @@ impl Database {
             ],
         )?;
         Self::log_change_on(&tx, "journal_entry", &entry.id.to_string(), "create")?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn update_journal_entry(&self, id: Uuid, content: &str) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "UPDATE journal_entries SET content = ?1, updated_at = ?2 WHERE id = ?3",
+            params![content, Utc::now().to_rfc3339(), id.to_string()],
+        )?;
+        Self::log_change_on(&tx, "journal_entry", &id.to_string(), "update")?;
         tx.commit()?;
         Ok(())
     }
@@ -4663,6 +4696,28 @@ impl Database {
         Ok(())
     }
 
+    /// Decodes a stored hex-encoded encryption key, returning an error
+    /// instead of panicking on malformed input (an odd-length string used to
+    /// slice `key_hex[i..i+2]` one byte past the end on its last step —
+    /// reachable from a hand-edited or truncated recovery/backup file via
+    /// `import_from_json`, which inserts arbitrary JSON string values into
+    /// any column with no validation).
+    fn decode_hex_key(key_hex: &str) -> Result<Vec<u8>> {
+        if key_hex.len() % 2 != 0 {
+            return Err(anyhow::anyhow!(
+                "invalid stored project encryption key: odd-length hex ({} chars)",
+                key_hex.len()
+            ));
+        }
+        (0..key_hex.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&key_hex[i..i + 2], 16)
+                    .map_err(|e| anyhow::anyhow!("invalid stored project encryption key: {e}"))
+            })
+            .collect()
+    }
+
     pub fn get_project_encryption_key(
         &self,
         project_id: &str,
@@ -4676,10 +4731,7 @@ impl Database {
             )
             .optional()?;
         row.map(|(routing_id, key_hex)| {
-            let bytes = (0..key_hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let bytes = Self::decode_hex_key(&key_hex)?;
             let key: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;
@@ -4712,10 +4764,7 @@ impl Database {
                     .flatten()
             });
         row.map(|(project_id, key_hex)| {
-            let bytes = (0..key_hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let bytes = Self::decode_hex_key(&key_hex)?;
             let key: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;
@@ -4743,10 +4792,7 @@ impl Database {
             )
             .optional()?;
         row.map(|(routing_id, key_hex)| {
-            let bytes = (0..key_hex.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let bytes = Self::decode_hex_key(&key_hex)?;
             let key: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("invalid stored project encryption key"))?;

@@ -39,6 +39,25 @@ impl<'a> TreasuryService<'a> {
 
     /// Inicializa la tesorería y sus categorías de forma idempotente para evitar duplicados entre dispositivos.
     pub fn ensure_campaign(&self, campaign_id: Uuid) -> Result<CampaignTreasury> {
+        // Fast path: the render loop calls this every ~50ms while the
+        // Treasury tab is open, but after the very first call there's
+        // nothing left to do — every INSERT OR IGNORE below is a no-op
+        // forever after. Once the treasury row exists and every default
+        // category has been seeded, skip straight to loading it (2 cheap
+        // SELECTs) instead of re-running up to 1 + 2*DEFAULT_CATEGORIES.len()
+        // statements on every single frame. Falls through to the full path
+        // below if a future release adds a new default category an
+        // existing campaign hasn't been seeded with yet.
+        if let Some(existing) = self.get_campaign(campaign_id)? {
+            let default_category_count: i64 = self.db.conn.query_row(
+                "SELECT COUNT(*) FROM ledger_categories WHERE campaign_id = ?1 AND is_default = 1",
+                params![campaign_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if default_category_count as usize >= DEFAULT_CATEGORIES.len() {
+                return Ok(existing);
+            }
+        }
         self.ensure_campaign_exists(campaign_id)?;
         let now = Utc::now().to_rfc3339();
         let inserted = self.db.conn.execute(

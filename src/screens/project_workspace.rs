@@ -137,8 +137,19 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 "Unassigned" => assignments_by_task
                     .get(&t.id.to_string())
                     .is_none_or(|list| list.is_empty()),
-                "Blocked" => statuses_by_task.get(&t.id.to_string())
-                    == Some(&crate::models::QuestStatus::Blocked),
+                // Must match visible_workspace_tasks' "Blocked" arm exactly
+                // (app/mod.rs) — that's what the keyboard handler filters
+                // by, so a task this list shows-or-hides has to agree with
+                // it or Up/Down/Enter/Space/Delete act on a different task
+                // than the one highlighted on screen.
+                "Blocked" => {
+                    statuses_by_task.get(&t.id.to_string())
+                        == Some(&crate::models::QuestStatus::Blocked)
+                        || app
+                            .db
+                            .has_unresolved_task_dependencies(&t.id.to_string())
+                            .unwrap_or(false)
+                }
                 "Review" => statuses_by_task.get(&t.id.to_string())
                     == Some(&crate::models::QuestStatus::Review),
                 "Overdue" => !t.completed && t.due_date.is_some_and(|due| due < Utc::now()),
@@ -153,7 +164,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 _ => true,
             })
             .filter(|t| {
-                if searching && !search_query.is_empty() {
+                // Matches visible_workspace_tasks' search filter exactly —
+                // that one keys only on "is the query non-empty", not on
+                // whether the search box is still focused, so a committed
+                // (Enter-closed) search stays applied here too instead of
+                // reverting to the unfiltered list while the handler still
+                // acts on the filtered one.
+                if !search_query.is_empty() {
                     t.title
                         .to_lowercase()
                         .contains(&search_query.to_lowercase())
@@ -248,7 +265,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                         .unwrap_or(true))
         })
         .filter(|n| {
-            if searching && !search_query.is_empty() {
+            // Same reasoning as the Tasks tab's search filter above — keyed
+            // only on the query text, not on whether the box still has focus.
+            if !search_query.is_empty() {
                 n.title
                     .to_lowercase()
                     .contains(&search_query.to_lowercase())
@@ -265,7 +284,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         .iter()
         .filter(|j| j.project_id == project.id)
         .filter(|j| {
-            if searching && !search_query.is_empty() {
+            // Same reasoning as the Tasks tab's search filter above.
+            if !search_query.is_empty() {
                 j.content
                     .to_lowercase()
                     .contains(&search_query.to_lowercase())
@@ -411,6 +431,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     // WorkspaceHitRegions for why each tab needs its own field rather than
     // a single shared shape.
     let mut tasks_hit = None;
+    let mut ledger_hit = None;
     let mut notes_hit = None;
     let mut journal_hit = None;
     let mut treasury_hit = None;
@@ -418,6 +439,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     let mut kanban_hit = None;
     match active_tab {
         0 if app.quest_board_open && app.viewing_step_for_task.is_none() => {
+            let kanban_statuses = app
+                .db
+                .get_quest_statuses_by_project(&p_id.to_string())
+                .unwrap_or_default();
             kanban_hit = Some(draw_quest_board(
                 f,
                 body_chunks[1],
@@ -426,10 +451,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 app,
                 theme,
                 sidebar_focused,
+                &kanban_statuses,
             ));
         }
         0 => {
-            tasks_hit = draw_tasks_tab(
+            (tasks_hit, ledger_hit) = draw_tasks_tab(
                 f,
                 body_chunks[1],
                 &sorted_tasks,
@@ -448,6 +474,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 is_shared,
                 &app.identity.public_key,
                 &app.db,
+                app.quest_ledger_focused,
+                app.quest_ledger_scroll,
+                &app.quest_ledger_max_scroll,
             );
         }
         1 => {
@@ -791,8 +820,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
                 *recurrence,
             );
         }
-        ModalType::NewJournalEntry { content } => {
-            draw_journal_modal(f, content, theme);
+        ModalType::NewJournalEntry { entry_id, content } => {
+            draw_journal_modal(f, entry_id.is_some(), content, theme);
         }
         ModalType::TreasuryEntry {
             entry_id,
@@ -997,6 +1026,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         notes: notes_hit,
         tasks: tasks_hit,
         kanban: kanban_hit,
+        ledger: ledger_hit,
     }
 }
 
@@ -1911,6 +1941,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         Line::from(vec![]),
         Line::from(vec![h("  3 · CHRONICLES")]),
         binding("n", "New journal log", can_edit),
+        binding("e", "Edit entry", can_edit),
         binding("v", "Toggle visibility", can_edit),
         binding("Delete", "Delete entry", can_edit),
         Line::from(vec![]),
@@ -2373,13 +2404,23 @@ fn draw_tasks_tab(
     is_shared: bool,
     my_identity: &str,
     db: &crate::database::Database,
-) -> Option<crate::screens::hit_test::WorkspaceRowList> {
+    ledger_focused: bool,
+    ledger_scroll: usize,
+    ledger_max_scroll: &std::cell::Cell<usize>,
+) -> (Option<crate::screens::hit_test::WorkspaceRowList>, Option<Rect>) {
     let accent_color = theme.primary;
     let content_border = if sidebar_focused {
         theme.border
     } else {
         accent_color
     };
+    let ledger_border = if ledger_focused { accent_color } else { theme.border };
+    let ledger_title = if ledger_focused {
+        " Quest Ledger  ↑↓ Scroll "
+    } else {
+        " Quest Ledger "
+    };
+    ledger_max_scroll.set(0);
 
     let sub_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -2666,8 +2707,8 @@ fn draw_tasks_tab(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border))
-                .title(" Quest Ledger "),
+                .border_style(Style::default().fg(ledger_border))
+                .title(ledger_title),
         )
     } else {
         let t = tasks[selected_idx];
@@ -2832,29 +2873,46 @@ fn draw_tasks_tab(
             }
         }
 
-        Paragraph::new(text)
+        // Envolvemos nosotros mismos (en vez de Wrap{trim:true}) para poder medir
+        // el conteo real de filas visuales y así hacerle scroll — mismo patrón que
+        // el preview de scrolls, que necesita lo mismo para ubicar sus enlaces.
+        let ledger_inner = Block::default().borders(Borders::ALL).inner(sub_chunks[1]);
+        let ledger_width = ledger_inner.width as usize;
+        let ledger_height = ledger_inner.height as usize;
+        let rows: Vec<Line> = text
+            .iter()
+            .flat_map(|line| crate::screens::text_wrap::split_styled_line(line, ledger_width))
+            .collect();
+        let max_scroll = rows.len().saturating_sub(ledger_height);
+        ledger_max_scroll.set(max_scroll);
+        let scroll = ledger_scroll.min(max_scroll);
+
+        Paragraph::new(rows)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.border))
-                    .title(" Quest Ledger "),
+                    .border_style(Style::default().fg(ledger_border))
+                    .title(ledger_title),
             )
-            .wrap(ratatui::widgets::Wrap { trim: true })
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0))
     };
     f.render_widget(details_widget, sub_chunks[1]);
 
     // Every branch above renders exactly one Line per task (even the
     // multi-badge ones), so — like Archive/Legends — this is a plain,
     // unscrolled List: row N is tasks[N] directly, no wrap/offset math.
-    if tasks.is_empty() {
+    let list_hit = if tasks.is_empty() {
         None
     } else {
         Some(crate::screens::hit_test::WorkspaceRowList {
             area: list_inner,
             row_targets: (0..tasks.len()).map(Some).collect(),
         })
-    }
+    };
+    // Full pane, border included — same shape as the Notes preview, so a
+    // scroll or click there can focus and scroll it independently of the list.
+    (list_hit, Some(sub_chunks[1]))
 }
 
 fn draw_quest_dependencies_modal(
@@ -3208,6 +3266,7 @@ fn draw_quest_board(
     app: &App,
     theme: &Theme,
     sidebar_focused: bool,
+    statuses_by_task: &std::collections::HashMap<String, QuestStatus>,
 ) -> crate::screens::hit_test::WorkspaceKanbanHitRegions {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -3223,7 +3282,8 @@ fn draw_quest_board(
     ];
     // Filled in column-by-column below, in the same row-major order as
     // `statuses` — see WorkspaceKanbanHitRegions.
-    let mut kanban_columns: Vec<crate::screens::hit_test::WorkspaceRowList> = Vec::with_capacity(6);
+    let mut kanban_columns: Vec<crate::screens::hit_test::WorkspaceKanbanColumn> =
+        Vec::with_capacity(6);
 
     for (row_idx, row) in rows.iter().enumerate() {
         let columns = Layout::default()
@@ -3236,104 +3296,140 @@ fn draw_quest_board(
             .split(*row);
         for (column_idx, column) in columns.iter().enumerate() {
             let status = statuses[row_idx * 3 + column_idx];
-            // One entry per rendered card, in lockstep with `cards` below —
-            // every row here is a real, selectable card, no dividers.
-            let mut card_task_indices: Vec<Option<usize>> = Vec::new();
-            let cards: Vec<ListItem> = tasks
-                .iter()
-                .enumerate()
-                .filter(|(_, task)| task.parent_task_id.is_none())
-                .filter_map(|(task_idx, task)| {
-                    let task_status = app
+            // One entry per rendered screen row, in lockstep with `flat_rows`
+            // below — a card with steps spans multiple rows (its header plus
+            // one per step), each carrying which task it belongs to and,
+            // for a step row, which step — so a click can select that exact
+            // step instead of only ever landing on the card as a whole, same
+            // idea as the Overview tab's milestone rows but one level finer.
+            let mut flat_rows: Vec<ListItem> = Vec::new();
+            let mut flat_targets: Vec<Option<crate::screens::hit_test::WorkspaceKanbanRow>> =
+                Vec::new();
+            let mut selected_row_in_column: Option<usize> = None;
+            let mut card_count = 0usize;
+
+            for (task_idx, task) in tasks.iter().enumerate() {
+                if task.parent_task_id.is_some() {
+                    continue;
+                }
+                // Bulk-computed once per render (see the call site) instead
+                // of a fresh get_quest_status() DB round trip here — this
+                // loop already runs once per status column (6x) per task,
+                // so the old per-task query ran up to 6 times/task/frame.
+                let Some(&task_status) = statuses_by_task.get(&task.id.to_string()) else {
+                    continue;
+                };
+                if task_status != status {
+                    continue;
+                }
+                card_count += 1;
+                // The card's header is only "selected" when focus hasn't
+                // moved onto one of its steps (`kanban_step_idx`) — the two
+                // are mutually exclusive highlights on the same card.
+                let is_header_selected = task_idx == selected_idx && app.kanban_step_idx.is_none();
+                let marker = if is_header_selected { "▶ " } else { "  " };
+                let priority = match task.priority {
+                    TaskPriority::High => " !",
+                    TaskPriority::Medium => " ·",
+                    TaskPriority::Low => "",
+                };
+                // get_quest_status (and its bulk sibling above) already
+                // folds "has an unresolved dependency" into Blocked, so
+                // re-querying has_unresolved_task_dependencies here to OR
+                // into this can never change the result — task_status would
+                // already be Blocked in every case it could apply.
+                let is_blocked = task_status == QuestStatus::Blocked;
+                let is_blocker = !task.completed
+                    && app
                         .db
-                        .get_quest_status(&task.id.to_string(), task.completed)
-                        .ok()?;
-                    if task_status != status {
-                        return None;
-                    }
-                    let marker = if task_idx == selected_idx {
-                        "▶ "
-                    } else {
-                        "  "
-                    };
-                    let priority = match task.priority {
-                        TaskPriority::High => " !",
-                        TaskPriority::Medium => " ·",
-                        TaskPriority::Low => "",
-                    };
-                    let is_blocked = task_status == QuestStatus::Blocked
-                        || app
-                            .db
-                            .has_unresolved_task_dependencies(&task.id.to_string())
-                            .unwrap_or(false);
-                    let is_blocker = !task.completed
-                        && app
-                            .db
-                            .get_tasks_blocked_by(&task.id.to_string())
-                            .unwrap_or_default()
-                            .into_iter()
-                            .any(|dependent_id| {
-                                app.all_tasks.iter().any(|candidate| {
-                                    candidate.id.to_string() == dependent_id && !candidate.completed
-                                })
-                            });
-                    let blocker = if is_blocked {
-                        " [BLOCKED]"
-                    } else if is_blocker {
-                        " [BLOCKER]"
-                    } else {
-                        ""
-                    };
-                    let step_count = app
-                        .all_tasks
-                        .iter()
-                        .filter(|step| step.parent_task_id == Some(task.id))
-                        .count();
-                    let completed_step_count = app
-                        .all_tasks
-                        .iter()
-                        .filter(|step| step.parent_task_id == Some(task.id) && step.completed)
-                        .count();
-                    let steps = if step_count > 0 {
-                        let steps_left = step_count.saturating_sub(completed_step_count);
-                        format!(
-                            " · {} step{} ({} left)",
-                            step_count,
-                            if step_count == 1 { "" } else { "s" },
-                            steps_left
-                        )
-                    } else {
-                        String::new()
-                    };
-                    let style = if task_idx == selected_idx {
+                        .get_tasks_blocked_by(&task.id.to_string())
+                        .unwrap_or_default()
+                        .into_iter()
+                        .any(|dependent_id| {
+                            app.all_tasks.iter().any(|candidate| {
+                                candidate.id.to_string() == dependent_id && !candidate.completed
+                            })
+                        });
+                let blocker = if is_blocked {
+                    " [BLOCKED]"
+                } else if is_blocker {
+                    " [BLOCKER]"
+                } else {
+                    ""
+                };
+                let style = if is_header_selected {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(theme.selection)
+                        .add_modifier(Modifier::BOLD)
+                } else if task.completed {
+                    Style::default().fg(theme.muted)
+                } else if is_blocked {
+                    Style::default()
+                        .fg(theme.danger)
+                        .add_modifier(Modifier::BOLD)
+                } else if is_blocker {
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.text)
+                };
+
+                if is_header_selected {
+                    selected_row_in_column = Some(flat_rows.len());
+                }
+                flat_rows.push(
+                    ListItem::new(format!("{}{}{}{}", marker, task.title, priority, blocker))
+                        .style(style),
+                );
+                flat_targets.push(Some(crate::screens::hit_test::WorkspaceKanbanRow {
+                    task_idx,
+                    step_idx: None,
+                }));
+
+                // Steps nested right under their task, same checkbox language
+                // as the Ledger's step rows — every step shows (no cap): the
+                // column itself scrolls, so a long checklist just makes that
+                // card taller instead of hiding steps behind a "+N more".
+                // Up/Down can move focus onto one of them (`kanban_step_idx`)
+                // without leaving the board, highlighted the same way the
+                // header is.
+                let steps = app
+                    .all_tasks
+                    .iter()
+                    .filter(|step| step.parent_task_id == Some(task.id));
+                for (step_pos, step) in steps.enumerate() {
+                    let is_step_selected =
+                        task_idx == selected_idx && app.kanban_step_idx == Some(step_pos);
+                    let checkbox = if step.completed { "[x]" } else { "[ ]" };
+                    let step_marker = if is_step_selected { "  ▶ " } else { "    " };
+                    let step_style = if is_step_selected {
                         Style::default()
                             .fg(Color::Black)
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
-                    } else if task.completed {
-                        Style::default().fg(theme.muted)
-                    } else if is_blocked {
+                    } else if step.completed {
                         Style::default()
-                            .fg(theme.danger)
-                            .add_modifier(Modifier::BOLD)
-                    } else if is_blocker {
-                        Style::default()
-                            .fg(Color::Magenta)
-                            .add_modifier(Modifier::BOLD)
+                            .fg(theme.muted)
+                            .add_modifier(Modifier::CROSSED_OUT)
                     } else {
-                        Style::default().fg(theme.text)
+                        Style::default().fg(theme.muted)
                     };
-                    card_task_indices.push(Some(task_idx));
-                    Some(
-                        ListItem::new(format!(
-                            "{}{}{}{}{}",
-                            marker, task.title, priority, blocker, steps
-                        ))
-                        .style(style),
-                    )
-                })
-                .collect();
-            let count = cards.len();
+                    if is_step_selected {
+                        selected_row_in_column = Some(flat_rows.len());
+                    }
+                    flat_rows.push(
+                        ListItem::new(format!("{}{} {}", step_marker, checkbox, step.title))
+                            .style(step_style),
+                    );
+                    flat_targets.push(Some(crate::screens::hit_test::WorkspaceKanbanRow {
+                        task_idx,
+                        step_idx: Some(step_pos),
+                    }));
+                }
+            }
+
             let selected_in_column = tasks.get(selected_idx).and_then(|task| {
                 app.db
                     .get_quest_status(&task.id.to_string(), task.completed)
@@ -3348,7 +3444,7 @@ fn draw_quest_board(
             let title = format!(
                 " {} ({}){} ",
                 status.display_name(),
-                count,
+                card_count,
                 if content_focused { " [FOCUS]" } else { "" }
             );
             let card_block = Block::default()
@@ -3357,11 +3453,31 @@ fn draw_quest_board(
                 .border_style(Style::default().fg(border))
                 .title(title);
             let card_inner = card_block.inner(*column);
-            f.render_widget(List::new(cards).block(card_block), *column);
 
-            kanban_columns.push(crate::screens::hit_test::WorkspaceRowList {
+            // A `ListState` (instead of the plain `render_widget` this used
+            // to be) so a column with more cards/steps than fit scrolls to
+            // keep the selected card in view as Up/Down/Left/Right move
+            // `selected_idx` between and within columns — same auto-scroll
+            // Dashboard and the Adventure Log already lean on.
+            let mut list_state = ListState::default();
+            list_state.select(selected_row_in_column);
+            f.render_stateful_widget(List::new(flat_rows).block(card_block), *column, &mut list_state);
+
+            // `render_stateful_widget` may have shifted the offset to keep
+            // the selection visible — read it back rather than assuming row 0
+            // of `flat_targets` is still the top of what's on screen.
+            let visible_start = list_state.offset();
+            let row_targets: Vec<Option<crate::screens::hit_test::WorkspaceKanbanRow>> =
+                flat_targets
+                    .iter()
+                    .skip(visible_start)
+                    .take(card_inner.height as usize)
+                    .copied()
+                    .collect();
+
+            kanban_columns.push(crate::screens::hit_test::WorkspaceKanbanColumn {
                 area: card_inner,
-                row_targets: card_task_indices,
+                row_targets,
             });
         }
     }
@@ -5631,7 +5747,7 @@ pub fn draw_task_calendar(
 }
 
 // Modal sencillo para escribir la entrada de journal del día — sin mucho rollo
-fn draw_journal_modal(f: &mut Frame, content: &str, theme: &Theme) {
+fn draw_journal_modal(f: &mut Frame, is_editing: bool, content: &str, theme: &Theme) {
     let area = centered_rect(55, 30, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -5642,7 +5758,8 @@ fn draw_journal_modal(f: &mut Frame, content: &str, theme: &Theme) {
     let accent_color = theme.primary;
     let chars_used = content.chars().count();
     let chars_left = JOURNAL_ENTRY_CHAR_LIMIT.saturating_sub(chars_used);
-    let modal_title = format!(" Write Daily Chronicle (Journal) [{:03}] ", chars_left);
+    let action_label = if is_editing { "Edit" } else { "Write" };
+    let modal_title = format!(" {action_label} Daily Chronicle (Journal) [{:03}] ", chars_left);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -6264,9 +6381,13 @@ mod tests {
         let backend = TestBackend::new(52, 22);
         let mut terminal = Terminal::new(backend).unwrap();
         let tasks = app.all_tasks.iter().collect::<Vec<_>>();
+        let statuses = app
+            .db
+            .get_quest_statuses_by_project(&project_id.to_string())
+            .unwrap_or_default();
         terminal
             .draw(|frame| {
-                draw_quest_board(frame, frame.size(), &tasks, 0, &app, &theme, false);
+                draw_quest_board(frame, frame.size(), &tasks, 0, &app, &theme, false, &statuses);
             })
             .unwrap();
         terminal
