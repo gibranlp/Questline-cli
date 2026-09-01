@@ -81,6 +81,11 @@ pub struct EditorState {
     pub pending_cmd: String,
     pub show_help: bool,
     pub scroll_offset: usize,
+    /// Set whenever a yank fails to reach the OS clipboard (e.g. no wl-copy/xclip/xsel
+    /// found, or no display server reachable) — the in-app yank register still works for
+    /// p/P, but callers should surface this so the failure isn't silent. Taken (cleared)
+    /// once reported.
+    pub clipboard_error: Option<String>,
 }
 
 // ── UTF-8 helpers ─────────────────────────────────────────────────────────────
@@ -158,6 +163,7 @@ impl EditorState {
             pending_cmd: String::new(),
             show_help: false,
             scroll_offset: 0,
+            clipboard_error: None,
         }
     }
 
@@ -507,7 +513,11 @@ impl EditorState {
     pub fn set_yank_register(&mut self, text: String, is_line: bool) {
         self.yank_register = text;
         self.yank_is_line = is_line;
-        let _ = crate::services::identity::copy_to_clipboard(&self.yank_register);
+        self.clipboard_error = match crate::services::identity::copy_to_clipboard(&self.yank_register)
+        {
+            Ok(()) => None,
+            Err(e) => Some(e.to_string()),
+        };
     }
 
     // ── Normal-mode edits ─────────────────────────────────────────────────────

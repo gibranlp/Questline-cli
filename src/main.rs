@@ -456,6 +456,26 @@ fn print_cli_help() {
     println!("  --version, --help");
 }
 
+// Manda una secuencia OSC/DCS cruda a la terminal real, envolviéndola en el passthrough de
+// tmux/screen cuando aplica — sin esto, tmux y screen se comen secuencias que no reconocen,
+// así que el interior de la grilla queda pintado del color del tema pero el chrome de la
+// terminal (padding, fondo del pane) se queda con lo que sea que tuviera antes (típicamente
+// negro), dejando un "marco" que no combina con el resto del fondo.
+fn write_terminal_seq(seq: &str) {
+    if std::env::var_os("TMUX").is_some() {
+        // Passthrough de tmux (requiere `set -g allow-passthrough on` en tmux >= 3.3)
+        let escaped = seq.replace('\x1b', "\x1b\x1b");
+        print!("\x1bPtmux;{}\x1b\\", escaped);
+    } else if std::env::var_os("STY").is_some() {
+        // Passthrough DCS de GNU screen
+        let escaped = seq.replace('\x1b', "\x1b\x1b");
+        print!("\x1bP{}\x1b\\", escaped);
+    } else {
+        print!("{}", seq);
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 // Aquí empieza todo el desmadre — inicializa la terminal, corre el loop y maneja el shutdown
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -836,8 +856,7 @@ async fn main() -> Result<()> {
     let mut app = match App::new(&db_path) {
         Ok(a) => a,
         Err(e) => {
-            print!("\x1b]111\x07");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            write_terminal_seq("\x1b]111\x07");
             disable_raw_mode()?;
             execute!(
                 io::stdout(),
@@ -1012,16 +1031,13 @@ async fn main() -> Result<()> {
             // Ajusta el color de fondo de la terminal (para pintar el padding/borde)
             match theme.background {
                 Color::Rgb(r, g, b) => {
-                    print!("\x1b]11;#{:02x}{:02x}{:02x}\x07", r, g, b);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq(&format!("\x1b]11;#{:02x}{:02x}{:02x}\x07", r, g, b));
                 }
                 Color::Black => {
-                    print!("\x1b]11;#000000\x07");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq("\x1b]11;#000000\x07");
                 }
                 Color::White => {
-                    print!("\x1b]11;#ffffff\x07");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq("\x1b]11;#ffffff\x07");
                 }
                 _ => {}
             }
@@ -3085,8 +3101,7 @@ async fn main() -> Result<()> {
     app.audio_player.stop();
 
     // Restaura la terminal a su estado normal — sin esto la consola queda cagada
-    print!("\x1b]111\x07");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    write_terminal_seq("\x1b]111\x07");
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),

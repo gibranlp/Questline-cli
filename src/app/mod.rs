@@ -2747,6 +2747,10 @@ impl App {
         app.reload_hydration_config();
         if app.user.is_some() {
             app.check_new_day()?;
+            // check_new_day() may generate/insert today's daily quests; refresh_stats_cache()
+            // above already ran before they existed, so re-sync it or the dashboard shows
+            // an empty Daily section until an unrelated action happens to refresh it.
+            app.refresh_stats_cache();
             let _ = app.check_action_achievements();
         }
 
@@ -7169,6 +7173,17 @@ impl App {
             }
             ActiveScreen::Editor => {
                 self.handle_editor_key(key)?;
+                if let Some(err) = self
+                    .editor_state
+                    .as_mut()
+                    .and_then(|state| state.clipboard_error.take())
+                {
+                    self.sync_status_msg = format!("Yank did not reach clipboard: {}", err);
+                    self.notifications.push(Notification::warning(format!(
+                        "Yank saved in-editor only — couldn't reach the system clipboard: {}",
+                        err
+                    )));
+                }
             }
             ActiveScreen::Workspace => {
                 self.handle_workspace_key(key)?;
@@ -16675,6 +16690,13 @@ impl App {
                 Self::handle_task_desc_editor_key(editor, key, home_end_whole_text);
                 desc = editor.get_content();
                 desc_cursor = Self::task_desc_cursor_from_editor(editor);
+                if let Some(err) = editor.clipboard_error.take() {
+                    self.sync_status_msg = format!("Yank did not reach clipboard: {}", err);
+                    self.notifications.push(Notification::warning(format!(
+                        "Yank saved in-editor only — couldn't reach the system clipboard: {}",
+                        err
+                    )));
+                }
             }
             self.update_task_modal_state(
                 task_id,
