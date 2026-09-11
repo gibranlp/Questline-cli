@@ -8,7 +8,7 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
-Current stable version: **2.0.0**.
+Current stable version: **1.1.3**. Version **2.0.0** is in release preparation.
 
 ---
 
@@ -185,9 +185,9 @@ Every action earns XP. XP drives levels. Levels unlock class powers, new titles,
 
 ### The Treasury
 
-Every Campaign has a Treasury — a full ledger for the money behind the work. Press `4` in a Campaign workspace to open it. You get overall and per-category budgets, income and expense entries with vendors, due dates, payment dates, notes and recurrence, plus estimated, actual, and billable amounts on individual Quests.
+Every Campaign has a Treasury — a full ledger for the money behind the work. Press `4` in a Campaign workspace to open it. You get overall and per-category budgets; Spending, Savings, and Cash accounts; income, expense, and transfer entries with vendors, due dates, payment dates, notes and recurrence; plus estimated, actual, and billable amounts on individual Quests.
 
-The Treasury summarizes Budget, Income, Paid, Committed, and Available at a glance, warns at 80%, 90%, and 100% of any budget, tracks upcoming and overdue payments, and exports the whole ledger to CSV and JSON with `x`.
+The Treasury summarizes Budget, Income, Paid, Committed, Saved, and Available at a glance, warns at 80%, 90%, and 100% of any budget, tracks upcoming and overdue payments, and exports the whole ledger to CSV and JSON with `x`. Transfers move money between accounts without changing Campaign income or spending totals.
 
 Choose the currency your Campaign works in — **USD** or **MXN**:
 
@@ -197,7 +197,7 @@ Choose the currency your Campaign works in — **USD** or **MXN**:
 
 Currency is per Campaign, so different Campaigns can be kept in different currencies.
 
-Treasury keys: `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter, `s` sort, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
+Treasury keys: `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter by transaction type, `F` filter by status, `g` filter by account, `s` sort, `A` add an account, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
 
 ### Encrypted Sync and Fellowship
 
@@ -350,6 +350,30 @@ irm https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install
 cargo install questline
 ```
 
+### Upgrading from v1.1.3
+
+Install v2.0 normally and launch Questline without `--profile`. The installers
+replace only the executable; they do not remove the existing database,
+`identity.key`, or `config.toml`. The default v2.0 launch uses the same
+`questline.db` location as v1.1.3.
+
+Before the first schema migration, Questline creates and verifies a
+SQLite-consistent `questline-pre-v2.0.db` snapshot beside the live database.
+This backup includes committed WAL data and is never overwritten. The upgrade
+then adds the v2.0 tables and columns in place while retaining the user,
+Campaigns, Quests and steps, Scrolls and Codices, journals, progression,
+rituals, milestones, settings, Fellowship records, and local sync history.
+
+`--profile <name>` intentionally opens an isolated profile directory. Do not
+add that option during the first post-upgrade launch unless you want a separate,
+empty profile.
+
+If the account still uses the v1 plaintext cloud protocol, v2.0 asks which
+computer holds the authoritative copy before publishing a complete encrypted
+snapshot. Choose the computer with the fullest local data. The encrypted server
+uses a separate database, and the legacy cloud history remains available during
+the migration/rollback window until the replacement snapshot is confirmed.
+
 ---
 
 ## Community
@@ -381,7 +405,7 @@ If Questline helps you on your adventures, consider starring the repository and 
 ## Changelog
 
 ### v2.0.0 — Encrypted Fellowship
-*Released 2026-08-01*
+*Unreleased*
 
 - Private sync-v2 encrypts content with AES-256-GCM before it leaves the CLI or
   browser.
@@ -736,6 +760,30 @@ If Questline helps you on your adventures, consider starring the repository and 
 **Dashboard Layouts, Chronicle Editing, and a Bug-Fix Pass:**
 
 - **New Dashboard looks:** Press `m` on the Dashboard to switch between 4 views — the classic layout, a Journey Map (your tasks shown as a trail), Today's Agenda (tasks grouped by how urgent they are), and a Deadline Timeline (a calendar strip of what's coming up). Whichever one you pick is remembered the next time you open Questline.
+- **Consistent Dashboard deadlines:** Every Command Center layout now displays
+  due dates as `11-sep-2026`, and Quick Wins are ordered by their nearest due
+  date with undated work last.
+- **Cleaner recurring Quests:** A new occurrence carries forward only unfinished
+  steps. Completed steps remain part of the finished occurrence instead of
+  reopening in the next week, month, or year.
+- **Sync keeps moving through conflicts:** Malformed remote events are
+  selectively quarantined while valid events in the same cloud page continue
+  to apply. Handled conflicts no longer disable automatic sync.
+- **Smaller, calmer reminders:** The hydration reminder uses a compact centered
+  panel, and Notification Swarm alerts disappear after ten seconds.
+- **Treasury accounts and savings:** Every Campaign starts with Spending,
+  Savings, and Cash accounts, supports custom accounts and neutral transfers
+  between them, and shows Saved plus individual account balances. Account
+  assignments are included in encrypted sync and CSV/JSON exports. Income,
+  expense, transfer, and adjustment categories are kept separate; changing an
+  entry's type immediately switches its category choices. Built-in income
+  categories include Salary, Bonus, Freelance, Business Income, Investment
+  Income, Interest, Rental Income, Gift, Refund, and Other Income. Custom
+  categories choose their transaction type when created.
+- **Safe upgrade from v1.1.3:** The normal launch keeps using the historical
+  database, identity, and configuration paths. Before migrating the schema,
+  Questline writes and verifies a one-time `questline-pre-v2.0.db` snapshot
+  that includes committed WAL data, then preserves all legacy records in place.
 - **Edit Chronicle entries:** Press `e` on a Chronicle entry to fix or change what you wrote, instead of only being able to add new ones.
 - **Water reminders no longer interrupt you:** The hydration reminder used to be able to pop up while you were writing a note, editing a task, or typing anything else — and typing would then accidentally hit its buttons instead of your text. It now waits until you're free.
 - **Fixed a few crashes:** The app could close unexpectedly if the terminal window was too small, if a shared project got deleted while you were looking at it, or if your profile briefly went missing during a sync hiccup. All three are now handled safely.

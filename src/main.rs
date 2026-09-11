@@ -978,10 +978,6 @@ async fn main() -> Result<()> {
             }
         }
 
-        if app.quitting_after_sync && !app.sync_in_progress {
-            app.should_quit = true;
-        }
-
         if app.should_quit {
             break;
         }
@@ -1003,7 +999,7 @@ async fn main() -> Result<()> {
         app.tick_focus_session()?;
         app.tick_mpris();
         app.tick_particles();
-        app.tick_pywal_theme();
+        app.tick_dynamic_theme();
         app.tick_update_check();
         app.tick_companion_lookup();
         if !sync_busy {
@@ -1404,8 +1400,10 @@ async fn main() -> Result<()> {
                 );
             }
 
-            // Limpia notificaciones viejas cada frame — solo duran 4 segundos y bye
-            app.notifications.retain(|n| n.unlocked_at.elapsed().as_secs() < 4);
+            // Los ataques del Swarm necesitan más tiempo de lectura; el resto dura 4 segundos.
+            let notification_now = std::time::Instant::now();
+            app.notifications
+                .retain(|notification| notification.is_visible_at(notification_now));
 
             // Suena el efecto y dispara OS alert para notificaciones nuevas
             if let Some(notif) = app.notifications.last() {
@@ -1423,12 +1421,22 @@ async fn main() -> Result<()> {
                             NotificationKind::Warning => NotificationIcon::Warning,
                             NotificationKind::Swarm => NotificationIcon::NotificationSwarm,
                         };
-                        questline::services::notifications::send_system_notification_with_icon(
-                            &notif.title,
-                            &notif.message,
-                            urgent,
-                            icon,
-                        );
+                        if urgent {
+                            questline::services::notifications::send_timed_system_notification_with_icon(
+                                &notif.title,
+                                &notif.message,
+                                urgent,
+                                icon,
+                                std::time::Duration::from_secs(10),
+                            );
+                        } else {
+                            questline::services::notifications::send_system_notification_with_icon(
+                                &notif.title,
+                                &notif.message,
+                                urgent,
+                                icon,
+                            );
+                        }
                     }
                     last_notification_time = Some(notif.unlocked_at);
                 }
@@ -3110,6 +3118,12 @@ async fn main() -> Result<()> {
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
+
+    if app.quit_completed_sync {
+        println!("\n  ✓ Chronicle saved locally and synchronized.\n");
+    } else if app.should_quit {
+        println!("\n  ✓ Chronicle saved locally.\n");
+    }
 
     // Si el usuario aceptó el update, corre el installer después de limpiar la terminal
     if app.run_installer_on_exit {

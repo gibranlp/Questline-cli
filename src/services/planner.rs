@@ -191,9 +191,10 @@ pub fn generate_plan(
     let main_quest = scored.first().map(|(_, r, t)| build_scored(t, r));
     let next_quest = scored.get(1).map(|(_, r, t)| build_scored(t, r));
 
-    // Victorias rápidas: tareas sin pasos pendientes, dentro del mismo horizonte de
-    // planificación, excluyendo las ya mostradas arriba
-    let quick_wins: Vec<Task> = parent_tasks
+    // Quick Wins: tasks without pending steps, inside the planning horizon, excluding Main/Next.
+    // Sort before taking five so the Command Center always shows the nearest deadlines instead of
+    // whichever rows SQLite happened to return first. Undated work follows all dated work.
+    let mut quick_win_candidates: Vec<&Task> = parent_tasks
         .iter()
         .filter(|t| {
             within_planning_horizon(t)
@@ -201,8 +202,19 @@ pub fn generate_plan(
                 && Some(t.id) != main_id
                 && Some(t.id) != next_id
         })
+        .copied()
+        .collect();
+    quick_win_candidates.sort_by(|a, b| {
+        (a.due_date.is_none(), a.due_date)
+            .cmp(&(b.due_date.is_none(), b.due_date))
+            .then_with(|| b.priority.cmp(&a.priority))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let quick_wins: Vec<Task> = quick_win_candidates
+        .into_iter()
         .take(5)
-        .map(|t| (*t).clone())
+        .cloned()
         .collect();
 
     let estimated_minutes: u32 = parent_tasks
@@ -402,6 +414,31 @@ mod tests {
             plan.main_quest.map(|s| s.task.id),
             shortcut.map(|t| t.id),
             "the [o] shortcut must jump to the same task the dashboard displays as Main Quest"
+        );
+    }
+
+    #[test]
+    fn quick_wins_are_sorted_by_due_date_with_undated_tasks_last() {
+        let tasks = vec![
+            make_task("Main", TaskPriority::Medium, Some(-2)),
+            make_task("Next", TaskPriority::Medium, Some(-1)),
+            make_task("Due in ten days", TaskPriority::Medium, Some(10)),
+            make_task("Undated", TaskPriority::High, None),
+            make_task("Due in thirteen days", TaskPriority::Medium, Some(13)),
+            make_task("Due in eleven days", TaskPriority::Medium, Some(11)),
+        ];
+
+        let plan = generate_plan(&tasks, &[], today(), 2, 0, 100, 0, 0, Some(14));
+        let titles: Vec<&str> = plan.quick_wins.iter().map(|task| task.title.as_str()).collect();
+
+        assert_eq!(
+            titles,
+            vec![
+                "Due in ten days",
+                "Due in eleven days",
+                "Due in thirteen days",
+                "Undated",
+            ]
         );
     }
 }

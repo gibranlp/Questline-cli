@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Datelike, Duration, Utc};
 use rusqlite::{OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -10,22 +10,43 @@ use crate::database::Database;
 use crate::models::{
     BudgetUsage, BudgetWarningLevel, CampaignTotals, CampaignTreasury, CategoryBudget,
     CategoryReport, CategoryTotals, Currency, LedgerCategory, LedgerEntry, LedgerEntryType,
-    LedgerFilter, LedgerRecurrence, LedgerSort, LedgerStatus, MonthlySpending, TaskFinancials,
-    TaskPaymentStatus, TreasuryReport,
+    LedgerFilter, LedgerRecurrence, LedgerSort, LedgerStatus, MonthlySpending,
+    MonthlyTreasuryMetrics, TaskFinancials, TaskPaymentStatus, TreasuryAccount,
+    TreasuryAccountBalance, TreasuryAccountKind, TreasuryReport,
 };
 
-pub const DEFAULT_CATEGORIES: [&str; 11] = [
-    "Development",
-    "Infrastructure",
-    "Design",
-    "Marketing",
-    "Equipment",
-    "Subscriptions",
-    "Contractors",
-    "Travel",
-    "Administrative",
-    "Food",
-    "Other",
+pub const DEFAULT_CATEGORIES: [(&str, LedgerEntryType); 25] = [
+    ("Salary", LedgerEntryType::Income),
+    ("Bonus", LedgerEntryType::Income),
+    ("Freelance", LedgerEntryType::Income),
+    ("Business Income", LedgerEntryType::Income),
+    ("Investment Income", LedgerEntryType::Income),
+    ("Interest", LedgerEntryType::Income),
+    ("Rental Income", LedgerEntryType::Income),
+    ("Gift", LedgerEntryType::Income),
+    ("Refund", LedgerEntryType::Income),
+    ("Other Income", LedgerEntryType::Income),
+    ("Development", LedgerEntryType::Expense),
+    ("Infrastructure", LedgerEntryType::Expense),
+    ("Design", LedgerEntryType::Expense),
+    ("Marketing", LedgerEntryType::Expense),
+    ("Equipment", LedgerEntryType::Expense),
+    ("Subscriptions", LedgerEntryType::Expense),
+    ("Contractors", LedgerEntryType::Expense),
+    ("Travel", LedgerEntryType::Expense),
+    ("Administrative", LedgerEntryType::Expense),
+    ("Food", LedgerEntryType::Expense),
+    ("Other", LedgerEntryType::Expense),
+    ("Internal Transfer", LedgerEntryType::Transfer),
+    ("Balance Correction", LedgerEntryType::Adjustment),
+    ("Reconciliation", LedgerEntryType::Adjustment),
+    ("Other Adjustment", LedgerEntryType::Adjustment),
+];
+
+pub const DEFAULT_ACCOUNTS: [(&str, TreasuryAccountKind); 3] = [
+    ("Spending", TreasuryAccountKind::Spending),
+    ("Savings", TreasuryAccountKind::Savings),
+    ("Cash", TreasuryAccountKind::Cash),
 ];
 
 pub struct TreasuryService<'a> {
@@ -54,7 +75,14 @@ impl<'a> TreasuryService<'a> {
                 params![campaign_id.to_string()],
                 |row| row.get(0),
             )?;
-            if default_category_count as usize >= DEFAULT_CATEGORIES.len() {
+            let default_account_count: i64 = self.db.conn.query_row(
+                "SELECT COUNT(*) FROM treasury_accounts WHERE campaign_id = ?1 AND is_default = 1",
+                params![campaign_id.to_string()],
+                |row| row.get(0),
+            )?;
+            if default_category_count as usize >= DEFAULT_CATEGORIES.len()
+                && default_account_count as usize >= DEFAULT_ACCOUNTS.len()
+            {
                 return Ok(existing);
             }
         }
@@ -70,19 +98,61 @@ impl<'a> TreasuryService<'a> {
             self.db
                 .log_change("campaign_treasury", &campaign_id.to_string(), "create")?;
         }
-        for name in DEFAULT_CATEGORIES {
+        for (name, entry_type) in DEFAULT_CATEGORIES {
             let id = deterministic_category_id(campaign_id, name);
             let inserted = self.db.conn.execute(
                 "INSERT OR IGNORE INTO ledger_categories
-                 (id, campaign_id, name, is_default, version, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, 1, 1, ?4, ?4)",
-                params![id.to_string(), campaign_id.to_string(), name, now],
+                 (id, campaign_id, name, entry_type, is_default, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, 1, ?5, ?5)",
+                params![
+                    id.to_string(),
+                    campaign_id.to_string(),
+                    name,
+                    entry_type.as_str(),
+                    now
+                ],
             )?;
             if inserted > 0 {
                 self.db
                     .log_change("ledger_category", &id.to_string(), "create")?;
+            } else {
+                let updated = self.db.conn.execute(
+                    "UPDATE ledger_categories
+                     SET entry_type=?1, version=version+1, updated_at=?2
+                     WHERE id=?3 AND is_default=1 AND entry_type != ?1",
+                    params![entry_type.as_str(), now, id.to_string()],
+                )?;
+                if updated > 0 {
+                    self.db
+                        .log_change("ledger_category", &id.to_string(), "upsert")?;
+                }
             }
         }
+        for (name, kind) in DEFAULT_ACCOUNTS {
+            let id = deterministic_account_id(campaign_id, name);
+            let inserted = self.db.conn.execute(
+                "INSERT OR IGNORE INTO treasury_accounts
+                 (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, 1, ?5, ?5)",
+                params![
+                    id.to_string(),
+                    campaign_id.to_string(),
+                    name,
+                    kind.as_str(),
+                    now
+                ],
+            )?;
+            if inserted > 0 {
+                self.db
+                    .log_change("treasury_account", &id.to_string(), "create")?;
+            }
+        }
+        let spending_id = deterministic_account_id(campaign_id, "Spending");
+        self.db.conn.execute(
+            "UPDATE ledger_entries SET account_id=?1
+             WHERE campaign_id=?2 AND account_id IS NULL",
+            params![spending_id.to_string(), campaign_id.to_string()],
+        )?;
         self.get_campaign(campaign_id)?
             .ok_or_else(|| anyhow!("Treasury initialization did not persist"))
     }
@@ -208,6 +278,15 @@ impl<'a> TreasuryService<'a> {
     }
 
     pub fn create_category(&self, campaign_id: Uuid, name: &str) -> Result<LedgerCategory> {
+        self.create_category_for_type(campaign_id, name, LedgerEntryType::Expense)
+    }
+
+    pub fn create_category_for_type(
+        &self,
+        campaign_id: Uuid,
+        name: &str,
+        entry_type: LedgerEntryType,
+    ) -> Result<LedgerCategory> {
         self.ensure_campaign(campaign_id)?;
         let name = name.trim();
         if name.is_empty() {
@@ -217,12 +296,13 @@ impl<'a> TreasuryService<'a> {
         let now = Utc::now();
         self.db.conn.execute(
             "INSERT INTO ledger_categories
-             (id, campaign_id, name, is_default, version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, 0, 1, ?4, ?4)",
+             (id, campaign_id, name, entry_type, is_default, version, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, ?5)",
             params![
                 id.to_string(),
                 campaign_id.to_string(),
                 name,
+                entry_type.as_str(),
                 now.to_rfc3339()
             ],
         )?;
@@ -235,13 +315,126 @@ impl<'a> TreasuryService<'a> {
     pub fn categories(&self, campaign_id: Uuid) -> Result<Vec<LedgerCategory>> {
         self.ensure_campaign(campaign_id)?;
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, campaign_id, name, is_default, version, created_at, updated_at
+            "SELECT id, campaign_id, name, entry_type, is_default, version, created_at, updated_at
              FROM ledger_categories WHERE campaign_id = ?1
-             ORDER BY is_default DESC, name COLLATE NOCASE",
+             ORDER BY CASE entry_type WHEN 'Income' THEN 0 WHEN 'Expense' THEN 1
+                       WHEN 'Transfer' THEN 2 ELSE 3 END,
+                      is_default DESC, name COLLATE NOCASE",
         )?;
         stmt.query_map(params![campaign_id.to_string()], map_category)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    pub fn categories_for_type(
+        &self,
+        campaign_id: Uuid,
+        entry_type: LedgerEntryType,
+    ) -> Result<Vec<LedgerCategory>> {
+        Ok(self
+            .categories(campaign_id)?
+            .into_iter()
+            .filter(|category| category.entry_type == entry_type)
+            .collect())
+    }
+
+    pub fn accounts(&self, campaign_id: Uuid) -> Result<Vec<TreasuryAccount>> {
+        self.ensure_campaign(campaign_id)?;
+        let mut stmt = self.db.conn.prepare(
+            "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at
+             FROM treasury_accounts WHERE campaign_id=?1
+             ORDER BY is_default DESC,
+                      CASE kind WHEN 'Spending' THEN 0 WHEN 'Savings' THEN 1 WHEN 'Cash' THEN 2 ELSE 3 END,
+                      name COLLATE NOCASE",
+        )?;
+        stmt.query_map(params![campaign_id.to_string()], map_account)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn create_account(
+        &self,
+        campaign_id: Uuid,
+        name: &str,
+        kind: TreasuryAccountKind,
+    ) -> Result<TreasuryAccount> {
+        self.ensure_campaign(campaign_id)?;
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("Account name cannot be empty");
+        }
+        let id = Uuid::new_v4();
+        let now = Utc::now();
+        self.db.conn.execute(
+            "INSERT INTO treasury_accounts
+             (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, ?5)",
+            params![
+                id.to_string(),
+                campaign_id.to_string(),
+                name,
+                kind.as_str(),
+                now.to_rfc3339()
+            ],
+        )?;
+        self.db
+            .log_change("treasury_account", &id.to_string(), "create")?;
+        self.get_account(id)?.context("Account was not persisted")
+    }
+
+    pub fn get_account(&self, id: Uuid) -> Result<Option<TreasuryAccount>> {
+        self.db
+            .conn
+            .query_row(
+                "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at
+                 FROM treasury_accounts WHERE id=?1",
+                params![id.to_string()],
+                map_account,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn account_balances(&self, campaign_id: Uuid) -> Result<Vec<TreasuryAccountBalance>> {
+        let accounts = self.accounts(campaign_id)?;
+        let fallback = deterministic_account_id(campaign_id, "Spending");
+        let mut balances = accounts
+            .into_iter()
+            .map(|account| TreasuryAccountBalance {
+                account,
+                balance_minor: 0,
+            })
+            .collect::<Vec<_>>();
+        let mut apply = |account_id: Uuid, delta: i64| {
+            if let Some(balance) = balances
+                .iter_mut()
+                .find(|balance| balance.account.id == account_id)
+            {
+                balance.balance_minor += delta;
+            }
+        };
+        for entry in self.entries(campaign_id, &LedgerFilter::default(), LedgerSort::Oldest)? {
+            if entry.status == LedgerStatus::Cancelled || entry.status == LedgerStatus::Planned {
+                continue;
+            }
+            let source = entry.account_id.unwrap_or(fallback);
+            match (entry.entry_type, entry.status) {
+                (LedgerEntryType::Income, LedgerStatus::Approved | LedgerStatus::Paid) => {
+                    apply(source, entry.amount_minor)
+                }
+                (LedgerEntryType::Expense, LedgerStatus::Paid) => {
+                    apply(source, -entry.amount_minor)
+                }
+                (LedgerEntryType::Transfer, LedgerStatus::Paid) => {
+                    apply(source, -entry.amount_minor);
+                    if let Some(destination) = entry.transfer_account_id {
+                        apply(destination, entry.amount_minor);
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(balances)
     }
 
     pub fn set_category_budget(
@@ -257,6 +450,9 @@ impl<'a> TreasuryService<'a> {
             .get_category(category_id)?
             .filter(|category| category.campaign_id == campaign_id)
             .context("Category does not belong to this campaign")?;
+        if category.entry_type != LedgerEntryType::Expense {
+            bail!("Budgets can only be assigned to expense categories");
+        }
         let previous = self.get_category_budget(category_id)?;
         let now = Utc::now();
         self.db.conn.execute(
@@ -314,9 +510,9 @@ impl<'a> TreasuryService<'a> {
              (id, campaign_id, title, description, entry_type, category_id, amount_minor,
               currency_code, status, due_date, payment_date, vendor_source, related_task_id,
               notes, attachment_ref, recurrence, custom_recurrence, version, created_at, updated_at,
-              created_by_identity)
+              created_by_identity, account_id, transfer_account_id)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                     ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                     ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
             entry_params(&entry),
         )?;
         self.record_history(entry.campaign_id, "ledger_entry", entry.id, "created", 1)?;
@@ -353,7 +549,8 @@ impl<'a> TreasuryService<'a> {
                  currency_code=?6, status=?7, due_date=?8, payment_date=?9, vendor_source=?10,
                  related_task_id=?11, notes=?12, attachment_ref=?13, recurrence=?14,
                  custom_recurrence=?15, version=?16, updated_at=?17, created_at=?18
-             WHERE id=?19 AND version=?20",
+                 , account_id=?19, transfer_account_id=?20
+             WHERE id=?21 AND version=?22",
             params![
                 entry.title,
                 entry.description,
@@ -373,6 +570,8 @@ impl<'a> TreasuryService<'a> {
                 entry.version,
                 entry.updated_at.to_rfc3339(),
                 entry.created_at.to_rfc3339(),
+                entry.account_id.map(|id| id.to_string()),
+                entry.transfer_account_id.map(|id| id.to_string()),
                 entry.id.to_string(),
                 expected_version,
             ],
@@ -485,6 +684,63 @@ impl<'a> TreasuryService<'a> {
             committed_minor: committed,
             available_minor: income - paid - committed,
         })
+    }
+
+    /// Builds a continuous calendar-month series from the ledger. Empty months
+    /// are retained so the dashboard does not jump around when activity is sparse.
+    /// Paid movements use their payment date; open commitments use their due date.
+    pub fn monthly_metrics(
+        &self,
+        campaign_id: Uuid,
+        through: DateTime<Utc>,
+        months: usize,
+    ) -> Result<Vec<MonthlyTreasuryMetrics>> {
+        if months == 0 {
+            return Ok(Vec::new());
+        }
+        let end_month = through.year() * 12 + through.month0() as i32;
+        let start_month = end_month - months.saturating_sub(1) as i32;
+        let mut metrics = (start_month..=end_month)
+            .map(|month_index| MonthlyTreasuryMetrics {
+                month: month_key(month_index),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        for entry in self.entries(campaign_id, &LedgerFilter::default(), LedgerSort::Oldest)? {
+            let included = match (entry.entry_type, entry.status) {
+                (LedgerEntryType::Income, LedgerStatus::Approved | LedgerStatus::Paid)
+                | (LedgerEntryType::Expense, LedgerStatus::Approved | LedgerStatus::Paid) => true,
+                _ => false,
+            };
+            if !included {
+                continue;
+            }
+            let effective_date = if entry.status == LedgerStatus::Paid {
+                entry
+                    .payment_date
+                    .or(entry.due_date)
+                    .unwrap_or(entry.created_at)
+            } else {
+                entry.due_date.unwrap_or(entry.created_at)
+            };
+            let month_index = effective_date.year() * 12 + effective_date.month0() as i32;
+            if !(start_month..=end_month).contains(&month_index) {
+                continue;
+            }
+            let bucket = &mut metrics[(month_index - start_month) as usize];
+            match (entry.entry_type, entry.status) {
+                (LedgerEntryType::Income, _) => bucket.income_minor += entry.amount_minor,
+                (LedgerEntryType::Expense, LedgerStatus::Paid) => {
+                    bucket.paid_minor += entry.amount_minor
+                }
+                (LedgerEntryType::Expense, LedgerStatus::Approved) => {
+                    bucket.committed_minor += entry.amount_minor
+                }
+                _ => {}
+            }
+        }
+        Ok(metrics)
     }
 
     pub fn calculate_category_totals(&self, campaign_id: Uuid) -> Result<Vec<CategoryTotals>> {
@@ -653,6 +909,7 @@ impl<'a> TreasuryService<'a> {
             },
             LedgerSort::DueDate,
         )?;
+        let accounts = self.account_balances(campaign_id)?;
         Ok(TreasuryReport {
             campaign_id,
             generated_at: Utc::now(),
@@ -660,6 +917,7 @@ impl<'a> TreasuryService<'a> {
             totals: totals.into(),
             categories,
             monthly_spending,
+            accounts,
             outstanding_payments,
         })
     }
@@ -671,7 +929,7 @@ impl<'a> TreasuryService<'a> {
     pub fn export_csv(&self, campaign_id: Uuid) -> Result<String> {
         let entries = self.entries(campaign_id, &LedgerFilter::default(), LedgerSort::Newest)?;
         let mut output = String::from(
-            "id,title,type,category_id,amount_minor,currency,status,due_date,payment_date,vendor_source,task_id,created_at,updated_at,recorded_by\n",
+            "id,title,type,category_id,account_id,transfer_account_id,amount_minor,currency,status,due_date,payment_date,vendor_source,task_id,created_at,updated_at,recorded_by\n",
         );
         for entry in entries {
             let values = [
@@ -679,6 +937,14 @@ impl<'a> TreasuryService<'a> {
                 entry.title,
                 entry.entry_type.as_str().to_string(),
                 entry.category_id.to_string(),
+                entry
+                    .account_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+                entry
+                    .transfer_account_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
                 entry.amount_minor.to_string(),
                 entry.currency_code,
                 entry.status.as_str().to_string(),
@@ -749,6 +1015,35 @@ impl<'a> TreasuryService<'a> {
         if category.campaign_id != entry.campaign_id {
             bail!("Category does not belong to this campaign");
         }
+        if category.entry_type != entry.entry_type {
+            bail!("Category does not match the transaction type");
+        }
+        if let Some(account_id) = entry.account_id {
+            let account = self
+                .get_account(account_id)?
+                .context("Treasury account not found")?;
+            if account.campaign_id != entry.campaign_id {
+                bail!("Account does not belong to this campaign");
+            }
+        }
+        match (entry.entry_type, entry.transfer_account_id) {
+            (LedgerEntryType::Transfer, Some(destination_id)) => {
+                let destination = self
+                    .get_account(destination_id)?
+                    .context("Transfer destination account not found")?;
+                if destination.campaign_id != entry.campaign_id {
+                    bail!("Transfer destination does not belong to this campaign");
+                }
+                if entry.account_id == Some(destination_id) {
+                    bail!("Transfer source and destination must be different accounts");
+                }
+            }
+            (LedgerEntryType::Transfer, None) => {
+                bail!("Transfers require a destination account");
+            }
+            (_, Some(_)) => bail!("Only transfers may have a destination account"),
+            _ => {}
+        }
         if let Some(task_id) = entry.related_task_id {
             let project_id: Option<String> = self
                 .db
@@ -771,7 +1066,7 @@ impl<'a> TreasuryService<'a> {
         self.db
             .conn
             .query_row(
-                "SELECT id, campaign_id, name, is_default, version, created_at, updated_at
+                "SELECT id, campaign_id, name, entry_type, is_default, version, created_at, updated_at
              FROM ledger_categories WHERE id=?1",
                 params![id.to_string()],
                 map_category,
@@ -919,7 +1214,7 @@ fn ledger_select() -> &'static str {
     "SELECT id, campaign_id, title, description, entry_type, category_id, amount_minor,
             currency_code, status, due_date, payment_date, vendor_source, related_task_id,
             notes, attachment_ref, recurrence, custom_recurrence, version, created_at, updated_at,
-            created_by_identity
+            created_by_identity, account_id, transfer_account_id
      FROM ledger_entries"
 }
 
@@ -936,14 +1231,17 @@ fn map_campaign(row: &Row<'_>) -> rusqlite::Result<CampaignTreasury> {
 }
 
 fn map_category(row: &Row<'_>) -> rusqlite::Result<LedgerCategory> {
+    let entry_type: String = row.get(3)?;
     Ok(LedgerCategory {
         id: parse_uuid(row, 0)?,
         campaign_id: parse_uuid(row, 1)?,
         name: row.get(2)?,
-        is_default: row.get::<_, i32>(3)? != 0,
-        version: row.get(4)?,
-        created_at: parse_datetime(row, 5)?,
-        updated_at: parse_datetime(row, 6)?,
+        entry_type: LedgerEntryType::parse(&entry_type)
+            .ok_or_else(|| conversion_error(3, "ledger category type"))?,
+        is_default: row.get::<_, i32>(4)? != 0,
+        version: row.get(5)?,
+        created_at: parse_datetime(row, 6)?,
+        updated_at: parse_datetime(row, 7)?,
     })
 }
 
@@ -955,6 +1253,21 @@ fn map_category_budget(row: &Row<'_>) -> rusqlite::Result<CategoryBudget> {
         version: row.get(3)?,
         created_at: parse_datetime(row, 4)?,
         updated_at: parse_datetime(row, 5)?,
+    })
+}
+
+fn map_account(row: &Row<'_>) -> rusqlite::Result<TreasuryAccount> {
+    let kind: String = row.get(3)?;
+    Ok(TreasuryAccount {
+        id: parse_uuid(row, 0)?,
+        campaign_id: parse_uuid(row, 1)?,
+        name: row.get(2)?,
+        kind: TreasuryAccountKind::parse(&kind)
+            .ok_or_else(|| conversion_error(3, "treasury account kind"))?,
+        is_default: row.get::<_, i32>(4)? != 0,
+        version: row.get(5)?,
+        created_at: parse_datetime(row, 6)?,
+        updated_at: parse_datetime(row, 7)?,
     })
 }
 
@@ -986,6 +1299,8 @@ fn map_entry(row: &Row<'_>) -> rusqlite::Result<LedgerEntry> {
         created_at: parse_datetime(row, 18)?,
         updated_at: parse_datetime(row, 19)?,
         created_by_identity: row.get(20)?,
+        account_id: parse_optional_uuid(row, 21)?,
+        transfer_account_id: parse_optional_uuid(row, 22)?,
     })
 }
 
@@ -1109,6 +1424,14 @@ fn entry_params(entry: &LedgerEntry) -> rusqlite::ParamsFromIter<Vec<rusqlite::t
             .created_by_identity
             .clone()
             .map_or(Value::Null, Into::into),
+        entry
+            .account_id
+            .map(|v| v.to_string())
+            .map_or(Value::Null, Into::into),
+        entry
+            .transfer_account_id
+            .map(|v| v.to_string())
+            .map_or(Value::Null, Into::into),
     ])
 }
 
@@ -1122,6 +1445,13 @@ fn matches_filter(entry: &LedgerEntry, filter: &LedgerFilter) -> bool {
     filter
         .category_id
         .is_none_or(|value| entry.category_id == value)
+        && filter.account_id.is_none_or(|value| {
+            entry
+                .account_id
+                .unwrap_or_else(|| deterministic_account_id(entry.campaign_id, "Spending"))
+                == value
+                || entry.transfer_account_id == Some(value)
+        })
         && filter.status.is_none_or(|value| entry.status == value)
         && filter
             .entry_type
@@ -1216,6 +1546,19 @@ fn deterministic_category_id(campaign_id: Uuid, name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+fn deterministic_account_id(campaign_id: Uuid, name: &str) -> Uuid {
+    let mut digest = Sha256::new();
+    digest.update(b"treasury-account:");
+    digest.update(campaign_id.as_bytes());
+    digest.update(name.as_bytes());
+    let hash = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes.copy_from_slice(&hash[..16]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Uuid::from_bytes(bytes)
+}
+
 pub fn format_minor(value: i64) -> String {
     let sign = if value < 0 { "-" } else { "" };
     let absolute = value.unsigned_abs();
@@ -1232,6 +1575,31 @@ pub fn format_money(value_minor: i64, currency: Currency) -> String {
         group_thousands(absolute / 100),
         absolute % 100
     )
+}
+
+/// Compact monetary label for dense dashboard metrics.
+pub fn format_compact_money(value_minor: i64, currency: Currency) -> String {
+    let sign = if value_minor < 0 { "-" } else { "" };
+    let absolute = value_minor.unsigned_abs() as f64 / 100.0;
+    let (scaled, suffix) = if absolute >= 1_000_000.0 {
+        (absolute / 1_000_000.0, "m")
+    } else if absolute >= 1_000.0 {
+        (absolute / 1_000.0, "k")
+    } else {
+        return format_money(value_minor, currency);
+    };
+    let number = if scaled >= 100.0 || scaled.fract() < 0.05 {
+        format!("{scaled:.0}")
+    } else {
+        format!("{scaled:.1}")
+    };
+    format!("{sign}{}{number}{suffix}", currency.symbol())
+}
+
+fn month_key(month_index: i32) -> String {
+    let year = month_index.div_euclid(12);
+    let month = month_index.rem_euclid(12) + 1;
+    format!("{year:04}-{month:02}")
 }
 
 fn group_thousands(value: u64) -> String {
@@ -1329,18 +1697,33 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             created_by_identity: None,
+            account_id: None,
+            transfer_account_id: None,
         }
+    }
+
+    fn category_id(
+        service: &TreasuryService<'_>,
+        campaign_id: Uuid,
+        entry_type: LedgerEntryType,
+    ) -> Uuid {
+        service
+            .categories_for_type(campaign_id, entry_type)
+            .unwrap()
+            .remove(0)
+            .id
     }
 
     #[test]
     fn available_uses_confirmed_income_paid_and_committed() {
         let (_file, db, campaign_id) = test_db();
         let service = TreasuryService::new(&db);
-        let category = service.categories(campaign_id).unwrap().remove(0);
+        let income_category = category_id(&service, campaign_id, LedgerEntryType::Income);
+        let expense_category = category_id(&service, campaign_id, LedgerEntryType::Expense);
         service
             .create_entry(entry(
                 campaign_id,
-                category.id,
+                income_category,
                 LedgerEntryType::Income,
                 LedgerStatus::Paid,
                 10_000,
@@ -1349,7 +1732,7 @@ mod tests {
         service
             .create_entry(entry(
                 campaign_id,
-                category.id,
+                expense_category,
                 LedgerEntryType::Expense,
                 LedgerStatus::Paid,
                 2_500,
@@ -1358,7 +1741,7 @@ mod tests {
         service
             .create_entry(entry(
                 campaign_id,
-                category.id,
+                expense_category,
                 LedgerEntryType::Expense,
                 LedgerStatus::Approved,
                 1_500,
@@ -1367,7 +1750,7 @@ mod tests {
         service
             .create_entry(entry(
                 campaign_id,
-                category.id,
+                expense_category,
                 LedgerEntryType::Expense,
                 LedgerStatus::Planned,
                 8_000,
@@ -1385,10 +1768,141 @@ mod tests {
         let service = TreasuryService::new(&db);
         service.ensure_campaign(campaign_id).unwrap();
         service.ensure_campaign(campaign_id).unwrap();
+
+        // Simulate a Campaign created before Salary became a built-in category.
+        db.conn
+            .execute(
+                "DELETE FROM ledger_categories WHERE campaign_id=?1 AND name='Salary'",
+                params![campaign_id.to_string()],
+            )
+            .unwrap();
+        service.ensure_campaign(campaign_id).unwrap();
+
+        let categories = service.categories(campaign_id).unwrap();
+        assert_eq!(categories.len(), DEFAULT_CATEGORIES.len());
+        assert!(categories.iter().any(|category| category.name == "Salary"
+            && category.entry_type == LedgerEntryType::Income
+            && category.is_default));
+        for entry_type in LedgerEntryType::ALL {
+            assert!(
+                categories
+                    .iter()
+                    .any(|category| category.entry_type == entry_type),
+                "{entry_type:?} must have at least one category"
+            );
+        }
         assert_eq!(
-            service.categories(campaign_id).unwrap().len(),
-            DEFAULT_CATEGORIES.len()
+            service.accounts(campaign_id).unwrap().len(),
+            DEFAULT_ACCOUNTS.len()
         );
+    }
+
+    #[test]
+    fn custom_categories_are_scoped_to_their_transaction_type() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let royalties = service
+            .create_category_for_type(campaign_id, "Royalties", LedgerEntryType::Income)
+            .unwrap();
+
+        assert!(
+            service
+                .categories_for_type(campaign_id, LedgerEntryType::Income)
+                .unwrap()
+                .iter()
+                .any(|category| category.id == royalties.id)
+        );
+        assert!(
+            service
+                .categories_for_type(campaign_id, LedgerEntryType::Expense)
+                .unwrap()
+                .iter()
+                .all(|category| category.id != royalties.id)
+        );
+
+        let error = service
+            .create_entry(entry(
+                campaign_id,
+                royalties.id,
+                LedgerEntryType::Expense,
+                LedgerStatus::Paid,
+                1_000,
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn transfers_move_money_between_accounts_without_changing_campaign_totals() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let income_category = category_id(&service, campaign_id, LedgerEntryType::Income);
+        let transfer_category = category_id(&service, campaign_id, LedgerEntryType::Transfer);
+        let expense_category = category_id(&service, campaign_id, LedgerEntryType::Expense);
+        let accounts = service.accounts(campaign_id).unwrap();
+        let spending = accounts
+            .iter()
+            .find(|account| account.kind == TreasuryAccountKind::Spending)
+            .unwrap()
+            .id;
+        let savings = accounts
+            .iter()
+            .find(|account| account.kind == TreasuryAccountKind::Savings)
+            .unwrap()
+            .id;
+
+        let mut income = entry(
+            campaign_id,
+            income_category,
+            LedgerEntryType::Income,
+            LedgerStatus::Paid,
+            10_000,
+        );
+        income.account_id = Some(spending);
+        service.create_entry(income).unwrap();
+
+        let mut transfer = entry(
+            campaign_id,
+            transfer_category,
+            LedgerEntryType::Transfer,
+            LedgerStatus::Paid,
+            4_000,
+        );
+        transfer.account_id = Some(spending);
+        transfer.transfer_account_id = Some(savings);
+        service.create_entry(transfer).unwrap();
+
+        let mut expense = entry(
+            campaign_id,
+            expense_category,
+            LedgerEntryType::Expense,
+            LedgerStatus::Paid,
+            1_000,
+        );
+        expense.account_id = Some(savings);
+        service.create_entry(expense).unwrap();
+
+        let balances = service.account_balances(campaign_id).unwrap();
+        assert_eq!(
+            balances
+                .iter()
+                .find(|balance| balance.account.id == spending)
+                .unwrap()
+                .balance_minor,
+            6_000
+        );
+        assert_eq!(
+            balances
+                .iter()
+                .find(|balance| balance.account.id == savings)
+                .unwrap()
+                .balance_minor,
+            3_000
+        );
+        let totals = service.calculate_campaign_totals(campaign_id).unwrap();
+        assert_eq!(totals.income_minor, 10_000);
+        assert_eq!(totals.paid_minor, 1_000);
+        assert_eq!(totals.available_minor, 9_000);
     }
 
     #[test]
@@ -1429,13 +1943,93 @@ mod tests {
         assert_eq!(format_money(123_456_789, Currency::Mxn), "MX$1,234,567.89");
         assert_eq!(format_money(-99, Currency::Usd), "-US$0.99");
         assert_eq!(format_money(100_000, Currency::Mxn), "MX$1,000.00");
+        assert_eq!(format_compact_money(125_000, Currency::Usd), "US$1.2k");
+        assert_eq!(format_compact_money(-2_000_000, Currency::Eur), "-€20k");
+    }
+
+    #[test]
+    fn monthly_metrics_are_continuous_and_use_effective_dates() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let income_category = category_id(&service, campaign_id, LedgerEntryType::Income);
+        let expense_category = category_id(&service, campaign_id, LedgerEntryType::Expense);
+        let at = |value: &str| value.parse::<DateTime<Utc>>().unwrap();
+
+        let mut income = entry(
+            campaign_id,
+            income_category,
+            LedgerEntryType::Income,
+            LedgerStatus::Paid,
+            10_000,
+        );
+        income.created_at = at("2026-01-03T12:00:00Z");
+        income.payment_date = Some(at("2026-01-05T12:00:00Z"));
+        service.create_entry(income).unwrap();
+
+        let mut paid = entry(
+            campaign_id,
+            expense_category,
+            LedgerEntryType::Expense,
+            LedgerStatus::Paid,
+            2_500,
+        );
+        paid.created_at = at("2025-12-20T12:00:00Z");
+        paid.due_date = Some(at("2026-02-01T12:00:00Z"));
+        paid.payment_date = Some(at("2026-01-18T12:00:00Z"));
+        service.create_entry(paid).unwrap();
+
+        let mut commitment = entry(
+            campaign_id,
+            expense_category,
+            LedgerEntryType::Expense,
+            LedgerStatus::Approved,
+            3_000,
+        );
+        commitment.created_at = at("2026-01-10T12:00:00Z");
+        commitment.due_date = Some(at("2026-03-10T12:00:00Z"));
+        service.create_entry(commitment).unwrap();
+
+        let mut planned = entry(
+            campaign_id,
+            expense_category,
+            LedgerEntryType::Expense,
+            LedgerStatus::Planned,
+            99_000,
+        );
+        planned.created_at = at("2026-02-01T12:00:00Z");
+        service.create_entry(planned).unwrap();
+
+        let metrics = service
+            .monthly_metrics(campaign_id, at("2026-03-20T12:00:00Z"), 3)
+            .unwrap();
+        assert_eq!(
+            metrics
+                .iter()
+                .map(|item| item.month.as_str())
+                .collect::<Vec<_>>(),
+            ["2026-01", "2026-02", "2026-03"]
+        );
+        assert_eq!(metrics[0].income_minor, 10_000);
+        assert_eq!(metrics[0].paid_minor, 2_500);
+        assert_eq!(metrics[0].net_minor(), 7_500);
+        assert_eq!(
+            metrics[1],
+            MonthlyTreasuryMetrics {
+                month: "2026-02".into(),
+                ..Default::default()
+            }
+        );
+        assert_eq!(metrics[2].committed_minor, 3_000);
     }
 
     #[test]
     fn switching_currency_relabels_without_converting() {
         let (_file, db, campaign_id) = test_db();
         let service = TreasuryService::new(&db);
-        let category = service.categories(campaign_id).unwrap().remove(0);
+        let category = service
+            .categories_for_type(campaign_id, LedgerEntryType::Expense)
+            .unwrap()
+            .remove(0);
         let created = service
             .create_entry(entry(
                 campaign_id,
@@ -1520,6 +2114,35 @@ mod migration_tests {
             )
             .unwrap();
         assert_eq!(has_column, 1, "the migration must add created_by_identity");
+        for column in ["account_id", "transfer_account_id"] {
+            let present: i32 = db
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('ledger_entries') WHERE name=?1",
+                    params![column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "the migration must add {column}");
+        }
+        let category_type: String = db
+            .conn
+            .query_row(
+                "SELECT entry_type FROM ledger_categories WHERE id='cat1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(category_type, "Expense");
+        let has_accounts_table: i32 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='treasury_accounts'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(has_accounts_table, 1);
 
         // La fila vieja se sigue leyendo por la ruta normal del servicio.
         let entry = TreasuryService::new(&db)

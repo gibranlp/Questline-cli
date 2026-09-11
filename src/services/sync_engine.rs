@@ -686,6 +686,11 @@ impl<'a> SyncEngine<'a> {
                     .ok()
                     .flatten()
                     .and_then(|value| serde_json::to_string(&value).ok()),
+                "treasury_account" => crate::services::TreasuryService::new(self.db)
+                    .get_account(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|value| serde_json::to_string(&value).ok()),
                 "task_financials" => crate::services::TreasuryService::new(self.db)
                     .get_task_financials(uuid)
                     .ok()
@@ -1518,53 +1523,59 @@ impl<'a> SyncEngine<'a> {
             .map(|task| (task.id, task.project_id))
             .collect::<std::collections::HashMap<_, _>>();
 
-        let mut destructive_note_unlinks = 0usize;
-        let mut destructive_task_unlinks = 0usize;
-        let mut invalid_note_payloads = 0usize;
-        let mut invalid_task_payloads = 0usize;
+        // Validate each independently mutable entity before applying the page. A malformed event
+        // must not block unrelated changes that merely happen to share its cloud page.
+        let mut quarantined_events = std::collections::HashMap::<String, String>::new();
         for log in &remote_logs {
             if already_processed.contains(&log.id) || log.device_id == self.device_id {
                 continue;
             }
-            let Some(content) = log.content.as_ref() else {
-                continue;
-            };
             match log.entity_type.as_str() {
                 "note" if log.operation != "delete" => {
-                    if let Ok(remote_note) = serde_json::from_str::<Note>(content) {
-                        if remote_note.project_id.is_none() {
-                            invalid_note_payloads += 1;
-                            if let Ok(local_note) = self.db.get_note_by_id(remote_note.id) {
-                                if local_note.project_id.is_some()
-                                    && remote_note.project_id.is_none()
-                                {
-                                    destructive_note_unlinks += 1;
-                                }
+                    let reason = match log.content.as_deref() {
+                        None => Some("missing payload".to_string()),
+                        Some(content) => match serde_json::from_str::<Note>(content) {
+                            Err(error) => Some(format!("invalid payload: {error}")),
+                            Ok(remote_note) if remote_note.project_id.is_none() => {
+                                Some("missing project link".to_string())
                             }
-                        }
+                            Ok(_) => None,
+                        },
+                    };
+                    if let Some(reason) = reason {
+                        quarantined_events.insert(
+                            log.id.clone(),
+                            format!("Scroll {} quarantined: {reason}", log.entity_id),
+                        );
                     }
                 }
                 "task" if log.operation != "delete" => {
-                    if let Ok(remote_task) = serde_json::from_str::<Task>(content) {
-                        if !self.task_payload_project_is_valid(&remote_task, &remote_task_projects)
-                        {
-                            invalid_task_payloads += 1;
-                            if let Ok(local_task) = self.db.get_task_by_id(remote_task.id) {
-                                if local_task.project_id.is_some() {
-                                    destructive_task_unlinks += 1;
-                                }
+                    let reason = match log.content.as_deref() {
+                        None => Some("missing payload".to_string()),
+                        Some(content) => match serde_json::from_str::<Task>(content) {
+                            Err(error) => Some(format!("invalid payload: {error}")),
+                            Ok(remote_task)
+                                if !self.task_payload_project_is_valid(
+                                    &remote_task,
+                                    &remote_task_projects,
+                                ) =>
+                            {
+                                Some("invalid parent/project link".to_string())
                             }
-                        }
+                            Ok(_) => None,
+                        },
+                    };
+                    if let Some(reason) = reason {
+                        quarantined_events.insert(
+                            log.id.clone(),
+                            format!("Task {} quarantined: {reason}", log.entity_id),
+                        );
                     }
                 }
                 _ => {}
             }
         }
-        if destructive_note_unlinks >= 5
-            || destructive_task_unlinks >= 5
-            || invalid_note_payloads >= 5
-            || invalid_task_payloads >= 5
-        {
+        if !quarantined_events.is_empty() {
             let quarantined_to = remote_next_seq.max(
                 remote_logs
                     .iter()
@@ -1572,38 +1583,15 @@ impl<'a> SyncEngine<'a> {
                     .max()
                     .unwrap_or(since_seq),
             );
-            let last_remote_head_seq = remote_head_seq.max(quarantined_to);
-            let _ = self
-                .db
-                .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
-            let lag = last_remote_head_seq.saturating_sub(since_seq);
-            let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
-            let _ = self.db.set_setting("sync_restore_hold", "1");
-            let _ = self.db.set_setting("auto_sync", "false");
             let _ = self.db.set_setting(
                 "last_quarantined_remote_page",
                 &format!(
-                    "Quarantined remote page at seq {}..{} because it contained {} invalid scrolls, {} invalid tasks, and would unlink {} scrolls and {} tasks. Cursor held at {}; reset cloud from a clean device.",
+                    "Selectively quarantined {} invalid event(s) while processing seq {}..{}; valid events continued syncing.",
+                    quarantined_events.len(),
                     since_seq,
                     quarantined_to,
-                    invalid_note_payloads,
-                    invalid_task_payloads,
-                    destructive_note_unlinks,
-                    destructive_task_unlinks,
-                    since_seq
                 ),
             );
-            conflicts.push(format!(
-                "Remote sync page quarantined: {} invalid scrolls, {} invalid tasks",
-                invalid_note_payloads, invalid_task_payloads
-            ));
-            return Ok((
-                pushed_count,
-                pulled_count,
-                conflicts,
-                remote_downloaded,
-                remote_has_more && remote_downloaded > 0,
-            ));
         }
 
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
@@ -1623,6 +1611,14 @@ impl<'a> SyncEngine<'a> {
             }
             // Saltar eventos que ya aplicamos en un sync anterior — end del ciclo de replay infinito
             if already_processed.contains(&log.id) {
+                continue;
+            }
+
+            // Durable signed events are immutable. Quarantine a bad event once, advance beyond it,
+            // and keep syncing valid later events instead of retrying the same poisoned page.
+            if let Some(reason) = quarantined_events.get(&log.id) {
+                conflicts.push(reason.clone());
+                newly_processed_ids.push(log.id);
                 continue;
             }
 
@@ -1863,6 +1859,7 @@ impl<'a> SyncEngine<'a> {
                 "milestone" => self.incoming_entity_is_newer("milestones", &log),
                 "campaign_treasury" => self.incoming_entity_is_newer("campaign_treasury", &log),
                 "ledger_entry" => self.incoming_entity_is_newer("ledger_entries", &log),
+                "treasury_account" => self.incoming_entity_is_newer("treasury_accounts", &log),
                 "ledger_category" => self.incoming_entity_is_newer("ledger_categories", &log),
                 "category_budget" => self.incoming_entity_is_newer("category_budgets", &log),
                 "task_financials" => self.incoming_entity_is_newer("task_financials", &log),
@@ -1959,6 +1956,13 @@ impl<'a> SyncEngine<'a> {
                             self.save_local_revision_before_delete("ledger_entry", &log.entity_id);
                             let _ = self.db.conn.execute(
                                 "DELETE FROM ledger_entries WHERE id = ?1",
+                                params![log.entity_id],
+                            );
+                            pulled_count += 1;
+                        }
+                        "treasury_account" => {
+                            let _ = self.db.conn.execute(
+                                "DELETE FROM treasury_accounts WHERE id = ?1",
                                 params![log.entity_id],
                             );
                             pulled_count += 1;
@@ -2145,8 +2149,6 @@ impl<'a> SyncEngine<'a> {
                                         "Task '{}' rejected: missing project link",
                                         t.title
                                     ));
-                                    let _ = self.db.set_setting("auto_sync", "false");
-                                    let _ = self.db.set_setting("sync_restore_hold", "1");
                                     newly_processed_ids.push(log.id);
                                     continue;
                                 }
@@ -2319,8 +2321,6 @@ impl<'a> SyncEngine<'a> {
                                         "Scroll '{}' rejected: missing project link",
                                         n.title
                                     ));
-                                    let _ = self.db.set_setting("auto_sync", "false");
-                                    let _ = self.db.set_setting("sync_restore_hold", "1");
                                     newly_processed_ids.push(log.id);
                                     continue;
                                 }
@@ -2440,19 +2440,32 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "ledger_category" => {
-                            if let Ok(value) =
+                            if let Ok(mut value) =
                                 serde_json::from_str::<crate::models::LedgerCategory>(content)
                             {
+                                // Old clients do not include entry_type in their payload. Keep
+                                // canonical built-ins correctly classified when such an event
+                                // returns from another device.
+                                if value.is_default {
+                                    if let Some((_, entry_type)) =
+                                        crate::services::treasury::DEFAULT_CATEGORIES
+                                            .iter()
+                                            .find(|(name, _)| *name == value.name)
+                                    {
+                                        value.entry_type = *entry_type;
+                                    }
+                                }
                                 let stored = self.db.conn.execute(
                                     "INSERT INTO ledger_categories
-                                     (id, campaign_id, name, is_default, version, created_at, updated_at)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                     (id, campaign_id, name, entry_type, is_default, version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                                      ON CONFLICT(id) DO UPDATE SET name=excluded.name,
-                                      is_default=excluded.is_default, version=excluded.version,
+                                      entry_type=excluded.entry_type, is_default=excluded.is_default,
+                                      version=excluded.version,
                                       updated_at=excluded.updated_at",
                                     params![value.id.to_string(), value.campaign_id.to_string(), value.name,
-                                        value.is_default as i32, value.version, value.created_at.to_rfc3339(),
-                                        value.updated_at.to_rfc3339()],
+                                        value.entry_type.as_str(), value.is_default as i32, value.version,
+                                        value.created_at.to_rfc3339(), value.updated_at.to_rfc3339()],
                                 );
                                 if Self::defer_treasury_event(
                                     &log,
@@ -2490,6 +2503,32 @@ impl<'a> SyncEngine<'a> {
                                 pulled_count += 1;
                             }
                         }
+                        "treasury_account" => {
+                            if let Ok(value) =
+                                serde_json::from_str::<crate::models::TreasuryAccount>(content)
+                            {
+                                let stored = self.db.conn.execute(
+                                    "INSERT INTO treasury_accounts
+                                     (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     ON CONFLICT(id) DO UPDATE SET name=excluded.name,
+                                      kind=excluded.kind, is_default=excluded.is_default,
+                                      version=excluded.version, updated_at=excluded.updated_at",
+                                    params![value.id.to_string(), value.campaign_id.to_string(), value.name,
+                                        value.kind.as_str(), value.is_default as i32, value.version,
+                                        value.created_at.to_rfc3339(), value.updated_at.to_rfc3339()],
+                                );
+                                if Self::defer_treasury_event(
+                                    &log,
+                                    stored,
+                                    &mut conflicts,
+                                    &mut retry_from_seq,
+                                ) {
+                                    continue;
+                                }
+                                pulled_count += 1;
+                            }
+                        }
                         "ledger_entry" => {
                             if let Ok(value) =
                                 serde_json::from_str::<crate::models::LedgerEntry>(content)
@@ -2499,9 +2538,9 @@ impl<'a> SyncEngine<'a> {
                                      (id, campaign_id, title, description, entry_type, category_id, amount_minor,
                                       currency_code, status, due_date, payment_date, vendor_source, related_task_id,
                                       notes, attachment_ref, recurrence, custom_recurrence, version, created_at, updated_at,
-                                      created_by_identity)
+                                      created_by_identity, account_id, transfer_account_id)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)
                                      ON CONFLICT(id) DO UPDATE SET title=excluded.title,
                                       description=excluded.description, entry_type=excluded.entry_type,
                                       category_id=excluded.category_id, amount_minor=excluded.amount_minor,
@@ -2512,6 +2551,8 @@ impl<'a> SyncEngine<'a> {
                                       recurrence=excluded.recurrence, custom_recurrence=excluded.custom_recurrence,
                                       version=excluded.version, created_at=excluded.created_at,
                                       updated_at=excluded.updated_at,
+                                      account_id=COALESCE(excluded.account_id, ledger_entries.account_id),
+                                      transfer_account_id=excluded.transfer_account_id,
                                       created_by_identity=COALESCE(excluded.created_by_identity,
                                                                    ledger_entries.created_by_identity)",
                                     params![value.id.to_string(), value.campaign_id.to_string(), value.title,
@@ -2522,7 +2563,8 @@ impl<'a> SyncEngine<'a> {
                                         value.related_task_id.map(|id| id.to_string()), value.notes,
                                         value.attachment_ref, value.recurrence.as_str(), value.custom_recurrence,
                                         value.version, value.created_at.to_rfc3339(), value.updated_at.to_rfc3339(),
-                                        value.created_by_identity],
+                                        value.created_by_identity, value.account_id.map(|id| id.to_string()),
+                                        value.transfer_account_id.map(|id| id.to_string())],
                                 );
                                 if Self::defer_treasury_event(
                                     &log,
@@ -3319,6 +3361,7 @@ impl<'a> SyncEngine<'a> {
                     "campaign_treasury"
                         | "ledger_category"
                         | "category_budget"
+                        | "treasury_account"
                         | "ledger_entry"
                         | "task_financials"
                 )
@@ -3788,6 +3831,89 @@ mod tests {
         let saved = db.get_task_by_id(legacy_task.id).unwrap();
         assert_eq!(saved.due_date, Some(scheduled));
         assert_eq!(saved.set_date, None);
+
+        drop(db);
+        let _ = std::fs::remove_file(&temp_db_path);
+    }
+
+    #[test]
+    fn invalid_event_is_quarantined_without_stopping_valid_sync() {
+        let temp_db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_questline_selective_sync_quarantine.db");
+        let _ = std::fs::remove_file(&temp_db_path);
+        let db = Database::new(&temp_db_path).expect("Failed to create test DB");
+        db.set_setting("auto_sync", "true").unwrap();
+        db.set_setting("sync_restore_hold", "0").unwrap();
+
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Valid remote campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        let malformed_task_id = Uuid::new_v4();
+        let payload = serde_json::json!({
+            "events": [
+                {
+                    "id": "malformed-remote-task",
+                    "entity_type": "task",
+                    "entity_id": malformed_task_id.to_string(),
+                    "operation": "update",
+                    "timestamp": now.to_rfc3339(),
+                    "content": serde_json::json!({
+                        "id": malformed_task_id,
+                        "title": "Missing required Task fields"
+                    }).to_string(),
+                    "device_id": "other-device",
+                    "seq": 1
+                },
+                {
+                    "id": "valid-remote-project",
+                    "entity_type": "project",
+                    "entity_id": project.id.to_string(),
+                    "operation": "update",
+                    "timestamp": now.to_rfc3339(),
+                    "content": serde_json::to_string(&project).unwrap(),
+                    "device_id": "other-device",
+                    "seq": 2
+                }
+            ],
+            "head_seq": 2,
+            "next_seq": 2,
+            "has_more": false
+        })
+        .to_string();
+        let identity = test_identity();
+        let (_, pulled, conflicts) = SyncEngine {
+            db: &db,
+            identity: &identity,
+            device_id: "local-device",
+            provider: Box::new(StaticCloudProvider {
+                pull_payload: payload,
+            }),
+        }
+        .sync()
+        .expect("one malformed event must not fail the sync page");
+
+        assert_eq!(pulled, 1, "the valid event after the bad event was not applied");
+        assert_eq!(db.get_projects().unwrap()[0].id, project.id);
+        assert_eq!(conflicts.len(), 1);
+        assert!(conflicts[0].contains("quarantined"));
+        assert_eq!(db.get_setting("auto_sync").unwrap().as_deref(), Some("true"));
+        assert_eq!(db.get_setting("sync_restore_hold").unwrap().as_deref(), Some("0"));
+        assert_eq!(db.get_setting("last_pull_seq_v2").unwrap().as_deref(), Some("2"));
+        let processed = db.load_processed_remote_ids().unwrap();
+        assert!(processed.contains("malformed-remote-task"));
+        assert!(processed.contains("valid-remote-project"));
 
         drop(db);
         let _ = std::fs::remove_file(&temp_db_path);
@@ -4648,6 +4774,12 @@ mod tests {
         service
             .set_category_budget(campaign_id, category.id, 1_200_00)
             .unwrap();
+        let savings_account = service
+            .accounts(campaign_id)
+            .unwrap()
+            .into_iter()
+            .find(|account| account.kind == crate::models::TreasuryAccountKind::Savings)
+            .unwrap();
         let now = Utc::now();
         let entry = service
             .create_entry(crate::models::LedgerEntry {
@@ -4672,6 +4804,8 @@ mod tests {
                 created_at: now,
                 updated_at: now,
                 created_by_identity: Some(author.to_string()),
+                account_id: Some(savings_account.id),
+                transfer_account_id: None,
             })
             .unwrap();
         service
@@ -4710,7 +4844,10 @@ mod tests {
         assert!(
             categories
                 .iter()
-                .any(|item| item.id == category_id && item.name == "Smithing" && !item.is_default),
+                .any(|item| item.id == category_id
+                    && item.name == "Smithing"
+                    && item.entry_type == crate::models::LedgerEntryType::Expense
+                    && !item.is_default),
             "custom ledger category did not sync"
         );
         assert_eq!(
@@ -4739,6 +4876,11 @@ mod tests {
         assert!(entry.payment_date.is_some());
         // La autoría viaja: de ella depende que un Companion pueda tocar su movimiento.
         assert_eq!(entry.created_by_identity.as_deref(), Some(author));
+        let account = service
+            .get_account(entry.account_id.expect("entry account did not sync"))
+            .unwrap()
+            .expect("referenced account did not sync");
+        assert_eq!(account.kind, crate::models::TreasuryAccountKind::Savings);
 
         let financials = service
             .get_task_financials(entry.related_task_id.unwrap())
@@ -4789,6 +4931,7 @@ mod tests {
             "campaign_treasury",
             "ledger_category",
             "category_budget",
+            "treasury_account",
             "ledger_entry",
             "task_financials",
         ];
@@ -5197,6 +5340,7 @@ mod tests {
                     "campaign_treasury"
                         | "ledger_category"
                         | "category_budget"
+                        | "treasury_account"
                         | "ledger_entry"
                         | "task_financials"
                 )

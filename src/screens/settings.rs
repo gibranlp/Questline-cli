@@ -314,14 +314,27 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitR
         .as_ref()
         .map(|u| Theme::for_choice(selected, u.class))
         .unwrap_or_else(Theme::default_theme);
-    let pywal_missing = selected == ThemeChoice::Pywal
-        && std::env::var("HOME")
-            .map(|home| {
-                !std::path::Path::new(&home)
-                    .join(".cache/wal/colors.json")
-                    .exists()
-            })
-            .unwrap_or(true);
+    let dynamic_theme_warning = match selected {
+        ThemeChoice::SpectrumOS
+            if Theme::spectrum_palette_path()
+                .map(|path| !path.exists())
+                .unwrap_or(true) =>
+        {
+            Some("SpectrumOS palette not found; using the built-in Spectrum fallback.")
+        }
+        ThemeChoice::Pywal
+            if std::env::var("HOME")
+                .map(|home| {
+                    !std::path::Path::new(&home)
+                        .join(".cache/wal/colors.json")
+                        .exists()
+                })
+                .unwrap_or(true) =>
+        {
+            Some("Pywal palette not found: ~/.cache/wal/colors.json")
+        }
+        _ => None,
+    };
 
     let swatches = vec![
         ("Primary", preview_theme.primary),
@@ -358,9 +371,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitR
         Line::from(""),
     ];
 
-    if pywal_missing {
+    if let Some(warning) = dynamic_theme_warning {
         lines.push(Line::from(Span::styled(
-            "Pywal palette not found: ~/.cache/wal/colors.json",
+            warning,
             Style::default()
                 .fg(theme.warning)
                 .add_modifier(Modifier::BOLD),

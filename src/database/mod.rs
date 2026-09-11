@@ -4,10 +4,10 @@
 
 pub mod schema;
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc, Weekday};
-use rusqlite::{Connection, OptionalExtension, params};
-use std::path::Path;
+use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::models::{
@@ -18,6 +18,76 @@ use crate::models::{
 
 pub struct Database {
     pub conn: Connection,
+}
+
+fn sqlite_integrity_ok(path: &Path) -> Result<bool> {
+    let connection = Connection::open_with_flags(
+        path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let result: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    Ok(result == "ok")
+}
+
+/// Before the first schema upgrade of the historical default/profile database,
+/// preserve a SQLite-consistent snapshot beside it. `Connection::backup` reads
+/// through SQLite rather than copying only the main file, so committed WAL pages
+/// are included too. An existing verified snapshot is never overwritten.
+fn backup_before_schema_upgrade(
+    source: &Connection,
+    database_path: &Path,
+    from_version: i64,
+    to_version: i64,
+) -> Result<Option<PathBuf>> {
+    if from_version >= to_version
+        || database_path.file_name().and_then(|name| name.to_str()) != Some("questline.db")
+    {
+        return Ok(None);
+    }
+    let has_legacy_data: bool = source.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master
+         WHERE type='table' AND name IN ('users', 'projects', 'tasks', 'notes'))",
+        [],
+        |row| row.get::<_, i32>(0).map(|value| value != 0),
+    )?;
+    if !has_legacy_data {
+        return Ok(None);
+    }
+
+    let parent = database_path
+        .parent()
+        .context("Questline database has no parent directory")?;
+    let backup_path = parent.join("questline-pre-v2.0.db");
+    if backup_path.exists() {
+        if sqlite_integrity_ok(&backup_path)? {
+            return Ok(Some(backup_path));
+        }
+        bail!(
+            "The existing pre-v2.0 backup is not a valid SQLite database: {}",
+            backup_path.display()
+        );
+    }
+
+    let temporary_path = parent.join(format!(".questline-pre-v2.0-{}.tmp", std::process::id()));
+    if temporary_path.exists() {
+        std::fs::remove_file(&temporary_path)?;
+    }
+    let backup_result = source
+        .backup(DatabaseName::Main, &temporary_path, None)
+        .map_err(Into::into)
+        .and_then(|()| {
+            if sqlite_integrity_ok(&temporary_path)? {
+                Ok(())
+            } else {
+                bail!("The pre-v2.0 database snapshot failed its integrity check")
+            }
+        });
+    if let Err(error) = backup_result {
+        let _ = std::fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+    std::fs::rename(&temporary_path, &backup_path)?;
+    Ok(Some(backup_path))
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -379,7 +449,7 @@ impl Database {
     /// column-existence-check block below, so upgraded installs re-run that
     /// whole block once (idempotent either way) instead of it silently
     /// staying skipped forever via a stale `PRAGMA user_version`.
-    const SCHEMA_VERSION: i64 = 1;
+    const SCHEMA_VERSION: i64 = 3;
 
     pub fn database_size_bytes(&self) -> Result<u64> {
         let page_count: u64 = self
@@ -391,8 +461,24 @@ impl Database {
         Ok(page_count.saturating_mul(page_size))
     }
 
+    /// Finish a clean local save before the process exits. Writes throughout
+    /// Questline are committed immediately; this checkpoint folds committed
+    /// WAL pages back into the main database so shutdown has an explicit,
+    /// verifiable durability boundary as well.
+    pub fn flush_for_shutdown(&self) -> Result<()> {
+        self.conn.execute_batch(
+            "PRAGMA busy_timeout = 5000; PRAGMA wal_checkpoint(TRUNCATE);",
+        )?;
+        Ok(())
+    }
+
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+
+        // Read and protect the old database before CREATE TABLE or ALTER TABLE can
+        // touch it. v1.x databases have user_version 0; newer migrations advance it.
+        let schema_version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        backup_before_schema_upgrade(&conn, path, schema_version, Self::SCHEMA_VERSION)?;
 
         // WAL mode: permite lecturas concurrentes mientras el sync thread escribe — sin esto la UI puede congelarse
         conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
@@ -409,8 +495,6 @@ impl Database {
         // nothing changed does one PRAGMA read instead of eighty queries;
         // an upgrade (stored version behind Self::SCHEMA_VERSION) still runs
         // every check, same as before.
-        let schema_version: i64 =
-            conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if schema_version < Self::SCHEMA_VERSION {
         // Encrypted invitation envelopes were added after the original local schema.
         // SQLite has no portable ADD COLUMN IF NOT EXISTS, so inspect the schema first
@@ -458,7 +542,6 @@ impl Database {
                 conn.execute(migration, [])?;
             }
         }
-
         // La autoría del movimiento llegó con los permisos de tesorería por rol: las
         // filas viejas quedan sin autor y solo un Owner/Steward puede tocarlas.
         let has_ledger_author = conn.query_row(
@@ -472,6 +555,46 @@ impl Database {
                 [],
             )?;
         }
+
+        let has_category_entry_type = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ledger_categories') WHERE name = 'entry_type')",
+            [],
+            |row| row.get::<_, i32>(0),
+        )? != 0;
+        if !has_category_entry_type {
+            // All categories before v2.0 were expense-oriented. Built-in income and
+            // adjustment categories are reclassified by TreasuryService::ensure_campaign.
+            conn.execute(
+                "ALTER TABLE ledger_categories ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'Expense'",
+                [],
+            )?;
+        }
+
+        for (column, migration) in [
+            (
+                "account_id",
+                "ALTER TABLE ledger_entries ADD COLUMN account_id TEXT",
+            ),
+            (
+                "transfer_account_id",
+                "ALTER TABLE ledger_entries ADD COLUMN transfer_account_id TEXT",
+            ),
+        ] {
+            let exists = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('ledger_entries') WHERE name = ?1)",
+                params![column],
+                |row| row.get::<_, i32>(0),
+            )? != 0;
+            if !exists {
+                conn.execute(migration, [])?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_account
+                 ON ledger_entries(campaign_id, account_id);
+             CREATE INDEX IF NOT EXISTS idx_ledger_transfer_account
+                 ON ledger_entries(campaign_id, transfer_account_id);",
+        )?;
 
         // Migraciones por columna — ALTER TABLE si el campo no existe todavía (upgrades de versiones viejas)
         let has_lore_unlock_type: bool = conn.query_row(
@@ -3972,6 +4095,7 @@ impl Database {
             ("campaign_treasury", "campaign_treasury", "campaign_id"),
             ("ledger_category", "ledger_categories", "id"),
             ("category_budget", "category_budgets", "category_id"),
+            ("treasury_account", "treasury_accounts", "id"),
             ("ledger_entry", "ledger_entries", "id"),
             ("task_financials", "task_financials", "task_id"),
             ("xp_event", "xp_events", "id"),
@@ -4853,6 +4977,7 @@ impl Database {
                 OR (entity_type = 'campaign_treasury' AND entity_id = ?1)
                 OR (entity_type = 'ledger_category' AND entity_id IN (SELECT id FROM ledger_categories WHERE campaign_id = ?1))
                 OR (entity_type = 'category_budget' AND entity_id IN (SELECT category_id FROM category_budgets WHERE campaign_id = ?1))
+                OR (entity_type = 'treasury_account' AND entity_id IN (SELECT id FROM treasury_accounts WHERE campaign_id = ?1))
                 OR (entity_type = 'ledger_entry' AND entity_id IN (SELECT id FROM ledger_entries WHERE campaign_id = ?1))
                 OR (entity_type = 'task_financials' AND entity_id IN (SELECT task_id FROM task_financials WHERE campaign_id = ?1))
                 OR (entity_type = 'project_key' AND entity_id = ?1)
@@ -6809,6 +6934,153 @@ mod tests {
     use chrono::TimeZone;
 
     #[test]
+    fn schema_upgrade_creates_a_verified_backup_and_preserves_existing_data() {
+        let directory =
+            std::env::temp_dir().join(format!("questline_v1_upgrade_{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let database_path = directory.join("questline.db");
+        let backup_path = directory.join("questline-pre-v2.0.db");
+
+        // Reproduce the core v1.1.3 schema before opening it with current code.
+        // That release used SQLite's default user_version (zero).
+        let legacy = Connection::open(&database_path).unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE users (
+                    id TEXT PRIMARY KEY, username TEXT NOT NULL, class TEXT NOT NULL,
+                    level INTEGER NOT NULL DEFAULT 1, xp INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL);
+                 CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 CREATE TABLE projects (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT,
+                    created_at TEXT NOT NULL, updated_at TEXT NOT NULL DEFAULT '',
+                    archived INTEGER NOT NULL DEFAULT 0, completed INTEGER NOT NULL DEFAULT 0,
+                    owner_identity TEXT, owner_username TEXT,
+                    is_shared INTEGER NOT NULL DEFAULT 0);
+                 CREATE TABLE tasks (
+                    id TEXT PRIMARY KEY, project_id TEXT, title TEXT NOT NULL, description TEXT,
+                    due_date TEXT, set_date TEXT, completed INTEGER NOT NULL DEFAULT 0,
+                    priority TEXT NOT NULL DEFAULT 'Medium', created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT '', owner_identity TEXT,
+                    owner_username TEXT, parent_task_id TEXT,
+                    xp_awarded INTEGER NOT NULL DEFAULT 0, recurrence TEXT,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL,
+                    FOREIGN KEY(parent_task_id) REFERENCES tasks(id) ON DELETE CASCADE);
+                 CREATE TABLE notes (
+                    id TEXT PRIMARY KEY, project_id TEXT, title TEXT NOT NULL,
+                    markdown_content TEXT NOT NULL, created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    sharing_permission TEXT NOT NULL DEFAULT 'collaborative', codex_id TEXT,
+                    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE SET NULL);",
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO users (id, username, class, level, xp, created_at)
+                 VALUES ('legacy-user', 'Aria', 'Systems Architect', 17, 4242, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO projects
+                 (id, name, description, created_at, updated_at, archived, completed, is_shared)
+                 VALUES ('legacy-project', 'Old Campaign', 'Keep me', ?1, ?1, 0, 0, 0)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO tasks
+                 (id, project_id, title, description, completed, priority, created_at, updated_at,
+                  xp_awarded)
+                 VALUES ('legacy-task', 'legacy-project', 'Old Quest', 'Still here', 0, 'High',
+                         ?1, ?1, 0)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO notes
+                 (id, project_id, title, markdown_content, created_at, updated_at)
+                 VALUES ('legacy-note', 'legacy-project', 'Old Scroll', 'Preserved text', ?1, ?1)",
+                params![Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+        legacy
+            .execute("INSERT INTO settings VALUES ('theme', 'Legacy Theme')", [])
+            .unwrap();
+        legacy.execute("PRAGMA user_version = 0", []).unwrap();
+        drop(legacy);
+
+        let upgraded = Database::new(&database_path).unwrap();
+        assert!(backup_path.exists());
+        assert!(sqlite_integrity_ok(&backup_path).unwrap());
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row(
+                    "SELECT username FROM users WHERE id='legacy-user'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Aria"
+        );
+        assert_eq!(
+            upgraded.get_setting("theme").unwrap().as_deref(),
+            Some("Legacy Theme")
+        );
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM tasks WHERE id='legacy-task'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row(
+                    "SELECT markdown_content FROM notes WHERE id='legacy-note'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "Preserved text"
+        );
+        assert_eq!(
+            upgraded
+                .conn
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            Database::SCHEMA_VERSION
+        );
+
+        // The snapshot contains the original rows as well, and a second launch
+        // leaves that safety copy untouched.
+        let backup =
+            Connection::open_with_flags(&backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let backup_xp: i64 = backup
+            .query_row("SELECT xp FROM users WHERE id='legacy-user'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(backup_xp, 4242);
+        drop(backup);
+        drop(upgraded);
+        Database::new(&database_path).unwrap();
+        assert!(sqlite_integrity_ok(&backup_path).unwrap());
+
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn ritual_streak_stays_visible_until_todays_completion() {
         let db_file = Path::new("test_questline_active_ritual_streak.db");
         let _ = std::fs::remove_file(db_file);
@@ -7854,4 +8126,3 @@ mod tests {
         let _ = std::fs::remove_file(db_file);
     }
 }
-

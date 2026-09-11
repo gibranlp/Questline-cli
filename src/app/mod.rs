@@ -497,6 +497,13 @@ pub enum ModalType {
     },
     TreasuryCategory {
         name: String,
+        entry_type_idx: usize,
+        focus_idx: usize,
+    },
+    TreasuryAccount {
+        name: String,
+        kind_idx: usize,
+        focus_idx: usize,
     },
     // Divisa de trabajo de la campaña — solo cambia la denominación, no convierte importes
     TreasuryCurrency {
@@ -748,6 +755,9 @@ pub struct PaneSwipeGesture {
 type CouncilNotice = (String, String, String, String, Option<String>, bool, String);
 
 impl Notification {
+    pub const DEFAULT_DISPLAY_DURATION: std::time::Duration = std::time::Duration::from_secs(4);
+    pub const SWARM_DISPLAY_DURATION: std::time::Duration = std::time::Duration::from_secs(10);
+
     pub fn info(msg: impl Into<String>) -> Self {
         Self {
             message: msg.into(),
@@ -777,6 +787,17 @@ impl Notification {
             title,
             unlocked_at: std::time::Instant::now(),
         }
+    }
+
+    pub fn display_duration(&self) -> std::time::Duration {
+        match self.kind {
+            NotificationKind::Swarm => Self::SWARM_DISPLAY_DURATION,
+            NotificationKind::Info | NotificationKind::Warning => Self::DEFAULT_DISPLAY_DURATION,
+        }
+    }
+
+    pub fn is_visible_at(&self, now: std::time::Instant) -> bool {
+        now.saturating_duration_since(self.unlocked_at) < self.display_duration()
     }
 }
 
@@ -1047,6 +1068,7 @@ pub struct App {
     pub projects: Vec<Project>,
     pub should_quit: bool,
     pub quitting_after_sync: bool,
+    pub quit_completed_sync: bool,
 
     pub selected_project_idx: usize,
     pub projects_all_selected: bool,
@@ -1113,6 +1135,8 @@ pub struct App {
     pub selected_treasury_idx: usize,
     pub treasury_filter: crate::models::LedgerFilter,
     pub treasury_sort: crate::models::LedgerSort,
+    pub treasury_account_idx: usize,
+    pub treasury_transfer_account_idx: usize,
     pub pending_financial_completion_bypass: Option<Uuid>,
 
     pub audio_player: crate::audio::AudioPlayer,
@@ -1209,8 +1233,8 @@ pub struct App {
     pub quit_confirm_ticks: usize,
     pub intro_ticks: usize,
     pub music_scroll_ticks: usize,
-    pub last_pywal_check: Option<std::time::Instant>,
-    pub last_pywal_modified: Option<std::time::SystemTime>,
+    pub last_dynamic_theme_check: Option<std::time::Instant>,
+    pub last_dynamic_theme_modified: Option<std::time::SystemTime>,
     pub last_home_key_at: Option<std::time::Instant>,
     pub last_end_key_at: Option<std::time::Instant>,
     // Gesto horizontal en curso. Ver PaneSwipeGesture y handle_pane_swipe.
@@ -2541,6 +2565,7 @@ impl App {
             projects: Vec::new(),
             should_quit: false,
             quitting_after_sync: false,
+            quit_completed_sync: false,
 
             selected_project_idx: 0,
             projects_all_selected: true,
@@ -2589,6 +2614,8 @@ impl App {
             selected_treasury_idx: 0,
             treasury_filter: crate::models::LedgerFilter::default(),
             treasury_sort: crate::models::LedgerSort::Newest,
+            treasury_account_idx: 0,
+            treasury_transfer_account_idx: 1,
             pending_financial_completion_bypass: None,
 
             audio_player: crate::audio::AudioPlayer::new(),
@@ -2661,8 +2688,8 @@ impl App {
             quit_confirm_ticks: 0,
             intro_ticks: 0,
             music_scroll_ticks: 0,
-            last_pywal_check: None,
-            last_pywal_modified: None,
+            last_dynamic_theme_check: None,
+            last_dynamic_theme_modified: None,
             last_home_key_at: None,
             last_end_key_at: None,
             pane_swipe: None,
@@ -3249,13 +3276,13 @@ impl App {
                     focus_fields: None,
                 })
             }
-            // ui::draw_hydration_reminder_modal's own centered_rect(40, 35, area).
+            // Keep hit testing on the exact rectangle rendered by the hydration UI.
             // Its button row is Layout-split (content[5]), bottom-anchored
             // by a Min(1) spacer above it rather than a fixed line count —
             // approximated here as the last row of the popup interior,
             // which is where that Min(1) spacer settles in practice.
             ModalType::HydrationReminder => {
-                let popup = pct(40, 35, term);
+                let popup = crate::ui::hydration_reminder_area(term);
                 let popup_inner = inner(popup);
                 let text = " [d] Drink  [s] Snooze 15m  [x] Dismiss ";
                 let line_rect = Rect {
@@ -3384,7 +3411,7 @@ impl App {
                 task_modal_fields(term, *due_date_type, !is_step, show_steps, steps_count)
             }
             ModalType::TreasuryEntry { entry_id, .. } => {
-                let popup = pct(62, 48, term);
+                let popup = pct(68, 58, term);
                 let block_inner = inner(popup);
                 let line = |n: u16| Rect {
                     x: block_inner.x,
@@ -3393,13 +3420,22 @@ impl App {
                     height: 1,
                 };
                 // Title(0), Amount(2), Type(4), Status(5), Category(6),
-                // Date(8) — one blank spacer line between most fields; the
+                // Account(7), destination(8), Date(10) — the
                 // extra "Owner/Steward only" line only appears while
                 // editing, but it isn't a focus stop either way.
                 let _ = entry_id;
                 fields(
                     popup,
-                    vec![line(0), line(2), line(4), line(5), line(6), line(8)],
+                    vec![
+                        line(0),
+                        line(2),
+                        line(4),
+                        line(5),
+                        line(6),
+                        line(7),
+                        line(8),
+                        line(10),
+                    ],
                 )
             }
             ModalType::TreasuryBudget { .. } => {
@@ -3509,7 +3545,48 @@ impl App {
                 height: 5,
             }),
             ModalType::NewJournalEntry { .. } => outside_only(pct(55, 30, term)),
-            ModalType::TreasuryCategory { .. } => outside_only(pct(52, 24, term)),
+            ModalType::TreasuryCategory { .. } => {
+                let popup = pct(52, 28, term);
+                let block_inner = inner(popup);
+                fields(
+                    popup,
+                    vec![
+                        Rect {
+                            x: block_inner.x,
+                            y: block_inner.y + 2,
+                            width: block_inner.width,
+                            height: 1,
+                        },
+                        Rect {
+                            x: block_inner.x,
+                            y: block_inner.y + 4,
+                            width: block_inner.width,
+                            height: 1,
+                        },
+                    ],
+                )
+            }
+            ModalType::TreasuryAccount { .. } => {
+                let popup = pct(56, 30, term);
+                let block_inner = inner(popup);
+                fields(
+                    popup,
+                    vec![
+                        Rect {
+                            x: block_inner.x,
+                            y: block_inner.y + 2,
+                            width: block_inner.width,
+                            height: 1,
+                        },
+                        Rect {
+                            x: block_inner.x,
+                            y: block_inner.y + 4,
+                            width: block_inner.width,
+                            height: 1,
+                        },
+                    ],
+                )
+            }
             ModalType::CustomFocusDuration { .. } => outside_only(pct(40, 25, term)),
             ModalType::EditServerUrl { .. } => outside_only(pct(50, 20, content_area)),
             ModalType::RestoreIdentity { .. } => outside_only(pct(60, 35, content_area)),
@@ -3913,6 +3990,8 @@ impl App {
             | ModalType::EditTask { focus_idx, .. }
             | ModalType::TreasuryEntry { focus_idx, .. }
             | ModalType::TreasuryBudget { focus_idx, .. }
+            | ModalType::TreasuryCategory { focus_idx, .. }
+            | ModalType::TreasuryAccount { focus_idx, .. }
             | ModalType::TaskFinancials { focus_idx, .. }
             | ModalType::DailyReflection { focus_idx, .. }
             | ModalType::NewRitual { focus_idx, .. }
@@ -3999,9 +4078,9 @@ impl App {
             }
         }
 
-        // TreasuryEntry's Title/Amount rows are plain unbordered lines with
-        // a `"{label:<12} "` prefix before the value — and Amount has a
-        // currency-symbol prefix after that, whose width varies by
+        // TreasuryEntry's Title row uses exactly `"Title "`; the other rows
+        // use an aligned `"{label:<12} "` prefix. Amount also has a
+        // currency-symbol prefix, whose width varies by
         // campaign currency, fetched the same way draw_treasury_entry_modal
         // does. Both need `self` immutably, so resolved before taking any
         // mutable borrow of modal_state/overlay_modal below.
@@ -4010,7 +4089,7 @@ impl App {
                 .active_project_id
                 .and_then(|id| crate::services::TreasuryService::new(&self.db).campaign_currency(id).ok())
                 .unwrap_or_default();
-            let title_label_len = "Title".chars().count().max(12) + 1;
+            let title_label_len = "Title ".chars().count();
             let amount_label_len = format!("Amount ({})", currency.code()).chars().count().max(12) + 1;
             (title_label_len, amount_label_len + currency.symbol().chars().count())
         } else {
@@ -6443,7 +6522,17 @@ impl App {
         ) {
             return Ok(());
         }
-        let categories = crate::services::TreasuryService::new(&self.db).categories(p_id)?;
+        let categories = crate::services::TreasuryService::new(&self.db)
+            .categories_for_type(p_id, entry.entry_type)?;
+        let accounts = crate::services::TreasuryService::new(&self.db).accounts(p_id)?;
+        self.treasury_account_idx = entry
+            .account_id
+            .and_then(|id| accounts.iter().position(|account| account.id == id))
+            .unwrap_or(0);
+        self.treasury_transfer_account_idx = entry
+            .transfer_account_id
+            .and_then(|id| accounts.iter().position(|account| account.id == id))
+            .unwrap_or_else(|| if accounts.len() > 1 { 1 } else { 0 });
         let amount = crate::services::treasury::format_minor(entry.amount_minor);
         self.modal_state = ModalType::TreasuryEntry {
             entry_id: Some(entry.id),
@@ -7430,16 +7519,17 @@ impl App {
                     | KeyCode::Char('Y')
                     | KeyCode::Char('q')
                     | KeyCode::Char('Q') => {
-                        if self.auto_sync && self.config.sync_enabled && !self.sync_in_progress {
-                            // Sincroniza antes de salir — el loop detecta cuando termina y cierra
-                            self.start_background_sync();
-                            self.quitting_after_sync = true;
-                        } else {
-                            self.should_quit = true;
-                            self.modal_state = ModalType::None;
-                        }
+                        self.begin_graceful_quit();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        if self.quitting_after_sync {
+                            self.quitting_after_sync = false;
+                            self.run_installer_on_exit = false;
+                            self.sync_status_msg =
+                                "Exit canceled; the current sync will finish in the background."
+                                    .to_string();
+                            self.last_sync_status_time = Some(std::time::Instant::now());
+                        }
                         self.modal_state = ModalType::None;
                     }
                     _ => {}
@@ -7473,8 +7563,7 @@ impl App {
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Char('Y') => {
                         self.run_installer_on_exit = true;
-                        self.should_quit = true;
-                        self.modal_state = ModalType::None;
+                        self.begin_graceful_quit();
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.update_check_done = true;
@@ -14753,6 +14842,18 @@ impl App {
                     self.cycle_quest_stance(&task, p_id, false)?;
                 }
             }
+            KeyCode::Char('g') if self.workspace_tab_idx == 4 => {
+                let accounts = crate::services::TreasuryService::new(&self.db).accounts(p_id)?;
+                self.treasury_filter.account_id = match self.treasury_filter.account_id {
+                    None => accounts.first().map(|account| account.id),
+                    Some(current) => accounts
+                        .iter()
+                        .position(|account| account.id == current)
+                        .and_then(|index| accounts.get(index + 1))
+                        .map(|account| account.id),
+                };
+                self.selected_treasury_idx = 0;
+            }
             KeyCode::Char('G') if self.workspace_tab_idx == 0 => {
                 if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
                     let task = proj_tasks[self.selected_task_idx].clone();
@@ -15140,6 +15241,21 @@ impl App {
                 }
                 self.modal_state = ModalType::TreasuryCategory {
                     name: String::new(),
+                    entry_type_idx: 1,
+                    focus_idx: 0,
+                };
+            }
+            KeyCode::Char('A') if self.workspace_tab_idx == 4 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::ManageCategories,
+                ) {
+                    return Ok(());
+                }
+                self.modal_state = ModalType::TreasuryAccount {
+                    name: String::new(),
+                    kind_idx: 0,
+                    focus_idx: 0,
                 };
             }
             KeyCode::Char('p') if self.workspace_tab_idx == 4 => {
@@ -15277,6 +15393,8 @@ impl App {
                     ) {
                         return Ok(());
                     }
+                    self.treasury_account_idx = 0;
+                    self.treasury_transfer_account_idx = 1;
                     self.modal_state = ModalType::TreasuryEntry {
                         entry_id: None,
                         title: String::new(),
@@ -15392,7 +15510,7 @@ impl App {
                     }
                 }
             }
-            // f: filter tasks
+            // f: filter tasks or Treasury transaction types
             KeyCode::Char('f') => {
                 if self.workspace_tab_idx == 0 {
                     self.task_filter = match self.task_filter.as_str() {
@@ -15409,21 +15527,38 @@ impl App {
                     };
                     self.selected_task_idx = 0;
                 } else if self.workspace_tab_idx == 4 {
-                    self.treasury_filter.status = match self.treasury_filter.status {
-                        None => Some(crate::models::LedgerStatus::Planned),
-                        Some(crate::models::LedgerStatus::Planned) => {
-                            Some(crate::models::LedgerStatus::Approved)
+                    self.treasury_filter.entry_type = match self.treasury_filter.entry_type {
+                        None => Some(crate::models::LedgerEntryType::Income),
+                        Some(crate::models::LedgerEntryType::Income) => {
+                            Some(crate::models::LedgerEntryType::Expense)
                         }
-                        Some(crate::models::LedgerStatus::Approved) => {
-                            Some(crate::models::LedgerStatus::Paid)
+                        Some(crate::models::LedgerEntryType::Expense) => {
+                            Some(crate::models::LedgerEntryType::Transfer)
                         }
-                        Some(crate::models::LedgerStatus::Paid) => {
-                            Some(crate::models::LedgerStatus::Cancelled)
+                        Some(crate::models::LedgerEntryType::Transfer) => {
+                            Some(crate::models::LedgerEntryType::Adjustment)
                         }
                         _ => None,
                     };
                     self.selected_treasury_idx = 0;
                 }
+            }
+            // Shift+F keeps the pre-existing status filter available independently.
+            KeyCode::Char('F') if self.workspace_tab_idx == 4 => {
+                self.treasury_filter.status = match self.treasury_filter.status {
+                    None => Some(crate::models::LedgerStatus::Planned),
+                    Some(crate::models::LedgerStatus::Planned) => {
+                        Some(crate::models::LedgerStatus::Approved)
+                    }
+                    Some(crate::models::LedgerStatus::Approved) => {
+                        Some(crate::models::LedgerStatus::Paid)
+                    }
+                    Some(crate::models::LedgerStatus::Paid) => {
+                        Some(crate::models::LedgerStatus::Cancelled)
+                    }
+                    _ => None,
+                };
+                self.selected_treasury_idx = 0;
             }
             // s: sort tasks or share note
             KeyCode::Char('s') => {
@@ -15880,10 +16015,21 @@ impl App {
                                 financials.actual_cost_minor = Some(amount);
                                 service.set_task_financials(&financials)?;
                                 let category = service
-                                    .categories(project_id)?
+                                    .categories_for_type(
+                                        project_id,
+                                        crate::models::LedgerEntryType::Expense,
+                                    )?
                                     .into_iter()
                                     .find(|category| category.name == "Other")
                                     .context("Default treasury category is missing")?;
+                                let account_id = service
+                                    .accounts(project_id)?
+                                    .into_iter()
+                                    .find(|account| {
+                                        account.kind
+                                            == crate::models::TreasuryAccountKind::Spending
+                                    })
+                                    .map(|account| account.id);
                                 let now = Utc::now();
                                 service.create_entry(crate::models::LedgerEntry {
                                     id: Uuid::new_v4(),
@@ -15907,6 +16053,8 @@ impl App {
                                     created_at: now,
                                     updated_at: now,
                                     created_by_identity: Some(self.identity.public_key.clone()),
+                                    account_id,
+                                    transfer_account_id: None,
                                 })?;
                             } else if selected_idx == 2 {
                                 financials.estimated_cost_minor = None;
@@ -15932,7 +16080,8 @@ impl App {
                 let mut target_idx = target_idx;
                 let mut focus_idx = focus_idx;
                 let service = crate::services::TreasuryService::new(&self.db);
-                let categories = service.categories(project_id)?;
+                let categories = service
+                    .categories_for_type(project_id, crate::models::LedgerEntryType::Expense)?;
                 match key.code {
                     KeyCode::Esc => self.modal_state = ModalType::None,
                     KeyCode::Tab | KeyCode::Up | KeyCode::Down => focus_idx = (focus_idx + 1) % 2,
@@ -16112,17 +16261,36 @@ impl App {
                     focus_idx,
                 };
             }
-            ModalType::TreasuryCategory { ref name } => {
+            ModalType::TreasuryCategory {
+                ref name,
+                entry_type_idx,
+                focus_idx,
+            } => {
                 let mut name = name.clone();
+                let mut entry_type_idx = entry_type_idx.min(3);
+                let mut focus_idx = focus_idx.min(1);
                 match key.code {
                     KeyCode::Esc => self.modal_state = ModalType::None,
-                    KeyCode::Backspace => {
+                    KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                        focus_idx = (focus_idx + 1) % 2;
+                    }
+                    KeyCode::Left if focus_idx == 1 => {
+                        entry_type_idx = (entry_type_idx + 3) % 4;
+                    }
+                    KeyCode::Right if focus_idx == 1 => {
+                        entry_type_idx = (entry_type_idx + 1) % 4;
+                    }
+                    KeyCode::Backspace if focus_idx == 0 => {
                         name.pop();
                     }
-                    KeyCode::Char(character) if name.chars().count() < 40 => name.push(character),
+                    KeyCode::Char(character) if focus_idx == 0 && name.chars().count() < 40 => {
+                        name.push(character)
+                    }
+                    KeyCode::Enter if focus_idx == 0 => focus_idx = 1,
                     KeyCode::Enter if !name.trim().is_empty() => {
+                        let entry_type = crate::models::LedgerEntryType::ALL[entry_type_idx];
                         crate::services::TreasuryService::new(&self.db)
-                            .create_category(project_id, &name)?;
+                            .create_category_for_type(project_id, &name, entry_type)?;
                         self.mark_dirty();
                         self.modal_state = ModalType::None;
                         self.notifications
@@ -16132,7 +16300,62 @@ impl App {
                     _ => {}
                 }
                 if self.modal_state != ModalType::None {
-                    self.modal_state = ModalType::TreasuryCategory { name };
+                    self.modal_state = ModalType::TreasuryCategory {
+                        name,
+                        entry_type_idx,
+                        focus_idx,
+                    };
+                }
+            }
+            ModalType::TreasuryAccount {
+                ref name,
+                kind_idx,
+                focus_idx,
+            } => {
+                let mut name = name.clone();
+                let mut kind_idx = kind_idx.min(crate::models::TreasuryAccountKind::ALL.len() - 1);
+                let mut focus_idx = focus_idx.min(1);
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
+                        focus_idx = (focus_idx + 1) % 2
+                    }
+                    KeyCode::Left if focus_idx == 1 => {
+                        kind_idx = (kind_idx + crate::models::TreasuryAccountKind::ALL.len() - 1)
+                            % crate::models::TreasuryAccountKind::ALL.len();
+                    }
+                    KeyCode::Right if focus_idx == 1 => {
+                        kind_idx = (kind_idx + 1) % crate::models::TreasuryAccountKind::ALL.len();
+                    }
+                    KeyCode::Backspace if focus_idx == 0 => {
+                        name.pop();
+                    }
+                    KeyCode::Char(character)
+                        if focus_idx == 0 && name.chars().count() < 40 =>
+                    {
+                        name.push(character)
+                    }
+                    KeyCode::Enter if focus_idx == 0 => focus_idx = 1,
+                    KeyCode::Enter if !name.trim().is_empty() => {
+                        crate::services::TreasuryService::new(&self.db).create_account(
+                            project_id,
+                            &name,
+                            crate::models::TreasuryAccountKind::ALL[kind_idx],
+                        )?;
+                        self.mark_dirty();
+                        self.modal_state = ModalType::None;
+                        self.notifications
+                            .push(Notification::info("Treasury account created.".to_string()));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if self.modal_state != ModalType::None {
+                    self.modal_state = ModalType::TreasuryAccount {
+                        name,
+                        kind_idx,
+                        focus_idx,
+                    };
                 }
             }
             ModalType::TreasuryCurrency { selected_idx } => {
@@ -17474,13 +17697,16 @@ impl App {
         mut date_val: String,
         mut focus_idx: usize,
     ) -> Result<()> {
-        let categories = crate::services::TreasuryService::new(&self.db).categories(project_id)?;
+        let entry_types = crate::models::LedgerEntryType::ALL;
+        let categories = crate::services::TreasuryService::new(&self.db)
+            .categories_for_type(project_id, entry_types[entry_type_idx.min(3)])?;
+        let accounts = crate::services::TreasuryService::new(&self.db).accounts(project_id)?;
         title_cursor = title_cursor.min(title.len());
         amount_cursor = amount_cursor.min(amount.len());
         // El campo Date siempre está disponible — al crear nace en "hoy", al editar en la
         // fecha ya guardada. Se mueve un día a la vez con ←/→ (step_date_val); reasentar el
         // día de un movimiento existente sigue exigiendo permiso de Owner/Steward al guardar.
-        let field_count = 6;
+        let field_count = 8;
         match key.code {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
@@ -17490,8 +17716,14 @@ impl App {
             KeyCode::BackTab | KeyCode::Up => {
                 focus_idx = (focus_idx + field_count - 1) % field_count
             }
-            KeyCode::Left if focus_idx == 2 => entry_type_idx = (entry_type_idx + 3) % 4,
-            KeyCode::Right if focus_idx == 2 => entry_type_idx = (entry_type_idx + 1) % 4,
+            KeyCode::Left if focus_idx == 2 => {
+                entry_type_idx = (entry_type_idx + 3) % 4;
+                category_idx = 0;
+            }
+            KeyCode::Right if focus_idx == 2 => {
+                entry_type_idx = (entry_type_idx + 1) % 4;
+                category_idx = 0;
+            }
             KeyCode::Left if focus_idx == 3 => status_idx = (status_idx + 3) % 4,
             KeyCode::Right if focus_idx == 3 => status_idx = (status_idx + 1) % 4,
             KeyCode::Left if focus_idx == 4 && !categories.is_empty() => {
@@ -17500,8 +17732,23 @@ impl App {
             KeyCode::Right if focus_idx == 4 && !categories.is_empty() => {
                 category_idx = (category_idx + 1) % categories.len();
             }
-            KeyCode::Left if focus_idx == 5 => date_val = step_date_val(&date_val, -1),
-            KeyCode::Right if focus_idx == 5 => date_val = step_date_val(&date_val, 1),
+            KeyCode::Left if focus_idx == 5 && !accounts.is_empty() => {
+                self.treasury_account_idx =
+                    (self.treasury_account_idx + accounts.len() - 1) % accounts.len();
+            }
+            KeyCode::Right if focus_idx == 5 && !accounts.is_empty() => {
+                self.treasury_account_idx = (self.treasury_account_idx + 1) % accounts.len();
+            }
+            KeyCode::Left if focus_idx == 6 && !accounts.is_empty() => {
+                self.treasury_transfer_account_idx =
+                    (self.treasury_transfer_account_idx + accounts.len() - 1) % accounts.len();
+            }
+            KeyCode::Right if focus_idx == 6 && !accounts.is_empty() => {
+                self.treasury_transfer_account_idx =
+                    (self.treasury_transfer_account_idx + 1) % accounts.len();
+            }
+            KeyCode::Left if focus_idx == 7 => date_val = step_date_val(&date_val, -1),
+            KeyCode::Right if focus_idx == 7 => date_val = step_date_val(&date_val, 1),
             KeyCode::Left if focus_idx == 0 => {
                 if title_cursor > 0 {
                     title_cursor -= 1;
@@ -17590,12 +17837,6 @@ impl App {
                         return Ok(());
                     }
                 };
-                let entry_types = [
-                    crate::models::LedgerEntryType::Income,
-                    crate::models::LedgerEntryType::Expense,
-                    crate::models::LedgerEntryType::Transfer,
-                    crate::models::LedgerEntryType::Adjustment,
-                ];
                 let statuses = [
                     crate::models::LedgerStatus::Planned,
                     crate::models::LedgerStatus::Approved,
@@ -17603,6 +17844,41 @@ impl App {
                     crate::models::LedgerStatus::Cancelled,
                 ];
                 let status = statuses[status_idx.min(3)];
+                let entry_type = entry_types[entry_type_idx.min(3)];
+                let account_id = accounts
+                    .get(self.treasury_account_idx.min(accounts.len().saturating_sub(1)))
+                    .map(|account| account.id);
+                let transfer_account_id = (entry_type == crate::models::LedgerEntryType::Transfer)
+                    .then(|| {
+                        accounts
+                            .get(
+                                self.treasury_transfer_account_idx
+                                    .min(accounts.len().saturating_sub(1)),
+                            )
+                            .map(|account| account.id)
+                    })
+                    .flatten();
+                if entry_type == crate::models::LedgerEntryType::Transfer
+                    && (account_id.is_none() || account_id == transfer_account_id)
+                {
+                    self.notifications.push(Notification::warning(
+                        "Choose two different accounts for a transfer.".to_string(),
+                    ));
+                    focus_idx = 6;
+                    self.modal_state = ModalType::TreasuryEntry {
+                        entry_id,
+                        title,
+                        title_cursor,
+                        amount,
+                        amount_cursor,
+                        entry_type_idx,
+                        status_idx,
+                        category_idx,
+                        date_val,
+                        focus_idx,
+                    };
+                    return Ok(());
+                }
                 // El campo de estado no puede ser una puerta trasera a aprobar o pagar:
                 // quien no tiene esos permisos solo puede dejar el movimiento en Planned.
                 if !status.is_open() {
@@ -17634,10 +17910,12 @@ impl App {
                         .get_entry(entry_id)?
                         .context("Treasury entry is no longer available")?;
                     entry.title = title.trim().to_string();
-                    entry.entry_type = entry_types[entry_type_idx.min(3)];
+                    entry.entry_type = entry_type;
                     entry.category_id = categories[category_idx.min(categories.len() - 1)].id;
                     entry.amount_minor = amount_minor;
                     entry.status = status;
+                    entry.account_id = account_id;
+                    entry.transfer_account_id = transfer_account_id;
                     entry.payment_date = if status == crate::models::LedgerStatus::Paid {
                         entry.payment_date.or(Some(now))
                     } else {
@@ -17672,7 +17950,7 @@ impl App {
                                                 .with_timezone(&Local)
                                                 .format("%Y-%m-%d")
                                                 .to_string(),
-                                            focus_idx: 5,
+                                            focus_idx: 7,
                                         };
                                         return Ok(());
                                     }
@@ -17694,7 +17972,7 @@ impl App {
                                     status_idx,
                                     category_idx,
                                     date_val,
-                                    focus_idx: 5,
+                                    focus_idx: 7,
                                 };
                                 return Ok(());
                             }
@@ -17711,7 +17989,7 @@ impl App {
                         campaign_id: project_id,
                         title: title.trim().to_string(),
                         description: String::new(),
-                        entry_type: entry_types[entry_type_idx.min(3)],
+                        entry_type,
                         category_id: categories[category_idx.min(categories.len() - 1)].id,
                         amount_minor,
                         currency_code: service.campaign_currency(project_id)?.code().to_string(),
@@ -17728,6 +18006,8 @@ impl App {
                         created_at,
                         updated_at: now,
                         created_by_identity: Some(self.identity.public_key.clone()),
+                        account_id,
+                        transfer_account_id,
                     })?;
                 }
                 self.mark_dirty();
@@ -17921,7 +18201,7 @@ impl App {
         };
         let next_steps = source_steps
             .iter()
-            .filter(|step| step.parent_task_id == Some(source.id))
+            .filter(|step| step.parent_task_id == Some(source.id) && !step.completed)
             .map(|step| Task {
                 id: Uuid::new_v4(),
                 project_id: source.project_id,
@@ -17961,7 +18241,7 @@ impl App {
         self.db.insert_task_tree(&next_task, &next_steps)?;
         let recurrence = source.recurrence.expect("recurrence checked above");
         self.notifications.push(Notification::info(format!(
-            "Quest recurring! Next {} occurrence queued for {} with {} reusable step{}.",
+            "Quest recurring! Next {} occurrence queued for {} with {} unfinished step{} carried forward.",
             recurrence.name(),
             next_due.with_timezone(&Local).format("%Y-%m-%d"),
             next_steps.len(),
@@ -21272,6 +21552,15 @@ impl App {
                         }
                         self.last_sync_status_time = Some(std::time::Instant::now());
                         let _ = self.reload_data();
+                        if self.quitting_after_sync {
+                            self.quitting_after_sync = false;
+                            self.run_installer_on_exit = false;
+                            self.modal_state = ModalType::None;
+                            self.notifications.push(Notification::warning(
+                                "Exit paused because cloud sync failed. Your data is saved locally; press [q] to retry."
+                                    .to_string(),
+                            ));
+                        }
                     }
                     None => {
                         self.sync_failure_count = 0;
@@ -21282,14 +21571,17 @@ impl App {
                             self.auto_sync = false;
                         }
                         if !self.sync_conflicts.is_empty() {
-                            self.pause_auto_sync("Auto Sync disabled after sync conflicts.");
                             self.notifications.push(Notification::warning(format!(
-                                "{} sync conflict(s) detected — automatic sync paused",
+                                "{} sync conflict(s) resolved or quarantined — automatic sync continues",
                                 self.sync_conflicts.len()
                             )));
                         }
                         self.last_sync_warlock_xp = 0;
-                        self.sync_status_msg = format!("↑{}↓{}", bg.pushed, bg.pulled);
+                        self.sync_status_msg = if self.sync_conflicts.is_empty() {
+                            format!("↑{}↓{}", bg.pushed, bg.pulled)
+                        } else {
+                            format!("↑{}↓{} · {} handled", bg.pushed, bg.pulled, self.sync_conflicts.len())
+                        };
                         if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
                             self.modal_state = ModalType::SyncProgress {
                                 step: 2,
@@ -21303,6 +21595,29 @@ impl App {
                         self.load_chapter_progress_from_cache();
                         self.great_chronicle_entries =
                             self.db.get_global_chronicle_entries().unwrap_or_default();
+                        if self.quitting_after_sync {
+                            match self.db.flush_for_shutdown() {
+                                Ok(()) => {
+                                    self.quitting_after_sync = false;
+                                    self.quit_completed_sync = true;
+                                    self.should_quit = true;
+                                    self.modal_state = ModalType::None;
+                                }
+                                Err(e) => {
+                                    self.quitting_after_sync = false;
+                                    self.run_installer_on_exit = false;
+                                    self.sync_status_msg =
+                                        format!("Final local save failed: {}", e);
+                                    self.last_sync_status_time =
+                                        Some(std::time::Instant::now());
+                                    self.modal_state = ModalType::None;
+                                    self.notifications.push(Notification::warning(
+                                        "Exit paused because the final local save could not be verified."
+                                            .to_string(),
+                                    ));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -21891,6 +22206,74 @@ impl App {
         self.do_background_sync(false);
     }
 
+    /// Save all local state and, when automatic cloud sync is enabled, wait
+    /// for a final sync result before allowing the event loop to terminate.
+    /// A sync or checkpoint failure deliberately leaves the app open so the
+    /// user can see the error and retry instead of losing that feedback.
+    fn begin_graceful_quit(&mut self) {
+        let editor_is_dirty = self
+            .editor_state
+            .as_ref()
+            .map(|state| state.has_unsaved_changes())
+            .unwrap_or(false);
+        if editor_is_dirty {
+            if let Err(e) = self.save_editor_note(false, true) {
+                self.modal_state = ModalType::None;
+                self.run_installer_on_exit = false;
+                self.sync_status_msg = format!("Final local save failed: {}", e);
+                self.last_sync_status_time = Some(std::time::Instant::now());
+                self.notifications.push(Notification::warning(
+                    "Exit paused because the open Scroll could not be saved.".to_string(),
+                ));
+                return;
+            }
+        }
+
+        // An already-running sync owns a second SQLite connection. Do not
+        // contend with it for a checkpoint; wait for its result and perform
+        // the final checkpoint after that connection has been dropped.
+        if self.auto_sync && self.config.sync_enabled && self.sync_in_progress {
+            self.should_quit = false;
+            self.quitting_after_sync = true;
+            self.sync_status_msg = "Finishing cloud sync before exit…".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            if !matches!(self.modal_state, ModalType::QuitConfirm { .. }) {
+                self.modal_state = ModalType::QuitConfirm {
+                    quote: "The Chronicle is sealing every page before departure.".to_string(),
+                };
+            }
+            return;
+        }
+
+        if let Err(e) = self.db.flush_for_shutdown() {
+            self.modal_state = ModalType::None;
+            self.run_installer_on_exit = false;
+            self.sync_status_msg = format!("Final local save failed: {}", e);
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            self.notifications.push(Notification::warning(
+                "Exit paused because the local save could not be verified.".to_string(),
+            ));
+            return;
+        }
+
+        if self.auto_sync && self.config.sync_enabled {
+            self.should_quit = false;
+            self.quitting_after_sync = true;
+            self.sync_status_msg = "Saving locally and syncing before exit…".to_string();
+            self.last_sync_status_time = Some(std::time::Instant::now());
+            if !matches!(self.modal_state, ModalType::QuitConfirm { .. }) {
+                self.modal_state = ModalType::QuitConfirm {
+                    quote: "The Chronicle is sealing every page before departure.".to_string(),
+                };
+            }
+            self.start_background_sync();
+        } else {
+            self.quit_completed_sync = false;
+            self.should_quit = true;
+            self.modal_state = ModalType::None;
+        }
+    }
+
     fn pause_auto_sync(&mut self, reason: &str) {
         self.auto_sync = false;
         let _ = self.db.set_setting("auto_sync", "false");
@@ -22373,14 +22756,12 @@ impl App {
         self.db
             .set_setting("equipped_theme", crate::theme::Theme::theme_key(choice))?;
         self.theme_service.set_theme_choice(choice);
-        if choice == ThemeChoice::Pywal {
-            if let Some(modified) = Self::pywal_colors_modified() {
-                self.last_pywal_modified = Some(modified);
-            }
+        if matches!(choice, ThemeChoice::Pywal | ThemeChoice::SpectrumOS) {
+            self.last_dynamic_theme_modified = Self::dynamic_theme_modified(choice);
         } else {
-            self.last_pywal_modified = None;
+            self.last_dynamic_theme_modified = None;
         }
-        self.last_pywal_check = Some(std::time::Instant::now());
+        self.last_dynamic_theme_check = Some(std::time::Instant::now());
         self.selected_settings_theme_idx = crate::theme::Theme::all_choices()
             .iter()
             .position(|c| *c == choice)
@@ -22580,31 +22961,38 @@ impl App {
         Ok(())
     }
 
-    fn pywal_colors_modified() -> Option<std::time::SystemTime> {
-        let home = std::env::var("HOME").ok()?;
-        std::fs::metadata(std::path::Path::new(&home).join(".cache/wal/colors.json"))
-            .ok()?
-            .modified()
-            .ok()
+    fn dynamic_theme_modified(choice: ThemeChoice) -> Option<std::time::SystemTime> {
+        match choice {
+            ThemeChoice::SpectrumOS => crate::theme::Theme::spectrum_palette_modified(),
+            ThemeChoice::Pywal => {
+                let home = std::env::var("HOME").ok()?;
+                std::fs::metadata(std::path::Path::new(&home).join(".cache/wal/colors.json"))
+                    .ok()?
+                    .modified()
+                    .ok()
+            }
+            _ => None,
+        }
     }
 
-    pub fn tick_pywal_theme(&mut self) {
-        if self.theme_service.choice() != ThemeChoice::Pywal {
+    pub fn tick_dynamic_theme(&mut self) {
+        let choice = self.theme_service.choice();
+        if !matches!(choice, ThemeChoice::Pywal | ThemeChoice::SpectrumOS) {
             return;
         }
-        if let Some(last) = self.last_pywal_check {
+        if let Some(last) = self.last_dynamic_theme_check {
             if last.elapsed() < std::time::Duration::from_millis(750) {
                 return;
             }
         }
-        self.last_pywal_check = Some(std::time::Instant::now());
+        self.last_dynamic_theme_check = Some(std::time::Instant::now());
 
-        let Some(modified) = Self::pywal_colors_modified() else {
+        let Some(modified) = Self::dynamic_theme_modified(choice) else {
             return;
         };
-        if Some(modified) != self.last_pywal_modified {
-            self.last_pywal_modified = Some(modified);
-            self.theme_service.set_theme_choice(ThemeChoice::Pywal);
+        if Some(modified) != self.last_dynamic_theme_modified {
+            self.last_dynamic_theme_modified = Some(modified);
+            self.theme_service.set_theme_choice(choice);
         }
     }
 
@@ -24609,7 +24997,7 @@ mod app_tests {
     }
 
     #[test]
-    fn recurring_quest_copies_steps_and_resets_completion() {
+    fn recurring_quest_carries_only_unfinished_steps() {
         let now = Utc::now();
         let source_id = Uuid::new_v4();
         let source = Task {
@@ -24629,7 +25017,7 @@ mod app_tests {
             xp_awarded: true,
             recurrence: Some(RecurrenceType::Weekly),
         };
-        let source_step = Task {
+        let completed_step = Task {
             id: Uuid::new_v4(),
             title: "Review calendar".to_string(),
             description: Some("Look for conflicts".to_string()),
@@ -24642,9 +25030,23 @@ mod app_tests {
             recurrence: None,
             ..source.clone()
         };
+        let unfinished_step = Task {
+            id: Uuid::new_v4(),
+            title: "Prepare new agenda".to_string(),
+            description: Some("Carry this work into next week".to_string()),
+            due_date: None,
+            set_date: Some(now + chrono::Duration::days(2)),
+            completed: false,
+            priority: TaskPriority::Medium,
+            parent_task_id: Some(source_id),
+            xp_awarded: false,
+            recurrence: None,
+            ..source.clone()
+        };
 
         let (next, steps, next_due) =
-            App::build_next_recurring_quest(&source, &[source_step], now).unwrap();
+            App::build_next_recurring_quest(&source, &[completed_step, unfinished_step], now)
+                .unwrap();
 
         assert_eq!(next_due, now + chrono::Duration::days(7));
         assert!(!next.completed);
@@ -24652,11 +25054,11 @@ mod app_tests {
         assert_eq!(next.set_date, None);
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].parent_task_id, Some(next.id));
-        assert_eq!(steps[0].title, "Review calendar");
+        assert_eq!(steps[0].title, "Prepare new agenda");
         assert!(!steps[0].completed);
         assert!(!steps[0].xp_awarded);
         assert_eq!(steps[0].recurrence, None);
-        assert_eq!(steps[0].due_date, Some(now + chrono::Duration::days(8)));
+        assert_eq!(steps[0].due_date, Some(now + chrono::Duration::days(9)));
         assert_eq!(steps[0].set_date, None);
     }
 
@@ -24772,6 +25174,22 @@ mod app_tests {
 
         let already_labeled = Notification::swarm("Again.", "Notification Swarm");
         assert_eq!(already_labeled.title, "Notification Swarm");
+    }
+
+    #[test]
+    fn test_swarm_notifications_remain_visible_for_ten_seconds() {
+        let swarm = Notification::swarm("Still here.", "Notification Swarm");
+        assert!(swarm.is_visible_at(
+            swarm.unlocked_at + std::time::Duration::from_millis(9_999)
+        ));
+        assert!(!swarm.is_visible_at(
+            swarm.unlocked_at + std::time::Duration::from_secs(10)
+        ));
+
+        let info = Notification::info("Short bulletin.");
+        assert!(!info.is_visible_at(
+            info.unlocked_at + std::time::Duration::from_secs(4)
+        ));
     }
 
     #[test]
@@ -27502,7 +27920,10 @@ mod app_tests {
             .unwrap();
         let service = crate::services::TreasuryService::new(&app.db);
         service.ensure_campaign(project_id).unwrap();
-        let category = service.categories(project_id).unwrap().remove(0);
+        let category = service
+            .categories_for_type(project_id, crate::models::LedgerEntryType::Expense)
+            .unwrap()
+            .remove(0);
         // Movimiento asentado por otra persona: nunca es "propio" para quien prueba.
         let now = Utc::now();
         let foreign = service
@@ -27528,6 +27949,8 @@ mod app_tests {
                 created_at: now,
                 updated_at: now,
                 created_by_identity: Some("someone-else".to_string()),
+                account_id: None,
+                transfer_account_id: None,
             })
             .unwrap();
         app.projects = app.db.get_projects().unwrap();
@@ -27567,6 +27990,159 @@ mod app_tests {
     }
 
     #[test]
+    fn treasury_filter_shortcuts_cycle_type_and_status_independently() {
+        let db_file = Path::new("test_questline_treasury_filter_shortcuts.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Owner");
+        app.selected_treasury_idx = 8;
+
+        for expected in [
+            Some(crate::models::LedgerEntryType::Income),
+            Some(crate::models::LedgerEntryType::Expense),
+            Some(crate::models::LedgerEntryType::Transfer),
+            Some(crate::models::LedgerEntryType::Adjustment),
+            None,
+        ] {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char('f'),
+                KeyModifiers::empty(),
+            ))
+            .unwrap();
+            assert_eq!(app.treasury_filter.entry_type, expected);
+            assert_eq!(app.selected_treasury_idx, 0);
+        }
+
+        for expected in [
+            Some(crate::models::LedgerStatus::Planned),
+            Some(crate::models::LedgerStatus::Approved),
+            Some(crate::models::LedgerStatus::Paid),
+            Some(crate::models::LedgerStatus::Cancelled),
+            None,
+        ] {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char('F'),
+                KeyModifiers::SHIFT,
+            ))
+            .unwrap();
+            assert_eq!(app.treasury_filter.status, expected);
+        }
+        let account_ids = crate::services::TreasuryService::new(&app.db)
+            .accounts(project_id)
+            .unwrap()
+            .into_iter()
+            .map(|account| account.id)
+            .collect::<Vec<_>>();
+        for expected in account_ids.into_iter().map(Some).chain(std::iter::once(None)) {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::empty(),
+            ))
+            .unwrap();
+            assert_eq!(app.treasury_filter.account_id, expected);
+        }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_can_create_savings_accounts_and_record_account_transfers() {
+        let db_file = Path::new("test_questline_treasury_accounts.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Owner");
+
+        app.handle_key_event(KeyEvent::new(
+            KeyCode::Char('A'),
+            KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        for character in "Rainy Day".chars() {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::empty(),
+            ))
+            .unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        let accounts = crate::services::TreasuryService::new(&app.db)
+            .accounts(project_id)
+            .unwrap();
+        assert!(accounts.iter().any(|account| {
+            account.name == "Rainy Day"
+                && account.kind == crate::models::TreasuryAccountKind::Savings
+        }));
+
+        app.treasury_account_idx = 1;
+        app.treasury_transfer_account_idx = 0;
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: "Move savings to spending".into(),
+            title_cursor: 24,
+            amount: "25.00".into(),
+            amount_cursor: 5,
+            entry_type_idx: 2,
+            status_idx: 2,
+            category_idx: 0,
+            date_val: Local::now().format("%Y-%m-%d").to_string(),
+            focus_idx: 7,
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        let transfer = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter {
+                    entry_type: Some(crate::models::LedgerEntryType::Transfer),
+                    ..Default::default()
+                },
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap()
+            .remove(0);
+        assert_eq!(transfer.account_id, Some(accounts[1].id));
+        assert_eq!(transfer.transfer_account_id, Some(accounts[0].id));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_can_create_an_income_category() {
+        let db_file = Path::new("test_questline_treasury_income_category.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Owner");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()))
+            .unwrap();
+        for character in "Royalties".chars() {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::empty(),
+            ))
+            .unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        let income_categories = crate::services::TreasuryService::new(&app.db)
+            .categories_for_type(project_id, crate::models::LedgerEntryType::Income)
+            .unwrap();
+        assert!(income_categories.iter().any(|category| {
+            category.name == "Royalties"
+                && category.entry_type == crate::models::LedgerEntryType::Income
+        }));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn companion_cannot_approve_settle_budget_or_switch_currency() {
         let db_file = Path::new("test_questline_treasury_companion.db");
         let (mut app, project_id, entry_id) = treasury_role_app(db_file, "Companion");
@@ -27575,6 +28151,7 @@ mod app_tests {
             ('p', "settle"),
             ('B', "budgets"),
             ('c', "categories"),
+            ('A', "categories"),
             ('$', "currency"),
         ] {
             app.notifications.clear();
@@ -27672,8 +28249,8 @@ mod app_tests {
             ModalType::TreasuryEntry { ref amount, .. } => assert_eq!(amount, "321"),
             ref other => panic!("expected the entry modal to stay open, got {other:?}"),
         }
-        // Los Enter restantes recorren Type/Status/Category/Date y guardan.
-        for _ in 0..5 {
+        // Los Enter restantes recorren Type/Status/Category/Accounts/Date y guardan.
+        for _ in 0..7 {
             app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
                 .unwrap();
         }
@@ -27715,7 +28292,7 @@ mod app_tests {
             status_idx: 0,
             category_idx,
             date_val: Local::now().date_naive().format("%Y-%m-%d").to_string(),
-            focus_idx: 5,
+            focus_idx: 7,
         };
         // Dos días atrás.
         app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
@@ -27789,7 +28366,7 @@ mod app_tests {
             status_idx: 2, // Paid
             category_idx: 0,
             date_val: String::new(),
-            focus_idx: 5, // Date is now the last field — Enter here attempts the save.
+            focus_idx: 7, // Date is the last field — Enter here attempts the save.
         };
 
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -27878,7 +28455,7 @@ mod app_tests {
             status_idx: 0,
             category_idx: 0,
             date_val: "2020-01-15".to_string(),
-            focus_idx: 5,
+            focus_idx: 7,
         };
         app.notifications.clear();
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -27909,7 +28486,10 @@ mod app_tests {
         let db_file = Path::new("test_questline_treasury_companion_reschedule.db");
         let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
         let service = crate::services::TreasuryService::new(&app.db);
-        let category = service.categories(project_id).unwrap().remove(0);
+        let category = service
+            .categories_for_type(project_id, crate::models::LedgerEntryType::Expense)
+            .unwrap()
+            .remove(0);
         let now = Utc::now();
         let mine = service
             .create_entry(crate::models::LedgerEntry {
@@ -27934,6 +28514,8 @@ mod app_tests {
                 created_at: now,
                 updated_at: now,
                 created_by_identity: Some(app.identity.public_key.clone()),
+                account_id: None,
+                transfer_account_id: None,
             })
             .unwrap();
 
@@ -27948,7 +28530,7 @@ mod app_tests {
             status_idx: 0,
             category_idx: 0,
             date_val: "2020-01-15".to_string(),
-            focus_idx: 5,
+            focus_idx: 7,
         };
         app.notifications.clear();
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
@@ -28889,6 +29471,86 @@ mod app_tests {
         assert_eq!(app.modal_state, ModalType::None);
         assert!(app.should_quit);
 
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quit_waits_for_running_sync_and_stays_open_on_failure() {
+        let db_file = Path::new("test_questline_quit_running_sync.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.auto_sync = true;
+        app.config.sync_enabled = true;
+        app.sync_in_progress = true;
+        app.modal_state = ModalType::QuitConfirm {
+            quote: "The Chronicle waits.".to_string(),
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(app.quitting_after_sync);
+        assert!(!app.should_quit, "an active sync must not be abandoned");
+        assert!(matches!(app.modal_state, ModalType::QuitConfirm { .. }));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+        assert!(!app.quitting_after_sync);
+        assert!(!app.should_quit);
+        assert_eq!(app.modal_state, ModalType::None);
+
+        app.modal_state = ModalType::QuitConfirm {
+            quote: "The Chronicle waits.".to_string(),
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()))
+            .unwrap();
+
+        *app.sync_result.lock().unwrap() = Some(BackgroundSyncResult {
+            pushed: 0,
+            pulled: 0,
+            conflicts: Vec::new(),
+            error: Some("network unavailable".to_string()),
+        });
+        app.tick_auto_sync().unwrap();
+
+        assert!(!app.sync_in_progress);
+        assert!(!app.quitting_after_sync);
+        assert!(!app.should_quit, "a failed final sync must pause exit");
+        assert_eq!(app.modal_state, ModalType::None);
+        assert!(app.sync_status_msg.contains("network unavailable"));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn successful_final_sync_is_the_only_sync_path_that_exits() {
+        let db_file = Path::new("test_questline_quit_sync_success.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.auto_sync = true;
+        app.config.sync_enabled = true;
+        app.sync_in_progress = true;
+        app.quitting_after_sync = true;
+        app.modal_state = ModalType::QuitConfirm {
+            quote: "The Chronicle waits.".to_string(),
+        };
+        *app.sync_result.lock().unwrap() = Some(BackgroundSyncResult {
+            pushed: 2,
+            pulled: 1,
+            conflicts: Vec::new(),
+            error: None,
+        });
+
+        app.tick_auto_sync().unwrap();
+
+        assert!(!app.sync_in_progress);
+        assert!(!app.quitting_after_sync);
+        assert!(app.should_quit);
+        assert!(app.quit_completed_sync);
+        assert_eq!(app.modal_state, ModalType::None);
+
+        drop(app);
         let _ = std::fs::remove_file(db_file);
     }
 
@@ -31552,7 +32214,11 @@ mod app_tests {
             focus_idx: 0,
         };
         let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
-        assert_eq!(fields.len(), 6, "Title/Amount/Type/Status/Category/Date");
+        assert_eq!(
+            fields.len(),
+            8,
+            "Title/Amount/Type/Status/Category/Account/To Account/Date"
+        );
         let amount_field = fields[1]; // second focus stop
 
         left_click(&mut app, amount_field.x, amount_field.y, KeyModifiers::empty());
@@ -31719,6 +32385,47 @@ mod app_tests {
             ModalType::TreasuryEntry { focus_idx, amount_cursor, .. } => {
                 assert_eq!(*focus_idx, 1);
                 assert_eq!(*amount_cursor, 3);
+            }
+            other => panic!("expected TreasuryEntry, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_title_click_mapping_uses_the_single_space_label_gap() {
+        let db_file = Path::new("test_questline_modal_cursor_treasury_title.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: "Monthly salary".to_string(),
+            title_cursor: 0,
+            amount: "0.00".to_string(),
+            amount_cursor: 0,
+            entry_type_idx: 0,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2026-09-11".to_string(),
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let title_field = fields[0];
+        // "Title " is exactly 6 cells. Click after "Monthly" in the value.
+        left_click(
+            &mut app,
+            title_field.x + 6 + 7,
+            title_field.y,
+            KeyModifiers::empty(),
+        );
+
+        match &app.modal_state {
+            ModalType::TreasuryEntry {
+                focus_idx,
+                title_cursor,
+                ..
+            } => {
+                assert_eq!(*focus_idx, 0);
+                assert_eq!(*title_cursor, 7);
             }
             other => panic!("expected TreasuryEntry, got {other:?}"),
         }

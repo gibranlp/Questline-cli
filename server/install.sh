@@ -5,7 +5,7 @@
 set -euo pipefail
 
 INSTALL_DIR="${HOME}/.local/bin"
-CONFIG_DIR="${HOME}/.config/questline"
+CONFIG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/questline"
 BASE_URL="https://github.com/gibranlp/Questline-cli/releases/latest/download"
 
 BOLD='\033[1m'
@@ -24,7 +24,10 @@ echo -e "  ${DIM}─────────────────────
 OS_RAW="$(uname -s)"
 case "${OS_RAW}" in
   Linux*)  OS="linux"  ;;
-  Darwin*) OS="macos"  ;;
+  Darwin*)
+    OS="macos"
+    CONFIG_DIR="${HOME}/Library/Application Support/questline"
+    ;;
   *)
     echo -e "  ${RED}Error: Unsupported OS: ${OS_RAW}${RESET}"
     echo -e "  For Windows, use: irm https://raw.githubusercontent.com/gibranlp/Questline-cli/main/server/install.ps1 | iex"
@@ -63,6 +66,10 @@ echo ""
 # Crear directorios de instalación y config — si ya existen no pasa nada
 mkdir -p "${INSTALL_DIR}"
 mkdir -p "${CONFIG_DIR}"
+
+if [ -f "${CONFIG_DIR}/questline.db" ]; then
+  echo -e "  ${GREEN}✓ Existing Questline data found${RESET} — v2.0 will preserve and migrate it on first launch"
+fi
 
 # ── Helpers de la barra de progreso — pura cosmética pero se ve chido ─────────
 _file_bytes() {

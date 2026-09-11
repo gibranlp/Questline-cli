@@ -14,7 +14,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use super::default_layout;
-use super::{priority_label, short_text, sidequest_rank, task_energy_tag};
+use super::{format_due_date, priority_label, short_text, sidequest_rank, task_energy_tag};
 use crate::app::App;
 use crate::models::Task;
 use crate::screens::hit_test::DeadlineTimelineHitRegions;
@@ -203,13 +203,9 @@ fn draw_deadline_list(
         if item.action_idx == app.selected_dashboard_task_idx {
             selected_visual_idx = Some(rows.len());
         }
-        let due_str = item
-            .task
-            .due_date
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "no date".to_string());
+        let due_str = format_due_date(item.task.due_date);
         rows.push(ListItem::new(Line::from(vec![
-            Span::styled(format!("{:>10} ", due_str), Style::default().fg(theme.focus_timer)),
+            Span::styled(format!("{:>11} ", due_str), Style::default().fg(theme.focus_timer)),
             Span::styled(format!("{} ", short_text(&item.project_name, 14)), Style::default().fg(theme.muted)),
             Span::styled(format!("[{}] ", prio_label), Style::default().fg(prio_color)),
             Span::styled(item.task.title.as_str(), Style::default().fg(theme.text)),

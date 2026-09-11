@@ -11,24 +11,16 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
-fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(r);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
+/// Compact fixed-size reminder that clamps safely inside small terminals.
+pub fn hydration_reminder_area(area: Rect) -> Rect {
+    let width = 46.min(area.width);
+    let height = 10.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
 }
 
 fn progress_bar(filled: usize, width: usize) -> String {
@@ -44,7 +36,7 @@ pub fn draw_hydration_reminder_modal(
     target: i32,
     _theme: &Theme,
 ) {
-    let modal_area = centered_rect(40, 35, area);
+    let modal_area = hydration_reminder_area(area);
     let hydration_bg = Color::Rgb(7, 25, 48);
     let hydration_border = Color::Rgb(56, 189, 248);
     let hydration_title = Color::Rgb(224, 242, 254);
@@ -120,4 +112,22 @@ pub fn draw_hydration_reminder_modal(
         .alignment(Alignment::Center),
         content[5],
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hydration_reminder_area;
+    use ratatui::layout::Rect;
+
+    #[test]
+    fn hydration_reminder_is_compact_centered_and_clamped() {
+        assert_eq!(
+            hydration_reminder_area(Rect::new(0, 0, 120, 40)),
+            Rect::new(37, 15, 46, 10)
+        );
+        assert_eq!(
+            hydration_reminder_area(Rect::new(4, 2, 30, 8)),
+            Rect::new(4, 2, 30, 8)
+        );
+    }
 }

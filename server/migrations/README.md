@@ -57,12 +57,25 @@ server-code deployment only and requires no migration beyond the current `005`.
 
 ## Durable event-signature cutover
 
-Apply `006_signed_sync_events.sql` before deploying signed clients. During the
-compatibility window, accounts without a cutover row may still contain unsigned
-history. A trusted client cuts an account over by replacing its encrypted
-snapshot: every replacement event must carry a valid Ed25519 signature, and the
-server atomically sets `account_v2_security.signatures_required = 1`. After that
-point the server rejects unsigned writes and clients reject unsigned pulls.
+For an existing sync-v2 database, apply these migrations in order before
+deploying signed clients:
+
+1. Apply `006_signed_sync_events.sql` to add durable author signatures and the
+   per-account signature cutover state.
+2. Apply `007_widen_signed_entity_ids.sql` to widen compound Fellowship entity
+   IDs. This migration removes only truncated compound rows that can no longer
+   pass signature or AES-GCM verification; an authoritative trusted device must
+   perform one full sync afterward to republish them.
+
+Migration `001_sync_v2.sql` already includes both schema changes for a brand-new
+database, so do not reapply `006` or `007` after a fresh bootstrap.
+
+During the compatibility window, accounts without a cutover row may still
+contain unsigned history. A trusted client cuts an account over by replacing
+its encrypted snapshot: every replacement event must carry a valid Ed25519
+signature, and the server atomically sets
+`account_v2_security.signatures_required = 1`. After that point the server
+rejects unsigned writes and clients reject unsigned pulls.
 
 Do not set the cutover flag manually. Replacing the snapshot retires the old
 unsigned rows without invalidating signed Fellowship history copied between

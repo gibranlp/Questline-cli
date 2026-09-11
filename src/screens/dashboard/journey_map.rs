@@ -8,12 +8,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use super::default_layout;
-use super::{priority_label, short_text, sidequest_rank, task_energy_tag, workload_label};
+use super::{format_due_date, priority_label, short_text, sidequest_rank, task_energy_tag, workload_label};
 use crate::app::{App, DashboardCommandTarget};
 use crate::screens::hit_test::JourneyMapHitRegions;
 use crate::services::planner::{DashboardPlan, format_duration};
 use crate::theme::Theme;
-use chrono::Local;
 use ratatui::{
     Frame,
     layout::{Constraint, Direction, Layout, Rect},
@@ -161,6 +160,10 @@ fn draw_waypoint_list(
             Span::styled("▲ HERE ", Style::default().fg(theme.warning)),
             Span::styled(format!("{} ", short_text(&main.project_name, 14)), Style::default().fg(theme.muted)),
             Span::styled(format!("[{}] ", prio_label), Style::default().fg(prio_color)),
+            Span::styled(
+                format!("[{}] ", format_due_date(main.task.due_date)),
+                Style::default().fg(theme.focus_timer),
+            ),
             Span::styled(main.task.title.as_str(), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(format!("  {}", format_duration(main.est_minutes)), Style::default().fg(theme.muted)),
         ])));
@@ -177,6 +180,10 @@ fn draw_waypoint_list(
             Span::styled("○ NEXT ", Style::default().fg(theme.focus_timer)),
             Span::styled(format!("{} ", short_text(&next.project_name, 14)), Style::default().fg(theme.muted)),
             Span::styled(format!("[{}] ", prio_label), Style::default().fg(prio_color)),
+            Span::styled(
+                format!("[{}] ", format_due_date(next.task.due_date)),
+                Style::default().fg(theme.focus_timer),
+            ),
             Span::styled(next.task.title.as_str(), Style::default().fg(theme.text)),
             Span::styled(format!("  {}", format_duration(next.est_minutes)), Style::default().fg(theme.muted)),
         ])));
@@ -201,6 +208,10 @@ fn draw_waypoint_list(
             Span::styled("● ", Style::default().fg(theme.primary)),
             Span::styled(format!("{} ", short_text(project_name, 14)), Style::default().fg(theme.muted)),
             Span::styled(format!("[{}] ", prio_label), Style::default().fg(prio_color)),
+            Span::styled(
+                format!("[{}] ", format_due_date(task.due_date)),
+                Style::default().fg(theme.focus_timer),
+            ),
             Span::styled(task.title.as_str(), Style::default().fg(theme.text)),
             Span::styled(format!(" [{}]", energy_label), Style::default().fg(energy_color)),
         ])));
@@ -310,10 +321,7 @@ fn draw_waypoint_detail(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             Span::styled(short_text(&task.title, 30), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
             Span::styled(format!(" ({})", short_text(project_name, 14)), Style::default().fg(theme.muted)),
         ]));
-        let due_label = task
-            .due_date
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "None".to_string());
+        let due_label = format_due_date(task.due_date);
         lines.push(Line::from(vec![
             Span::styled("  Due: ", Style::default().fg(theme.muted)),
             Span::styled(due_label, Style::default().fg(theme.text)),

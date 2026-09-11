@@ -9,8 +9,58 @@ permissions:
   contents: write
 
 jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: webapp/package-lock.json
+
+      - name: Install system test dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config php-cli shellcheck
+
+      - name: Verify release versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          cargo_version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          web_version="$(node -p "require('./webapp/package.json').version")"
+          server_version="$(node -p "require('./server/version.json').version")"
+          test "$release_version" = "$cargo_version"
+          test "$release_version" = "$web_version"
+          test "$release_version" = "$server_version"
+
+      - name: Test Rust application
+        run: cargo test --locked --all-targets -- --test-threads=1
+
+      - name: Test and build web application
+        working-directory: webapp
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Validate PHP and shell scripts
+        shell: bash
+        run: |
+          find server webapp/api scripts -type f -name '*.php' -print0 | xargs -0 -n1 php -l
+          shellcheck scripts/*.sh
+
   build:
     name: Build ${{ matrix.artifact }}
+    needs: validate
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,6 +69,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             artifact: questline-linux-x86_64
+            binary: questline
+
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: questline-linux-aarch64
             binary: questline
 
           - os: windows-latest
@@ -61,7 +116,7 @@ jobs:
           sudo apt-get install -y libdbus-1-dev libasound2-dev pkg-config
 
       - name: Compilar
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --target ${{ matrix.target }}
 
       - name: Copiar binario con el nombre final (Unix)
         if: runner.os != 'Windows'
@@ -94,6 +149,7 @@ jobs:
           generate_release_notes: true
           files: |
             questline-linux-x86_64
+            questline-linux-aarch64
             questline-windows-x86_64.exe
             questline-macos-x86_64
             questline-macos-arm64

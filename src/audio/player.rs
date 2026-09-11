@@ -5,7 +5,7 @@
 use crate::audio::state::{AudioState, PlaybackStatus};
 use crate::audio::streams::build_source;
 use rodio::{OutputStream, Sink, Source};
-#[cfg(not(target_os = "windows"))]
+#[cfg(all(not(target_os = "windows"), not(test)))]
 use souvlaki::{MediaControlEvent, MediaControls, MediaMetadata, MediaPlayback, PlatformConfig};
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -51,7 +51,21 @@ impl Default for AudioPlayer {
 }
 
 impl AudioPlayer {
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self {
+            _stream: None,
+            handle: None,
+            sink: Arc::new(Mutex::new(None)),
+            state: Arc::new(Mutex::new(AudioState::new())),
+            cinematic_sink: Arc::new(Mutex::new(None)),
+            spectrum: crate::audio::spectrum::new_spectrum_data(),
+            playing_effects: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
     // inicializa el sistema de audio — si falla, el app sigue en modo silencioso, no truena
+    #[cfg(not(test))]
     pub fn new() -> Self {
         let state = Arc::new(Mutex::new(AudioState::new()));
 
@@ -442,7 +456,7 @@ impl AudioPlayer {
     }
 
     // integración con MPRIS para que los controles de media del sistema funcionen con Questline
-    #[cfg(not(target_os = "windows"))]
+    #[cfg(all(not(target_os = "windows"), not(test)))]
     fn init_mpris(&self) {
         let state_clone = self.state.clone();
         let sink_clone = self.sink.clone();
@@ -613,6 +627,7 @@ impl AudioPlayer {
     }
 }
 
+#[cfg(all(not(target_os = "windows"), not(test)))]
 fn mpris_display_title(current_title: &str) -> String {
     let cleaned = current_title
         .strip_prefix("Local: ")

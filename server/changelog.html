@@ -74,7 +74,7 @@
       <div style="display:flex;align-items:baseline;gap:1rem;margin-bottom:0.75rem;">
         <span style="font-size:1.1rem;font-weight:bold;animation:cycleColor 9s linear infinite;">v2.0.0</span>
         <span style="font-size:0.82rem;color:var(--text-dim);letter-spacing:0.15em;text-transform:uppercase;">— Encrypted Fellowship</span>
-        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-08-01</span>
+        <span style="font-size:0.78rem;color:#444;letter-spacing:0.1em;margin-left:auto;">2026-09-11</span>
       </div>
       <div class="term">
         <pre style="margin-top:0.5rem;line-height:2;">
@@ -251,6 +251,45 @@
   same key once per change it carries — both now ask once, and remember the
   answer.
 
+  <span class="hi">The Command Center learned to read the calendar, not merely fear it.</span>
+
+  Every layout now carries a Quest's due date in a compact, unmistakable hand,
+  and Quick Wins line up by the day they are owed. A recurring Quest no longer
+  resurrects work already finished: only the steps left undone cross into the
+  next occurrence. Yesterday's victories remain victories.
+
+  The Treasury learned to remember seasons as well as sums. Month-by-month
+  measures reveal what entered, what left, and what remained. Recent movements
+  scroll around the selected line until the ledger truly reaches an edge, while
+  direct shortcuts turn the view through income, expense, transfer, adjustment,
+  status, and account without making the hero negotiate another menu.
+
+  Coin now has a place, not only a purpose. Spending, Savings, Cash, and custom
+  accounts keep separate balances within one Campaign. Transfers move value
+  between them without inventing income or expense, so salary can enter through
+  the front gate, savings can be set aside, and saved coin can return when it is
+  time to spend. Categories follow the kind of movement they describe, with a
+  fuller income ledger and room for each Fellowship to name its own.
+
+  <span class="hi">The old Chronicle is not sacrificed to open the new one.</span>
+
+  A v1.1.3 installation keeps its database, identity, settings, Quests, Scrolls,
+  and history in their established paths. Before the first v2 migration changes
+  a page, Questline writes and verifies a SQLite-aware snapshot that includes
+  committed WAL records. Legacy cloud accounts choose one trusted device as
+  truth before the encrypted Chronicle replaces their older remote history.
+
+  Departure now keeps the same promise. Questline flushes the local Chronicle,
+  waits for a sync already in flight, and closes only after the final cloud
+  result is known. If that last crossing fails, the gates remain open and the
+  hero is told why. A clean farewell now says plainly whether the Chronicle was
+  saved locally or saved and synchronized.
+
+  And on SpectrumOS, the realm finally wears the colors of the world around it.
+  Questline reads Spectrum's active semantic palette, follows atomic wallpaper
+  theme changes while running, respects light and dark contrast, and carries an
+  official Spectrum fallback for journeys beyond that OS.
+
 <span class="comment">// Changes in this version</span>
 <span class="cmd">  ✓  AES-256-GCM private sync-v2 encrypts content before it leaves the CLI or browser</span>
 <span class="cmd">  ✓  Ed25519 signatures authenticate complete encrypted envelopes before decryption</span>
@@ -300,6 +339,22 @@
 <span class="cmd">  ✓  Fixed a queued Quest assignment leaking under the wrong key after an access revocation</span>
 <span class="cmd">  ✓  Removing a Companion now clears their assigned Quests from workload and unassigned queues</span>
 <span class="cmd">  ✓  Fixed the Command Center overstating urgency for High-priority Quests due far in the future</span>
+<span class="cmd">  ✓  Every Command Center layout shows compact due dates and orders Quick Wins by deadline</span>
+<span class="cmd">  ✓  Recurring Quests carry only unfinished steps into their next occurrence</span>
+<span class="cmd">  ✓  Invalid cloud events are selectively quarantined without disabling automatic sync</span>
+<span class="cmd">  ✓  Hydration reminders are more compact and Notification Swarm alerts expire after ten seconds</span>
+<span class="cmd">  ✓  Treasury adds Spending, Savings, Cash, custom accounts, and balance-neutral transfers</span>
+<span class="cmd">  ✓  Account balances and assignments travel through encrypted sync and CSV/JSON exports</span>
+<span class="cmd">  ✓  Month-by-month Treasury metrics reveal income, paid costs, open commitments, and net movement</span>
+<span class="cmd">  ✓  Recent Transactions scroll around the selection and expose direct type, status, and account filters</span>
+<span class="cmd">  ✓  Treasury categories now follow Income, Expense, Transfer, and Adjustment entry types</span>
+<span class="cmd">  ✓  Salary, Bonus, Freelance, investments, interest, rent, gifts, and refunds classify income</span>
+<span class="cmd">  ✓  Custom Treasury categories choose their transaction type when created</span>
+<span class="cmd">  ✓  v1.1.3 upgrades retain the historical database, identity, and configuration paths</span>
+<span class="cmd">  ✓  First v2.0 launch writes a verified WAL-aware pre-upgrade database snapshot</span>
+<span class="cmd">  ✓  Legacy cloud accounts choose an authoritative device before encrypted snapshot cutover</span>
+<span class="cmd">  ✓  Quit now flushes SQLite, waits for active sync, and pauses exit visibly when cloud delivery fails</span>
+<span class="cmd">  ✓  SpectrumOS theme follows the active semantic palette, including live light and dark changes</span>
 <span class="cmd">  ✓  Campaign task filters no longer query the archive once per Quest on every render</span>
 <span class="cmd">  ✓  A shared Campaign's encryption key is now cached for the length of a sync batch</span>
 <span class="cmd">  –  Authenticated calendar subscriptions remain sealed until their security gate is complete</span>

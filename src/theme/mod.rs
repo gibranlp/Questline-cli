@@ -24,6 +24,7 @@ pub enum ThemeChoice {
     SolarizedDark,
     SolarizedLight,
     TerminalNative,
+    SpectrumOS,
     Pywal,
 }
 
@@ -37,6 +38,7 @@ pub struct Theme {
     pub panel: Color,
     pub border: Color,
     pub selection: Color,
+    selection_text: Color,
     pub text: Color,
     pub muted: Color,
     pub success: Color,
@@ -56,7 +58,7 @@ const DISABLED: Color = Color::Rgb(107, 114, 128);
 
 impl Theme {
     pub fn selected_fg(&self) -> Color {
-        Color::Black
+        self.selection_text
     }
 
     pub fn selected_style(&self) -> Style {
@@ -84,6 +86,7 @@ impl Theme {
             ThemeChoice::SolarizedDark,
             ThemeChoice::SolarizedLight,
             ThemeChoice::TerminalNative,
+            ThemeChoice::SpectrumOS,
             ThemeChoice::Forest,
             ThemeChoice::AncientLibrary,
             ThemeChoice::MountainFortress,
@@ -117,6 +120,7 @@ impl Theme {
             ThemeChoice::SolarizedDark => "SolarizedDark",
             ThemeChoice::SolarizedLight => "SolarizedLight",
             ThemeChoice::TerminalNative => "TerminalNative",
+            ThemeChoice::SpectrumOS => "SpectrumOS",
             ThemeChoice::Pywal => "Pywal",
         }
     }
@@ -141,6 +145,7 @@ impl Theme {
             ThemeChoice::SolarizedDark => "Chronicle Dusk",
             ThemeChoice::SolarizedLight => "Chronicle Dawn",
             ThemeChoice::TerminalNative => "Terminal Sigil",
+            ThemeChoice::SpectrumOS => "SpectrumOS",
             ThemeChoice::Pywal => "Wallpaper Relic",
         }
     }
@@ -164,6 +169,7 @@ impl Theme {
             "SolarizedDark" => ThemeChoice::SolarizedDark,
             "SolarizedLight" => ThemeChoice::SolarizedLight,
             "TerminalNative" => ThemeChoice::TerminalNative,
+            "SpectrumOS" => ThemeChoice::SpectrumOS,
             "Pywal" => ThemeChoice::Pywal,
             _ => ThemeChoice::ClassDefault,
         }
@@ -185,6 +191,7 @@ impl Theme {
                 panel: Color::Rgb(220, 224, 230),
                 border: Color::Rgb(100, 116, 139),
                 selection: Color::Blue,
+                selection_text: Color::Black,
                 text: Color::Black,
                 muted: Color::Rgb(100, 116, 139),
                 success: SUCCESS,
@@ -203,6 +210,7 @@ impl Theme {
                 panel: Color::Black,
                 border: Color::White,
                 selection: Color::White,
+                selection_text: Color::Black,
                 text: Color::White,
                 muted: Color::Gray,
                 success: SUCCESS,
@@ -287,6 +295,7 @@ impl Theme {
                 panel: Color::Rgb(230, 223, 202),
                 border: Color::Rgb(147, 161, 161),
                 selection: Color::Rgb(42, 161, 152),
+                selection_text: Color::Black,
                 text: Color::Rgb(0, 43, 54),
                 muted: Color::Rgb(101, 123, 131),
                 success: SUCCESS,
@@ -297,6 +306,9 @@ impl Theme {
                 disabled: DISABLED,
             },
             ThemeChoice::TerminalNative => Self::terminal_native(),
+            ThemeChoice::SpectrumOS => {
+                Self::from_spectrum_os().unwrap_or_else(Self::spectrum_fallback)
+            }
             ThemeChoice::Pywal => Self::from_pywal()
                 .or_else(Self::xresources)
                 .unwrap_or_else(|| Self::for_class(class)),
@@ -314,6 +326,7 @@ impl Theme {
                 panel: Color::Rgb(34, 26, 51),
                 border: Color::Rgb(76, 29, 149),
                 selection: Color::Rgb(109, 40, 217),
+                selection_text: Color::Black,
                 text: Color::Rgb(245, 243, 255),
                 muted: Color::Rgb(167, 139, 250),
                 success: SUCCESS,
@@ -331,6 +344,7 @@ impl Theme {
                 panel: Color::Rgb(51, 22, 37),
                 border: Color::Rgb(190, 24, 93),
                 selection: Color::Rgb(219, 39, 119),
+                selection_text: Color::Black,
                 text: Color::Rgb(255, 241, 247),
                 muted: Color::Rgb(249, 168, 212),
                 success: SUCCESS,
@@ -348,6 +362,7 @@ impl Theme {
                 panel: Color::Rgb(18, 50, 59),
                 border: Color::Rgb(8, 145, 178),
                 selection: Color::Rgb(14, 165, 233),
+                selection_text: Color::Black,
                 text: Color::Rgb(236, 254, 255),
                 muted: Color::Rgb(103, 232, 249),
                 success: SUCCESS,
@@ -365,6 +380,7 @@ impl Theme {
                 panel: Color::Rgb(21, 42, 74),
                 border: Color::Rgb(37, 99, 235),
                 selection: Color::Rgb(29, 78, 216),
+                selection_text: Color::Black,
                 text: Color::Rgb(239, 246, 255),
                 muted: Color::Rgb(147, 197, 253),
                 success: SUCCESS,
@@ -382,6 +398,7 @@ impl Theme {
                 panel: Color::Rgb(56, 33, 19),
                 border: Color::Rgb(234, 88, 12),
                 selection: Color::Rgb(194, 65, 12),
+                selection_text: Color::Black,
                 text: Color::Rgb(255, 247, 237),
                 muted: Color::Rgb(253, 186, 116),
                 success: SUCCESS,
@@ -399,6 +416,7 @@ impl Theme {
                 panel: Color::Rgb(56, 43, 11),
                 border: Color::Rgb(217, 119, 6),
                 selection: Color::Rgb(180, 83, 9),
+                selection_text: Color::Black,
                 text: Color::Rgb(255, 251, 235),
                 muted: Color::Rgb(252, 211, 77),
                 success: SUCCESS,
@@ -450,6 +468,7 @@ impl Theme {
             panel,
             border,
             selection,
+            selection_text: Color::Black,
             text,
             muted,
             success: SUCCESS,
@@ -459,6 +478,88 @@ impl Theme {
             focus_timer: FOCUS_TIMER,
             disabled: DISABLED,
         }
+    }
+
+    pub fn spectrum_palette_path() -> Option<std::path::PathBuf> {
+        let cache_root = std::env::var_os("XDG_CACHE_HOME")
+            .filter(|value| !value.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|value| !value.is_empty())
+                    .map(|home| std::path::PathBuf::from(home).join(".cache"))
+            })?;
+        Some(
+            cache_root
+                .join("spectrumos")
+                .join("theme")
+                .join("current")
+                .join("palette.json"),
+        )
+    }
+
+    pub fn spectrum_palette_modified() -> Option<std::time::SystemTime> {
+        std::fs::metadata(Self::spectrum_palette_path()?)
+            .ok()?
+            .modified()
+            .ok()
+    }
+
+    pub fn from_spectrum_os() -> Option<Self> {
+        let data = std::fs::read_to_string(Self::spectrum_palette_path()?).ok()?;
+        Self::from_spectrum_json(&data)
+    }
+
+    fn from_spectrum_json(data: &str) -> Option<Self> {
+        let payload: serde_json::Value = serde_json::from_str(data).ok()?;
+        if payload.get("schema_version")?.as_u64()? != 1 {
+            return None;
+        }
+        let roles = payload.get("roles")?.as_object()?;
+        let role = |name: &str| hex_color(roles.get(name)?.as_str()?);
+        let selection = role("accent")?;
+        let success = role("success")?;
+        let accent_alt = role("accent_alt")?;
+
+        Some(Self {
+            primary: selection,
+            secondary: accent_alt,
+            background: role("background")?,
+            surface: role("surface")?,
+            panel: role("surface_alt")?,
+            border: role("surface_alt")?,
+            selection,
+            selection_text: readable_text_on(selection),
+            text: role("foreground")?,
+            muted: role("muted")?,
+            success,
+            warning: role("warning")?,
+            danger: role("error")?,
+            xp_bar: success,
+            focus_timer: accent_alt,
+            disabled: role("muted")?,
+        })
+    }
+
+    fn spectrum_fallback() -> Self {
+        Self::from_spectrum_json(
+            r##"{
+                "schema_version": 1,
+                "roles": {
+                    "background": "#101218",
+                    "surface": "#191c24",
+                    "surface_alt": "#252a35",
+                    "foreground": "#e9edf5",
+                    "muted": "#9ca6b8",
+                    "accent": "#76b7ff",
+                    "accent_alt": "#c49aff",
+                    "success": "#78dba9",
+                    "warning": "#f2c66d",
+                    "error": "#ff8c9a"
+                }
+            }"##,
+        )
+        .expect("the bundled SpectrumOS fallback palette must remain valid")
     }
 
     pub fn from_pywal() -> Option<Self> {
@@ -494,6 +595,7 @@ impl Theme {
             panel: Color::Reset,
             border: Color::Gray,
             selection: Color::Blue,
+            selection_text: Color::Black,
             text: Color::Reset,
             muted: Color::DarkGray,
             success: Color::Green,
@@ -534,6 +636,7 @@ impl Theme {
             selection: lookup("color4")
                 .or_else(|| lookup("color12"))
                 .unwrap_or(Color::Blue),
+            selection_text: Color::Black,
             text: lookup("foreground").unwrap_or(Color::Reset),
             muted: lookup("color7")
                 .or_else(|| lookup("foreground"))
@@ -591,4 +694,80 @@ fn hex_color(input: &str) -> Option<Color> {
     let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
     let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
     Some(Color::Rgb(r, g, b))
+}
+
+fn readable_text_on(color: Color) -> Color {
+    let Color::Rgb(r, g, b) = color else {
+        return Color::Black;
+    };
+    let channel = |value: u8| {
+        let value = value as f64 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+    let black_contrast = (luminance + 0.05) / 0.05;
+    let white_contrast = 1.05 / (luminance + 0.05);
+    if black_contrast >= white_contrast {
+        Color::Black
+    } else {
+        Color::White
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LIGHT_SPECTRUM: &str = r##"{
+        "schema_version": 1,
+        "name": "Spectrum Light Test",
+        "variant": "light",
+        "roles": {
+            "background": "#f7f8fb",
+            "surface": "#eef1f6",
+            "surface_alt": "#e1e6ee",
+            "foreground": "#1c2430",
+            "muted": "#566273",
+            "accent": "#245f9e",
+            "accent_alt": "#6a3d91",
+            "success": "#176b46",
+            "warning": "#7a5200",
+            "error": "#a3293d"
+        }
+    }"##;
+
+    #[test]
+    fn spectrum_theme_maps_every_semantic_role() {
+        let theme = Theme::from_spectrum_json(LIGHT_SPECTRUM).unwrap();
+        assert_eq!(theme.background, Color::Rgb(247, 248, 251));
+        assert_eq!(theme.surface, Color::Rgb(238, 241, 246));
+        assert_eq!(theme.panel, Color::Rgb(225, 230, 238));
+        assert_eq!(theme.text, Color::Rgb(28, 36, 48));
+        assert_eq!(theme.muted, Color::Rgb(86, 98, 115));
+        assert_eq!(theme.primary, Color::Rgb(36, 95, 158));
+        assert_eq!(theme.secondary, Color::Rgb(106, 61, 145));
+        assert_eq!(theme.success, Color::Rgb(23, 107, 70));
+        assert_eq!(theme.warning, Color::Rgb(122, 82, 0));
+        assert_eq!(theme.danger, Color::Rgb(163, 41, 61));
+        assert_eq!(theme.selected_fg(), Color::White);
+    }
+
+    #[test]
+    fn spectrum_theme_rejects_unknown_or_incomplete_palettes() {
+        assert!(Theme::from_spectrum_json(r#"{"schema_version": 2, "roles": {}}"#).is_none());
+        assert!(Theme::from_spectrum_json(r#"{"schema_version": 1, "roles": {}}"#).is_none());
+        assert!(Theme::from_spectrum_json("not json").is_none());
+    }
+
+    #[test]
+    fn spectrum_theme_is_selectable_and_has_a_stable_key() {
+        assert!(Theme::all_choices().contains(&ThemeChoice::SpectrumOS));
+        assert_eq!(Theme::theme_key(ThemeChoice::SpectrumOS), "SpectrumOS");
+        assert_eq!(Theme::theme_label(ThemeChoice::SpectrumOS), "SpectrumOS");
+        assert_eq!(Theme::choice_from_key("SpectrumOS"), ThemeChoice::SpectrumOS);
+    }
 }

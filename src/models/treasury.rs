@@ -102,7 +102,63 @@ pub enum LedgerEntryType {
     Adjustment,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreasuryAccountKind {
+    Spending,
+    Savings,
+    Cash,
+    Other,
+}
+
+impl TreasuryAccountKind {
+    pub const ALL: [Self; 4] = [Self::Spending, Self::Savings, Self::Cash, Self::Other];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Spending => "Spending",
+            Self::Savings => "Savings",
+            Self::Cash => "Cash",
+            Self::Other => "Other",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "Spending" => Some(Self::Spending),
+            "Savings" => Some(Self::Savings),
+            "Cash" => Some(Self::Cash),
+            "Other" => Some(Self::Other),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreasuryAccount {
+    pub id: Uuid,
+    pub campaign_id: Uuid,
+    pub name: String,
+    pub kind: TreasuryAccountKind,
+    pub is_default: bool,
+    pub version: i64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreasuryAccountBalance {
+    pub account: TreasuryAccount,
+    pub balance_minor: i64,
+}
+
 impl LedgerEntryType {
+    pub const ALL: [Self; 4] = [
+        Self::Income,
+        Self::Expense,
+        Self::Transfer,
+        Self::Adjustment,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Income => "Income",
@@ -235,10 +291,16 @@ pub struct LedgerCategory {
     pub id: Uuid,
     pub campaign_id: Uuid,
     pub name: String,
+    #[serde(default = "default_category_entry_type")]
+    pub entry_type: LedgerEntryType,
     pub is_default: bool,
     pub version: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+fn default_category_entry_type() -> LedgerEntryType {
+    LedgerEntryType::Expense
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -277,6 +339,12 @@ pub struct LedgerEntry {
     /// llegan sin este campo, así que se trata como autoría desconocida.
     #[serde(default)]
     pub created_by_identity: Option<String>,
+    /// Account affected by income/expense, or the source of a transfer.
+    #[serde(default)]
+    pub account_id: Option<Uuid>,
+    /// Destination account for transfers. Empty for every other entry type.
+    #[serde(default)]
+    pub transfer_account_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,6 +391,7 @@ pub enum LedgerSort {
 #[derive(Debug, Clone, Default)]
 pub struct LedgerFilter {
     pub category_id: Option<Uuid>,
+    pub account_id: Option<Uuid>,
     pub status: Option<LedgerStatus>,
     pub date_from: Option<DateTime<Utc>>,
     pub date_to: Option<DateTime<Utc>>,
@@ -340,6 +409,22 @@ pub struct MonthlySpending {
     pub amount_minor: i64,
 }
 
+/// A calendar-month snapshot derived from ledger entries. This is intentionally
+/// not persisted: every device can rebuild it from the synced ledger.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MonthlyTreasuryMetrics {
+    pub month: String,
+    pub income_minor: i64,
+    pub paid_minor: i64,
+    pub committed_minor: i64,
+}
+
+impl MonthlyTreasuryMetrics {
+    pub fn net_minor(&self) -> i64 {
+        self.income_minor - self.paid_minor
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TreasuryReport {
     pub campaign_id: Uuid,
@@ -348,6 +433,8 @@ pub struct TreasuryReport {
     pub totals: CampaignTotalsReport,
     pub categories: Vec<CategoryReport>,
     pub monthly_spending: Vec<MonthlySpending>,
+    #[serde(default)]
+    pub accounts: Vec<TreasuryAccountBalance>,
     pub outstanding_payments: Vec<LedgerEntry>,
 }
 

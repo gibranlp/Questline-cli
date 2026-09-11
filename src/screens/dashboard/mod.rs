@@ -16,7 +16,7 @@ use crate::models::{Task, TaskPriority};
 use crate::screens::hit_test::DashboardHitRegions;
 use crate::services::planner::{self, DashboardPlan};
 use crate::theme::Theme;
-use chrono::{Local, Timelike};
+use chrono::{DateTime, Local, Timelike, Utc};
 use ratatui::{Frame, layout::Rect, style::Color};
 
 /// Which full-screen presentation of the dashboard's data is active.
@@ -161,6 +161,18 @@ pub(super) fn task_energy_tag(task: &Task) -> (&'static str, Color) {
     }
 }
 
+/// One stable, compact due-date label shared by every Dashboard layout.
+pub(super) fn format_due_date(due_date: Option<DateTime<Utc>>) -> String {
+    due_date
+        .map(|date| {
+            date.with_timezone(&Local)
+                .format("%d-%b-%Y")
+                .to_string()
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_else(|| "no date".to_string())
+}
+
 pub(super) fn short_text(value: &str, max_chars: usize) -> String {
     let mut chars = value.chars();
     let short: String = chars.by_ref().take(max_chars).collect();
@@ -252,4 +264,20 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> DashboardHit
     modals::draw_modals(f, app, theme, area);
 
     regions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_due_date;
+    use chrono::{Local, TimeZone, Utc};
+
+    #[test]
+    fn dashboard_due_dates_use_day_lowercase_month_and_year() {
+        let local_due = Local.with_ymd_and_hms(2026, 9, 11, 12, 0, 0).unwrap();
+        assert_eq!(
+            format_due_date(Some(local_due.with_timezone(&Utc))),
+            "11-sep-2026"
+        );
+        assert_eq!(format_due_date(None), "no date");
+    }
 }

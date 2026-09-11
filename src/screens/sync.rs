@@ -391,11 +391,11 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
         },
     ];
 
-    // si hubo conflictos al sincronizar los mostramos aquí abajo — no manches, a veces pasa
+    // Conflicts are resolved or selectively quarantined without stopping future syncs.
     if !app.sync_conflicts.is_empty() {
         left_text.push(Line::from(""));
         left_text.push(Line::from(vec![Span::styled(
-            "   === Resolved Conflicts ===",
+            "   === Handled Sync Conflicts ===",
             Style::default()
                 .fg(theme.danger)
                 .add_modifier(Modifier::BOLD),

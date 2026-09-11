@@ -16,7 +16,7 @@ chrono = { version = "0.4.38", features = ["serde"] }
 chrono-tz = "0.10.4"
 keyring = { version = "4.1.6", features = ["v1"] }
 directories = "5.0.1"
-rusqlite = { version = "0.31.0", features = ["bundled"] }
+rusqlite = { version = "0.31.0", features = ["bundled", "backup"] }
 rand = "0.8.5"
 rodio = "0.17.3"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }

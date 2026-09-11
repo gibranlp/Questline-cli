@@ -8,7 +8,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use super::default_layout;
-use super::{priority_label, short_text, sidequest_rank, task_energy_tag, workload_label};
+use super::{format_due_date, priority_label, short_text, sidequest_rank, task_energy_tag, workload_label};
 use crate::app::App;
 use crate::models::Task;
 use crate::screens::hit_test::TodaysAgendaHitRegions;
@@ -223,6 +223,10 @@ fn draw_agenda_list(
                     Style::default().fg(theme.muted),
                 ),
                 Span::styled(format!("[{}] ", prio_label), Style::default().fg(prio_color)),
+                Span::styled(
+                    format!("[{}] ", format_due_date(item.task.due_date)),
+                    Style::default().fg(theme.focus_timer),
+                ),
                 Span::styled(item.task.title.as_str(), Style::default().fg(theme.text)),
                 Span::styled(format!(" [{}]", energy_label), Style::default().fg(energy_color)),
             ])));
@@ -319,4 +323,3 @@ fn draw_agenda_list(
         visible_start,
     }
 }
-

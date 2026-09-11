@@ -460,6 +460,7 @@ CREATE TABLE IF NOT EXISTS ledger_categories (
     id TEXT PRIMARY KEY,
     campaign_id TEXT NOT NULL,
     name TEXT NOT NULL COLLATE NOCASE,
+    entry_type TEXT NOT NULL DEFAULT 'Expense' CHECK(entry_type IN ('Income', 'Expense', 'Transfer', 'Adjustment')),
     is_default INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL,
@@ -476,6 +477,19 @@ CREATE TABLE IF NOT EXISTS category_budgets (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     FOREIGN KEY(category_id) REFERENCES ledger_categories(id) ON DELETE CASCADE,
+    FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS treasury_accounts (
+    id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    name TEXT NOT NULL COLLATE NOCASE,
+    kind TEXT NOT NULL CHECK(kind IN ('Spending', 'Savings', 'Cash', 'Other')),
+    is_default INTEGER NOT NULL DEFAULT 0,
+    version INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(campaign_id, name),
     FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE
 );
 
@@ -503,9 +517,13 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
     -- Companion Key de quien registró el movimiento: los Companions solo pueden
     -- editar o borrar los suyos, y la Fellowship necesita saber quién lo asentó.
     created_by_identity TEXT,
+    account_id TEXT,
+    transfer_account_id TEXT,
     FOREIGN KEY(campaign_id) REFERENCES projects(id) ON DELETE CASCADE,
     FOREIGN KEY(category_id) REFERENCES ledger_categories(id) ON DELETE RESTRICT,
-    FOREIGN KEY(related_task_id) REFERENCES tasks(id) ON DELETE SET NULL
+    FOREIGN KEY(related_task_id) REFERENCES tasks(id) ON DELETE SET NULL,
+    FOREIGN KEY(account_id) REFERENCES treasury_accounts(id) ON DELETE RESTRICT,
+    FOREIGN KEY(transfer_account_id) REFERENCES treasury_accounts(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS task_financials (
@@ -578,6 +596,7 @@ CREATE INDEX IF NOT EXISTS idx_ledger_amount ON ledger_entries(campaign_id, amou
 CREATE INDEX IF NOT EXISTS idx_ledger_search ON ledger_entries(campaign_id, title, vendor_source);
 CREATE INDEX IF NOT EXISTS idx_categories_campaign ON ledger_categories(campaign_id, name);
 CREATE INDEX IF NOT EXISTS idx_category_budgets_campaign ON category_budgets(campaign_id);
+CREATE INDEX IF NOT EXISTS idx_treasury_accounts_campaign ON treasury_accounts(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_task_financials_campaign ON task_financials(campaign_id);
 CREATE INDEX IF NOT EXISTS idx_treasury_history_entity ON treasury_history(entity_type, entity_id, version);
 CREATE INDEX IF NOT EXISTS idx_treasury_history_campaign ON treasury_history(campaign_id, created_at DESC);

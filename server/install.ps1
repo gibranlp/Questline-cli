@@ -29,6 +29,9 @@ if (-not (Test-Path $InstallDir)) {
 if (-not (Test-Path $ConfigDir)) {
     New-Item -ItemType Directory -Force -Path $ConfigDir | Out-Null
 }
+if (Test-Path "$ConfigDir\questline.db") {
+    Write-Host "  Existing Questline data found - v2.0 will preserve and migrate it on first launch" -ForegroundColor Green
+}
 
 # ── Clean up any leftover temp files from a previous interrupted update ───────
 if (Test-Path $TempPath) { Remove-Item -Force $TempPath -ErrorAction SilentlyContinue }

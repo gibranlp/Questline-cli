@@ -666,7 +666,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             if allows(role, TreasuryAction::MarkPaid) {
                 push(&mut spans, "p", " Paid");
             }
-            push(&mut spans, "f", " Filter");
+            push(&mut spans, "f", " Type");
+            push(&mut spans, "F", " Status");
+            push(&mut spans, "g", " Account");
             push(&mut spans, "s", " Sort");
             push(&mut spans, "x", " Export");
             if allows(role, TreasuryAction::SetOverallBudget) {
@@ -674,6 +676,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             }
             if allows(role, TreasuryAction::ManageCategories) {
                 push(&mut spans, "c", " Category");
+                push(&mut spans, "A", " Account");
             }
             if allows(role, TreasuryAction::SwitchCurrency) {
                 push(&mut spans, "$", " Currency");
@@ -874,7 +877,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             *focus_idx,
             theme,
         ),
-        ModalType::TreasuryCategory { name } => draw_treasury_category_modal(f, name, theme),
+        ModalType::TreasuryCategory {
+            name,
+            entry_type_idx,
+            focus_idx,
+        } => draw_treasury_category_modal(f, name, *entry_type_idx, *focus_idx, theme),
+        ModalType::TreasuryAccount {
+            name,
+            kind_idx,
+            focus_idx,
+        } => draw_treasury_account_modal(f, name, *kind_idx, *focus_idx, theme),
         ModalType::TreasuryCurrency { selected_idx } => {
             draw_treasury_currency_modal(f, app, *selected_idx, theme)
         }
@@ -1050,14 +1062,20 @@ fn draw_treasury_tab(
     let entries = service
         .entries(campaign_id, &filter, app.treasury_sort)
         .unwrap_or_default();
-    let categories = service
-        .calculate_category_totals(campaign_id)
-        .unwrap_or_default();
+    let account_balances = service.account_balances(campaign_id).unwrap_or_default();
+    let saved_minor = account_balances
+        .iter()
+        .filter(|balance| balance.account.kind == crate::models::TreasuryAccountKind::Savings)
+        .map(|balance| balance.balance_minor)
+        .sum::<i64>();
     let upcoming = service
         .upcoming_payments(campaign_id, Utc::now(), 30)
         .unwrap_or_default();
     let overdue = service
         .overdue_payments(campaign_id, Utc::now())
+        .unwrap_or_default();
+    let monthly_metrics = service
+        .monthly_metrics(campaign_id, Utc::now(), 6)
         .unwrap_or_default();
     let currency = treasury
         .as_ref()
@@ -1073,7 +1091,7 @@ fn draw_treasury_tab(
         .constraints([
             Constraint::Length(5),
             Constraint::Min(9),
-            Constraint::Length(8),
+            Constraint::Length(10),
         ])
         .split(area);
 
@@ -1082,17 +1100,23 @@ fn draw_treasury_tab(
         ("Income", totals.income_minor),
         ("Paid", totals.paid_minor),
         ("Committed", totals.committed_minor),
+        ("Saved", saved_minor),
         ("Available", totals.available_minor),
     ];
     let summary_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 5); 5])
+        .constraints([Constraint::Ratio(1, 6); 6])
         .split(sections[0]);
     for (index, (label, amount)) in summary.into_iter().enumerate() {
-        let color = if label == "Available" && amount < 0 {
-            theme.danger
-        } else {
-            theme.text
+        let color = match label {
+            "Income" => theme.success,
+            "Paid" => theme.danger,
+            "Committed" => theme.warning,
+            "Saved" if amount < 0 => theme.danger,
+            "Saved" => theme.secondary,
+            "Available" if amount < 0 => theme.danger,
+            "Available" => theme.success,
+            _ => theme.primary,
         };
         f.render_widget(
             Paragraph::new(vec![
@@ -1129,35 +1153,102 @@ fn draw_treasury_tab(
             None => "—".to_string(),
         }
     };
-    let transaction_rows = entries.iter().enumerate().map(|(index, entry)| {
-        let style = if index == app.selected_treasury_idx {
-            Style::default().fg(Color::Black).bg(theme.selection)
-        } else {
-            Style::default().fg(theme.text)
-        };
-        Row::new(vec![
-            Cell::from(entry.created_at.format("%Y-%m-%d").to_string()),
-            Cell::from(entry.title.clone()),
-            Cell::from(entry.entry_type.as_str()),
-            Cell::from(entry.status.as_str()),
-            Cell::from(crate::services::treasury::format_money(
-                entry.amount_minor,
-                crate::models::Currency::from_code_or_default(&entry.currency_code),
-            )),
-            Cell::from(recorded_by(entry)),
-            Cell::from(
-                entry
-                    .due_date
-                    .map(|date| date.format("%Y-%m-%d").to_string())
-                    .unwrap_or_else(|| "—".to_string()),
-            ),
-        ])
-        .style(style)
-    });
-    let title = format!(
-        " Recent Transactions · {:?} · {} items · {} · {} ",
-        app.treasury_sort,
+    let account_name = |id: Option<uuid::Uuid>| -> String {
+        id.and_then(|id| {
+            account_balances
+                .iter()
+                .find(|balance| balance.account.id == id)
+                .map(|balance| balance.account.name.clone())
+        })
+        .unwrap_or_else(|| "Spending".to_string())
+    };
+    // Keep the active row around the middle of the viewport while there are
+    // still transactions above and below it. At either end, let it naturally
+    // travel to the first/last screen row so the boundary is obvious.
+    let table_inner = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .inner(sections[1]);
+    let visible_transactions = table_inner.height.saturating_sub(1) as usize;
+    let transaction_start = centered_list_offset(
+        app.selected_treasury_idx,
         entries.len(),
+        visible_transactions,
+    );
+    let transaction_end = (transaction_start + visible_transactions).min(entries.len());
+    let transaction_rows = entries
+        .iter()
+        .enumerate()
+        .skip(transaction_start)
+        .take(visible_transactions)
+        .map(|(index, entry)| {
+            let style = if index == app.selected_treasury_idx {
+                Style::default().fg(Color::Black).bg(theme.selection)
+            } else {
+                Style::default().fg(theme.text)
+            };
+            Row::new(vec![
+                Cell::from(entry.created_at.format("%Y-%m-%d").to_string()),
+                Cell::from(entry.title.clone()),
+                Cell::from(entry.entry_type.as_str()),
+                Cell::from(entry.status.as_str()),
+                Cell::from(crate::services::treasury::format_money(
+                    entry.amount_minor,
+                    crate::models::Currency::from_code_or_default(&entry.currency_code),
+                )),
+                Cell::from(if entry.entry_type == crate::models::LedgerEntryType::Transfer {
+                    format!(
+                        "{} → {}",
+                        account_name(entry.account_id),
+                        account_name(entry.transfer_account_id)
+                    )
+                } else {
+                    account_name(entry.account_id)
+                }),
+                Cell::from(recorded_by(entry)),
+                Cell::from(
+                    entry
+                        .due_date
+                        .map(|date| date.format("%Y-%m-%d").to_string())
+                        .unwrap_or_else(|| "—".to_string()),
+                ),
+            ])
+            .style(style)
+        });
+    let visible_range = if entries.is_empty() {
+        "0/0".to_string()
+    } else {
+        format!(
+            "{}–{}/{}",
+            transaction_start + 1,
+            transaction_end,
+            entries.len()
+        )
+    };
+    let type_filter = filter
+        .entry_type
+        .map(|entry_type| entry_type.as_str())
+        .unwrap_or("All types");
+    let status_filter = filter
+        .status
+        .map(|status| status.as_str())
+        .unwrap_or("Any status");
+    let account_filter = filter
+        .account_id
+        .and_then(|id| {
+            account_balances
+                .iter()
+                .find(|balance| balance.account.id == id)
+                .map(|balance| balance.account.name.as_str())
+        })
+        .unwrap_or("All accounts");
+    let title = format!(
+        " Recent Transactions · {:?} · {} · {} · {} · {} · {} · {} ",
+        app.treasury_sort,
+        visible_range,
+        type_filter,
+        status_filter,
+        account_filter,
         currency.code(),
         role.label()
     );
@@ -1169,6 +1260,7 @@ fn draw_treasury_tab(
             Constraint::Length(10),
             Constraint::Length(10),
             Constraint::Length(16),
+            Constraint::Length(20),
             Constraint::Length(12),
             Constraint::Length(11),
         ],
@@ -1180,6 +1272,7 @@ fn draw_treasury_tab(
             "Type",
             "Status",
             "Amount",
+            "Account",
             "Recorded by",
             "Due",
         ])
@@ -1197,76 +1290,120 @@ fn draw_treasury_tab(
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border)),
     );
-    // Table (unlike Block) doesn't hand its Block back after .block(), so
-    // .inner() is computed from an identical throwaway one instead — the
-    // border config alone (not title/style) is what .inner() depends on.
-    let table_inner = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .inner(sections[1]);
     let entry_count = entries.len();
     f.render_widget(table, sections[1]);
 
     let lower = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(2, 3), Constraint::Ratio(1, 3)])
+        .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
         .split(sections[2]);
-    let category_lines = categories
-        .into_iter()
-        .take(5)
-        .map(|item| {
-            let usage = item.budget_minor.map(|budget| {
-                crate::services::TreasuryService::budget_usage(budget, item.spending_minor)
-            });
-            let marker = usage
-                .map(|usage| match usage.warning {
-                    crate::models::BudgetWarningLevel::Healthy => "",
-                    crate::models::BudgetWarningLevel::EightyPercent => "  ! 80%",
-                    crate::models::BudgetWarningLevel::NinetyPercent => "  !! 90%",
-                    crate::models::BudgetWarningLevel::Exhausted => "  !!! 100%",
-                    crate::models::BudgetWarningLevel::Exceeded => "  !!! EXCEEDED",
-                })
-                .unwrap_or("");
-            let bar = usage
-                .map(|usage| {
-                    let filled = (usage.ratio.clamp(0.0, 1.0) * 10.0).round() as usize;
-                    format!("[{}{}]", "█".repeat(filled), "░".repeat(10 - filled))
-                })
-                .unwrap_or_else(|| "[no budget]".to_string());
-            Line::from(format!(
-                "{} {}  {} spent  {} remaining{}",
-                item.category.name,
-                bar,
-                crate::services::treasury::format_money(item.spending_minor, currency),
-                item.remaining_minor
-                    .map(|value| crate::services::treasury::format_money(value, currency))
-                    .unwrap_or_else(|| "—".to_string()),
-                marker
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut monthly_lines = vec![Line::from(vec![
+        Span::styled("MONTH    ", Style::default().fg(theme.muted)),
+        Span::styled("INCOME", Style::default().fg(theme.success)),
+        Span::styled("       PAID", Style::default().fg(theme.danger)),
+        Span::styled("        OPEN", Style::default().fg(theme.warning)),
+        Span::styled("        NET", Style::default().fg(theme.primary)),
+    ])];
+    monthly_lines.extend(monthly_metrics.iter().map(|item| {
+        let net = item.net_minor();
+        let net_label = if net >= 0 {
+            format!(
+                "+{}",
+                crate::services::treasury::format_compact_money(net, currency)
+            )
+        } else {
+            crate::services::treasury::format_compact_money(net, currency)
+        };
+        Line::from(vec![
+            Span::styled(
+                format!("{:<8}", treasury_month_label(&item.month)),
+                Style::default().fg(theme.muted),
+            ),
+            Span::styled(
+                format!(
+                    "{:<12}",
+                    crate::services::treasury::format_compact_money(item.income_minor, currency)
+                ),
+                Style::default().fg(theme.success),
+            ),
+            Span::styled(
+                format!(
+                    "{:<12}",
+                    crate::services::treasury::format_compact_money(item.paid_minor, currency)
+                ),
+                Style::default().fg(theme.danger),
+            ),
+            Span::styled(
+                format!(
+                    "{:<12}",
+                    crate::services::treasury::format_compact_money(item.committed_minor, currency)
+                ),
+                Style::default().fg(theme.warning),
+            ),
+            Span::styled(
+                net_label,
+                Style::default()
+                    .fg(if net < 0 { theme.danger } else { theme.success })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    }));
     f.render_widget(
-        Paragraph::new(category_lines).block(
+        Paragraph::new(monthly_lines).block(
             Block::default()
-                .title(" Category Breakdown ")
+                .title(" Monthly Flow · Last 6 Months ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.border)),
+                .border_style(Style::default().fg(theme.primary)),
         ),
         lower[0],
     );
-    let due_lines = vec![
+
+    let upcoming_amount = upcoming.iter().map(|entry| entry.amount_minor).sum::<i64>();
+    let overdue_amount = overdue.iter().map(|entry| entry.amount_minor).sum::<i64>();
+    let used_minor = totals.paid_minor + totals.committed_minor;
+    let budget_percent = if totals.budget_minor > 0 {
+        (used_minor as f64 / totals.budget_minor as f64 * 100.0).round() as i64
+    } else {
+        0
+    };
+    let mut signal_lines = vec![
         Line::from(vec![
-            Span::styled("Upcoming (30d): ", Style::default().fg(theme.muted)),
+            Span::styled("Budget used  ", Style::default().fg(theme.muted)),
             Span::styled(
-                upcoming.len().to_string(),
+                if totals.budget_minor > 0 {
+                    format!("{budget_percent}%")
+                } else {
+                    "Not set".to_string()
+                },
+                Style::default()
+                    .fg(if budget_percent > 100 {
+                        theme.danger
+                    } else {
+                        theme.primary
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Next 30 days ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!(
+                    "{} · {}",
+                    upcoming.len(),
+                    crate::services::treasury::format_compact_money(upcoming_amount, currency)
+                ),
                 Style::default().fg(theme.warning),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Overdue: ", Style::default().fg(theme.muted)),
+            Span::styled("Overdue     ", Style::default().fg(theme.muted)),
             Span::styled(
-                overdue.len().to_string(),
+                format!(
+                    "{} · {}",
+                    overdue.len(),
+                    crate::services::treasury::format_compact_money(overdue_amount, currency)
+                ),
                 Style::default().fg(if overdue.is_empty() {
                     theme.text
                 } else {
@@ -1274,11 +1411,47 @@ fn draw_treasury_tab(
                 }),
             ),
         ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "ACCOUNT BALANCES",
+            Style::default().fg(theme.muted),
+        )),
     ];
+    signal_lines.extend(
+        account_balances
+            .iter()
+            .take(3)
+            .map(|balance| {
+                Line::from(vec![
+                    Span::styled(
+                        format!(
+                            "{:<16}",
+                            balance.account.name.chars().take(15).collect::<String>()
+                        ),
+                        Style::default().fg(theme.text),
+                    ),
+                    Span::styled(
+                        crate::services::treasury::format_compact_money(
+                            balance.balance_minor,
+                            currency,
+                        ),
+                        Style::default().fg(if balance.balance_minor < 0 {
+                            theme.danger
+                        } else if balance.account.kind
+                            == crate::models::TreasuryAccountKind::Savings
+                        {
+                            theme.secondary
+                        } else {
+                            theme.success
+                        }),
+                    ),
+                ])
+            }),
+    );
     f.render_widget(
-        Paragraph::new(due_lines).block(
+        Paragraph::new(signal_lines).block(
             Block::default()
-                .title(" Due Dates ")
+                .title(" Treasury Pulse ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.border)),
@@ -1296,8 +1469,33 @@ fn draw_treasury_tab(
                 width: table_inner.width,
                 height: table_inner.height.saturating_sub(1),
             },
-            row_targets: (0..entry_count).map(Some).collect(),
+            row_targets: (transaction_start..transaction_end).map(Some).collect(),
         })
+    }
+}
+
+fn centered_list_offset(selected: usize, item_count: usize, visible_count: usize) -> usize {
+    if visible_count == 0 || item_count <= visible_count {
+        return 0;
+    }
+    let selected = selected.min(item_count - 1);
+    selected
+        .saturating_sub(visible_count / 2)
+        .min(item_count - visible_count)
+}
+
+fn treasury_month_label(month: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut parts = month.split('-');
+    let year = parts.next().and_then(|value| value.parse::<i32>().ok());
+    let parsed_month = parts.next().and_then(|value| value.parse::<usize>().ok());
+    match (year, parsed_month) {
+        (Some(year), Some(month @ 1..=12)) => {
+            format!("{} {:02}", MONTHS[month - 1], year % 100)
+        }
+        _ => month.to_string(),
     }
 }
 
@@ -1316,13 +1514,14 @@ fn draw_treasury_entry_modal(
     focus_idx: usize,
     theme: &Theme,
 ) {
-    let area = centered_rect(62, 48, f.size());
+    let area = centered_rect(68, 58, f.size());
     f.render_widget(Clear, area);
+    let entry_type = crate::models::LedgerEntryType::ALL[entry_type_idx.min(3)];
     let categories = app
         .active_project_id
         .and_then(|id| {
             crate::services::TreasuryService::new(&app.db)
-                .categories(id)
+                .categories_for_type(id, entry_type)
                 .ok()
         })
         .unwrap_or_default();
@@ -1334,17 +1533,40 @@ fn draw_treasury_entry_modal(
                 .ok()
         })
         .unwrap_or_default();
+    let accounts = app
+        .active_project_id
+        .and_then(|id| {
+            crate::services::TreasuryService::new(&app.db)
+                .accounts(id)
+                .ok()
+        })
+        .unwrap_or_default();
     let entry_types = ["Income", "Expense", "Transfer", "Adjustment"];
     let statuses = ["Planned", "Approved", "Paid", "Cancelled"];
     let category = categories
         .get(category_idx)
         .map(|value| value.name.as_str())
         .unwrap_or("Other");
+    let account = accounts
+        .get(app.treasury_account_idx.min(accounts.len().saturating_sub(1)))
+        .map(|value| value.name.as_str())
+        .unwrap_or("Spending");
+    let destination = accounts
+        .get(
+            app.treasury_transfer_account_idx
+                .min(accounts.len().saturating_sub(1)),
+        )
+        .map(|value| value.name.as_str())
+        .unwrap_or("Savings");
     let label_span = |index: usize, label: &str| {
         Span::styled(
-            // El espacio extra tras el ancho fijo garantiza un hueco visible antes del
-            // valor aun cuando la etiqueta (p. ej. "Amount (MXN)") ya mide 12 caracteres.
-            format!("{label:<12} "),
+            // The title reads naturally as "Title value". The remaining rows
+            // keep their aligned labels for quick scanning.
+            if index == 0 {
+                format!("{label} ")
+            } else {
+                format!("{label:<12} ")
+            },
             Style::default().fg(if focus_idx == index {
                 theme.primary
             } else {
@@ -1429,8 +1651,18 @@ fn draw_treasury_entry_modal(
         ),
         field(3, "Status", format!("◀ {} ▶", statuses[status_idx.min(3)])),
         field(4, "Category", format!("◀ {} ▶", category)),
+        field(5, "Account", format!("◀ {} ▶", account)),
+        field(
+            6,
+            "To Account",
+            if entry_type_idx == 2 {
+                format!("◀ {} ▶", destination)
+            } else {
+                "— transfer only —".to_string()
+            },
+        ),
         Line::from(""),
-        field(5, "Date", format!("◀ {} ▶", date_val)),
+        field(7, "Date", format!("◀ {} ▶", date_val)),
     ];
     if is_editing {
         lines.push(Line::from(Span::styled(
@@ -1522,7 +1754,7 @@ fn draw_treasury_budget_modal(
         .active_project_id
         .and_then(|id| {
             crate::services::TreasuryService::new(&app.db)
-                .categories(id)
+                .categories_for_type(id, crate::models::LedgerEntryType::Expense)
                 .ok()
         })
         .unwrap_or_default();
@@ -1668,26 +1900,102 @@ fn draw_task_financials_modal(
     );
 }
 
-fn draw_treasury_category_modal(f: &mut Frame, name: &str, theme: &Theme) {
-    let area = centered_rect(52, 24, f.size());
+fn draw_treasury_category_modal(
+    f: &mut Frame,
+    name: &str,
+    entry_type_idx: usize,
+    focus_idx: usize,
+    theme: &Theme,
+) {
+    let area = centered_rect(52, 28, f.size());
     f.render_widget(Clear, area);
+    let entry_type = crate::models::LedgerEntryType::ALL[entry_type_idx.min(3)].as_str();
     f.render_widget(
         Paragraph::new(vec![
             Line::from("Create a campaign-specific ledger category."),
             Line::from(""),
             Line::from(Span::styled(
                 format!("Name  {name}_"),
-                Style::default().fg(theme.text),
+                Style::default()
+                    .fg(if focus_idx == 0 { theme.primary } else { theme.text })
+                    .add_modifier(if focus_idx == 0 {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
             )),
             Line::from(""),
+            Line::from(vec![
+                Span::styled(
+                    "Type  ",
+                    Style::default().fg(if focus_idx == 1 {
+                        theme.primary
+                    } else {
+                        theme.muted
+                    }),
+                ),
+                Span::styled(
+                    format!("◀ {entry_type} ▶"),
+                    Style::default().fg(theme.text).add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
             Line::from(Span::styled(
-                "Enter save · Esc cancel",
+                "Tab/↑↓ field · ←→ type · Enter continue/save · Esc cancel",
                 Style::default().fg(theme.muted),
             )),
         ])
         .block(
             Block::default()
                 .title(" Custom Treasury Category ")
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(theme.primary)),
+        ),
+        area,
+    );
+}
+
+fn draw_treasury_account_modal(
+    f: &mut Frame,
+    name: &str,
+    kind_idx: usize,
+    focus_idx: usize,
+    theme: &Theme,
+) {
+    let area = centered_rect(56, 30, f.size());
+    f.render_widget(Clear, area);
+    let kinds = crate::models::TreasuryAccountKind::ALL;
+    let kind = kinds[kind_idx.min(kinds.len() - 1)].as_str();
+    let label_style = |index| {
+        Style::default().fg(if focus_idx == index {
+            theme.primary
+        } else {
+            theme.muted
+        })
+    };
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from("Create an account to separate spendable funds, savings, or cash."),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Name  ", label_style(0)),
+                Span::styled(format!("{name}_"), Style::default().fg(theme.text)),
+            ]),
+            Line::from(""),
+            Line::from(vec![
+                Span::styled("Type  ", label_style(1)),
+                Span::styled(format!("◀ {kind} ▶"), Style::default().fg(theme.text)),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Tab/↑↓ field · ←→ type · Enter continue/save · Esc cancel",
+                Style::default().fg(theme.muted),
+            )),
+        ])
+        .block(
+            Block::default()
+                .title(" New Treasury Account ")
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(theme.primary)),
@@ -2013,10 +2321,18 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
             allows(treasury_role, TreasuryAction::ManageCategories),
         ));
         right.push(binding(
+            "A",
+            "Create Treasury account",
+            allows(treasury_role, TreasuryAction::ManageCategories),
+        ));
+        right.push(binding(
             "$",
             "Switch currency",
             allows(treasury_role, TreasuryAction::SwitchCurrency),
         ));
+        right.push(binding("f", "Filter transaction type", true));
+        right.push(binding("F", "Filter payment status", true));
+        right.push(binding("g", "Filter account", true));
         right.push(binding("x", "Export ledger", true));
         if is_shared {
             right.push(Line::from(vec![]));
@@ -6322,6 +6638,123 @@ mod tests {
         assert_eq!(workload_band(4, 1, 0, 0), "BALANCED");
         assert_eq!(workload_band(3, 0, 0, 2), "OVERLOADED");
         assert_eq!(workload_band(8, 0, 0, 0), "OVERLOADED");
+    }
+
+    #[test]
+    fn treasury_scroll_centers_selection_until_it_reaches_the_ends() {
+        let visible = 7;
+        let count = 20;
+        assert_eq!(centered_list_offset(0, count, visible), 0);
+        assert_eq!(centered_list_offset(3, count, visible), 0);
+        assert_eq!(centered_list_offset(4, count, visible), 1);
+        assert_eq!(centered_list_offset(10, count, visible), 7);
+        assert_eq!(centered_list_offset(18, count, visible), 13);
+        assert_eq!(centered_list_offset(19, count, visible), 13);
+        assert_eq!(centered_list_offset(5, 6, visible), 0);
+        assert_eq!(centered_list_offset(5, count, 0), 0);
+    }
+
+    #[test]
+    fn treasury_monthly_metrics_render_at_wide_and_narrow_sizes() {
+        let db_path = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join("test_treasury_monthly_metrics.db");
+        let _ = std::fs::remove_file(&db_path);
+        let mut app = App::new(&db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Treasury Campaign".into(),
+                description: None,
+                archived: false,
+                completed: false,
+                created_at: now,
+                updated_at: now,
+                owner_identity: Some(app.identity.public_key.clone()),
+                owner_username: Some("Treasurer".into()),
+                is_shared: false,
+            })
+            .unwrap();
+        {
+            let service = crate::services::TreasuryService::new(&app.db);
+            let category = service
+                .categories_for_type(project_id, crate::models::LedgerEntryType::Expense)
+                .unwrap()
+                .remove(0);
+            for index in 0..20 {
+                let created_at = now + Duration::seconds(index);
+                service
+                    .create_entry(crate::models::LedgerEntry {
+                        id: uuid::Uuid::new_v4(),
+                        campaign_id: project_id,
+                        title: format!("Transaction {index:02}"),
+                        description: String::new(),
+                        entry_type: crate::models::LedgerEntryType::Expense,
+                        category_id: category.id,
+                        amount_minor: 1_000 + index * 100,
+                        currency_code: "USD".into(),
+                        status: crate::models::LedgerStatus::Paid,
+                        due_date: None,
+                        payment_date: Some(created_at),
+                        vendor_source: None,
+                        related_task_id: None,
+                        notes: None,
+                        attachment_ref: None,
+                        recurrence: crate::models::LedgerRecurrence::None,
+                        custom_recurrence: None,
+                        version: 0,
+                        created_at,
+                        updated_at: created_at,
+                        created_by_identity: Some(app.identity.public_key.clone()),
+                        account_id: None,
+                        transfer_account_id: None,
+                    })
+                    .unwrap();
+            }
+        }
+        app.selected_treasury_idx = 10;
+        let theme = Theme::default_theme();
+
+        let mut wide = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut treasury_hit = None;
+        wide.draw(|frame| {
+            treasury_hit = draw_treasury_tab(frame, frame.size(), &app, project_id, &theme, false);
+        })
+        .unwrap();
+        let rendered = wide
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Monthly Flow"));
+        assert!(rendered.contains("Treasury Pulse"));
+        assert!(rendered.contains("Saved"));
+        assert!(rendered.contains("ACCOUNT BALANCES"));
+        assert!(rendered.contains("Spending"));
+        assert!(rendered.contains("Savings"));
+        assert!(rendered.contains("Cash"));
+        assert!(rendered.contains("INCOME"));
+        assert!(rendered.contains("OPEN"));
+        let treasury_hit = treasury_hit.unwrap();
+        assert_eq!(treasury_hit.row_targets.first(), Some(&Some(4)));
+        assert_eq!(treasury_hit.row_targets.last(), Some(&Some(15)));
+
+        let mut narrow = Terminal::new(TestBackend::new(52, 22)).unwrap();
+        narrow
+            .draw(|frame| {
+                draw_treasury_tab(frame, frame.size(), &app, project_id, &theme, false);
+            })
+            .unwrap();
+
+        drop(narrow);
+        drop(wide);
+        drop(app);
+        let _ = std::fs::remove_file(&db_path);
     }
 
     #[test]

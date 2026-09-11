@@ -6,8 +6,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use super::{
-    greeting, priority_label, render_progress_bar, short_text, sidequest_rank, task_energy_tag,
-    word_wrap, workload_label,
+    format_due_date, greeting, priority_label, render_progress_bar, short_text, sidequest_rank,
+    task_energy_tag, word_wrap, workload_label,
 };
 use crate::app::{App, DashboardCommandTarget};
 use crate::models::{Achievement, Statistics, Task, TaskPriority, User};
@@ -145,6 +145,10 @@ pub(super) fn draw_today_command_center(
                 Style::default().fg(prio_color),
             ),
             Span::styled(
+                format!("[{}] ", format_due_date(main.task.due_date)),
+                Style::default().fg(theme.focus_timer),
+            ),
+            Span::styled(
                 main.task.title.as_str(),
                 Style::default()
                     .fg(Color::White)
@@ -174,6 +178,10 @@ pub(super) fn draw_today_command_center(
             Span::styled(
                 format!("[{}] ", prio_label),
                 Style::default().fg(prio_color),
+            ),
+            Span::styled(
+                format!("[{}] ", format_due_date(next.task.due_date)),
+                Style::default().fg(theme.focus_timer),
             ),
             Span::styled(next.task.title.as_str(), Style::default().fg(theme.text)),
             Span::styled(
@@ -208,6 +216,10 @@ pub(super) fn draw_today_command_center(
             Span::styled(
                 format!("[{}] ", prio_label),
                 Style::default().fg(prio_color),
+            ),
+            Span::styled(
+                format!("[{}] ", format_due_date(task.due_date)),
+                Style::default().fg(theme.focus_timer),
             ),
             Span::styled(task.title.as_str(), Style::default().fg(theme.text)),
             Span::styled(
@@ -382,10 +394,7 @@ pub(super) fn draw_campaign_intel(
                 Style::default().fg(theme.muted),
             ),
         ]));
-        let due_label = task
-            .due_date
-            .map(|d| d.with_timezone(&Local).format("%Y-%m-%d").to_string())
-            .unwrap_or_else(|| "None".to_string());
+        let due_label = format_due_date(task.due_date);
         lines.push(Line::from(vec![
             Span::styled("  Due Date: ", Style::default().fg(theme.muted)),
             Span::styled(due_label, Style::default().fg(theme.text)),

@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationIcon {
@@ -69,6 +70,27 @@ pub fn send_system_notification_with_icon(
     urgent: bool,
     icon: NotificationIcon,
 ) {
+    send_system_notification_with_icon_timeout(title, message, urgent, icon, None);
+}
+
+// Solicita al sistema operativo que retire la alerta tras el tiempo indicado.
+pub fn send_timed_system_notification_with_icon(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon: NotificationIcon,
+    timeout: Duration,
+) {
+    send_system_notification_with_icon_timeout(title, message, urgent, icon, Some(timeout));
+}
+
+fn send_system_notification_with_icon_timeout(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon: NotificationIcon,
+    timeout: Option<Duration>,
+) {
     let title = strip_non_ascii(title);
     let message = strip_non_ascii(message);
     let icon_path = notification_icon_path(icon);
@@ -76,7 +98,7 @@ pub fn send_system_notification_with_icon(
     std::thread::spawn(move || {
         #[cfg(target_os = "linux")]
         {
-            send_linux_notification(&title, &message, urgent, icon_path.as_ref());
+            send_linux_notification(&title, &message, urgent, icon_path.as_ref(), timeout);
         }
 
         #[cfg(target_os = "macos")]
@@ -115,6 +137,14 @@ pub fn send_system_notification_with_icon(
                     )
                 })
                 .unwrap_or_default();
+            let expiration_line = timeout
+                .map(|duration| {
+                    format!(
+                        "$toast.ExpirationTime=[DateTimeOffset]::Now.AddMilliseconds({});",
+                        duration.as_millis().min(i64::MAX as u128)
+                    )
+                })
+                .unwrap_or_default();
             let ps = format!(
                 concat!(
                     "[Windows.UI.Notifications.ToastNotificationManager,",
@@ -125,13 +155,16 @@ pub fn send_system_notification_with_icon(
                     "{image}",
                     "$x.GetElementsByTagName('text')[0].InnerText={title};",
                     "$x.GetElementsByTagName('text')[1].InnerText={message};",
+                    "$toast=[Windows.UI.Notifications.ToastNotification]::new($x);",
+                    "{expiration}",
                     "[Windows.UI.Notifications.ToastNotificationManager]",
                     "::CreateToastNotifier('Questline')",
-                    ".Show([Windows.UI.Notifications.ToastNotification]::new($x))"
+                    ".Show($toast)"
                 ),
                 template = template,
                 scenario = scenario_line,
                 image = image_line,
+                expiration = expiration_line,
                 title = powershell_quote(&title),
                 message = powershell_quote(&message),
             );
@@ -198,28 +231,34 @@ fn send_with_osascript(title: &str, message: &str, subtitle: &str) {
 }
 
 #[cfg(target_os = "linux")]
-fn send_linux_notification(title: &str, message: &str, urgent: bool, icon_path: Option<&PathBuf>) {
+fn send_linux_notification(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon_path: Option<&PathBuf>,
+    timeout: Option<Duration>,
+) {
     // notify-send talks to the Freedesktop notification portal/server and works with
     // Dunst, Mako, SwayNC, GNOME Shell, KDE Plasma, Xfce, Cinnamon, and similar desktops.
-    if send_with_notify_send(title, message, urgent, icon_path) {
+    if send_with_notify_send(title, message, urgent, icon_path, timeout) {
         return;
     }
 
     // Dunst users may have dunstify even when notify-send/libnotify is not installed.
-    if send_with_dunstify(title, message, urgent, icon_path) {
+    if send_with_dunstify(title, message, urgent, icon_path, timeout) {
         return;
     }
 
     // gdbus is commonly present on GNOME/GTK systems and calls the same notification API directly.
-    if send_with_gdbus(title, message, urgent, icon_path) {
+    if send_with_gdbus(title, message, urgent, icon_path, timeout) {
         return;
     }
 
     // KDE and GTK fallbacks. These are less featureful but still give the user a visible alert.
-    if send_with_kdialog(title, message) {
+    if send_with_kdialog(title, message, timeout) {
         return;
     }
-    let _ = send_with_zenity(title, message, icon_path);
+    let _ = send_with_zenity(title, message, icon_path, timeout);
 }
 
 #[cfg(target_os = "linux")]
@@ -233,6 +272,7 @@ fn send_with_notify_send(
     message: &str,
     urgent: bool,
     icon_path: Option<&PathBuf>,
+    timeout: Option<Duration>,
 ) -> bool {
     let urgency = if urgent { "critical" } else { "normal" };
     let mut cmd = std::process::Command::new("notify-send");
@@ -243,6 +283,9 @@ fn send_with_notify_send(
     if let Some(path) = icon_path {
         cmd.arg("--icon").arg(path);
     }
+    if let Some(timeout) = timeout {
+        cmd.arg(format!("--expire-time={}", timeout.as_millis()));
+    }
     command_succeeded(cmd.arg(title).arg(message))
 }
 
@@ -252,6 +295,7 @@ fn send_with_dunstify(
     message: &str,
     urgent: bool,
     icon_path: Option<&PathBuf>,
+    timeout: Option<Duration>,
 ) -> bool {
     let urgency = if urgent { "critical" } else { "normal" };
     let mut cmd = std::process::Command::new("dunstify");
@@ -264,13 +308,24 @@ fn send_with_dunstify(
     if let Some(path) = icon_path {
         cmd.arg("--icon").arg(path);
     }
+    if let Some(timeout) = timeout {
+        cmd.arg("--timeout").arg(timeout.as_millis().to_string());
+    }
     command_succeeded(cmd.arg(title).arg(message))
 }
 
 #[cfg(target_os = "linux")]
-fn send_with_gdbus(title: &str, message: &str, urgent: bool, icon_path: Option<&PathBuf>) -> bool {
+fn send_with_gdbus(
+    title: &str,
+    message: &str,
+    urgent: bool,
+    icon_path: Option<&PathBuf>,
+    timeout: Option<Duration>,
+) -> bool {
     let hints = format!("{{'urgency': <{}>}}", if urgent { 2 } else { 1 });
-    let timeout_ms = if urgent { "0" } else { "6000" };
+    let timeout_ms = timeout
+        .map(|duration| duration.as_millis().min(i32::MAX as u128).to_string())
+        .unwrap_or_else(|| if urgent { "0" } else { "6000" }.to_string());
     let icon = icon_path
         .map(|path| path.to_string_lossy().to_string())
         .unwrap_or_else(|| "questline".to_string());
@@ -299,21 +354,27 @@ fn send_with_gdbus(title: &str, message: &str, urgent: bool, icon_path: Option<&
 }
 
 #[cfg(target_os = "linux")]
-fn send_with_kdialog(title: &str, message: &str) -> bool {
+fn send_with_kdialog(title: &str, message: &str, timeout: Option<Duration>) -> bool {
+    let timeout_seconds = timeout.map_or(6, |duration| duration.as_secs().max(1));
     command_succeeded(
         std::process::Command::new("kdialog")
             .arg("--title")
             .arg(title)
             .arg("--passivepopup")
             .arg(message)
-            .arg("6")
+            .arg(timeout_seconds.to_string())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null()),
     )
 }
 
 #[cfg(target_os = "linux")]
-fn send_with_zenity(title: &str, message: &str, icon_path: Option<&PathBuf>) -> bool {
+fn send_with_zenity(
+    title: &str,
+    message: &str,
+    icon_path: Option<&PathBuf>,
+    timeout: Option<Duration>,
+) -> bool {
     let mut cmd = std::process::Command::new("zenity");
     cmd.arg("--notification")
         .arg("--title")
@@ -324,6 +385,9 @@ fn send_with_zenity(title: &str, message: &str, icon_path: Option<&PathBuf>) -> 
         .stderr(std::process::Stdio::null());
     if let Some(path) = icon_path {
         cmd.arg("--window-icon").arg(path);
+    }
+    if let Some(timeout) = timeout {
+        cmd.arg(format!("--timeout={}", timeout.as_secs().max(1)));
     }
     command_succeeded(&mut cmd)
 }
