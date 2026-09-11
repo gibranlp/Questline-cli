@@ -189,7 +189,9 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
             Span::styled("[ Enter ]", Style::default().fg(ghost)),
             Span::styled("  Invoke Restoration    ·    ", Style::default().fg(dim)),
             Span::styled("[ Esc ]", Style::default().fg(ghost)),
-            Span::styled("  Return to the Gates", Style::default().fg(dim)),
+            Span::styled("  Return to the Gates    ·    ", Style::default().fg(dim)),
+            Span::styled("[ q ]", Style::default().fg(ghost)),
+            Span::styled("  Quit", Style::default().fg(dim)),
         ]))
         .alignment(Alignment::Center),
         footer_area,

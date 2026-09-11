@@ -4,6 +4,7 @@
 
 use crate::app::{App, ModalType};
 use crate::models::Achievement;
+use crate::screens::hit_test::SyncHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -15,7 +16,7 @@ use ratatui::{
 
 // pantalla gorda de sync — aquí va todo: identidad, dispositivos, stats y los modales
 // divide en dos columnas, izquierda config/stats, derecha devices/snapshots/progresión RPG
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegions {
     let size = area;
     let accent_color = theme.primary;
 
@@ -33,7 +34,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .unwrap_or_else(|| "Never".to_string());
     let local_sync_seq = app
         .db
-        .get_setting("last_pull_seq")
+        .get_setting("last_pull_seq_v2")
         .unwrap_or(None)
         .unwrap_or_else(|| "0".to_string());
     let cloud_sync_seq = app
@@ -88,6 +89,13 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         theme.danger
     };
     let top_health_color = health_color;
+
+    // Fixed row indices into left_text below, for the three lines that get
+    // a click target — counted from the vec![] literal's start (index 0);
+    // update these if a line is added/removed above any of them.
+    const SYNC_NOW_ROW: u16 = 4;
+    const CLOUD_SYNC_TOGGLE_ROW: u16 = 22;
+    const AUTO_SYNC_TOGGLE_ROW: u16 = 23;
 
     let mut left_text = vec![
         Line::from(""),
@@ -149,7 +157,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         )]),
         Line::from(vec![
             Span::styled(
-                "   [c] Copy Share Key       ",
+                "   [c] Copy Companion Key   ",
                 Style::default().fg(theme.text),
             ),
             Span::styled("[b] Backup", Style::default().fg(theme.text)),
@@ -217,13 +225,26 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             ),
         ]),
         Line::from(vec![Span::styled(
-            "   Public Key (Share Key):",
+            "   Companion Key (public; safe to share):",
             Style::default().fg(theme.muted),
         )]),
         Line::from(vec![Span::styled(
-            format!("   {}", app.identity.public_key),
+            format!(
+                "   {}",
+                crate::services::identity::format_companion_key(&app.identity.public_key)
+            ),
             Style::default().fg(Color::LightCyan),
         )]),
+        Line::from(vec![
+            Span::styled("   Fingerprint: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                crate::services::identity::companion_key_fingerprint(&app.identity.public_key)
+                    .unwrap_or_else(|_| "Unavailable".to_string()),
+                Style::default()
+                    .fg(theme.warning)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
         Line::from(vec![
             Span::styled("   Created At: ", Style::default().fg(theme.muted)),
             Span::styled(&app.identity.created_at, Style::default().fg(theme.text)),
@@ -244,6 +265,38 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled("  [u] edit", Style::default().fg(theme.muted)),
+        ]),
+        Line::from(vec![
+            Span::styled("   Encryption: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                format!(
+                    "Active — sync-v{} / {} / {}",
+                    crate::services::encryption::SYNC_VERSION,
+                    crate::services::encryption::CIPHER_NAME,
+                    crate::services::encryption::KEY_ID,
+                ),
+                Style::default()
+                    .fg(theme.success)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("   Cloud Sync: ", Style::default().fg(theme.muted)),
+            Span::styled(
+                if app.config.sync_enabled {
+                    "Enabled"
+                } else {
+                    "Disabled — Local Only"
+                },
+                Style::default()
+                    .fg(if app.config.sync_enabled {
+                        theme.success
+                    } else {
+                        theme.warning
+                    })
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  [s] toggle", Style::default().fg(theme.muted)),
         ]),
         Line::from(vec![
             Span::styled("   Auto Sync:  ", Style::default().fg(theme.muted)),
@@ -355,25 +408,36 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         }
     }
 
-    let left_panel = Paragraph::new(left_text).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(accent_color))
-            .title(Span::styled(
-                " Questline Sync Node Settings ",
-                Style::default()
-                    .fg(theme.warning)
-                    .add_modifier(Modifier::BOLD),
-            )),
-    );
+    let left_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent_color))
+        .title(Span::styled(
+            " Questline Sync Node Settings ",
+            Style::default()
+                .fg(theme.warning)
+                .add_modifier(Modifier::BOLD),
+        ));
 
     // columna izquierda: arriba config del nodo, abajo las estadísticas de productividad
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(34), Constraint::Min(6)])
+        .constraints([Constraint::Length(36), Constraint::Min(6)])
         .split(chunks[0]);
 
+    let left_inner = left_block.inner(left_chunks[0]);
+    let one_row = |row: u16| Rect {
+        x: left_inner.x,
+        y: left_inner.y + row,
+        width: left_inner.width,
+        height: 1,
+    };
+    let sync_hit_regions = SyncHitRegions {
+        sync_now: one_row(SYNC_NOW_ROW),
+        cloud_sync_toggle: one_row(CLOUD_SYNC_TOGGLE_ROW),
+        auto_sync_toggle: one_row(AUTO_SYNC_TOGGLE_ROW),
+    };
+    let left_panel = Paragraph::new(left_text).block(left_block);
     f.render_widget(left_panel, left_chunks[0]);
 
     // pues hay que mostrar las estadísticas de trabajo del héroe — tasks, notas, journals, etc.
@@ -1121,6 +1185,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             [25, 65, 100],
         );
     }
+
+    sync_hit_regions
 }
 
 fn draw_cloud_progress_modal(

@@ -8,6 +8,8 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
+Current stable version: **2.0.0**.
+
 ---
 
 Questline is a terminal productivity app disguised as an RPG. Complete real tasks. Level up a real character. Explore a world that grows with your output.
@@ -90,28 +92,67 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ### Quest System
 Tasks in Questline are quests. They carry priority, due dates, subtasks, and steps. Completing a quest earns XP, waters your Zen Tree, and pushes chapter objectives forward. Fail to complete daily quests and the realm takes notice.
 
+Press `m` on a quest or step in a Campaign's War Room to move it — send it back to the top level, or file it as a step under any other top-level quest in that Campaign. A quest that still holds its own steps can't be moved into another quest until those steps are cleared or moved first, since a step cannot itself hold steps.
+
+Press `t` from Campaigns to start from a Software Release, Content Sprint, or Event Launch template. Reusable Campaign structure can also be exchanged as an identity-free JSON blueprint:
+
+```sh
+questline campaign-export "Campaign Name" campaign.json
+questline campaign-import campaign.json
+questline campaign-import campaign.json --confirm
+```
+
+Import previews the Campaign before making changes. Blueprint files contain only the Campaign name and description plus Quest titles, descriptions, priorities, and steps; sharing state, identities, assignments, completion history, comments, notes, activity, dates, and encryption keys are excluded.
+
+Local iCalendar files can be previewed and imported as due-dated Quests without connecting a calendar account:
+
+```sh
+questline calendar-import "Campaign Name" events.ics
+questline calendar-import "Campaign Name" events.ics --confirm
+questline calendar-import "Campaign Name" events.ics --reconcile
+```
+
+Repeated imports skip event UIDs already present in that Campaign. Use `--reconcile` explicitly to apply changed event titles, descriptions, and due times and to mark cancellations without deleting or completing Quests. Quest priority, completion, XP, and assignments remain untouched. IANA `TZID` values and daylight-saving transitions are resolved before the UTC due time is shown in preview. Importing into a shared Campaign displays a warning because the resulting Quests will use normal Fellowship sync.
+
+Authenticated calendar subscriptions are not enabled yet. Questline will not
+store calendar tokens or private feed URLs in its SQLite database or ordinary
+configuration files. A native credential-vault boundary is in place, but
+provider authorization and export-isolation checks must pass before login ships.
+
 ### The Main Quest
 
 Every time the Dashboard opens, Questline convenes an emergency session of the Planning Council — a deterministic scoring engine that reviews every incomplete task in your backlog and selects the single most important thing to do right now.
 
-The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points.
+The Council is not wise. It does not know you. It does not care that the overdue task from three weeks ago is actually fine and you have been meaning to close it. It simply assigns points — but it weighs time far more heavily than it used to, because a task due six weeks from now has no business winning the title of "most important thing to do today."
 
-| Condition | Points |
+| Due date | Points |
 |---|---|
-| Overdue | +100 |
-| Due today | +60 |
-| Due tomorrow | +40 |
-| Due within three days | +25 |
-| Due within seven days | +10 |
-| High priority | +30 |
-| Medium priority | +10 |
+| Overdue | +105 |
+| Due today | +90 |
+| Due tomorrow | +75 |
+| Due within three days | +60 |
+| Due within seven days | +45 |
+| Due within two weeks | +30 |
+| Due within thirty days | +15 |
+| Due beyond thirty days, or no due date | +0 |
+
+| Priority | Points |
+|---|---|
+| High priority | +14 |
+| Medium priority | +5 |
 | Low priority | +0 |
 
-The scores stack. A High priority task due today scores 90. An overdue task of any priority scores at least 100 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
+The due-date ladder climbs in steps of 15, and priority tops out at 14 — one point short of a full step. That gap is deliberate: no amount of priority can ever lift a task over a nearer deadline. A High priority task with no due date, or one due nine months from now, scores 14. A Low priority task due within the month already scores 15, and beats it. Time sets the ceiling; priority only breaks ties between tasks that are already similarly urgent.
+
+The scores still stack within a tier. A High priority task due today scores 104. An overdue task of any priority scores at least 105 and will continue appearing as the Main Quest until you resolve it, archive it, or make peace with its existence.
 
 The Council does not consider how long the task will take, how much you dread it, how many times you have quietly moved it to tomorrow, or whether finishing it would actually matter. Those are judgment calls. The Council only counts points.
 
 The second-highest scoring task is displayed as the Recommended Next Quest — a polite suggestion from an entity that has never experienced a Tuesday afternoon.
+
+The Council only lets tasks compete for Main Quest, Recommended Next Quest, Quick Wins, or Upcoming Threats if they are overdue, undated, or due within your configured planning horizon — 15 days by default. A task due a month out still scores exactly as the table says, but it cannot be crowned "the single most important thing to do right now" until it's actually close, so the Command Center reflects what deserves your attention today rather than everything eventually on the calendar.
+
+Set that horizon yourself from `[9] Settings` → Oath Calendar → **Show up to**, with `Left`/`Right`. Choose Today, Tomorrow, 1 week, 15 days, 1 month, 6 months, 1 year, or All (no limit). The setting syncs across your devices like the rest of the Oath Calendar.
 
 Press `o` from the Dashboard to open the current Main Quest directly in its workspace.
 
@@ -141,6 +182,107 @@ Collectible items discovered through focus sessions and long-form work. Each rel
 
 ### Progression
 Every action earns XP. XP drives levels. Levels unlock class powers, new titles, and deeper lore. Specializations let you redirect your growth. Achievements mark the moments worth remembering.
+
+### The Treasury
+
+Every Campaign has a Treasury — a full ledger for the money behind the work. Press `4` in a Campaign workspace to open it. You get overall and per-category budgets, income and expense entries with vendors, due dates, payment dates, notes and recurrence, plus estimated, actual, and billable amounts on individual Quests.
+
+The Treasury summarizes Budget, Income, Paid, Committed, and Available at a glance, warns at 80%, 90%, and 100% of any budget, tracks upcoming and overdue payments, and exports the whole ledger to CSV and JSON with `x`.
+
+Choose the currency your Campaign works in — **USD** or **MXN**:
+
+- Press `$` in the Treasury to switch. Amounts display with the currency symbol and thousands separators (`MX$1,234,567.89`).
+- Questline does not convert between currencies. It has no exchange rate and never invents one. You pick the denomination you are working in, and the numbers stay exactly as you entered them.
+- Switching relabels the existing ledger rather than converting it, so totals never silently mix denominations. The Chronicle records the switch.
+
+Currency is per Campaign, so different Campaigns can be kept in different currencies.
+
+Treasury keys: `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter, `s` sort, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
+
+### Encrypted Sync and Fellowship
+
+Questline now has an encrypted sync path for private data. Your tasks, notes,
+projects, journals, and progress are encrypted on your device before they are
+uploaded. The server stores encrypted data and does not receive your account
+decryption key.
+
+Encrypted sync works across the CLI and web app. A Transfer Code can move your
+identity to another trusted computer so it can derive the same encryption key.
+Treat that code like a master password: anyone who gets it can access your
+encrypted data.
+
+Fellowship projects use their own project key. Members receive encrypted key
+envelopes, project routes are opaque, and removing a member rotates the key so
+the old route can no longer receive new edits. A project becomes local again
+when its last companion is removed.
+
+Shared Campaigns now include a keyboard-first teamwork loop:
+
+- Exchange the public **Companion Key** and compare its short fingerprint.
+- Use Fellowship **My Quests** (`y`) to see assigned work across Campaigns.
+- In the Quest Ledger, use `a` to manage Quest bearers, `g` to advance a
+  Quest Stance, `Shift+G` to move it back, and `c` to convene the encrypted
+  **Quest Council**.
+- Quest Council mentions bind to stable Companion Keys. Authors can revise with
+  `Ctrl+E` or withdraw with `Ctrl+D` while retaining a sync tombstone.
+- Fellowship **Council Notices** (`b`) provide deep-links, filters, read/unread
+  controls, and account-encrypted read-state synchronization.
+- Owners and Stewards administer assignments. Companions work and discuss;
+  Observers remain read-only in Quest Councils.
+- Fellowship **Treasury** (`t`) shows a shared Campaign's totals, who recorded
+  each movement, and exactly what your own role may do.
+
+Decrypted notice and discussion content stays on trusted clients. The server
+receives encrypted payloads plus unavoidable routing metadata, never a plaintext
+Quest or Council message.
+
+#### Treasury in a Shared Campaign
+
+The whole Treasury syncs end-to-end encrypted. In a shared Campaign every
+treasury event — the Campaign treasury, ledger categories, category budgets,
+ledger entries, and Quest financials — is sealed with that Fellowship's project
+key and routed through its opaque route. In a private Campaign the same data
+uses your account key. The server stores ciphertext; it never receives an
+amount, a vendor, or an entry title in the clear.
+
+Money deserves separation of duties, so whoever records a cost is not who
+approves or settles it:
+
+| Action | Owner | Steward | Companion | Observer |
+|---|:---:|:---:|:---:|:---:|
+| View Treasury | Yes | Yes | Yes | Yes |
+| Record entry | Yes | Yes | Yes | No |
+| Edit/delete own Planned entry | Yes | Yes | Yes | No |
+| Edit/delete any entry | Yes | Yes | No | No |
+| Approve entry | Yes | Yes | No | No |
+| Settle payment | Yes | Yes | No | No |
+| Change entry date | Yes | Yes | No | No |
+| Set budgets | Yes | Yes | No | No |
+| Manage categories | Yes | Yes | No | No |
+| Switch currency | Yes | No | No | No |
+| Quest estimated/actual cost | Yes | Yes | Yes | No |
+| Quest billable amount and payment status | Yes | Yes | No | No |
+
+A Companion owns an entry only while it is still `Planned`. Once it is approved,
+paid, or cancelled it belongs to the Owner and Stewards. Authorship is recorded
+as the author's Companion Key when the entry is created and never changes, so
+editing someone else's entry does not transfer ownership of it. The status field
+in the entry form is not a shortcut either: saving anything other than `Planned`
+requires the right to approve or settle. The same goes for the entry's date —
+editing an entry shows a Date field (`YYYY-MM-DD`, `today`, `tomorrow`, or
+`in N days`) so an Owner or a Steward can correct or backdate when a movement
+actually occurred; a Companion can still edit their own Planned entry, but the
+date itself is Owner/Steward-only and reverts if they try to change it.
+
+The Treasury footer only advertises the shortcuts your role can actually use,
+and the Quest Codex (`?`) grays out the rest.
+
+You can also turn cloud sync off and use Questline locally. The local-only
+choice also lets you quit without waiting for a sync operation.
+
+The encrypted rollout is additive for now. Older accounts can continue using
+the legacy path while they migrate. The encrypted server database is separate
+from the old database so the migration can be verified and rolled back safely.
 
 ---
 
@@ -238,6 +380,370 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ## Changelog
 
+### v2.0.0 — Encrypted Fellowship
+*Released 2026-08-01*
+
+- Private sync-v2 encrypts content with AES-256-GCM before it leaves the CLI or
+  browser.
+- Every stored encrypted event carries a durable Ed25519 author signature. The
+  signature covers the complete envelope, including ciphertext, nonce, scope,
+  route, device, and author identity, and is verified before decryption.
+- Rust and WebCrypto use the same identity-based key derivation, so trusted
+  devices can restore the same account data.
+- Encrypted snapshots replace previous backups instead of duplicating the full
+  history on every export.
+- A trusted signed snapshot performs a per-account cutover: old unsigned account
+  history is retired, future unsigned writes are rejected, and clients reject
+  unsigned pulls without rewriting Fellowship authorship.
+- New-device restore, migration, cursor recovery, replay protection, and
+  suspicious remote-page quarantine are safer.
+- Fellowship projects use per-project encryption keys and opaque routing IDs.
+- Invitations contain encrypted project details and are checked before they are
+  accepted; repeated acceptance is safe after a crash.
+- Removing a Fellowship member rotates keys and routes. Removing the last
+  companion returns the project to local mode.
+- Production security checks cover request replay, duplicate event IDs,
+  ciphertext substitution, cross-identity forgery, concurrent invitation
+  acceptance, interrupted rotation rollback, removed-member revocation,
+  retired-route write rejection, and replacement-route delivery isolation.
+- Sync Settings show the active protocol and provide a local-only mode.
+- The webapp now protects Markdown previews, browser key storage, account cache,
+  and encrypted API envelopes more carefully.
+- The existing legacy sync path remains available during migration. It will be
+  removed only after the encrypted rollout and compatibility window are complete.
+- Added Companion Key fingerprints, cross-Campaign My Quests, Quest bearers,
+  six Quest Stances, encrypted Quest Councils with identity-backed mentions,
+  and actionable Council Notices.
+- Council Notice read state synchronizes as a separate account-encrypted opaque
+  entity; decrypted notice text remains local.
+- Owner/Steward assignment administration is enforced from signed event
+  metadata, and Quest Council authorship is checked against the event signer.
+- Production retention checks found no private-field markers in available API,
+  admin, PHP error, or Apache logs; no migrated account retains a legacy backup;
+  and encrypted event storage contains ciphertext rather than JSON plaintext.
+- The server still sees routing metadata such as account, device, event, entity,
+  operation, timestamp, approximate size, and sync frequency. Questline therefore
+  describes this as end-to-end encrypted content, not zero metadata knowledge.
+- Legacy plaintext history remains intentionally available for unmigrated users
+  and rollback. It must not be deleted until migration is complete, the rollback
+  window closes, runtime and migration database credentials are separated, and
+  hosting-provider snapshot retention is confirmed.
+
+**Campaign planning and exploration:**
+
+- Added private Campaign starter templates for Software Release, Content Sprint,
+  and Event Launch workflows, available from the Campaigns screen with a
+  keyboard-first preview and confirmation flow.
+- Campaign structure can be exported and imported as a versioned, identity-free
+  JSON blueprint. Portable templates exclude sharing state, identities,
+  assignments, completion history, comments, notes, activity, dates, and
+  encryption keys.
+- Added preview-first local `.ics` calendar import. Calendar events become
+  due-dated Quests only after explicit confirmation, repeated imports are
+  idempotent, and reconciliation must be requested explicitly.
+- Calendar reconciliation updates event-controlled titles, descriptions, and
+  due times while preserving Quest priority, completion, XP, and assignments.
+  Cancellations remain visible without deleting or completing the Quest.
+- IANA calendar timezones and daylight-saving transitions are resolved before
+  import, with malformed, ambiguous, and nonexistent times rejected safely.
+- Added the native credential-vault foundation required for future authenticated
+  calendar subscriptions. Provider login remains disabled until its OAuth and
+  export-isolation security checks are complete.
+- Somewhere beyond the usual menus, a class-specific terminal Easter egg now
+  waits for heroes who uncover the Forgotten Archive.
+- Heroes who carry a record out of the Archive find an unsigned note describing
+  a floor below it. The floor is not catalogued. It answers to its own name, it
+  is windowless, and it opens only for those who type the right thing.
+
+**Campaign Treasury:**
+
+- Added the Campaign Treasury: overall and per-category budgets, income and
+  expense entries with vendors, due and payment dates, notes and recurrence,
+  Quest-level estimated, actual, and billable amounts, budget warnings at 80%,
+  90%, and 100%, upcoming and overdue payment tracking, and CSV/JSON export.
+- Each Campaign chooses whether it works in USD or MXN. Questline performs no
+  currency conversion and holds no exchange rate; switching relabels the existing
+  ledger so totals never mix denominations silently, and the Chronicle records
+  the change. Amounts render with the currency symbol and thousands separators.
+- The full Treasury now syncs end-to-end encrypted. Shared Campaigns seal every
+  treasury entity with the Fellowship project key and its opaque route; private
+  Campaigns use the account key. Verified by round-trip tests that assert no
+  entry title, vendor, or category name appears in cleartext on the wire, and
+  that a wrong Fellowship key cannot open a treasury envelope.
+- Treasury permissions now follow Fellowship roles, with separation of duties:
+  Companions record their own entries and may amend them only while `Planned`;
+  Owners and Stewards approve, settle, budget, and manage categories; only the
+  Owner switches the Campaign currency; Observers audit but never alter. Entry
+  authorship is stored as the author's Companion Key, is set at creation, and is
+  immutable, so editing another member's entry never transfers ownership.
+- Fellowship gained a **Treasury** tab (`t`) showing a shared Campaign's totals,
+  who recorded each movement, and the permission matrix with your own role
+  highlighted. The Treasury footer and Quest Codex now hide or gray out the
+  actions your role cannot perform.
+- Fixed a treasury sync defect that could lose data silently: a ledger row whose
+  Campaign, category, or Quest had not arrived yet was dropped permanently while
+  the sync still reported success. Such a row is now reported and retried on the
+  next sync.
+- Fixed an Observer in a shared Campaign being able to queue a treasury write the
+  server rejects. Because that rejection rolls back the entire push batch, one
+  such edit previously stalled that account's whole sync.
+- Fixed `p` in the Treasury pausing audio instead of settling a payment, and `s`
+  stopping audio instead of sorting the ledger. Both shortcuts were shadowed by
+  global audio keys and had never worked.
+
+**Cross-device sync:**
+
+- XP history, daily quests, streaks, and hydration now sync across devices on
+  the same profile — previously they stayed stuck on whichever PC earned them.
+- Daily quests are now generated deterministically per day, so every device
+  gets the same 5 quests instead of each PC rolling its own random set.
+- Fixed a bug where Zen Tree progress could silently fail to sync because of a
+  random per-device ID mismatch, and where a tree that had already reset for a
+  new day could have yesterday's watering count resurrected by an older device.
+- Removed the unused `daily_quests` table and model (dead code).
+
+**Release-hardening pass:**
+
+- The full encryption implementation was audited against the design: private
+  sync-v2, HKDF account keys, AES-256-GCM with fail-closed decryption, the
+  four-layer replay protection, protocol lock, Transfer-Code migration and
+  new-device restore, and Fellowship key rotation/removal were all verified in
+  code.
+- CLI ↔ web cryptographic interoperability is now locked by shared test vectors
+  in the CLI itself: the account key derivation, the Fellowship X25519 public
+  key, and a browser-produced key envelope all decrypt and verify byte-for-byte
+  in the Rust client, so encrypted data stays portable across devices.
+- Fixed a specialization XP bug: task-focused specializations (Bug Hunter,
+  Execution Knight, and their class equivalents) now grant their +10% bonus on
+  every quest and task completion, not only high-priority ones.
+- Removed unreachable key-handling code and repaired the test suite so it runs
+  clean, keeping unrelated failures from masking a real encryption regression.
+
+**Fellowship, Currency, and Sync Hardening:**
+
+- Fixed the Dashboard's Fellowship widget counting unread Chronicle messages
+  and Council Notices from private, non-shared Campaigns toward its Unread and
+  Mentions totals. Both are now scoped to shared Campaigns only, matching the
+  rule that Fellowship is for shared projects.
+- Campaign Currency now offers five more denominations — EUR, GBP, CAD, AUD,
+  and CHF — alongside USD and MXN. As before, Questline performs no currency
+  conversion; switching only relabels the existing ledger.
+- Fixed a crash risk where a malformed or malicious hex field in a sync
+  server's response could panic the client instead of being rejected as an
+  invalid key envelope.
+- Cloud Sync Reset now re-confirms the remote Fellowship history was actually
+  replaced after the snapshot upload, instead of trusting a successful
+  response alone.
+- Fixed a queued Quest assignment change that could survive a Fellowship
+  access revocation and go out under the wrong encryption scope on the next
+  sync.
+- Removing a Companion from a Fellowship now also clears their assigned
+  Quests, so those Quests correctly reappear in Council Briefing's workload
+  breakdown and unassigned queue instead of silently vanishing from both.
+- Fixed the Command Center dashboard mislabeling a High-priority Quest due
+  more than a month out as demanding immediate action instead of showing its
+  actual due-date urgency.
+- Task-list filters (My Quests, Assignee, Unassigned, Blocked, Review) in a
+  Campaign workspace no longer query the database once per Quest on every
+  render frame, fixing a performance drag on larger Campaigns.
+- Sync now caches a shared Campaign's encryption key once per push batch
+  instead of re-reading it for every pending change, speeding up syncing a
+  large batch of offline edits.
+- Removed duplicate encrypt/decrypt helper functions in the sync engine that
+  had drifted into two names for the same operation.
+- Fixed yank/copy in the Notes editor (and other Copy to Clipboard actions)
+  silently failing under WSL: the clipboard helper now detects WSL at runtime
+  and hands text to Windows via `clip.exe` (falling back to PowerShell's
+  `Set-Clipboard`) instead of only trying Linux tools like `wl-copy`/`xclip`
+  that have no display to talk to. It also checks that the clipboard command
+  actually succeeded instead of just that it launched, so a failed copy is no
+  longer reported as if it worked.
+- Added mouse support to the Notes editor on Windows, macOS, and Linux:
+  click to place the cursor, click-and-drag to select text, double-click to
+  select a word, and scroll wheel to scroll. Right-click pastes from the
+  system clipboard, backed by a new cross-platform clipboard-read helper
+  (`pbpaste`/PowerShell `Get-Clipboard`/`wl-paste`/`xclip`/`xsel`) alongside
+  the existing copy helper. Scroll-wheel support was also added to the About,
+  Great Chronicle, and Library screens. Click-to-select in other list screens
+  is planned as a follow-up.
+- Extended click-to-select to the Archive, Gateway, Great Chronicle,
+  Onboarding, Hall of Legends, and Focus screens: clicking a row/option/card
+  now does what Enter or Up/Down would have — e.g. clicking an Archived
+  Campaign selects it, clicking a Gateway option activates it immediately,
+  and clicking either side of the Great Chronicle moves focus between the
+  Realm Activity feed and the Chapter panel.
+- Extended click-to-select to Campaigns and the Command Center: both lists
+  interleave non-selectable rows (the pinned "All Campaigns" entry and a
+  "Shared Campaigns" divider; "-- Quick Wins --"/"-- Sidequests --"/"--
+  Daily --" dividers) among the real, clickable ones, so clicking now maps
+  the row you actually clicked back to the right campaign or quest instead
+  of an off-by-however-many-dividers-are-above-it one.
+- Extended click-to-select to Soundscapes, the Lore Library, and Settings:
+  click a source to select it (and, under Local Folder, click a track or
+  Random Shuffle in the nested list); click a category, entry, or the
+  details pane in the Library to move focus there; click a theme, an
+  Alerts & Audio row, or an Oath Calendar row in Settings to focus it (a
+  click only selects — several of those rows are live toggles, and a
+  misclick flipping one would be worse than requiring the existing
+  Enter/Space keys to commit).
+- Extended click-to-select to Character, Sync, and tab-switching in
+  Fellowship: click an Adventure Log entry (even the hand word-wrapped,
+  variable-height ones) or a Reflections row to select it, or the
+  Reflection Detail pane to focus it; on Sync, click "Press [Enter] to
+  Sync Now", the Cloud Sync row, or the Auto Sync row to activate them
+  immediately, same as their keybindings (Sync has no existing selection
+  index at all, unlike every other screen here, and most of it is
+  read-only stats text with no keyboard action to hook into — only these
+  three rows got a click target); in Fellowship, click a tab to switch to
+  it and click a row in that tab's list — Shared Campaigns, Invitations,
+  Companions, My Quests, Council Notices, or the Chronicle chat transcript
+  itself — to select it (Activity and Treasury are read-only, nothing to
+  select there). Chat messages are variable height and manually scrolled
+  rather than a real list widget, so a click maps the screen line back to
+  whichever message's line range it fell in. Project Workspace is now fully
+  covered too: click a sidebar row to jump straight to that tab (same as
+  pressing 1-5), and click within whichever tab is open — a quest in Tasks,
+  a milestone (including its requirement sub-rows) in Overview, a ledger
+  row in Treasury, a chronicle entry in Journal, or a scroll (skipping
+  non-selectable "── Unassigned ──" dividers) or the preview pane in Notes.
+  The Tasks tab's Kanban/quest-board view — a separate rendering mode from
+  the list view, 6 status columns of cards — is clickable too: click any
+  card in any column to select it. This closes out Phase 2 entirely — every
+  list, table, and menu in the app now supports click-to-select.
+- Added double-click-to-open on top of click-to-select on Campaigns,
+  Dashboard, Project Workspace (including Kanban), Fellowship, Character,
+  Sync, Focus, Soundscapes, the Lore Library, Settings, the Archive, and
+  Onboarding — every screen where a keyboard action beyond plain selection
+  already existed. Double-clicking a row now does what Enter (or, for a
+  Treasury entry, 'e'; for a Class Quest, Space; for an archived Campaign,
+  'r') would have — open a Campaign into its War Room, open a Quest's edit
+  modal or drill into its steps on the Kanban board, open a Scroll in the
+  Editor, open a Treasury entry, accept a pending Fellowship invitation,
+  jump to a Council notice's target, open a "My Quests" entry in its
+  Campaign, jump straight to a Reflection's detail pane, start a Focus
+  session with whichever duration/Campaign/Quest/Soundscape is currently
+  selected, play a Soundscape (or a Local Folder track), start/complete a
+  Class Quest, apply a theme or flip an Alerts toggle in Settings, restore
+  an archived/completed Campaign, or confirm a class and finish
+  Onboarding. Rows with no existing keyboard "open" action (the pinned
+  "All Campaigns" row, Journal, Milestones, Companions, Chat messages, the
+  Adventure Log, Sync's already-immediate toggles, every Library category
+  besides Class Quests, and Settings' Sound Volume/Oath Calendar rows,
+  which are +/- adjustable rather than Enter-activated) are unchanged —
+  double-click stays a no-op there beyond selecting. Archive's Delete
+  action stays keyboard-only on purpose: double-click mirrors 'r' (restore
+  — reversible, one step) rather than Delete (permanent, and already
+  gated behind its own confirm modal). Great Chronicle, Hall of Legends,
+  and Gateway are the only screens left without it: the first two have no
+  "open" action to mirror at all beyond moving focus/selection, and
+  Gateway already activates on the very first click, same as Sync. Also
+  fixed a pre-existing bug where pressing Enter on Fellowship's Chat tab,
+  when no Campaign is shared yet, never actually marked its fallback
+  notification read — the branch handling that case sat after an
+  unconditional `active_screen == Fellowship` arm that always matched
+  first, so it could never run.
+- Added scroll-wheel support to the 13 screens that had none: Archive,
+  Onboarding, Hall of Legends, Focus, Campaigns, Dashboard, Soundscapes,
+  Settings, Character, Fellowship, and Project Workspace (Editor, Great
+  Chronicle, and Library already had it).
+  The wheel now does exactly what Up/Down/'k'/'j' already did on each
+  screen — cycling a selection with the same wrap-around, or scrolling a
+  raw offset with the same clamp, as the keyboard. Multi-pane screens route
+  the wheel to whichever pane makes sense for that screen: Character and
+  Project Workspace's Scrolls-tab preview target the pane the cursor is
+  actually over (matching their click behavior); Focus and Settings target
+  whichever field/row is currently focused, regardless of cursor position
+  (matching Great Chronicle/Library's existing convention); Fellowship's
+  always-visible left Campaign list scrolls independently of whichever tab
+  is active, while its sub-list (Invites/Companions/My Quests/Council/Chat)
+  scrolls whatever that tab is currently showing — including the Chat
+  transcript's message-browsing cursor, which has no raw scroll offset of
+  its own to begin with. Gateway and Sync need no scroll wheel at all —
+  Gateway's 2 options both fit on screen with nothing to page through, and
+  Sync's rows are static stats/toggles, not a navigable list.
+- Added basic mouse support to modals — all 63 `ModalType` variants, which
+  were previously 100% keyboard-only (every mouse event was swallowed
+  outright while any modal was open). Clicking outside a modal's popup now
+  cancels it, exactly like pressing Esc — including a handful of modals
+  where Esc isn't a pure discard (`NewProject`/`EditProject` actually save
+  the draft on Esc; `EncryptionMigrationPrompt` and `UpdateAvailable` have
+  their own Esc side effects) — clicking outside faithfully reproduces
+  whichever of those a modal's own Esc keybinding already does, rather than
+  inventing new "cancel" behavior. Confirm-style dialogs (Archive/Delete/
+  Conquer a Campaign, remove a Companion, prune old Quests, clean up local
+  history, and 5 more) now have real Yes/No button targets: clicking Yes
+  confirms and clicking No cancels, matching Enter/Esc exactly, and
+  clicking the dialog's message text (not a button) is an inert no-op
+  rather than an accidental confirm. `EncryptionMigrationPrompt` and
+  `HydrationReminder`, which offer three choices instead of two, get three
+  real buttons the same way. `QuitConfirm` is the one holdout still using a
+  single click-anywhere-inside zone, since its hint text ("Are you sure you
+  want to quit? [Y/N]") has no separate Yes/No substrings to split a
+  button out of. List-picker modals (Theme, Milestone Tier/Template, Assign Quest, Refile
+  Codex/Quest/Scroll, Council Briefing, Share Scroll/Journal permissions,
+  and more) support clicking a row or item to select it, same as Up/Down —
+  never confirming/activating it, matching how click-to-select already
+  works everywhere else in the app. Progress modals (Cloud Backup/Sync/
+  Restore) only become clickable once they're actually done — clicking
+  one mid-run does nothing, same as any key. Three list-pickers
+  (`RefileTask`, `SelectProjectForAction`, `RefileScroll`) use ratatui's
+  auto-scrolling list widget; clicking correctly accounts for that scroll
+  by replicating ratatui's own "keep the selection visible with minimal
+  scroll" formula, so a click still lands on the right row even once the
+  list has scrolled. Clicking a field inside the 9 multi-field forms that
+  have one (`NewProject`/`EditProject`, `NewTask`/`EditTask`,
+  `TreasuryEntry`, `TreasuryBudget`, `TaskFinancials`, `DailyReflection`,
+  `NewRitual`, `InviteMember`, `HydrationSettings`) now jumps keyboard
+  focus there, same as Tab — including disambiguating Priority/Due-Type/
+  Due-Value on `NewTask`/`EditTask`, which all share one row and need
+  their horizontal position, not just which row, to tell apart. Of those
+  fields, the ones with real mid-string cursor state — Campaign Name/
+  Description, Quest Title, and Treasury Title/Amount — also move the
+  cursor to the exact character clicked, same as clicking mid-line already
+  does in the Notes editor, rather than only focusing the field. Quest
+  Description is the one holdout still click-to-focus-only: unlike every
+  other field here, it has two divergent rendering/scroll models of its
+  own (a soft-wrapped-and-scrolled plain-text fallback, and a separate
+  vim-style editor overlay once it matches the field's content), neither
+  of which is the simple shape every other cursor-capable field has, so
+  repositioning its cursor mid-text was left out of this pass. Actually
+  typing into a field stays keyboard-only. Implementation note: unlike
+  every other screen's click support, a modal's popup bounds are
+  recomputed fresh from the same layout math its own render code uses,
+  rather than captured during rendering — no existing render function
+  needed to change to add this, at the cost of the two staying in sync by
+  convention rather than by construction.
+- Added mouse support to the task calendar (the month-grid date picker
+  opened from a Quest's due-date field, or the campaign planner opened
+  with `C`): click a day to select it, same as the arrow keys; double-
+  click a day to confirm it, same as Enter/Space (opens a new Quest
+  seeded with that date in planner mode, or writes the date back into the
+  Quest modal that opened the picker); click outside the calendar to
+  cancel it, same as Esc.
+- Closed out the last two mouse-support gaps. The Prologue's final page
+  has a real "Don't show this again" checkbox (previously `x`-only) that's
+  now clickable too. The About screen's title bar visually reads `[R] Send
+  Report` like a button; it's now a real click target that opens the Bug
+  Report modal, same as pressing `r` — and the scroll wheel now also
+  scrolls its two panels, matching the arrow keys. Its `[Support]` label,
+  right next to it, deliberately stays unclickable: it isn't wired to any
+  key on this screen either, a pre-existing gap the mouse-support pass
+  didn't invent and isn't the place to fix. Every other screen was
+  reviewed and found to need nothing further: Intro is a splash screen any
+  key/click already dismisses identically, and Restore is a single
+  always-focused text field with nothing else to click.
+
+**Dashboard Layouts, Chronicle Editing, and a Bug-Fix Pass:**
+
+- **New Dashboard looks:** Press `m` on the Dashboard to switch between 4 views — the classic layout, a Journey Map (your tasks shown as a trail), Today's Agenda (tasks grouped by how urgent they are), and a Deadline Timeline (a calendar strip of what's coming up). Whichever one you pick is remembered the next time you open Questline.
+- **Edit Chronicle entries:** Press `e` on a Chronicle entry to fix or change what you wrote, instead of only being able to add new ones.
+- **Water reminders no longer interrupt you:** The hydration reminder used to be able to pop up while you were writing a note, editing a task, or typing anything else — and typing would then accidentally hit its buttons instead of your text. It now waits until you're free.
+- **Fixed a few crashes:** The app could close unexpectedly if the terminal window was too small, if a shared project got deleted while you were looking at it, or if your profile briefly went missing during a sync hiccup. All three are now handled safely.
+- **Fixed search sometimes acting on the wrong task:** Searching for a task and pressing Enter could leave the list showing everything again while your next keypress (like Space or Delete) still acted on the filtered list underneath — meaning it could hit a different task than the one you saw on screen. This is fixed.
+- **Removed leftover test data:** Users with cloud sync turned off could occasionally see fake companions and chat messages appear from an old internal testing feature that should never have run for real users. It's now removed for good.
+- **Faster startup, smoother screens:** Questline now starts faster, and screens with lots of tasks or money entries (like the Task board and Treasury) respond more smoothly instead of slowing down.
+- **Tidied up old code:** Removed a half-finished, never-activated Spotify feature left over from an old version, keeping the codebase cleaner.
+
 ### v1.1.3 — The Chronicle Remembers
 *Released 2026-07-29*
 
@@ -261,6 +767,11 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **Better pasting and scrolling:** Large clipboard pastes are inserted at once, paragraphs and accented characters are preserved, wrapped text scrolls inside the editor, and the cursor remains visible without adding spaces inside words.
 - **Clearer campaign totals:** The Campaigns list now labels open quests as `!(n)`, steps as `->(n)`, and scrolls as `#(n)`.
 - **Quest Calendar:** Press `C` from Campaigns or a campaign workspace to view due quests from all campaigns in a full month calendar and create a new quest directly on any selected day. Due dates also anchor daily, weekly, monthly, and yearly recurring quests.
+- **Quest Kanban:** Press `k` in a Campaign's Quest workspace to toggle between the detailed Ledger and a six-column stance board. The board uses the same offline Quest Stances and permissions as the Ledger.
+- **Quest dependencies:** Press `l` on a Quest to link or unlink blockers. Unresolved blockers appear in the Ledger and are marked with `⛓` on Kanban cards; dependency cycles are rejected locally and during encrypted sync.
+- **Council Briefing:** Press `B` in a shared Campaign for an offline team summary of blocked, review, overdue, due-soon, and unassigned Quests, Companion workload and presence, and recent activity. Enter opens the selected queue or Companion workload in the Quest Ledger.
+- **Teamwork search and commands:** Global Search includes active Quest Council messages, Campaign Chronicle messages, and Companions from the local encrypted cache. The command palette can open My Quests, Kanban, Council Briefing, blocked/review queues, and the selected Quest Council.
+- **Workload and review visibility:** Council Briefing labels Companion workload as available, balanced, or overloaded and shows open/high/blocked/overdue counts. Its Awaiting Judgment panel names assignees, flags unassigned reviews, and identifies Owner/Steward review responsibility.
 
 ---
 

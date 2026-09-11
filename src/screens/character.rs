@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::models::{DailyReflection, User, XPEvent};
+use crate::screens::hit_test::CharacterHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -37,7 +38,7 @@ pub fn draw(
     reflection_detail_scroll: usize,
     theme: &Theme,
     area: ratatui::layout::Rect,
-) {
+) -> CharacterHitRegions {
     let size = area;
     let accent_color = theme.primary;
 
@@ -259,6 +260,8 @@ pub fn draw(
     f.render_widget(xp_list, left_chunks[2]);
 
     // el log del adventure book con word-wrap manual — no hay widget nativo que lo haga bien aquí
+    // entry_line_counts queda vacío cuando no hay entradas reales — así un click ahí es un no-op.
+    let mut entry_line_counts: Vec<usize> = Vec::new();
     let log_items: Vec<ListItem> = if chronicle_entries.is_empty() {
         vec![ListItem::new(
             "  The chronicle is empty. Embark on quests and focus to write your history.",
@@ -349,6 +352,7 @@ pub fn draw(
                         ]));
                     }
                 }
+                entry_line_counts.push(list_lines.len());
                 ListItem::new(list_lines)
             })
             .collect()
@@ -366,6 +370,7 @@ pub fn draw(
         .border_style(log_border_style)
         .title(" Adventure Log Book (Up/Down to scroll) ");
 
+    let log_inner = log_block.inner(left_chunks[3]);
     let log_list = List::new(log_items)
         .block(log_block)
         .highlight_style(Style::default().bg(Style::default().fg.unwrap_or(Color::Reset)));
@@ -373,6 +378,21 @@ pub fn draw(
     let mut state = ratatui::widgets::ListState::default();
     state.select(Some(selected_chronicle_idx));
     f.render_stateful_widget(log_list, left_chunks[3], &mut state);
+    // render_stateful_widget just mutated state.offset to whatever keeps the
+    // selection visible for *this* frame (in item-index terms, since items
+    // have variable height) — read it back, then walk forward accumulating
+    // each entry's real line count to get a row->entry map, one entry per
+    // rendered screen row, instead of re-deriving ratatui's wrap+scroll math.
+    let mut adventure_log_rows: Vec<usize> = Vec::new();
+    let visible_height = log_inner.height as usize;
+    'outer: for entry_idx in state.offset()..entry_line_counts.len() {
+        for _ in 0..entry_line_counts[entry_idx] {
+            if adventure_log_rows.len() >= visible_height {
+                break 'outer;
+            }
+            adventure_log_rows.push(entry_idx);
+        }
+    }
 
     // 4. Progress Gauge — clampeamos el ratio para que nunca pase de 1.0 aunque el XP sea raro
     let current_xp = user.xp;
@@ -436,6 +456,13 @@ pub fn draw(
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(chunks[1]);
+    // Computed unconditionally (not just inside the reflections branch below)
+    // so its Rects are available for the hit regions even when this frame
+    // takes the "no reflections yet" branch instead.
+    let ref_sub_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
+        .split(right_chunks[1]);
 
     let powers_list = List::new(power_items).block(
         Block::default()
@@ -459,6 +486,10 @@ pub fn draw(
         .border_style(Style::default().fg(theme.border))
         .title(ref_block_title);
 
+    // None while the "no reflections yet" hint is showing instead of the
+    // real list/detail split — nothing real there for a click to hit.
+    let mut reflections_hit: Option<(ratatui::layout::Rect, ratatui::layout::Rect)> = None;
+
     if reflections.is_empty() {
         let no_ref = Paragraph::new(
             "\n\n  No daily reflections recorded yet.\n  Press [r] on the Dashboard to write one.",
@@ -477,6 +508,7 @@ pub fn draw(
             .border_type(BorderType::Rounded)
             .border_style(list_border_style)
             .title(" Entries ");
+        let ref_list_inner = list_block.inner(ref_sub_chunks[0]);
 
         let detail_border_style = if character_focus == 2 {
             Style::default().fg(accent_color)
@@ -561,15 +593,12 @@ pub fn draw(
             .scroll((scroll_y, 0))
             .wrap(ratatui::widgets::Wrap { trim: true });
 
-        let ref_sub_chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(33), Constraint::Percentage(67)])
-            .split(right_chunks[1]);
-
         let mut list_state = ratatui::widgets::ListState::default();
         list_state.select(Some(sel_idx));
         f.render_stateful_widget(ref_list, ref_sub_chunks[0], &mut list_state);
         f.render_widget(ref_detail, ref_sub_chunks[1]);
+
+        reflections_hit = Some((ref_list_inner, ref_sub_chunks[1]));
     }
 
     // modal de especialización — solo aparece cuando el héroe llega a nivel 10, órale
@@ -645,5 +674,13 @@ pub fn draw(
             .block(block)
             .alignment(Alignment::Center);
         f.render_widget(p, area);
+    }
+
+    CharacterHitRegions {
+        adventure_log: log_inner,
+        adventure_log_rows,
+        reflections_list: reflections_hit.map(|(list, _)| list),
+        reflections_count: reflections.len(),
+        reflection_detail: reflections_hit.map(|(_, detail)| detail),
     }
 }

@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::models::ClassType;
+use crate::screens::hit_test::OnboardingHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -27,7 +28,7 @@ pub fn draw(
     focus: OnboardingFocus,
     classes: &[ClassType],
     error: Option<&str>,
-) {
+) -> OnboardingHitRegions {
     let size = f.size();
 
     // el color del tema cambia según la clase seleccionada — puro dinamismo, se ve muy chido
@@ -133,13 +134,13 @@ pub fn draw(
         })
         .collect();
 
-    let list = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(list_border_style)
-            .title(" Select RPG Class "),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(list_border_style)
+        .title(" Select RPG Class ");
+    let list_inner = list_block.inner(body_chunks[0]);
+    let list = List::new(list_items).block(list_block);
     f.render_widget(list, body_chunks[0]);
 
     // panel derecho: lore, descripción, motto y el primer poder — solo muestra el nivel 1 por ahora
@@ -233,4 +234,10 @@ pub fn draw(
         .style(Style::default().fg(class_theme.muted))
         .alignment(Alignment::Center);
     f.render_widget(help, chunks[4]);
+
+    OnboardingHitRegions {
+        name_input: chunks[1],
+        class_list: list_inner,
+        class_count: classes.len(),
+    }
 }

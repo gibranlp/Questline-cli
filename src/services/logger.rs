@@ -39,6 +39,21 @@ pub fn log_structured(level: &str, component: &str, message: &str, details: Opti
 // También escribe un recovery_report.json para que el usuario sepa qué pasó.
 pub fn init_panic_hook() {
     std::panic::set_hook(Box::new(|info| {
+        // First things first: get the terminal back to normal. Without
+        // this, any panic (this hook only logs, it never re-raises to abort
+        // the process) leaves the user's real shell stuck in raw mode with
+        // the alternate screen and mouse capture still on — the crash
+        // message below would otherwise print into that broken state.
+        // Mirrors the same teardown sequence main.rs's normal exit path
+        // uses; best-effort since a panic hook can't propagate errors.
+        let _ = crossterm::terminal::disable_raw_mode();
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::DisableMouseCapture,
+            crossterm::event::DisableBracketedPaste,
+            crossterm::terminal::LeaveAlternateScreen
+        );
+
         let payload = info.payload();
         let message = if let Some(s) = payload.downcast_ref::<&str>() {
             *s
@@ -83,7 +98,7 @@ fn write_recovery_report(panic_msg: &str, location: &str) {
             "diagnostics": {
                 "os": std::env::consts::OS,
                 "arch": std::env::consts::ARCH,
-                "version": "1.0.1"
+                "version": env!("CARGO_PKG_VERSION")
             }
         });
         if let Ok(json_str) = serde_json::to_string_pretty(&report) {

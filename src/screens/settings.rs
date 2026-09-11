@@ -1,4 +1,5 @@
-use crate::app::App;
+use crate::app::{App, QUEST_VISIBILITY_HORIZON_PRESETS};
+use crate::screens::hit_test::SettingsHitRegions;
 use crate::theme::{Theme, ThemeChoice};
 use ratatui::{
     Frame,
@@ -8,7 +9,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
 };
 
-pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
+pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitRegions {
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
@@ -71,6 +72,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
         .split(theme_inner);
+    let theme_count = choices.len();
     let list = List::new(items);
     f.render_widget(list, theme_cols[0]);
 
@@ -130,7 +132,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             },
         ),
         settings_row(
-            "Quest Burst",
+            "Completion Effect: ",
             App::ambient_effect_label(app.task_completion_ambient_effect).to_string(),
             "",
             4,
@@ -149,29 +151,30 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
         ),
     ];
 
+    let alerts_row_count = alerts.len();
+    let alerts_border = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(
+            if (1..=5).contains(&app.selected_settings_focus_idx) {
+                theme.primary
+            } else {
+                theme.border
+            },
+        ))
+        .title(Span::styled(
+            " Alerts & Audio ",
+            Style::default()
+                .fg(theme.secondary)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let alerts_inner = alerts_border.inner(chunks[1]);
     let alerts_block = Paragraph::new(alerts)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(
-                    if (1..=5).contains(&app.selected_settings_focus_idx) {
-                        theme.primary
-                    } else {
-                        theme.border
-                    },
-                ))
-                .title(Span::styled(
-                    " Alerts & Audio ",
-                    Style::default()
-                        .fg(theme.secondary)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        )
+        .block(alerts_border)
         .wrap(Wrap { trim: false });
     f.render_widget(alerts_block, chunks[1]);
 
-    let oath_calendar = vec![
+    let mut oath_calendar = vec![
         settings_row(
             "Monday",
             checked(app.streak_weekday_enabled(0)),
@@ -257,32 +260,48 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             theme,
             theme.secondary,
         ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "The flame honors only the sworn days and watch hours.",
-            Style::default().fg(theme.muted),
-        )),
+        settings_row(
+            "Show up to",
+            QUEST_VISIBILITY_HORIZON_PRESETS[app
+                .quest_visibility_horizon_idx
+                .min(QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1)]
+            .0
+            .to_string(),
+            "Left/Right",
+            15,
+            app,
+            theme,
+            theme.secondary,
+        ),
     ];
+    // Focus indices 6..=15 above — capture the count before the trailing
+    // decorative lines below, which aren't clickable rows.
+    let oath_row_count = oath_calendar.len();
+    oath_calendar.push(Line::from(""));
+    oath_calendar.push(Line::from(Span::styled(
+        "The flame honors only the sworn days and watch hours.",
+        Style::default().fg(theme.muted),
+    )));
 
+    let oath_border = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(
+            if (6..=15).contains(&app.selected_settings_focus_idx) {
+                theme.primary
+            } else {
+                theme.border
+            },
+        ))
+        .title(Span::styled(
+            " Oath Calendar ",
+            Style::default()
+                .fg(theme.secondary)
+                .add_modifier(Modifier::BOLD),
+        ));
+    let oath_inner = oath_border.inner(left_chunks[1]);
     let oath_block = Paragraph::new(oath_calendar)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(
-                    if (6..=14).contains(&app.selected_settings_focus_idx) {
-                        theme.primary
-                    } else {
-                        theme.border
-                    },
-                ))
-                .title(Span::styled(
-                    " Oath Calendar ",
-                    Style::default()
-                        .fg(theme.secondary)
-                        .add_modifier(Modifier::BOLD),
-                )),
-        )
+        .block(oath_border)
         .wrap(Wrap { trim: false });
     f.render_widget(oath_block, left_chunks[1]);
 
@@ -358,6 +377,15 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
 
     let preview = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(preview, theme_cols[1]);
+
+    SettingsHitRegions {
+        theme_list: theme_cols[0],
+        theme_count,
+        alerts_panel: alerts_inner,
+        alerts_row_count,
+        oath_panel: oath_inner,
+        oath_row_count,
+    }
 }
 
 fn settings_row(

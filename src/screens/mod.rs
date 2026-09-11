@@ -10,6 +10,7 @@ pub mod fellowship;
 pub mod focus;
 pub mod gateway;
 pub mod great_chronicle;
+pub mod hit_test;
 pub mod intro;
 pub mod legends;
 pub mod library;
@@ -21,6 +22,7 @@ pub mod restore;
 pub mod settings;
 pub mod soundscapes;
 pub mod sync;
+pub mod text_wrap;
 
 // Enum defining the active UI screen states in Questline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

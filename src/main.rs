@@ -12,9 +12,12 @@
     clippy::if_same_then_else
 )]
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -355,19 +358,192 @@ fn memory_fragment_art_lines(rarity: &str, ticks: usize) -> Vec<Line<'static>> {
     ]
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CliOptions {
+    profile: Option<String>,
+    command: Option<String>,
+    command_args: Vec<String>,
+}
+
+fn parse_cli_options(args: impl IntoIterator<Item = String>) -> Result<CliOptions> {
+    let mut args = args.into_iter().peekable();
+    let mut profile = None;
+    let mut command = None;
+    let mut command_args = Vec::new();
+
+    while let Some(arg) = args.next() {
+        if arg == "--profile" || arg == "-p" {
+            let value = args
+                .next()
+                .ok_or_else(|| anyhow!("{arg} requires a profile name"))?;
+            if profile.replace(value).is_some() {
+                return Err(anyhow!("Specify --profile only once"));
+            }
+        } else if let Some(value) = arg.strip_prefix("--profile=") {
+            if value.is_empty() {
+                return Err(anyhow!("--profile requires a profile name"));
+            }
+            if profile.replace(value.to_string()).is_some() {
+                return Err(anyhow!("Specify --profile only once"));
+            }
+        } else if command.is_none() {
+            command = Some(arg);
+        } else {
+            command_args.push(arg);
+        }
+    }
+
+    if let Some(command) = command.as_deref() {
+        match command {
+            "campaign-export" if !(1..=2).contains(&command_args.len()) => {
+                return Err(anyhow!(
+                    "campaign-export requires <Campaign name-or-id> and optional [file]"
+                ));
+            }
+            "campaign-import"
+                if command_args.is_empty()
+                    || command_args.len() > 2
+                    || command_args.get(1).is_some_and(|arg| arg != "--confirm") =>
+            {
+                return Err(anyhow!(
+                    "campaign-import requires <file> and optional --confirm"
+                ));
+            }
+            "calendar-import"
+                if command_args.len() < 2
+                    || command_args.len() > 3
+                    || command_args
+                        .get(2)
+                        .is_some_and(|arg| arg != "--confirm" && arg != "--reconcile") =>
+            {
+                return Err(anyhow!(
+                    "calendar-import requires <Campaign name-or-id> <file> and optional --confirm or --reconcile"
+                ));
+            }
+            "campaign-export" | "campaign-import" | "calendar-import" => {}
+            _ if !command_args.is_empty() => {
+                return Err(anyhow!("{command} does not accept additional arguments"));
+            }
+            _ => {}
+        }
+    }
+
+    Ok(CliOptions {
+        profile,
+        command,
+        command_args,
+    })
+}
+
+fn print_cli_help() {
+    println!("Questline {}", questline::build_info::version_label());
+    println!();
+    println!("Usage: questline [--profile <name>] [command] [arguments]");
+    println!();
+    println!("Testing options:");
+    println!("  -p, --profile <name>  Use an isolated database, identity, and config");
+    println!();
+    println!("Commands:");
+    println!("  export                         Export the complete profile backup");
+    println!("  import                         Import the complete profile backup");
+    println!("  backup                         Copy the local database");
+    println!("  campaign-export <name|id> [file]");
+    println!("                                 Export reusable Campaign structure only");
+    println!("  campaign-import <file> [--confirm]");
+    println!("                                 Preview, then import a Campaign template");
+    println!("  calendar-import <name|id> <file> [--confirm|--reconcile]");
+    println!("                                 Preview local iCalendar events as Quests");
+    println!("  --version, --help");
+}
+
+// Manda una secuencia OSC/DCS cruda a la terminal real, envolviéndola en el passthrough de
+// tmux/screen cuando aplica — sin esto, tmux y screen se comen secuencias que no reconocen,
+// así que el interior de la grilla queda pintado del color del tema pero el chrome de la
+// terminal (padding, fondo del pane) se queda con lo que sea que tuviera antes (típicamente
+// negro), dejando un "marco" que no combina con el resto del fondo.
+fn write_terminal_seq(seq: &str) {
+    if std::env::var_os("TMUX").is_some() {
+        // Passthrough de tmux (requiere `set -g allow-passthrough on` en tmux >= 3.3)
+        let escaped = seq.replace('\x1b', "\x1b\x1b");
+        print!("\x1bPtmux;{}\x1b\\", escaped);
+    } else if std::env::var_os("STY").is_some() {
+        // Passthrough DCS de GNU screen
+        let escaped = seq.replace('\x1b', "\x1b\x1b");
+        print!("\x1bP{}\x1b\\", escaped);
+    } else {
+        print!("{}", seq);
+    }
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 // Aquí empieza todo el desmadre — inicializa la terminal, corre el loop y maneja el shutdown
 #[tokio::main]
 async fn main() -> Result<()> {
     let startup_start = std::time::Instant::now();
     questline::services::init_panic_hook();
+    let options = parse_cli_options(std::env::args().skip(1))?;
+    if let Some(profile) = options.profile.as_deref() {
+        storage::set_profile(profile)?;
+    }
+
     // Checa si corrieron el binario con un subcomando (export / import / backup / --version)
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() > 1 {
-        let cmd = args[1].as_str();
-        let storage_dir = storage::ensure_storage_dir_exists()?;
-        let db_path = storage_dir.join("questline.db");
+    if let Some(cmd) = options.command.as_deref() {
         match cmd {
+            "archive" => {
+                let db_path = storage::get_storage_dir()?.join("questline.db");
+                if !db_path.exists() {
+                    return Err(anyhow!(
+                        "The Archive does not recognize you yet. Complete Questline onboarding first."
+                    ));
+                }
+                let db = database::Database::new(&db_path)?;
+                let user = db.get_user()?.ok_or_else(|| {
+                    anyhow!(
+                        "The Archive does not recognize you yet. Complete Questline onboarding first."
+                    )
+                })?;
+                let seed = questline::archive_game::random_seed();
+                let outcome =
+                    questline::archive_game::run(user.class, &user.username, user.level, seed)?;
+                // Escaping the Archive is the only thing that teaches the Backlog
+                // your name. Flag only — no XP, no productivity state.
+                if outcome == questline::archive_game::ArchiveStatus::Won {
+                    db.set_setting("archive_escaped", "1")?;
+                }
+                return Ok(());
+            }
+            "backlog" => {
+                let db_path = storage::get_storage_dir()?.join("questline.db");
+                if !db_path.exists() {
+                    return Err(anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    ));
+                }
+                let db = database::Database::new(&db_path)?;
+                let user = db.get_user()?.ok_or_else(|| {
+                    anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    )
+                })?;
+                if db.get_setting("archive_escaped")?.as_deref() != Some("1") {
+                    return Err(anyhow!(
+                        "The Backlog does not know your name yet. Something else must learn it first."
+                    ));
+                }
+                let escaped_before = db.get_setting("backlog_escaped")?.as_deref() == Some("1");
+                let outcome = questline::backlog_game::run(
+                    user.class,
+                    &user.username,
+                    user.level,
+                    escaped_before,
+                )?;
+                if outcome == questline::backlog_game::BacklogStatus::Escaped {
+                    db.set_setting("backlog_escaped", "1")?;
+                }
+                return Ok(());
+            }
             "export" => {
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let db = database::Database::new(&db_path)?;
                 let json = db.export_to_json()?;
                 std::fs::write(".questline-export", json)?;
@@ -375,6 +551,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             "import" => {
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let db = database::Database::new(&db_path)?;
                 if std::path::Path::new(".questline-export").exists() {
                     let json = std::fs::read_to_string(".questline-export")?;
@@ -385,7 +562,251 @@ async fn main() -> Result<()> {
                 }
                 return Ok(());
             }
+            "campaign-export" => {
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
+                let db = database::Database::new(&db_path)?;
+                let selector = &options.command_args[0];
+                let projects = db.get_projects()?;
+                let selected = if let Ok(id) = uuid::Uuid::parse_str(selector) {
+                    projects.iter().find(|project| project.id == id)
+                } else {
+                    let matches = projects
+                        .iter()
+                        .filter(|project| project.name.eq_ignore_ascii_case(selector))
+                        .collect::<Vec<_>>();
+                    if matches.len() > 1 {
+                        return Err(anyhow!(
+                            "More than one Campaign is named '{selector}'; use its UUID"
+                        ));
+                    }
+                    matches.into_iter().next()
+                }
+                .ok_or_else(|| anyhow!("Campaign '{selector}' was not found"))?;
+                let tasks = db.get_tasks_for_project(selected.id)?;
+                let portable = questline::campaign_templates::PortableCampaignFile::from_campaign(
+                    selected, &tasks,
+                )?;
+                let output = options
+                    .command_args
+                    .get(1)
+                    .map(String::as_str)
+                    .unwrap_or(".questline-campaign.json");
+                std::fs::write(output, portable.to_pretty_json()?)?;
+                println!(
+                    "Exported reusable Campaign template '{}' to {} (no identity, sharing, comments, notes, or completion history)",
+                    selected.name, output
+                );
+                return Ok(());
+            }
+            "campaign-import" => {
+                let input = &options.command_args[0];
+                let metadata = std::fs::metadata(input)?;
+                if metadata.len() as usize > questline::campaign_templates::MAX_TEMPLATE_BYTES {
+                    return Err(anyhow!("Campaign template exceeds the 256 KiB limit"));
+                }
+                let json = std::fs::read_to_string(input)?;
+                let portable = questline::campaign_templates::PortableCampaignFile::parse(&json)?;
+                let quest_count = portable.campaign.quests.len();
+                let step_count = portable
+                    .campaign
+                    .quests
+                    .iter()
+                    .map(|quest| quest.steps.len())
+                    .sum::<usize>();
+                println!("Campaign template preview");
+                println!("  Name: {}", portable.campaign.name);
+                println!(
+                    "  Description: {}",
+                    portable.campaign.description.as_deref().unwrap_or("None")
+                );
+                println!("  Quests: {}", quest_count);
+                println!("  Steps: {}", step_count);
+                for quest in &portable.campaign.quests {
+                    println!(
+                        "    - {} [{}] · {} step{}",
+                        quest.title,
+                        quest.priority.name(),
+                        quest.steps.len(),
+                        if quest.steps.len() == 1 { "" } else { "s" }
+                    );
+                }
+                if options.command_args.get(1).map(String::as_str) != Some("--confirm") {
+                    println!();
+                    println!(
+                        "Preview only. Re-run with --confirm to create this private Campaign."
+                    );
+                    return Ok(());
+                }
+
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
+                let db = database::Database::new(&db_path)?;
+                let existing_user = db.get_user()?;
+                let identity = questline::services::identity::Identity::load_or_create(
+                    existing_user.as_ref().map(|user| user.id),
+                )?;
+                let owner_username = existing_user
+                    .as_ref()
+                    .map(|user| user.username.clone())
+                    .unwrap_or_else(|| "Adventurer".to_string());
+                let existing_names = db
+                    .get_projects()?
+                    .into_iter()
+                    .map(|project| project.name.to_lowercase())
+                    .collect::<std::collections::HashSet<_>>();
+                let campaign_name = questline::campaign_templates::unique_campaign_name(
+                    &portable.campaign.name,
+                    &existing_names,
+                );
+                let (project, task_trees) = portable.materialize(
+                    campaign_name.clone(),
+                    identity.public_key,
+                    owner_username,
+                )?;
+                db.insert_campaign_template(&project, &task_trees)?;
+                println!(
+                    "Imported private Campaign '{}' with {} Quests and {} steps",
+                    campaign_name, quest_count, step_count
+                );
+                return Ok(());
+            }
+            "calendar-import" => {
+                let selector = &options.command_args[0];
+                let input = &options.command_args[1];
+                let metadata = std::fs::metadata(input)?;
+                if metadata.len() as usize > questline::calendar_import::MAX_ICS_BYTES {
+                    return Err(anyhow!("Calendar file exceeds the 512 KiB limit"));
+                }
+                let ics = std::fs::read_to_string(input)?;
+                let calendar = questline::calendar_import::parse_ics(&ics)?;
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
+                let db = database::Database::new(&db_path)?;
+                let projects = db.get_projects()?;
+                let selected = if let Ok(id) = uuid::Uuid::parse_str(selector) {
+                    projects.iter().find(|project| project.id == id)
+                } else {
+                    let matches = projects
+                        .iter()
+                        .filter(|project| project.name.eq_ignore_ascii_case(selector))
+                        .collect::<Vec<_>>();
+                    if matches.len() > 1 {
+                        return Err(anyhow!(
+                            "More than one Campaign is named '{selector}'; use its UUID"
+                        ));
+                    }
+                    matches.into_iter().next()
+                }
+                .ok_or_else(|| anyhow!("Campaign '{selector}' was not found"))?;
+                let existing_ids = db
+                    .get_tasks_for_project(selected.id)?
+                    .into_iter()
+                    .map(|task| task.id)
+                    .collect::<std::collections::HashSet<_>>();
+                let preview_tasks = questline::calendar_import::materialize_events(
+                    selected.id,
+                    &calendar.events,
+                    "",
+                    "",
+                );
+                let duplicate_count = preview_tasks
+                    .iter()
+                    .filter(|task| existing_ids.contains(&task.id))
+                    .count();
+                let cancelled_task_ids = calendar
+                    .cancellations
+                    .iter()
+                    .map(|uid| questline::calendar_import::task_id_for_event(selected.id, uid))
+                    .collect::<Vec<_>>();
+                let matched_cancellations = cancelled_task_ids
+                    .iter()
+                    .filter(|id| existing_ids.contains(id))
+                    .count();
+                let mode = options.command_args.get(2).map(String::as_str);
+
+                println!("Calendar import preview");
+                println!(
+                    "  Destination: {}{}",
+                    selected.name,
+                    if selected.is_shared {
+                        " (shared Fellowship Campaign)"
+                    } else {
+                        " (private Campaign)"
+                    }
+                );
+                println!("  New Quests: {}", calendar.events.len() - duplicate_count);
+                println!("  Existing event Quests: {}", duplicate_count);
+                println!(
+                    "  Matched cancellations: {} of {}",
+                    matched_cancellations,
+                    calendar.cancellations.len()
+                );
+                for (event, task) in calendar.events.iter().zip(preview_tasks.iter()) {
+                    println!(
+                        "    - {} · due {}{}",
+                        event.summary,
+                        event.due_at.to_rfc3339(),
+                        if existing_ids.contains(&task.id) {
+                            if mode == Some("--reconcile") {
+                                " · reconcile existing Quest"
+                            } else {
+                                " · already imported"
+                            }
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                if selected.is_shared {
+                    println!(
+                        "  Warning: confirmed Quests will sync to this Campaign's Fellowship."
+                    );
+                }
+                if mode.is_none() {
+                    println!();
+                    println!(
+                        "Preview only. Use --confirm for new Quests, or --reconcile to also apply event updates and visible cancellation markers."
+                    );
+                    return Ok(());
+                }
+
+                let existing_user = db.get_user()?;
+                let identity = questline::services::identity::Identity::load_or_create(
+                    existing_user.as_ref().map(|user| user.id),
+                )?;
+                let owner_username = existing_user
+                    .as_ref()
+                    .map(|user| user.username.clone())
+                    .unwrap_or_else(|| "Adventurer".to_string());
+                let tasks = questline::calendar_import::materialize_events(
+                    selected.id,
+                    &calendar.events,
+                    &identity.public_key,
+                    &owner_username,
+                );
+                if mode == Some("--reconcile") {
+                    let result =
+                        db.reconcile_calendar_tasks(selected.id, &tasks, &cancelled_task_ids)?;
+                    println!(
+                        "Calendar reconciliation for '{}': {} created, {} updated, {} marked cancelled, {} unchanged",
+                        selected.name,
+                        result.inserted,
+                        result.updated,
+                        result.cancelled,
+                        result.unchanged
+                    );
+                } else {
+                    let inserted = db.insert_calendar_tasks_if_missing(selected.id, &tasks)?;
+                    println!(
+                        "Imported {} calendar Quest{} into '{}' ({} already present; updates and cancellations not applied)",
+                        inserted,
+                        if inserted == 1 { "" } else { "s" },
+                        selected.name,
+                        tasks.len() - inserted
+                    );
+                }
+                return Ok(());
+            }
             "backup" => {
+                let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let date_str = chrono::Utc::now().format("%Y_%m_%d").to_string();
                 let backup_filename = format!("questline_backup_{}.db", date_str);
                 std::fs::copy(&db_path, &backup_filename)?;
@@ -404,8 +825,12 @@ async fn main() -> Result<()> {
                 println!("questline {}", questline::build_info::version_label());
                 return Ok(());
             }
+            "--help" | "-h" | "help" => {
+                print_cli_help();
+                return Ok(());
+            }
             _ => {
-                println!("Unknown command. Use: export, import, backup, --version");
+                println!("Unknown command. Run questline --help for usage.");
                 return Ok(());
             }
         }
@@ -414,7 +839,12 @@ async fn main() -> Result<()> {
     // Órale, a preparar la terminal — raw mode, pantalla alterna, backend de crossterm
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -426,10 +856,14 @@ async fn main() -> Result<()> {
     let mut app = match App::new(&db_path) {
         Ok(a) => a,
         Err(e) => {
-            print!("\x1b]111\x07");
-            let _ = std::io::Write::flush(&mut std::io::stdout());
+            write_terminal_seq("\x1b]111\x07");
             disable_raw_mode()?;
-            execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen)?;
+            execute!(
+                io::stdout(),
+                DisableMouseCapture,
+                DisableBracketedPaste,
+                LeaveAlternateScreen
+            )?;
             return Err(e);
         }
     };
@@ -462,31 +896,65 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Escanea los backups del directorio actual y avisa si alguno está cagado
+    // Escanea los backups del directorio actual y avisa si alguno está cagado.
+    // Backups are written once and never modified again, so a file that
+    // already passed this exact scan doesn't need a fresh full integrity
+    // scan + foreign-key scan every single launch forever — cache the
+    // "verified OK" result per filename+size+mtime and skip the rescan
+    // whenever none of those three have changed since.
     let mut corrupted_backups = Vec::new();
     if let Ok(entries) = std::fs::read_dir(".") {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(filename) = path.file_name().and_then(|n| n.to_str()) {
                 if filename.starts_with("questline_backup_") && filename.ends_with(".db") {
-                    match questline::database::Database::verify_db_backup(&path) {
-                        Ok(true) => {
-                            questline::services::log_structured(
-                                "INFO",
-                                "backup_verification",
-                                &format!("Backup validated successfully: {}", filename),
-                                None,
-                            );
+                    let fingerprint = std::fs::metadata(&path)
+                        .ok()
+                        .map(|m| {
+                            let mtime = m
+                                .modified()
+                                .ok()
+                                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            format!("{}:{}", m.len(), mtime)
+                        })
+                        .unwrap_or_default();
+                    let cache_key = format!("backup_verified:{}", filename);
+                    let already_verified = app
+                        .db
+                        .get_setting(&cache_key)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|cached| cached == fingerprint);
+
+                    let is_ok = if already_verified {
+                        true
+                    } else {
+                        match questline::database::Database::verify_db_backup(&path) {
+                            Ok(true) => {
+                                let _ = app.db.set_setting(&cache_key, &fingerprint);
+                                true
+                            }
+                            _ => false,
                         }
-                        _ => {
-                            questline::services::log_structured(
-                                "WARNING",
-                                "backup_verification",
-                                &format!("Corrupted backup detected: {}", filename),
-                                Some(&format!("Path: {:?}", path)),
-                            );
-                            corrupted_backups.push(filename.to_string());
-                        }
+                    };
+
+                    if is_ok {
+                        questline::services::log_structured(
+                            "INFO",
+                            "backup_verification",
+                            &format!("Backup validated successfully: {}", filename),
+                            None,
+                        );
+                    } else {
+                        questline::services::log_structured(
+                            "WARNING",
+                            "backup_verification",
+                            &format!("Corrupted backup detected: {}", filename),
+                            Some(&format!("Path: {:?}", path)),
+                        );
+                        corrupted_backups.push(filename.to_string());
                     }
                 }
             }
@@ -505,6 +973,7 @@ async fn main() -> Result<()> {
                     app.handle_key_event(key)?;
                 }
                 Event::Paste(text) => app.handle_paste(&text),
+                Event::Mouse(mouse) => app.handle_mouse_event(mouse)?,
                 _ => {}
             }
         }
@@ -536,6 +1005,7 @@ async fn main() -> Result<()> {
         app.tick_particles();
         app.tick_pywal_theme();
         app.tick_update_check();
+        app.tick_companion_lookup();
         if !sync_busy {
             app.tick_chapter_progress();
         }
@@ -561,16 +1031,13 @@ async fn main() -> Result<()> {
             // Ajusta el color de fondo de la terminal (para pintar el padding/borde)
             match theme.background {
                 Color::Rgb(r, g, b) => {
-                    print!("\x1b]11;#{:02x}{:02x}{:02x}\x07", r, g, b);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq(&format!("\x1b]11;#{:02x}{:02x}{:02x}\x07", r, g, b));
                 }
                 Color::Black => {
-                    print!("\x1b]11;#000000\x07");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq("\x1b]11;#000000\x07");
                 }
                 Color::White => {
-                    print!("\x1b]11;#ffffff\x07");
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    write_terminal_seq("\x1b]11;#ffffff\x07");
                 }
                 _ => {}
             }
@@ -586,12 +1053,13 @@ async fn main() -> Result<()> {
                     );
                 }
                 ActiveScreen::Gateway => {
-                    screens::gateway::draw(
+                    let regions = screens::gateway::draw(
                         f,
                         app.gateway_selected_idx,
                         app.intro_ticks,
                         &theme,
                     );
+                    app.hit_regions.gateway = Some(regions);
                 }
                 ActiveScreen::Restore => {
                     screens::restore::draw(
@@ -606,7 +1074,7 @@ async fn main() -> Result<()> {
                     screens::prologue::draw(f, &app, &theme);
                 }
                 ActiveScreen::Onboarding => {
-                    screens::onboarding::draw(
+                    let regions = screens::onboarding::draw(
                         f,
                         &app.onboarding_username,
                         app.onboarding_class_idx,
@@ -614,6 +1082,7 @@ async fn main() -> Result<()> {
                         &app.onboarding_classes,
                         app.onboarding_error.as_deref(),
                     );
+                    app.hit_regions.onboarding = Some(regions);
                 }
                 ActiveScreen::Editor => {
                     let quick_note = app
@@ -626,23 +1095,38 @@ async fn main() -> Result<()> {
                             .direction(Direction::Vertical)
                             .constraints([Constraint::Min(5), Constraint::Length(3)])
                             .split(size)[0];
-                        screens::dashboard::draw(f, &app, &theme, dashboard_area);
+                        // Discarded: the editor owns mouse dispatch while it's
+                        // active, so this backdrop's hit regions are never used.
+                        let _ = screens::dashboard::draw(f, &app, &theme, dashboard_area);
                     }
                     if let Some(ref mut s) = app.editor_state {
-                        if quick_note {
+                        let regions = if quick_note {
                             let area = screens::intro::centered_rect(84, 86, size);
-                            screens::editor::draw_in_area(f, s, &theme, area);
+                            screens::editor::draw_in_area(f, s, &theme, area)
                         } else {
-                            screens::editor::draw(f, s, &theme);
-                        }
+                            screens::editor::draw(f, s, &theme)
+                        };
+                        app.hit_regions.editor = Some(regions);
                     }
                 }
                 ActiveScreen::Workspace => {
-                    screens::project_workspace::draw(
-                        f,
-                        &app,
-                        &theme,
-                    );
+                    // project_workspace::draw() unwraps active_project_id and
+                    // its matching Project every frame — re-check here first
+                    // (mirrors the same fallback handle_workspace_key already
+                    // uses) so a project that vanished mid-session (removed
+                    // by its owner, or dropped by a sync) bounces back to
+                    // Projects instead of panicking the whole app.
+                    let project_still_exists = app
+                        .active_project_id
+                        .is_some_and(|p_id| app.projects.iter().any(|p| p.id == p_id));
+                    if project_still_exists {
+                        let regions = screens::project_workspace::draw(f, &app, &theme);
+                        app.hit_regions.workspace = Some(regions);
+                    } else {
+                        app.active_project_id = None;
+                        app.active_screen = ActiveScreen::Projects;
+                        app.projects_all_selected = true;
+                    }
                 }
 
                 _ => {
@@ -658,14 +1142,16 @@ async fn main() -> Result<()> {
                     // Render Screen Body
                     match app.active_screen {
                         ActiveScreen::Dashboard => {
-                            screens::dashboard::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::dashboard::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.dashboard = Some(regions);
                         },
 
                         ActiveScreen::Focus => {
-                            screens::focus::draw(f, &app, &theme);
+                            let regions = screens::focus::draw(f, &app, &theme);
+                            app.hit_regions.focus = regions;
                         },
                         ActiveScreen::Projects => {
-                            screens::projects::draw(
+                            let regions = screens::projects::draw(
                                 f,
                                 &app.projects,
                                 &app.all_tasks,
@@ -676,63 +1162,80 @@ async fn main() -> Result<()> {
                                 &theme,
                                 chunks[0],
                             );
+                            app.hit_regions.projects = Some(regions);
                         }
 
                         ActiveScreen::Character => {
-                            let achievements_count = app
-                                .stats_cache
-                                .achievements
-                                .iter()
-                                .filter(|a| a.unlocked_at.is_some())
-                                .count() as i32;
-                            let tree = &app.stats_cache.zen_tree;
-                            let streak_obj = &app.stats_cache.streak;
+                            if app.user.is_some() {
+                                let achievements_count = app
+                                    .stats_cache
+                                    .achievements
+                                    .iter()
+                                    .filter(|a| a.unlocked_at.is_some())
+                                    .count() as i32;
+                                let tree = &app.stats_cache.zen_tree;
+                                let streak_obj = &app.stats_cache.streak;
 
-                            screens::character::draw(
-                                f,
-                                app.user.as_ref().unwrap(),
-                                achievements_count,
-                                app.stats_cache.achievements.len(),
-                                tree.stage_name(),
-                                tree.growth,
-                                tree.health,
-                                streak_obj.current_streak,
-                                streak_obj.best_streak,
-                                &app.stats_cache.xp_history,
-                                &app.stats_cache.most_productive_project,
-                                &app.stats_cache.reflections,
-                                app.selected_reflection_idx,
-                                &app.modal_state,
-                                &app.stats_cache.devices,
-                                &app.stats_cache.chronicle_entries,
-                                app.selected_chronicle_idx,
-                                app.character_focus,
-                                app.reflection_detail_scroll,
-                                &theme,
-                                chunks[0],
-                            );
+                                let regions = screens::character::draw(
+                                    f,
+                                    app.user.as_ref().unwrap(),
+                                    achievements_count,
+                                    app.stats_cache.achievements.len(),
+                                    tree.stage_name(),
+                                    tree.growth,
+                                    tree.health,
+                                    streak_obj.current_streak,
+                                    streak_obj.best_streak,
+                                    &app.stats_cache.xp_history,
+                                    &app.stats_cache.most_productive_project,
+                                    &app.stats_cache.reflections,
+                                    app.selected_reflection_idx,
+                                    &app.modal_state,
+                                    &app.stats_cache.devices,
+                                    &app.stats_cache.chronicle_entries,
+                                    app.selected_chronicle_idx,
+                                    app.character_focus,
+                                    app.reflection_detail_scroll,
+                                    &theme,
+                                    chunks[0],
+                                );
+                                app.hit_regions.character = Some(regions);
+                            } else {
+                                // The local user record vanished unexpectedly
+                                // (e.g. a sync hiccup) — bounce back to the
+                                // Dashboard instead of unwrapping None and
+                                // panicking the whole app on this render.
+                                app.active_screen = ActiveScreen::Dashboard;
+                            }
                         }
                         ActiveScreen::Archive => {
-                            screens::archive::draw(f, &app.projects, app.selected_archive_idx, &theme);
+                            let regions =
+                                screens::archive::draw(f, &app.projects, app.selected_archive_idx, &theme);
+                            app.hit_regions.archive = Some(regions);
                         }
 
                         ActiveScreen::Soundscapes => {
-                            screens::soundscapes::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::soundscapes::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.soundscapes = Some(regions);
                         }
                         ActiveScreen::Settings => {
-                            screens::settings::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::settings::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.settings = Some(regions);
                         }
                         ActiveScreen::SyncSettings => {
-                            screens::sync::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::sync::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.sync = Some(regions);
                         }
                         ActiveScreen::Fellowship => {
-                            screens::fellowship::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::fellowship::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.fellowship = Some(regions);
                         }
                         ActiveScreen::About => {
                             screens::about::draw(f, &app, &theme, chunks[0]);
                         }
                         ActiveScreen::GreatChronicle => {
-                            screens::great_chronicle::draw(f, &app, &theme, chunks[0]);
+                            let regions = screens::great_chronicle::draw(f, &app, &theme, chunks[0]);
+                            app.hit_regions.great_chronicle = Some(regions);
                         }
 
                         ActiveScreen::Library => {
@@ -740,7 +1243,7 @@ async fn main() -> Result<()> {
                             let quests = app.db.get_class_quests(class_name).unwrap_or_default();
                             let lore = app.db.get_lore_entries().unwrap_or_default();
                             let used_soundscapes = app.db.get_unique_soundscapes_used().unwrap_or_default();
-                            screens::library::draw(
+                            let regions = screens::library::draw(
                                 f,
                                 app.library_active_col,
                                 app.selected_library_cat_idx,
@@ -764,10 +1267,11 @@ async fn main() -> Result<()> {
                                 &theme,
                                 app.quit_confirm_ticks,
                             );
+                            app.hit_regions.library = Some(regions);
                         }
                         ActiveScreen::Legends => {
                             let relics = app.db.get_relics().unwrap_or_default();
-                            screens::legends::draw(
+                            let regions = screens::legends::draw(
                                 f,
                                 &app.stats_cache.statistics,
                                 app.selected_relic_idx,
@@ -775,6 +1279,7 @@ async fn main() -> Result<()> {
                                 &theme,
                                 app.quit_confirm_ticks,
                             );
+                            app.hit_regions.legends = Some(regions);
                         }
                         _ => {}
                     }
@@ -839,6 +1344,10 @@ async fn main() -> Result<()> {
                     tab_spans.push(Span::styled("| ", Style::default().fg(muted)));
                     tab_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
                     tab_spans.push(Span::styled(" palette  ", Style::default().fg(muted)));
+                    if app.active_screen == ActiveScreen::Dashboard {
+                        tab_spans.push(Span::styled("m", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+                        tab_spans.push(Span::styled(" layout  ", Style::default().fg(muted)));
+                    }
                     tab_spans.push(Span::styled("Q", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
                     tab_spans.push(Span::styled(" quit", Style::default().fg(muted)));
 
@@ -941,7 +1450,11 @@ async fn main() -> Result<()> {
                     let popup_w = (size.width * 60 / 100).max(30);
                     let inner_w = popup_w.saturating_sub(4).max(1); // subtract borders + padding
                     let msg_lines = (notif.message.chars().count() as u16).div_ceil(inner_w) + 1;
-                    let popup_h = (msg_lines + 4).clamp(6, size.height.saturating_sub(4));
+                    // clamp(min, max) panics if min > max, which a terminal
+                    // shorter than 10 rows would trigger here — widen the
+                    // upper bound to never fall below the lower one instead.
+                    let popup_h_max = size.height.saturating_sub(4).max(6);
+                    let popup_h = (msg_lines + 4).clamp(6, popup_h_max);
                     let overlay_area = ratatui::layout::Rect {
                         x: size.x + (size.width.saturating_sub(popup_w)) / 2,
                         y: size.y + (size.height.saturating_sub(popup_h)) / 2,
@@ -1145,7 +1658,9 @@ async fn main() -> Result<()> {
                 && app.active_screen != ActiveScreen::Onboarding
                 && app.active_screen != ActiveScreen::Editor
                 && app.ambient_effects_enabled
-                && (app.active_ambient_effect > 0 || app.ambient_particles_ticks_remaining > 0)
+                && (app.active_ambient_effect > 0
+                    || app.ambient_particles_ticks_remaining > 0
+                    || !app.ambient_particles.is_empty())
             {
                 for p in &app.ambient_particles {
                     let px = p.x;
@@ -1650,6 +2165,55 @@ async fn main() -> Result<()> {
             }
 
             // Modal de confirmación de salida — con fogata animada y una quote, pura vibra RPG
+            if matches!(app.modal_state, questline::app::ModalType::EncryptionMigrationPrompt) {
+                let overlay_area = centered_rect_fixed_height(68, 15, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(
+                    Block::default().style(Style::default().bg(theme.background)),
+                    overlay_area,
+                );
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "ENCRYPTED SYNC UPGRADE",
+                        Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(""),
+                    Line::from("This account still uses the legacy plaintext sync protocol."),
+                    Line::from("Choose this device only if it contains your authoritative data."),
+                    Line::from("A complete encrypted snapshot will replace its cloud history."),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "[ M / Enter ]  Migrate this device to sync-v2",
+                        Style::default().fg(theme.success).add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        "[ L ]          Stay local-only (disable Cloud Sync)",
+                        Style::default().fg(theme.warning),
+                    )),
+                    Line::from(Span::styled(
+                        "[ Esc ]        Decide later",
+                        Style::default().fg(theme.muted),
+                    )),
+                ];
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(theme.primary))
+                    .title(Span::styled(
+                        " End-to-End Encryption Migration ",
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ));
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(block)
+                        .alignment(ratatui::layout::Alignment::Center)
+                        .wrap(ratatui::widgets::Wrap { trim: true }),
+                    overlay_area,
+                );
+            }
+
+            // Modal de confirmación de salida — con fogata animada y una quote, pura vibra RPG
             if let questline::app::ModalType::QuitConfirm { ref quote } = app.modal_state {
                 // Popup de altura fija para que no se pase en terminales pequeñas
                 let overlay_area = centered_rect_fixed_height(64, 17, size);
@@ -1870,11 +2434,12 @@ async fn main() -> Result<()> {
                 focus_idx,
             } = app.modal_state
             {
-                let area = questline::screens::intro::centered_rect(60, 65, size);
+                let modal_height = size.height.saturating_sub(2).min(26);
+                let area = centered_rect_fixed_height(68, modal_height, size);
                 f.render_widget(Clear, area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
 
-                let roles = ["Owner", "Steward", "Companion", "Observer"];
+                let roles = ["Steward", "Companion", "Observer"];
                 let block = Block::default()
                     .borders(Borders::ALL)
                     .border_type(BorderType::Double)
@@ -1890,7 +2455,7 @@ async fn main() -> Result<()> {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3), // Project select
-                        Constraint::Length(3), // Identity input
+                        Constraint::Length(5), // Companion Key + verification fingerprint
                         Constraint::Length(3), // Username input
                         Constraint::Length(3), // Role select
                         Constraint::Length(7), // Role permissions description
@@ -1923,7 +2488,39 @@ async fn main() -> Result<()> {
                 );
                 f.render_widget(input_project, inner_layout[0]);
 
-                let input_identity = Paragraph::new(format!("  {}", identity)).block(
+                let formatted_key = questline::services::identity::format_companion_key(identity);
+                let key_status = if identity.is_empty() {
+                    "Paste the companion's public key. This is not a Transfer Code.".to_string()
+                } else if app.companion_lookup_in_flight.as_deref() == Some(identity.as_str()) {
+                    "Valid public key  •  Looking up companion in the background…".to_string()
+                } else if app
+                    .companion_lookup_cache
+                    .as_ref()
+                    .is_some_and(|result| {
+                        result.identity == *identity && result.encryption_key.is_some()
+                    })
+                {
+                    let fingerprint = questline::services::identity::companion_key_fingerprint(identity)
+                        .unwrap_or_else(|_| "UNKNOWN".to_string());
+                    format!("Ready for encrypted Fellowship  •  Fingerprint: {fingerprint}")
+                } else if let Ok(fingerprint) =
+                    questline::services::identity::companion_key_fingerprint(identity)
+                {
+                    format!("Valid public key  •  Fingerprint: {fingerprint}")
+                } else {
+                    format!("{} / 64 hexadecimal characters", identity.len())
+                };
+                let input_identity = Paragraph::new(vec![
+                    Line::from(format!("  {formatted_key}")),
+                    Line::from(Span::styled(
+                        format!("  {key_status}"),
+                        Style::default().fg(if identity.len() == 64 {
+                            theme.success
+                        } else {
+                            theme.muted
+                        }),
+                    )),
+                ]).block(
                     Block::default()
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(if focus_idx == 1 {
@@ -1931,7 +2528,7 @@ async fn main() -> Result<()> {
                         } else {
                             theme.muted
                         }))
-                        .title(" Identity Public Key (Hex) "),
+                        .title(" Companion Key — Public and Safe to Share "),
                 );
                 f.render_widget(input_identity, inner_layout[1]);
 
@@ -1976,10 +2573,9 @@ async fn main() -> Result<()> {
                 f.render_widget(role_p, inner_layout[3]);
 
                 let permissions_text = match role_idx {
-                    0 => "  Permissions: Full Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Invite, modify, and remove members\n  • Delete project / transfer ownership",
-                    1 => "  Permissions: Administrative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Invite new members (Companion/Observer roles)\n  • Cannot delete project or transfer ownership",
-                    2 => "  Permissions: Standard Collaborative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Cannot manage members or project settings",
-                    3 => "  Permissions: Read-Only Access\n  • View project board, tasks, and notes\n  • Read Chronicle messages and activity feed\n  • Cannot add/edit tasks/notes or post messages",
+                    0 => "  Permissions: Administrative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Invite new members (Companion/Observer roles)\n  • Cannot delete project or transfer ownership",
+                    1 => "  Permissions: Standard Collaborative Control\n  • Read/Write all tasks and notes\n  • Send messages to Chronicle\n  • Cannot manage members or project settings",
+                    2 => "  Permissions: Read-Only Access\n  • View project board, tasks, and notes\n  • Read Chronicle messages and activity feed\n  • Cannot add/edit tasks/notes or post messages",
                     _ => "",
                 };
 
@@ -1992,8 +2588,15 @@ async fn main() -> Result<()> {
                 );
                 f.render_widget(perm_p, inner_layout[4]);
 
-                let help_p = Paragraph::new("  [Tab/Shift-Tab] navigate  |  [←/→] select project/change role  |  [Enter] send invitation  |  [Esc] cancel")
-                    .style(Style::default().fg(theme.muted));
+                let first_hint = match focus_idx {
+                    0 => "[←/→] choose project",
+                    3 => "[←/→] choose role",
+                    _ => "Paste/type Companion Key",
+                };
+                let help_p = Paragraph::new(format!(
+                    "  {first_hint}  |  [Tab] navigate  |  [Enter] invite  |  [Esc] cancel"
+                ))
+                .style(Style::default().fg(theme.muted));
                 f.render_widget(help_p, inner_layout[5]);
             }
 
@@ -2038,6 +2641,40 @@ async fn main() -> Result<()> {
                     .block(block)
                     .wrap(ratatui::widgets::Wrap { trim: false });
                 f.render_widget(p, overlay_area);
+            }
+
+            if let questline::app::ModalType::ConfirmRemoveFellowshipMember {
+                ref member_username,
+                ..
+            } = app.modal_state
+            {
+                let overlay_area = centered_rect_fixed_height(62, 11, size);
+                f.render_widget(Clear, overlay_area);
+                f.render_widget(
+                    Block::default().style(Style::default().bg(theme.background)),
+                    overlay_area,
+                );
+                let block = Block::default()
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Double)
+                    .border_style(Style::default().fg(Color::Red))
+                    .title(" Remove Fellowship Companion ");
+                let lines = vec![
+                    Line::from(""),
+                    Line::from(format!("  Remove {member_username} from this campaign?")),
+                    Line::from(""),
+                    Line::from("  Questline will generate a new project key and route."),
+                    Line::from("  Every remaining companion must have an encryption key."),
+                    Line::from("  Previously downloaded content cannot be revoked."),
+                    Line::from(""),
+                    Line::from("  Continue?  [Y] Yes   [N] No / Esc"),
+                ];
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .block(block)
+                        .wrap(ratatui::widgets::Wrap { trim: false }),
+                    overlay_area,
+                );
             }
 
             // Confirm de conquistar campaña — acción irreversible pero gloriosa
@@ -2277,7 +2914,8 @@ async fn main() -> Result<()> {
                     Line::from("  Ctrl+P / : / Ctrl+K / F1  Command Palette (Fuzzy Navigation & Commands)"),
                     Line::from("  Ctrl+N       Quick Note (title, campaign, then scroll editor)"),
                     Line::from("  ?            Show Keyboard Shortcuts Help (Context-Sensitive)"),
-                    Line::from("  1-8          Switch sections directly"),
+                    Line::from("  1-9          Switch sections directly"),
+                    Line::from("  Swipe ← / →  Two-finger swipe: previous/next section"),
                     Line::from("  Tab          Cycle input focus/fields"),
                     Line::from("  Shift+Tab    Cycle fields backwards"),
                     Line::from("  q / Q        Quit (seals Chronicle + syncs before exit)"),
@@ -2295,7 +2933,7 @@ async fn main() -> Result<()> {
                         lines.push(Line::from("  Ctrl+N       Write a Quick Note"));
                         lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
                         lines.push(Line::from("  f            Quick start Focus Session"));
-                        lines.push(Line::from("  m            Go to Music Screen"));
+                        lines.push(Line::from("  m            Cycle Dashboard Layout"));
                     }
                     ActiveScreen::Projects => {
                         lines.push(Line::from("  n            Create a New Project"));
@@ -2463,11 +3101,11 @@ async fn main() -> Result<()> {
     app.audio_player.stop();
 
     // Restaura la terminal a su estado normal — sin esto la consola queda cagada
-    print!("\x1b]111\x07");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    write_terminal_seq("\x1b]111\x07");
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
+        DisableMouseCapture,
         DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
@@ -2492,4 +3130,93 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::{CliOptions, parse_cli_options};
+
+    #[test]
+    fn profile_flag_can_precede_or_follow_a_command() {
+        assert_eq!(
+            parse_cli_options(["--profile", "Alice", "--version"].map(String::from)).unwrap(),
+            CliOptions {
+                profile: Some("Alice".to_string()),
+                command: Some("--version".to_string()),
+                command_args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_cli_options(["backup", "-p", "bob"].map(String::from)).unwrap(),
+            CliOptions {
+                profile: Some("bob".to_string()),
+                command: Some("backup".to_string()),
+                command_args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_cli_options(["--profile=steward"].map(String::from)).unwrap(),
+            CliOptions {
+                profile: Some("steward".to_string()),
+                command: None,
+                command_args: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_cli_options(
+                [
+                    "campaign-import",
+                    "planning.json",
+                    "--confirm",
+                    "--profile",
+                    "Alice",
+                ]
+                .map(String::from)
+            )
+            .unwrap(),
+            CliOptions {
+                profile: Some("Alice".to_string()),
+                command: Some("campaign-import".to_string()),
+                command_args: vec!["planning.json".to_string(), "--confirm".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn profile_flag_rejects_missing_duplicate_and_extra_values() {
+        assert!(parse_cli_options(["--profile"].map(String::from)).is_err());
+        assert!(parse_cli_options(["--profile", "one", "-p", "two"].map(String::from)).is_err());
+        assert!(parse_cli_options(["export", "backup"].map(String::from)).is_err());
+        assert!(parse_cli_options(["campaign-import"].map(String::from)).is_err());
+        assert!(parse_cli_options(["archive", "open"].map(String::from)).is_err());
+        assert!(parse_cli_options(["backlog", "descend"].map(String::from)).is_err());
+        assert!(
+            parse_cli_options(["campaign-import", "file.json", "--force"].map(String::from))
+                .is_err()
+        );
+        assert!(parse_cli_options(["calendar-import", "Campaign"].map(String::from)).is_err());
+        assert!(
+            parse_cli_options(
+                ["calendar-import", "Campaign", "events.ics", "--reconcile"].map(String::from)
+            )
+            .is_ok()
+        );
+        assert!(
+            parse_cli_options(
+                ["calendar-import", "Campaign", "events.ics", "--force"].map(String::from)
+            )
+            .is_err()
+        );
+    }
+
+    // Los dos easter eggs parsean como cualquier subcomando pero nunca salen en
+    // --help. Si alguien los agrega ahí, este test no lo atrapa; el de abajo sí.
+    #[test]
+    fn hidden_games_parse_as_bare_subcommands() {
+        for command in ["archive", "backlog"] {
+            let parsed = parse_cli_options([command].map(String::from)).unwrap();
+            assert_eq!(parsed.command.as_deref(), Some(command));
+            assert!(parsed.command_args.is_empty());
+        }
+    }
 }

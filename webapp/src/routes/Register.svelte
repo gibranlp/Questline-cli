@@ -1,8 +1,8 @@
 <script>
-  import { generateIdentity, saveIdentity } from '../lib/auth.js';
+  import { generateIdentity, saveIdentity, storeKeyInSession } from '../lib/auth.js';
   import { registerWithCredentials, checkAccessCode } from '../lib/api.js';
-  import { encryptSecretKey } from '../lib/crypto.js';
-  import { identity as identityStore } from '../lib/store.js';
+  import { deriveDataKey, encryptSecretKey, exportKeyHex } from '../lib/crypto.js';
+  import { dataKey as dataKeyStore, identity as identityStore } from '../lib/store.js';
   import { navigate } from '../lib/router.js';
 
   const secureContext = window.isSecureContext && crypto?.subtle != null;
@@ -83,6 +83,9 @@
         id.user_uuid = result.user_id;
       }
 
+      const key = await deriveDataKey(id.secret_key);
+      storeKeyInSession(await exportKeyHex(key));
+      dataKeyStore.set(key);
       saveIdentity(id);
       identityStore.set(id);
       step = 'done';

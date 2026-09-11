@@ -29,7 +29,12 @@ impl<'a> XPService<'a> {
                 // Especializaciones enfocadas en tareas — bonus por completar tasks o eventos Hero
                 "Bug Hunter" | "Execution Knight" | "Insight Seeker" | "Process Optimizer"
                 | "Temporal Ward" | "Audit Judge" => {
-                    event_type.contains("Task") || event_type.contains("Hero")
+                    // Task completions are labelled as "Quest"s (e.g. "Complete Quest"),
+                    // so match "Quest" too — otherwise only high-priority ("Hero") tasks
+                    // earned the bonus. Mirrors class_quest_bonus_percent's is_task.
+                    event_type.contains("Task")
+                        || event_type.contains("Hero")
+                        || event_type.contains("Quest")
                 }
                 // Especializaciones enfocadas en notas — bonus por crear scrolls o notes
                 "Automation Mage" | "Momentum Crusader" | "Knowledge Keeper"
@@ -70,24 +75,9 @@ impl<'a> XPService<'a> {
         };
         self.db.insert_xp_event(&event)?;
 
-        user.xp += final_xp;
-
-        // Loop de level-up — puede subir múltiples niveles de un jalón si el XP es grande
-        let mut leveled_up = false;
-        loop {
-            if user.level >= 100 {
-                // Nivel 100 es el tope — después de ahí el XP no cuenta para nada
-                break;
-            }
-            let needed = User::xp_for_next_level(user.level);
-            if user.xp >= needed {
-                user.xp -= needed;
-                user.level += 1;
-                leveled_up = true;
-            } else {
-                break;
-            }
-        }
+        // Delegado a User::apply_xp_delta — comparte el mismo loop de level-up que usa el
+        // sync engine al reproducir un XPEvent remoto, para que ambos caminos converjan.
+        let leveled_up = user.apply_xp_delta(final_xp);
 
         self.db.update_user(user)?;
 

@@ -11,6 +11,13 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Paragraph, Wrap},
 };
 
+// Shared with app/mod.rs's compute_about_hit_regions, so the mouse click
+// zones for "[R] Send Report" and "[Support]" are always derived from the
+// exact same text this title actually renders — never a hand-copied guess
+// that could silently drift out of sync with it.
+pub(crate) const ABOUT_TITLE_TEXT: &str = " About Questline  [↑↓] scroll  [R] Send Report  ";
+pub(crate) const ABOUT_SUPPORT_LABEL: &str = "[Support] ";
+
 const FACTS: &[&[&str]] = &[
     &["• The Great Backlog grows stronger when ignored."],
     &["• Scope Dragons feed on \"just one more feature.\""],
@@ -192,6 +199,21 @@ fn cl_div() -> Line<'static> {
 fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
+        (
+            "v2.0.0",
+            "Aug 1, 2026",
+            "Encrypted Fellowship",
+            &[
+                "Private sync-v2 encrypts content before it leaves the CLI or browser",
+                "Signed encrypted events protect identity, integrity, and authorship",
+                "Trusted devices can restore portable account data across Rust and WebCrypto",
+                "Fellowship projects use encrypted project keys and opaque routing IDs",
+                "Member removal rotates project keys and revokes the retired route",
+                "Migration, replay protection, recovery, and remote quarantine are safer",
+                "Sync Settings show the active protocol and offer a local-only mode",
+                "Markdown previews, browser key storage, and encrypted envelopes are hardened",
+            ],
+        ),
         (
             "v1.1.3",
             "Jul 29, 2026",
@@ -744,13 +766,13 @@ pub fn draw(f: &mut ratatui::Frame, app: &App, theme: &Theme, area: ratatui::lay
                 .border_style(Style::default().fg(theme.border))
                 .title(Line::from(vec![
                     Span::styled(
-                        " About Questline  [↑↓] scroll  [R] Send Report  ",
+                        ABOUT_TITLE_TEXT,
                         Style::default()
                             .fg(theme.warning)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
-                        "[Support] ",
+                        ABOUT_SUPPORT_LABEL,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),

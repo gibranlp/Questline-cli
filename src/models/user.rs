@@ -832,6 +832,27 @@ impl User {
         }
     }
 
+    // Aplica un delta de XP crudo (los bonos de clase/especialización ya vienen incluidos)
+    // usando el mismo loop de level-up que XPService::grant_xp. La comparten tanto el grant
+    // local como el replay de un XPEvent remoto durante el sync — así dos dispositivos que
+    // ganan XP por su cuenta terminan sumando sus ganancias en vez de que una snapshot
+    // sobrescriba silenciosamente a la otra. Returns true si hubo level-up.
+    pub fn apply_xp_delta(&mut self, xp_gained: i32) -> bool {
+        self.xp += xp_gained;
+        let mut leveled_up = false;
+        while self.level < 100 {
+            let needed = Self::xp_for_next_level(self.level);
+            if self.xp >= needed {
+                self.xp -= needed;
+                self.level += 1;
+                leveled_up = true;
+            } else {
+                break;
+            }
+        }
+        leveled_up
+    }
+
     // El título cambia según nivel y clase — 5 rangos antes del título final del nivel 100
     pub fn title(&self) -> &'static str {
         match self.class {

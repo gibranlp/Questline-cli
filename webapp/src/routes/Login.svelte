@@ -50,7 +50,7 @@
       };
 
       // Derive the data encryption key and store its bytes in sessionStorage
-      const key = await deriveDataKey(password, data.user_id);
+      const key = await deriveDataKey(secretKey);
       const keyHex = await exportKeyHex(key);
       storeKeyInSession(keyHex);
       dataKeyStore.set(key);

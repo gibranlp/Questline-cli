@@ -2,7 +2,7 @@
 // app/mod.rs — el estado global de la app: datos cargados, pantalla activa y modales
 // ─────────────────────────────────────────────────────────────────────────────
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Timelike, Utc};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use rusqlite::params;
@@ -13,17 +13,91 @@ use uuid::Uuid;
 use crate::database::Database;
 use crate::milestone_templates::{self, ProjectStats};
 use crate::models::{
-    Achievement, ClassType, DailyAdventure, DailyQuest, DailyReflection, FocusSession,
-    JournalEntry, Milestone, Note, Project, RecurrenceType, Ritual, Statistics, Streak, Task,
+    Achievement, ClassType, DailyAdventure, DailyReflection, FocusSession, JournalEntry,
+    Milestone, Note, Project, QuestStatus, RecurrenceType, Ritual, Statistics, Streak, Task,
     TaskPriority, User, XPEvent, ZenTree,
 };
 use crate::screens::ActiveScreen;
 use crate::screens::editor::EditorState;
 use crate::screens::onboarding::OnboardingFocus;
-use crate::services::{Identity, ThemeService, XPService};
+use crate::services::{ThemeService, XPService};
 use crate::theme::ThemeChoice;
 
 pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
+const TASK_TITLE_CHAR_LIMIT: usize = 100;
+
+// Presets del Oath Calendar para "Show quests up to" — cuántos días adelante puede
+// competir una quest por Main Quest / Next Quest / Quick Win / Upcoming Threats.
+// None = All (sin límite).
+pub const QUEST_VISIBILITY_HORIZON_PRESETS: [(&str, Option<i64>); 8] = [
+    ("Today", Some(0)),
+    ("Tomorrow", Some(1)),
+    ("1 week", Some(7)),
+    ("15 days", Some(15)),
+    ("1 month", Some(30)),
+    ("6 months", Some(180)),
+    ("1 year", Some(365)),
+    ("All", None),
+];
+
+// Convierte los días guardados en DB al índice de preset más cercano — por si un valor
+// sincronizado desde otra versión no calza exacto con ninguno de los presets actuales.
+fn quest_visibility_horizon_idx_from_days(days: Option<i64>) -> usize {
+    QUEST_VISIBILITY_HORIZON_PRESETS
+        .iter()
+        .position(|(_, preset)| *preset == days)
+        .unwrap_or_else(|| match days {
+            None => QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1,
+            Some(target) => QUEST_VISIBILITY_HORIZON_PRESETS
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, (_, preset))| preset.map(|d| (idx, (d - target).abs())))
+                .min_by_key(|(_, diff)| *diff)
+                .map(|(idx, _)| idx)
+                .unwrap_or(3),
+        })
+}
+
+pub(crate) fn council_mention_query(content: &str) -> Option<&str> {
+    if content.is_empty() || content.ends_with(char::is_whitespace) {
+        return None;
+    }
+    let token = content
+        .rsplit_once(char::is_whitespace)
+        .map(|(_, token)| token)
+        .unwrap_or(content);
+    token.strip_prefix('@').filter(|query| {
+        query
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_' || character == '-')
+    })
+}
+
+pub(crate) fn ordered_active_projects(projects: &[Project]) -> Vec<&Project> {
+    let mut active = projects
+        .iter()
+        .filter(|project| !project.archived && !project.completed)
+        .collect::<Vec<_>>();
+    active.sort_by(|left, right| {
+        left.is_shared
+            .cmp(&right.is_shared)
+            .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+    });
+    active
+}
+
+fn council_mention_candidates(content: &str, members: &[(String, String, String)]) -> Vec<usize> {
+    let Some(query) = council_mention_query(content) else {
+        return Vec::new();
+    };
+    let query = query.to_lowercase();
+    members
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, username, _))| username.to_lowercase().contains(&query))
+        .map(|(index, _)| index)
+        .collect()
+}
 
 #[derive(Debug, Clone)]
 pub struct AppStatsCache {
@@ -169,6 +243,17 @@ fn delete_last_word(input: &mut String) {
     delete_word_before_cursor(input, cursor);
 }
 
+// Mueve la fecha de un movimiento de Treasury un día a la vez (←/→ en el modal).
+// Si el valor guardado no se puede leer como YYYY-MM-DD (no debería pasar, nunca se
+// teclea a mano), se cae de vuelta a hoy en lugar de trabar el campo.
+fn step_date_val(date_val: &str, delta_days: i64) -> String {
+    let base = NaiveDate::parse_from_str(date_val.trim(), "%Y-%m-%d")
+        .unwrap_or_else(|_| Local::now().date_naive());
+    (base + chrono::Duration::days(delta_days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
 fn is_ctrl_backspace(key: KeyEvent) -> bool {
     let ctrl_word_delete = key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(
@@ -248,6 +333,9 @@ pub enum SearchResultType {
     Achievement,
     Lore,
     ChronicleEntry,
+    QuestCouncilMessage,
+    CampaignChronicleMessage,
+    Companion,
     Milestone,
     Ritual,
 }
@@ -263,6 +351,9 @@ impl SearchResultType {
             SearchResultType::Achievement => "Achievement",
             SearchResultType::Lore => "Lore",
             SearchResultType::ChronicleEntry => "Chronicle",
+            SearchResultType::QuestCouncilMessage => "Quest Council",
+            SearchResultType::CampaignChronicleMessage => "Campaign Chronicle",
+            SearchResultType::Companion => "Companion",
             SearchResultType::Milestone => "Milestone",
             SearchResultType::Ritual => "Sidequest",
         }
@@ -311,6 +402,9 @@ pub enum ModalType {
         desc_cursor: usize,
         focus_idx: usize,
     },
+    CampaignTemplateSelect {
+        selected_idx: usize,
+    },
     EditProject {
         id: Uuid,
         name: String,
@@ -343,6 +437,11 @@ pub enum ModalType {
         codex_id: Uuid,
         selected_idx: usize,
     },
+    // Mueve una tarea/step para que sea top-level o step de otra tarea top-level del mismo proyecto
+    RefileTask {
+        task_id: Uuid,
+        selected_idx: usize,
+    },
     EditTask {
         id: Uuid,
         title: String,
@@ -359,7 +458,49 @@ pub enum ModalType {
         recurrence: Option<RecurrenceType>,
     },
     NewJournalEntry {
+        // None while composing a brand-new entry; Some(id) while editing an
+        // existing one — handle_journal_modal_key branches on this to call
+        // update_journal_entry instead of insert_journal_entry on Enter.
+        entry_id: Option<Uuid>,
         content: String,
+    },
+    TreasuryEntry {
+        entry_id: Option<Uuid>,
+        title: String,
+        title_cursor: usize,
+        amount: String,
+        amount_cursor: usize,
+        entry_type_idx: usize,
+        status_idx: usize,
+        category_idx: usize,
+        // Siempre "YYYY-MM-DD" — se mueve un día a la vez con ←/→, nunca se teclea a mano.
+        // Al crear nace en "hoy"; al editar nace en la fecha ya guardada del movimiento.
+        date_val: String,
+        focus_idx: usize,
+    },
+    TaskExpenseCompletion {
+        task_id: Uuid,
+        selected_idx: usize,
+    },
+    TreasuryBudget {
+        amount: String,
+        target_idx: usize,
+        focus_idx: usize,
+    },
+    TaskFinancials {
+        task_id: Uuid,
+        estimated: String,
+        actual: String,
+        billable: String,
+        payment_status_idx: usize,
+        focus_idx: usize,
+    },
+    TreasuryCategory {
+        name: String,
+    },
+    // Divisa de trabajo de la campaña — solo cambia la denominación, no convierte importes
+    TreasuryCurrency {
+        selected_idx: usize,
     },
     CustomFocusDuration {
         input: String,
@@ -440,6 +581,20 @@ pub enum ModalType {
         task_id: Uuid,
         selected_member_idx: usize,
     },
+    QuestDependencies {
+        task_id: Uuid,
+        selected_quest_idx: usize,
+    },
+    CouncilBriefing {
+        selected_section_idx: usize,
+    },
+    QuestCouncil {
+        task_id: Uuid,
+        content: String,
+        selected_comment_idx: usize,
+        selected_member_idx: usize,
+        editing_comment_id: Option<String>,
+    },
     JournalVisibility {
         entry_id: Uuid,
         visibility_idx: usize,
@@ -491,6 +646,7 @@ pub enum ModalType {
     QuitConfirm {
         quote: String,
     },
+    EncryptionMigrationPrompt,
     ConfirmArchiveProject {
         project_id: Uuid,
         project_name: String,
@@ -498,6 +654,11 @@ pub enum ModalType {
     ConfirmDeleteProject {
         project_id: Uuid,
         project_name: String,
+    },
+    ConfirmRemoveFellowshipMember {
+        project_id: String,
+        member_identity: String,
+        member_username: String,
     },
     ConfirmConquerProject {
         project_id: Uuid,
@@ -551,6 +712,40 @@ pub struct Notification {
     pub title: String,
     pub unlocked_at: std::time::Instant,
 }
+
+/// Racha de scroll vertical en curso, para dosificar el trackpad sin castigar la rueda.
+///
+/// Un notch de rueda llega solo y espaciado; el trackpad manda decenas de eventos seguidos por
+/// gesto. Tratar los dos igual es lo que hacía que el contenido volara. Ver
+/// `App::throttle_vertical_scroll`.
+#[derive(Debug, Clone, Copy)]
+pub struct ScrollBurst {
+    /// Último evento vertical; el hueco contra el siguiente distingue rueda de trackpad.
+    pub last_event_at: std::time::Instant,
+    /// `true` = hacia abajo. Cambiar de sentido corta la racha.
+    pub down: bool,
+    /// Eventos tragados desde el último que sí pasó.
+    pub pending: u8,
+}
+
+/// Un swipe horizontal en curso, de los que cambian de panel.
+///
+/// El trackpad no manda "un swipe": manda una ráfaga de eventos que sigue corriendo sola por la
+/// inercia de macOS. Se acumulan aquí para que la ráfaga entera cuente como un solo gesto y mueva
+/// exactamente un panel. Ver `App::handle_pane_swipe`.
+#[derive(Debug, Clone, Copy)]
+pub struct PaneSwipeGesture {
+    /// Último evento horizontal recibido; el hueco contra el siguiente decide si el gesto sigue.
+    pub last_event_at: std::time::Instant,
+    /// `true` = derecha (panel siguiente). Invertirla arranca un gesto nuevo.
+    pub forward: bool,
+    /// Eventos acumulados en esta dirección, contra `SWIPE_EVENTS_TO_FIRE`.
+    pub events: u8,
+    /// Si este gesto ya movió el panel. Lo que queda de ráfaga se descarta.
+    pub fired: bool,
+}
+
+type CouncilNotice = (String, String, String, String, Option<String>, bool, String);
 
 impl Notification {
     pub fn info(msg: impl Into<String>) -> Self {
@@ -817,6 +1012,13 @@ pub struct ChatPollResult {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompanionLookupResult {
+    pub identity: String,
+    pub username: Option<String>,
+    pub encryption_key: Option<String>,
+}
+
 // El estado central de toda la app — todo pasa por aquí, desde la DB hasta los modales
 pub struct App {
     // Base de datos SQLite — la fuente de verdad de toda la información del héroe
@@ -841,7 +1043,6 @@ pub struct App {
     pub class_quote: Option<String>,
     pub class_quote_author: Option<String>,
 
-    pub daily_quests: Vec<DailyQuest>,
     pub tasks_due_today: Vec<Task>,
     pub projects: Vec<Project>,
     pub should_quit: bool,
@@ -853,6 +1054,13 @@ pub struct App {
     pub workspace_tab_idx: usize,
     pub workspace_sidebar_focused: bool,
     pub workspace_help_open: bool,
+    pub quest_board_open: bool,
+    /// Which step of the card at `selected_task_idx` is focused in the Kanban
+    /// board — `None` means the card's header itself is focused. Only
+    /// meaningful while `quest_board_open && viewing_step_for_task.is_none()`;
+    /// stale/out-of-range values are treated as `None` wherever this is read
+    /// rather than proactively reset on every task-changing action.
+    pub kanban_step_idx: Option<usize>,
     pub selected_task_idx: usize,
     pub selected_note_idx: usize,
     pub selected_journal_idx: usize,
@@ -866,11 +1074,25 @@ pub struct App {
     pub overlay_modal: ModalType,
     pub editor_state: Option<EditorState>,
     pub task_desc_editor: Option<EditorState>,
+    pub task_title_cursor: usize,
+    pub task_title_editing: bool,
     pub task_calendar: Option<TaskCalendarState>,
     pub pending_calendar_due_date: Option<NaiveDate>,
 
+    // Mouse support: rendered widget bounds stashed by the last frame's draw()
+    // calls (nothing else persists Rects between frames), plus interaction
+    // state for click/drag handling. UI interaction state, not document
+    // state — lives here rather than on EditorState, so it isn't part of
+    // undo/redo snapshots.
+    pub hit_regions: crate::screens::hit_test::HitRegions,
+    // (time, col, row, run length) — run length lets a same-cell click chain
+    // distinguish single/double/triple click instead of only double.
+    pub last_click: Option<(std::time::Instant, u16, u16, u8)>,
+    pub mouse_drag_anchor: Option<(usize, usize)>,
+
     pub dashboard_task_focus: bool,
     pub selected_dashboard_task_idx: usize,
+    pub dashboard_layout: crate::screens::dashboard::DashboardLayout,
 
     pub searching: bool,
     pub search_query: String,
@@ -888,6 +1110,10 @@ pub struct App {
 
     pub selected_ritual_idx: usize,
     pub selected_milestone_idx: usize,
+    pub selected_treasury_idx: usize,
+    pub treasury_filter: crate::models::LedgerFilter,
+    pub treasury_sort: crate::models::LedgerSort,
+    pub pending_financial_completion_bypass: Option<Uuid>,
 
     pub audio_player: crate::audio::AudioPlayer,
     pub selected_soundscape_idx: usize,
@@ -917,12 +1143,21 @@ pub struct App {
     pub last_mutation: Option<std::time::Instant>,
     pub last_sync_warlock_xp: i32,
 
+    // Companion metadata is resolved off the input thread so pasting a public key
+    // is rendered immediately even when the API is slow.
+    pub companion_lookup_result: std::sync::Arc<std::sync::Mutex<Option<CompanionLookupResult>>>,
+    pub companion_lookup_in_flight: Option<String>,
+    pub companion_lookup_cache: Option<CompanionLookupResult>,
+
     pub selected_fellowship_project_idx: usize,
+    pub selected_fellowship_member_idx: usize,
 
     pub fellowship_search_query: String,
-    pub selected_fellowship_tab: usize, // 0 = Projects/Chronicle, 1 = Invitations, 2 = Online Companions, 3 = Recent Activity, 4 = Search Messages
+    pub selected_fellowship_tab: usize, // 0 Chronicle, 1 Invites, 2 Companions, 3 Activity, 4 Search, 5 My Quests, 6 Council
     pub selected_invitation_idx: usize,
     pub selected_notification_idx: usize,
+    pub council_notice_filter: String,
+    pub selected_my_quest_idx: usize,
     pub fellowship_chat_input: String,
     pub fellowship_selected_msg_idx: usize, // usize::MAX = input focused (bottom)
     pub fellowship_focus_left: bool,        // true = left project list has focus
@@ -953,13 +1188,16 @@ pub struct App {
     pub library_scroll_offset: u16,
     pub library_detail_max_scroll: Cell<u16>,
     pub selected_relic_idx: usize,
-    pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End
+    pub selected_settings_focus_idx: usize, // 0 = Themes, 1 = OS Alerts, 2 = Task Alerts, 3 = Sounds, 4 = Quest Burst, 5 = Sound Volume, 6-12 = Streak Days, 13 = Start, 14 = End, 15 = Quest Horizon
     pub selected_settings_theme_idx: usize,
     pub sound_effects_enabled: bool,
     pub sound_effects_volume: f32,
     pub streak_workday_mask: u8,
     pub streak_active_from: u32,
     pub streak_active_to: u32,
+    // Índice en QUEST_VISIBILITY_HORIZON_PRESETS — cuántos días adelante puede competir
+    // una quest por Main Quest / Next Quest / Quick Win / Upcoming Threats.
+    pub quest_visibility_horizon_idx: usize,
     pub ambient_effects_enabled: bool,
     pub active_ambient_effect: usize,
     pub ambient_particles: Vec<Particle>,
@@ -975,6 +1213,10 @@ pub struct App {
     pub last_pywal_modified: Option<std::time::SystemTime>,
     pub last_home_key_at: Option<std::time::Instant>,
     pub last_end_key_at: Option<std::time::Instant>,
+    // Gesto horizontal en curso. Ver PaneSwipeGesture y handle_pane_swipe.
+    pub pane_swipe: Option<PaneSwipeGesture>,
+    // Racha de scroll vertical en curso. Ver ScrollBurst y throttle_vertical_scroll.
+    pub scroll_burst: Option<ScrollBurst>,
 
     // El hilo de fondo escribe aquí cuando termina de checar la versión más reciente
     pub update_check: std::sync::Arc<std::sync::Mutex<Option<String>>>,
@@ -987,6 +1229,12 @@ pub struct App {
     pub note_preview_scroll: usize,
     pub note_preview_max_scroll: Cell<usize>,
     pub note_preview_focused: bool,
+    // Scroll del panel de detalles (Quest Ledger) del tab de Tareas — mismo patrón
+    // que note_preview_* de arriba, pero para la descripción/steps/comentarios de
+    // la quest seleccionada.
+    pub quest_ledger_scroll: usize,
+    pub quest_ledger_max_scroll: Cell<usize>,
+    pub quest_ledger_focused: bool,
 
     // Cachés de performance — se llenan en reload_data() para no golpear la DB en cada frame
     pub all_tasks: Vec<Task>,
@@ -1025,6 +1273,11 @@ pub struct App {
     pub last_sprite_notification_time: Option<std::time::Instant>,
     pub last_sprite_check_time: Option<std::time::Instant>,
     pub last_task_notification_tick: Option<std::time::Instant>,
+    // Cooldown gates so tick_hydration/tick_auto_sync don't hit the DB on
+    // every ~50ms render tick just to check a once-a-day condition — mirrors
+    // last_task_notification_tick above.
+    pub last_hydration_day_check: Option<std::time::Instant>,
+    pub last_sync_cleanup_check: Option<std::time::Instant>,
 
     // Prologue — pantallas de historia con efecto typewriter que se muestran después del login
     pub prologue_page: u8,            // 0 = The Story So Far, 1 = Chapter One
@@ -1063,30 +1316,59 @@ pub fn extract_url(content: &str) -> Option<&str> {
     })
 }
 
-pub fn open_url(url: &str) {
+/// Tries to launch `url` in the user's browser, returning whether some
+/// launcher command actually spawned. Every platform has more than one
+/// plausible launcher — most notably WSL, which usually ships without
+/// `xdg-open` (or a portal for it to talk to) but can hand the URL to
+/// Windows itself — so we walk a fallback chain instead of trusting the
+/// first candidate.
+pub fn open_url(url: &str) -> bool {
     use std::process::Stdio;
+
+    fn try_spawn(cmd: &str, args: &[&str]) -> bool {
+        std::process::Command::new(cmd)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .is_ok()
+    }
+
     #[cfg(target_os = "linux")]
-    let _ = std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
+            || std::fs::read_to_string("/proc/version")
+                .map(|v| v.to_lowercase().contains("microsoft"))
+                .unwrap_or(false);
+        if is_wsl {
+            // `xdg-open` is rarely installed on WSL, and even when it is
+            // there's usually no desktop portal behind it. Hand off to the
+            // Windows interop binaries instead, which open the URL in the
+            // Windows default browser.
+            return try_spawn("wslview", &[url])
+                || try_spawn("explorer.exe", &[url])
+                || try_spawn("cmd.exe", &["/c", "start", "", url]);
+        }
+        try_spawn("xdg-open", &[url])
+            || try_spawn("gio", &["open", url])
+            || try_spawn("sensible-browser", &[url])
+    }
     #[cfg(target_os = "macos")]
-    let _ = std::process::Command::new("open")
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        try_spawn("open", &[url])
+    }
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/c", "start", "", url])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    {
+        try_spawn("cmd", &["/c", "start", "", url])
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
-enum DashboardCommandTarget {
+pub(crate) enum DashboardCommandTarget {
     Task(Task),
     Ritual(String),
     DailyAdventure(String),
@@ -1135,6 +1417,8 @@ fn visible_workspace_tasks(
     task_filter: &str,
     task_sort: &str,
     search_query: &str,
+    db: Option<&Database>,
+    my_identity: &str,
 ) -> Vec<Task> {
     if let Some(parent_id) = viewing_step_for_task {
         let mut steps: Vec<Task> = all_tasks
@@ -1165,6 +1449,44 @@ fn visible_workspace_tasks(
         .filter(|t| match task_filter {
             "Incomplete" => !t.completed,
             "Completed" => t.completed,
+            "MyQuests" => db
+                .into_iter()
+                .flat_map(|db| {
+                    db.get_task_assignments(&t.id.to_string())
+                        .unwrap_or_default()
+                })
+                .any(|(identity, _)| identity == my_identity),
+            filter if filter.starts_with("Assignee:") => db
+                .into_iter()
+                .flat_map(|db| {
+                    db.get_task_assignments(&t.id.to_string())
+                        .unwrap_or_default()
+                })
+                .any(|(identity, _)| identity == filter.trim_start_matches("Assignee:")),
+            "Unassigned" => db.is_some_and(|db| {
+                db.get_task_assignments(&t.id.to_string())
+                    .unwrap_or_default()
+                    .is_empty()
+            }),
+            "Blocked" => {
+                db.and_then(|db| db.get_quest_status(&t.id.to_string(), t.completed).ok())
+                    .is_some_and(|status| status == crate::models::QuestStatus::Blocked)
+                    || db.is_some_and(|db| {
+                        db.has_unresolved_task_dependencies(&t.id.to_string())
+                            .unwrap_or(false)
+                    })
+            }
+            "Review" => db
+                .and_then(|db| db.get_quest_status(&t.id.to_string(), t.completed).ok())
+                .is_some_and(|status| status == crate::models::QuestStatus::Review),
+            "Overdue" => !t.completed && t.due_date.is_some_and(|due| due < Utc::now()),
+            "HighPriority" => t.priority == TaskPriority::High,
+            "DueSoon" => {
+                !t.completed
+                    && t.due_date.is_some_and(|due| {
+                        due >= Utc::now() && due <= Utc::now() + chrono::Duration::days(7)
+                    })
+            }
             _ => true,
         })
         .filter(|t| {
@@ -1235,6 +1557,55 @@ fn visible_workspace_tasks(
     flat
 }
 
+fn move_quest_board_selection(
+    statuses: &[QuestStatus],
+    selected_idx: usize,
+    horizontal_delta: i32,
+    vertical_delta: i32,
+) -> usize {
+    if statuses.is_empty() || selected_idx >= statuses.len() {
+        return 0;
+    }
+    let selected_status = statuses[selected_idx];
+    let current_column: Vec<usize> = statuses
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, status)| (*status == selected_status).then_some(idx))
+        .collect();
+    let current_row = current_column
+        .iter()
+        .position(|idx| *idx == selected_idx)
+        .unwrap_or(0);
+
+    if vertical_delta != 0 {
+        let len = current_column.len() as i32;
+        let row = (current_row as i32 + vertical_delta).rem_euclid(len) as usize;
+        return current_column[row];
+    }
+
+    let order = QuestStatus::ACTIVE
+        .into_iter()
+        .chain(std::iter::once(QuestStatus::Done))
+        .collect::<Vec<_>>();
+    let start = order
+        .iter()
+        .position(|status| *status == selected_status)
+        .unwrap_or(0) as i32;
+    for distance in 1..order.len() {
+        let column_idx =
+            (start + horizontal_delta.signum() * distance as i32).rem_euclid(order.len() as i32);
+        let target_column: Vec<usize> = statuses
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, status)| (*status == order[column_idx as usize]).then_some(idx))
+            .collect();
+        if !target_column.is_empty() {
+            return target_column[current_row.min(target_column.len() - 1)];
+        }
+    }
+    selected_idx
+}
+
 fn local_date_at_noon_utc(date: NaiveDate) -> Option<DateTime<Utc>> {
     Local
         .with_ymd_and_hms(date.year(), date.month(), date.day(), 12, 0, 0)
@@ -1251,7 +1622,7 @@ impl App {
         match focus_idx {
             0 => 1,
             1..=5 => 6,
-            6..=14 => 0,
+            6..=15 => 0,
             _ => 0,
         }
     }
@@ -1260,7 +1631,7 @@ impl App {
         match focus_idx {
             0 => 6,
             1..=5 => 0,
-            6..=14 => 1,
+            6..=15 => 1,
             _ => 0,
         }
     }
@@ -1269,8 +1640,8 @@ impl App {
         match focus_idx {
             1 => 5,
             2..=5 => focus_idx - 1,
-            6 => 14,
-            7..=14 => focus_idx - 1,
+            6 => 15,
+            7..=15 => focus_idx - 1,
             _ => focus_idx,
         }
     }
@@ -1279,13 +1650,13 @@ impl App {
         match focus_idx {
             1..=4 => focus_idx + 1,
             5 => 1,
-            6..=13 => focus_idx + 1,
-            14 => 6,
+            6..=14 => focus_idx + 1,
+            15 => 6,
             _ => focus_idx,
         }
     }
 
-    fn dashboard_command_targets(&self) -> Vec<DashboardCommandTarget> {
+    pub(crate) fn dashboard_command_targets(&self) -> Vec<DashboardCommandTarget> {
         let all_tasks = self.db.get_tasks().unwrap_or_default();
         let today = Local::now().date_naive();
         let overdue_count = all_tasks
@@ -1307,11 +1678,16 @@ impl App {
             self.stats_cache.zen_tree.health,
             self.stats_cache.todays_daily_adventures_completed,
             self.stats_cache.todays_daily_adventures_total,
+            self.quest_visibility_horizon_days(),
         );
         let mut targets = Vec::new();
 
         if let Some(main) = plan.main_quest {
             targets.push(DashboardCommandTarget::Task(main.task));
+        }
+
+        if let Some(next) = plan.next_quest {
+            targets.push(DashboardCommandTarget::Task(next.task));
         }
 
         for task in plan.quick_wins {
@@ -1331,7 +1707,7 @@ impl App {
         targets
     }
 
-    fn selected_dashboard_command_target(&self) -> Option<DashboardCommandTarget> {
+    pub(crate) fn selected_dashboard_command_target(&self) -> Option<DashboardCommandTarget> {
         let targets = self.dashboard_command_targets();
         let idx = self
             .selected_dashboard_task_idx
@@ -1395,7 +1771,11 @@ impl App {
             self.db.get_focus_sessions().map(|s| s.len()).unwrap_or(0) as i64;
         self.stats_cache.daily_adventures_completed =
             self.db.get_daily_adventures_completed_count().unwrap_or(0);
-        let daily_adventures = self.db.get_daily_adventures().unwrap_or_default();
+        // todays_* de verdad: la tabla conserva historial, así que hay que filtrar por fecha.
+        let daily_adventures = self
+            .db
+            .get_daily_adventures_for(chrono::Local::now().date_naive())
+            .unwrap_or_default();
         self.stats_cache.todays_daily_adventures_completed =
             daily_adventures.iter().filter(|a| a.completed).count();
         self.stats_cache.todays_daily_adventures_total = daily_adventures.len();
@@ -2060,6 +2440,8 @@ impl App {
             .map(|v| v.min(7))
             .unwrap_or(7);
         let streak_schedule = db.get_streak_schedule();
+        let quest_visibility_horizon_idx =
+            quest_visibility_horizon_idx_from_days(db.get_quest_visibility_horizon_days());
 
         // Recuperación automática en dispositivo nuevo — jala el backup de la nube para que no llegue al onboarding
         #[cfg(not(test))]
@@ -2068,32 +2450,18 @@ impl App {
         let should_recover = false;
 
         if should_recover {
-            let client = crate::services::api_client::ApiClient::new(
-                &server_url,
-                identity.clone(),
+            let encrypted_restore = crate::services::sync_engine::SyncEngine::new(
+                &db,
+                &identity,
                 &device_id,
-            );
-            if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
-                if !json.trim().is_empty() {
-                    use base64::{Engine as _, engine::general_purpose::STANDARD};
-                    let decoded = STANDARD
-                        .decode(json.trim())
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or(json);
-                    if db.import_from_json(&decoded).is_ok() {
-                        let _ = App::anchor_restore_to_sync_head(
-                            &db,
-                            &identity,
-                            &device_id,
-                            &server_url,
-                        );
-                        let _ = db.set_setting("sync_restore_hold", "1");
-                        let _ = db.set_setting("auto_sync", "false");
-                        auto_sync = false;
-                        user = db.get_user()?;
-                    }
-                }
+                Some(&server_url),
+            )
+            .and_then(|engine| engine.sync());
+            if encrypted_restore.is_ok() && db.get_user()?.is_some() {
+                let _ = db.set_setting("sync_restore_hold", "1");
+                let _ = db.set_setting("auto_sync", "false");
+                auto_sync = false;
+                user = db.get_user()?;
             }
         }
 
@@ -2133,6 +2501,12 @@ impl App {
             let choice = crate::theme::Theme::choice_from_key(&theme_choice_str);
             theme_service.set_theme_choice(choice);
         }
+        let dashboard_layout = db
+            .get_setting("dashboard_layout")
+            .ok()
+            .flatten()
+            .map(|key| crate::screens::dashboard::DashboardLayout::from_key(&key))
+            .unwrap_or(crate::screens::dashboard::DashboardLayout::Default);
 
         let (quote, quote_author, class_quote_opt) = Self::choose_dynamic_quote(&user, &db);
         let class_quote = class_quote_opt.as_ref().map(|q| q.0.clone());
@@ -2163,7 +2537,6 @@ impl App {
             class_quote,
             class_quote_author,
 
-            daily_quests: Vec::new(),
             tasks_due_today: Vec::new(),
             projects: Vec::new(),
             should_quit: false,
@@ -2175,6 +2548,8 @@ impl App {
             workspace_tab_idx: 0,
             workspace_sidebar_focused: true,
             workspace_help_open: false,
+            quest_board_open: false,
+            kanban_step_idx: None,
             selected_task_idx: 0,
             selected_note_idx: 0,
             selected_journal_idx: 0,
@@ -2186,10 +2561,16 @@ impl App {
             overlay_modal: ModalType::None,
             editor_state: None,
             task_desc_editor: None,
+            task_title_cursor: 0,
+            task_title_editing: false,
             task_calendar: None,
             pending_calendar_due_date: None,
+            hit_regions: crate::screens::hit_test::HitRegions::default(),
+            last_click: None,
+            mouse_drag_anchor: None,
             dashboard_task_focus: true,
             selected_dashboard_task_idx: 0,
+            dashboard_layout,
             searching: false,
             search_query: String::new(),
             task_filter: "All".to_string(),
@@ -2205,6 +2586,10 @@ impl App {
             selected_focus_field_idx: 0,
             selected_ritual_idx: 0,
             selected_milestone_idx: 0,
+            selected_treasury_idx: 0,
+            treasury_filter: crate::models::LedgerFilter::default(),
+            treasury_sort: crate::models::LedgerSort::Newest,
+            pending_financial_completion_bypass: None,
 
             audio_player: crate::audio::AudioPlayer::new(),
             selected_soundscape_idx: 3,
@@ -2229,11 +2614,14 @@ impl App {
             last_sync_warlock_xp: 0,
 
             selected_fellowship_project_idx: 0,
+            selected_fellowship_member_idx: 0,
 
             fellowship_search_query: String::new(),
             selected_fellowship_tab: 0,
             selected_invitation_idx: 0,
             selected_notification_idx: 0,
+            council_notice_filter: "All".to_string(),
+            selected_my_quest_idx: 0,
             fellowship_search_results: Vec::new(),
             fellowship_chat_input: String::new(),
             fellowship_selected_msg_idx: usize::MAX,
@@ -2261,8 +2649,9 @@ impl App {
             streak_workday_mask: streak_schedule.workday_mask,
             streak_active_from: streak_schedule.active_from,
             streak_active_to: streak_schedule.active_to,
+            quest_visibility_horizon_idx,
             ambient_effects_enabled: true,
-            active_ambient_effect: 1,
+            active_ambient_effect: 0,
             ambient_particles: Vec::new(),
             ambient_particles_ticks_remaining: 0,
             ambient_burst_effect: 0,
@@ -2276,6 +2665,8 @@ impl App {
             last_pywal_modified: None,
             last_home_key_at: None,
             last_end_key_at: None,
+            pane_swipe: None,
+            scroll_burst: None,
             update_check: std::sync::Arc::new(std::sync::Mutex::new(None)),
             update_check_done: false,
             run_installer_on_exit: false,
@@ -2285,12 +2676,18 @@ impl App {
             note_preview_scroll: 0,
             note_preview_max_scroll: Cell::new(0),
             note_preview_focused: false,
+            quest_ledger_scroll: 0,
+            quest_ledger_max_scroll: Cell::new(0),
+            quest_ledger_focused: false,
             all_tasks: Vec::new(),
             all_notes: Vec::new(),
             all_journals: Vec::new(),
             stats_cache: AppStatsCache::default(),
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            companion_lookup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            companion_lookup_in_flight: None,
+            companion_lookup_cache: None,
             export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cloud_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cloud_restore_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -2318,6 +2715,8 @@ impl App {
             last_sprite_notification_time: None,
             last_sprite_check_time: None,
             last_task_notification_tick: None,
+            last_hydration_day_check: None,
+            last_sync_cleanup_check: None,
             prologue_page: 0,
             prologue_line_idx: 0,
             prologue_char_in_line: 0,
@@ -2348,7 +2747,39 @@ impl App {
         app.reload_hydration_config();
         if app.user.is_some() {
             app.check_new_day()?;
+            // check_new_day() may generate/insert today's daily quests; refresh_stats_cache()
+            // above already ran before they existed, so re-sync it or the dashboard shows
+            // an empty Daily section until an unrelated action happens to refresh it.
+            app.refresh_stats_cache();
             let _ = app.check_action_achievements();
+        }
+
+        // Existing users remain on plaintext protocol 1 until they explicitly choose
+        // which local device is authoritative and publish a complete encrypted snapshot.
+        #[cfg(not(test))]
+        if app.config.sync_enabled {
+            let client = crate::services::api_client::ApiClient::new(
+                &app.server_url,
+                app.identity.clone(),
+                &app.device_id,
+            );
+            if let Ok(public_key) =
+                crate::services::encryption::fellowship_public_key(&app.identity)
+            {
+                let body = serde_json::json!({ "public_key": public_key }).to_string();
+                let _ = client.send_request("POST", "encryption/register", &body);
+            }
+            if app.user.is_some()
+                && let Ok(response) = client.send_request("GET", "sync/protocol", "")
+            {
+                let protocol = serde_json::from_str::<serde_json::Value>(&response)
+                    .ok()
+                    .and_then(|value| value.get("protocol").and_then(|v| v.as_u64()))
+                    .unwrap_or(1);
+                if protocol < 2 {
+                    app.modal_state = ModalType::EncryptionMigrationPrompt;
+                }
+            }
         }
 
         // Checa la versión en un hilo aparte para no bloquear el arranque — el resultado llega después
@@ -2425,167 +2856,6 @@ impl App {
         Ok(app)
     }
 
-    // Simula eventos de Fellowship para pruebas offline — no manches, no llamar en producción
-    pub fn simulate_fellowship_sync(&self) -> Result<()> {
-        let my_identity = self.identity.public_key.clone();
-        let my_username = self
-            .user
-            .as_ref()
-            .map(|u| u.username.clone())
-            .unwrap_or_else(|| "Gibranlp".to_string());
-
-        self.db.update_presence(
-            "alex_key",
-            "Alex",
-            true,
-            "Just now",
-            Some("Fellowship Adventure"),
-            "Visible",
-        )?;
-        self.db.update_presence(
-            "fiona_key",
-            "Fiona",
-            true,
-            "2 mins ago",
-            Some("Zen Garden Maintenance"),
-            "Visible",
-        )?;
-        self.db
-            .update_presence("diana_key", "Diana", false, "2 hours ago", None, "Offline")?;
-
-        let invites = self.db.get_invitations()?;
-        if invites.is_empty() {
-            let sim_proj_id = "fellowship_adv_proj_id";
-            self.db.create_invitation(
-                sim_proj_id,
-                "Fellowship Adventure",
-                "alex_key",
-                "Alex",
-                &my_identity,
-                "Companion",
-            )?;
-            self.db.create_notification(
-                "invitation",
-                "Fellowship Invitation",
-                "Alex has invited you to join Fellowship Adventure as a Companion.",
-                Some(sim_proj_id),
-            )?;
-        }
-
-        let projects = self.db.get_projects()?;
-        if let Some(proj) = projects
-            .iter()
-            .find(|p| p.id.to_string() == "fellowship_adv_proj_id")
-        {
-            let msgs = self.db.get_chronicle_messages("fellowship_adv_proj_id")?;
-            if msgs.is_empty() {
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "alex_key",
-                    "Alex",
-                    "Greetings companions! Ready for our quest? ⚔️",
-                    "text",
-                )?;
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "system",
-                    "System",
-                    "Alex invited Gibranlp to the project.",
-                    "system",
-                )?;
-                self.db.log_activity(
-                    Some("fellowship_adv_proj_id"),
-                    "member_joined",
-                    "Gibranlp joined the fellowship.",
-                    &my_identity,
-                    &my_username,
-                )?;
-                self.db.log_activity(
-                    Some("fellowship_adv_proj_id"),
-                    "note_created",
-                    "Alex created shared note: Fellowship Codex.",
-                    "alex_key",
-                    "Alex",
-                )?;
-            }
-
-            let user_msg_count = msgs.iter().filter(|m| m.2 == my_identity).count();
-            let alex_reply_count = msgs
-                .iter()
-                .filter(|m| m.2 == "alex_key" && m.4.contains("Outstanding"))
-                .count();
-            if user_msg_count > alex_reply_count {
-                self.db.add_chronicle_message(
-                    "fellowship_adv_proj_id",
-                    "alex_key",
-                    "Alex",
-                    "Outstanding work! Let's keep pushing!",
-                    "text",
-                )?;
-                if let Some(last_user_msg) = msgs.iter().rfind(|m| m.2 == my_identity) {
-                    self.db
-                        .add_message_reaction(&last_user_msg.0, "alex_key", "⚔️")?;
-                }
-            }
-
-            let tasks = self.db.get_tasks()?;
-            let proj_tasks: Vec<_> = tasks
-                .into_iter()
-                .filter(|t| {
-                    t.project_id.map(|pid| pid.to_string())
-                        == Some("fellowship_adv_proj_id".to_string())
-                })
-                .collect();
-            if proj_tasks.is_empty() {
-                let t1 = Task {
-                    id: Uuid::new_v4(),
-                    project_id: Some(proj.id),
-                    title: "Design Fellowship Database Schema".to_string(),
-                    description: Some("Alex handles database schemas".to_string()),
-                    due_date: None,
-                    set_date: None,
-                    completed: true,
-                    priority: crate::models::TaskPriority::High,
-                    created_at: Utc::now() - chrono::Duration::hours(2),
-                    updated_at: Utc::now(),
-                    owner_identity: Some("alex_key".to_string()),
-                    owner_username: Some("Alex".to_string()),
-                    parent_task_id: None,
-                    xp_awarded: true,
-                    recurrence: None,
-                };
-                self.db.insert_task(&t1)?;
-                self.db
-                    .assign_task(&t1.id.to_string(), "alex_key", "Alex")?;
-                self.db
-                    .assign_task(&t1.id.to_string(), &my_identity, &my_username)?;
-
-                let t2 = Task {
-                    id: Uuid::new_v4(),
-                    project_id: Some(proj.id),
-                    title: "Build Fellowship TUI Dashboard".to_string(),
-                    description: Some("Implement Fellowship Tab 9".to_string()),
-                    due_date: Some(Utc::now() + chrono::Duration::days(3)),
-                    set_date: None,
-                    completed: false,
-                    priority: crate::models::TaskPriority::Medium,
-                    created_at: Utc::now(),
-                    updated_at: Utc::now(),
-                    owner_identity: Some("alex_key".to_string()),
-                    owner_username: Some("Alex".to_string()),
-                    parent_task_id: None,
-                    xp_awarded: false,
-                    recurrence: None,
-                };
-                self.db.insert_task(&t2)?;
-                self.db
-                    .assign_task(&t2.id.to_string(), &my_identity, &my_username)?;
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn reload_data(&mut self) -> Result<()> {
         self.user = self.db.get_user()?;
         if self.user.is_some() {
@@ -2629,13 +2899,17 @@ impl App {
                 .db
                 .get_setting("active_ambient_effect")?
                 .and_then(|s| s.parse::<usize>().ok())
-                .unwrap_or(1);
+                .unwrap_or(0);
             self.task_completion_ambient_effect = self
                 .db
                 .get_setting("task_completion_ambient_effect")?
                 .and_then(|s| s.parse::<usize>().ok())
                 .map(|v| v.min(7))
                 .unwrap_or(7);
+            // Recargar tras un pull remoto — así un cambio de horizonte hecho en otro
+            // dispositivo se refleja aquí sin esperar a reiniciar la app.
+            self.quest_visibility_horizon_idx =
+                quest_visibility_horizon_idx_from_days(self.db.get_quest_visibility_horizon_days());
 
             self.projects = self.db.get_projects()?;
             self.projects
@@ -2645,15 +2919,12 @@ impl App {
             self.all_tasks = self.db.get_tasks()?;
             self.all_notes = self.db.get_notes().unwrap_or_default();
             self.all_journals = self.db.get_journal_entries().unwrap_or_default();
-            let today = Utc::now().date_naive();
             self.tasks_due_today = self
                 .all_tasks
                 .iter()
                 .filter(|t| !t.completed)
                 .cloned()
                 .collect();
-
-            self.daily_quests = self.db.get_daily_quests_for_date(today)?;
 
             if let Some(pid) = self.active_project_id {
                 self.codices = self.db.get_codices_for_project(pid).unwrap_or_default();
@@ -2663,6 +2934,3753 @@ impl App {
             self.refresh_stats_cache();
         }
         Ok(())
+    }
+
+    /// Recomputes whichever modal is currently open's popup bounds (and,
+    /// for confirm/list-shaped modals, its click targets) from scratch,
+    /// using the exact same centered_rect/Layout calls that modal's own
+    /// render code uses. See the `modal` field doc on `HitRegions` for why
+    /// this recomputes rather than stashes from a render pass like every
+    /// other screen's hit-testing.
+    fn compute_modal_hit_regions(&self) -> Option<crate::screens::hit_test::ModalHitRegions> {
+        use crate::screens::hit_test::{ModalHitRegions, ModalListRegion};
+        use crossterm::event::KeyCode;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        // overlay_modal stacks on top of modal_state (e.g. creating a step
+        // while its parent task's modal is open) — mirrors the priority
+        // handle_rpg_modal_key already gives it.
+        let modal = if self.overlay_modal != ModalType::None {
+            &self.overlay_modal
+        } else {
+            &self.modal_state
+        };
+
+        let term = Rect {
+            x: 0,
+            y: 0,
+            width: self.terminal_width,
+            height: self.terminal_height,
+        };
+        // The catch-all screen layout (main.rs's `_ =>` arm) splits the
+        // terminal into a body area and a 3-row footer before handing the
+        // body to Dashboard/Sync/Fellowship/etc.'s own draw() — several
+        // modals are centered against that body area, not the raw terminal.
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(term)[0];
+
+        // Replicates main.rs's private `centered_rect_fixed_height` — not
+        // reachable from here since main.rs is the binary crate, not the
+        // library `app`/`screens` modules live in.
+        let fixed_h = |percent_x: u16, height_lines: u16, r: Rect| -> Rect {
+            let v = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(r.height.saturating_sub(height_lines) / 2),
+                    Constraint::Length(height_lines),
+                    Constraint::Length(r.height.saturating_sub(height_lines) / 2),
+                ])
+                .split(r);
+            Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([
+                    Constraint::Percentage((100 - percent_x) / 2),
+                    Constraint::Percentage(percent_x),
+                    Constraint::Percentage((100 - percent_x) / 2),
+                ])
+                .split(v[1])[1]
+        };
+        let pct =
+            |percent_x: u16, percent_y: u16, r: Rect| crate::screens::intro::centered_rect(percent_x, percent_y, r);
+        // Every confirm/list popup here renders `Block::bordered()`, so the
+        // interior (where content/list rows actually start) is the popup
+        // shrunk by 1 cell on every side.
+        let inner = |r: Rect| Rect {
+            x: r.x + 1,
+            y: r.y + 1,
+            width: r.width.saturating_sub(2),
+            height: r.height.saturating_sub(2),
+        };
+        let confirm = |popup_area: Rect, key: KeyCode| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: Some(key),
+                buttons: None,
+                list: None,
+                focus_fields: None,
+            })
+        };
+        let outside_only = |popup_area: Rect| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                buttons: None,
+                list: None,
+                focus_fields: None,
+            })
+        };
+        // Splits one line of button/key-hint text (e.g. "  Archive this
+        // realm?  [Y] Yes   [N] No / Esc") into N clickable button Rects,
+        // given the BYTE offset within `text` where each button after the
+        // first begins (e.g. the offset of "[N]"). Column positions count
+        // chars, not bytes, so multi-byte text (UpdateAvailable's em dash)
+        // still lines up — terminal columns are char cells, not bytes.
+        let button_line = |line_rect: Rect, text: &str, centered: bool, split_bytes: &[usize], keys: &[KeyCode]| {
+            let text_cols = text.chars().count() as u16;
+            let start_col = if centered {
+                line_rect.x + line_rect.width.saturating_sub(text_cols) / 2
+            } else {
+                line_rect.x
+            };
+            let mut bounds: Vec<u16> = split_bytes
+                .iter()
+                .map(|&b| text[..b].chars().count() as u16)
+                .collect();
+            bounds.push(text_cols);
+            let mut result = Vec::new();
+            let mut prev = 0u16;
+            for (&end, &key) in bounds.iter().zip(keys.iter()) {
+                result.push((
+                    Rect {
+                        x: start_col + prev,
+                        y: line_rect.y,
+                        width: end.saturating_sub(prev),
+                        height: 1,
+                    },
+                    key,
+                ));
+                prev = end;
+            }
+            result
+        };
+        // The common shape shared by every left-aligned "[Y] Yes  [N] No /
+        // Esc" confirm dialog: one line of text at a known row inside the
+        // popup's bordered interior, split into a Yes button ('y') and a
+        // No button ('n') at the literal "[N]" marker.
+        let yes_no_dialog = |popup_area: Rect, line: u16, text: &str| {
+            let popup_inner = inner(popup_area);
+            let line_rect = Rect {
+                x: popup_inner.x,
+                y: popup_inner.y + line,
+                width: popup_inner.width,
+                height: 1,
+            };
+            let split = text.find("[N]").expect("yes/no dialog text must contain a literal \"[N]\"");
+            let buttons = button_line(
+                line_rect,
+                text,
+                false,
+                &[split],
+                &[KeyCode::Char('y'), KeyCode::Char('n')],
+            );
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                buttons: Some(buttons),
+                list: None,
+                focus_fields: None,
+            })
+        };
+        let fields = |popup_area: Rect, focus_fields: Vec<Rect>| {
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                list: None,
+                focus_fields: Some(focus_fields),
+            buttons: None,
+            })
+        };
+        // Shared by NewTask/EditTask — replicates draw_task_modal's exact
+        // (state-dependent) vertical Layout, including the horizontal
+        // sub-split of the Priority/Due-Date row, which packs 2-3 focus
+        // stops onto one line. `hide_desc` is always false at every real
+        // call site, so it's hardcoded away here rather than threaded
+        // through as a parameter nothing ever varies.
+        let task_modal_fields = |term: Rect,
+                                  due_date_type: DueDateType,
+                                  show_recurrence: bool,
+                                  show_steps: bool,
+                                  steps_count: usize| {
+            let has_due_value = matches!(due_date_type, DueDateType::InDays | DueDateType::Specific);
+            const DESC_BOX_HEIGHT: u16 = 12;
+            let steps_content_height = (steps_count as u16).clamp(2, 6);
+            let steps_box_height = steps_content_height + 2;
+            let content_height = 3
+                + DESC_BOX_HEIGHT
+                + 3
+                + if show_recurrence { 3 } else { 0 }
+                + if show_steps { steps_box_height } else { 0 }
+                + 2;
+            let modal_height = (content_height + 2).min(term.height);
+            let full_width = pct(65, 100, term);
+            let popup = Rect {
+                x: full_width.x,
+                y: term.height.saturating_sub(modal_height) / 2,
+                width: full_width.width,
+                height: modal_height,
+            };
+            let block_inner = inner(popup);
+
+            let mut constraints = vec![
+                Constraint::Length(3),
+                Constraint::Length(DESC_BOX_HEIGHT),
+                Constraint::Length(3),
+            ];
+            if show_recurrence {
+                constraints.push(Constraint::Length(3));
+            }
+            if show_steps {
+                constraints.push(Constraint::Length(steps_box_height));
+            }
+            constraints.push(Constraint::Length(2));
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(constraints)
+                .split(block_inner);
+
+            let row_chunks = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(chunks[2]);
+
+            let mut field_rects = vec![chunks[0], chunks[1], row_chunks[0]];
+            if has_due_value {
+                let due_sub = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+                    .split(row_chunks[1]);
+                field_rects.push(due_sub[0]);
+                field_rects.push(due_sub[1]);
+            } else {
+                field_rects.push(row_chunks[1]);
+            }
+            if show_recurrence {
+                field_rects.push(chunks[3]);
+            }
+            if show_steps {
+                let steps_chunk_idx = if show_recurrence { 4 } else { 3 };
+                field_rects.push(chunks[steps_chunk_idx]);
+            }
+
+            Some(ModalHitRegions {
+                popup_area: popup,
+                confirm_key: None,
+                list: None,
+                focus_fields: Some(field_rects),
+            buttons: None,
+            })
+        };
+        // Replicates ratatui's List widget auto-scroll for the few modals
+        // that render via a `ListState` — since each render starts from a
+        // fresh `ListState::default()` (offset 0) and only calls
+        // `.select(Some(selected_idx))`, the scroll ratatui settles on is a
+        // pure function of (selected_idx, visible_height): stay at 0 until
+        // the selection would run off the bottom, then scroll by exactly
+        // enough to keep it as the last visible row.
+        let list_state_offset = |selected_idx: usize, visible_height: u16| -> usize {
+            let visible_height = visible_height as usize;
+            if visible_height == 0 || selected_idx < visible_height {
+                0
+            } else {
+                selected_idx - visible_height + 1
+            }
+        };
+        let rows = |popup_area: Rect, header_lines: u16, count: usize, first_visible_index: usize| {
+            let list_inner = inner(popup_area);
+            Some(ModalHitRegions {
+                popup_area,
+                confirm_key: None,
+                list: Some(ModalListRegion::Rows {
+                    area: Rect {
+                        x: list_inner.x,
+                        y: list_inner.y + header_lines,
+                        width: list_inner.width,
+                        height: list_inner.height.saturating_sub(header_lines),
+                    },
+                    count,
+                    first_visible_index,
+                }),
+                focus_fields: None,
+            buttons: None,
+            })
+        };
+
+        match modal {
+            ModalType::None => None,
+
+            // ── Confirm / info dialogs — click inside confirms, outside cancels ──
+            ModalType::ChapterComplete => {
+                let (w, h) = (66u16, 35u16);
+                confirm(
+                    Rect {
+                        x: term.width.saturating_sub(w) / 2,
+                        y: term.height.saturating_sub(h) / 2,
+                        width: w.min(term.width),
+                        height: h.min(term.height),
+                    },
+                    KeyCode::Enter,
+                )
+            }
+            ModalType::SupportRealm => confirm(fixed_h(58, 14, term), KeyCode::Enter),
+            ModalType::KeyboardHelp => confirm(pct(75, 35, term), KeyCode::Enter),
+            // EncryptionMigrationPrompt is a 3-way choice already laid out
+            // as 3 separate, full-width Lines (not one string to split) —
+            // one Rect per choice, centered like the render code.
+            ModalType::EncryptionMigrationPrompt => {
+                let popup = fixed_h(68, 15, term);
+                let popup_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: popup_inner.x,
+                    y: popup_inner.y + n,
+                    width: popup_inner.width,
+                    height: 1,
+                };
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: Some(vec![
+                        (line(7), KeyCode::Char('m')),
+                        (line(8), KeyCode::Char('l')),
+                        (line(9), KeyCode::Esc),
+                    ]),
+                    list: None,
+                    focus_fields: None,
+                })
+            }
+            // ui::draw_hydration_reminder_modal's own centered_rect(40, 35, area).
+            // Its button row is Layout-split (content[5]), bottom-anchored
+            // by a Min(1) spacer above it rather than a fixed line count —
+            // approximated here as the last row of the popup interior,
+            // which is where that Min(1) spacer settles in practice.
+            ModalType::HydrationReminder => {
+                let popup = pct(40, 35, term);
+                let popup_inner = inner(popup);
+                let text = " [d] Drink  [s] Snooze 15m  [x] Dismiss ";
+                let line_rect = Rect {
+                    x: popup_inner.x,
+                    y: popup_inner.y + popup_inner.height.saturating_sub(1),
+                    width: popup_inner.width,
+                    height: 1,
+                };
+                let buttons = button_line(
+                    line_rect,
+                    text,
+                    true,
+                    &[text.find("[s]").unwrap(), text.find("[x]").unwrap()],
+                    &[KeyCode::Char('d'), KeyCode::Char('s'), KeyCode::Char('x')],
+                );
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: Some(buttons),
+                    list: None,
+                    focus_fields: None,
+                })
+            }
+            // QuitConfirm's hint is a compact "[Y/N]" with no separate Yes/
+            // No text to split on — kept as the original single confirm
+            // zone rather than an arbitrary, unanchored split.
+            ModalType::QuitConfirm { .. } => confirm(fixed_h(64, 17, term), KeyCode::Char('y')),
+            ModalType::ConfirmArchiveProject { .. } => yes_no_dialog(
+                fixed_h(55, 9, term),
+                5,
+                "  Archive this realm?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmDeleteProject { .. } => yes_no_dialog(
+                fixed_h(55, 10, term),
+                6,
+                "  Slay this realm forever?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmRemoveFellowshipMember { .. } => yes_no_dialog(
+                fixed_h(62, 11, term),
+                7,
+                "  Continue?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmConquerProject { .. } => yes_no_dialog(
+                fixed_h(58, 11, term),
+                6,
+                "  Conquer this campaign?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmDeleteCodex { .. } => yes_no_dialog(
+                fixed_h(55, 9, term),
+                5,
+                "  Delete this codex?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmPruneTasks { .. } => yes_no_dialog(
+                fixed_h(55, 10, term),
+                5,
+                "  Prune completed tasks?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::ConfirmCleanupLocalHistory { .. } => yes_no_dialog(
+                fixed_h(62, 12, term),
+                9,
+                "  Clean local history?  [Y] Yes   [N] No / Esc",
+            ),
+            ModalType::UpdateAvailable { .. } => yes_no_dialog(
+                fixed_h(62, 12, term),
+                4,
+                "  Install now? [Y] Yes \u{2014} exit & update    [N] Skip",
+            ),
+            ModalType::Celebration { .. } => confirm(pct(68, 52, term), KeyCode::Enter),
+            ModalType::CloudBackupProgress { step, .. }
+            | ModalType::SyncProgress { step, .. }
+            | ModalType::CloudRestoreProgress { step, .. } => {
+                // screens::sync's own private centered_rect, against
+                // content_area (chunks[0] passed into sync::draw), not term.
+                let popup_area = pct(58, 40, content_area);
+                // Only dismissible once done (step >= 2) — matches the
+                // guarded Esc|Enter|q arm; clicking while still running
+                // does nothing, same as any other key.
+                if *step >= 2 {
+                    confirm(popup_area, KeyCode::Enter)
+                } else {
+                    outside_only(popup_area)
+                }
+            }
+
+            // ── Click-outside-only form/text modals (editing fields is out of scope) ──
+            ModalType::NewProject { .. } | ModalType::EditProject { .. } => {
+                let popup = pct(60, 40, term);
+                // draw_project_modal's own `Layout::margin(2)` insets
+                // further beyond the border `inner()` already accounts for.
+                let block_inner = inner(popup);
+                let content = Rect {
+                    x: block_inner.x + 2,
+                    y: block_inner.y + 2,
+                    width: block_inner.width.saturating_sub(4),
+                    height: block_inner.height.saturating_sub(4),
+                };
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(5), Constraint::Length(2)])
+                    .split(content);
+                fields(popup, vec![chunks[0], chunks[1]])
+            }
+            ModalType::NewTask {
+                due_date_type,
+                parent_task_id,
+                ..
+            } => {
+                let is_step = parent_task_id.is_some();
+                task_modal_fields(term, *due_date_type, !is_step, false, 0)
+            }
+            ModalType::EditTask {
+                id,
+                due_date_type,
+                is_step,
+                ..
+            } => {
+                let show_steps = !is_step;
+                let steps_count = if show_steps {
+                    self.all_tasks
+                        .iter()
+                        .filter(|t| t.parent_task_id == Some(*id))
+                        .count()
+                } else {
+                    0
+                };
+                task_modal_fields(term, *due_date_type, !is_step, show_steps, steps_count)
+            }
+            ModalType::TreasuryEntry { entry_id, .. } => {
+                let popup = pct(62, 48, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                // Title(0), Amount(2), Type(4), Status(5), Category(6),
+                // Date(8) — one blank spacer line between most fields; the
+                // extra "Owner/Steward only" line only appears while
+                // editing, but it isn't a focus stop either way.
+                let _ = entry_id;
+                fields(
+                    popup,
+                    vec![line(0), line(2), line(4), line(5), line(6), line(8)],
+                )
+            }
+            ModalType::TreasuryBudget { .. } => {
+                let popup = pct(56, 34, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                fields(popup, vec![line(0), line(2)])
+            }
+            ModalType::TaskFinancials { .. } => {
+                let popup = pct(58, 42, term);
+                let block_inner = inner(popup);
+                let line = |n: u16| Rect {
+                    x: block_inner.x,
+                    y: block_inner.y + n,
+                    width: block_inner.width,
+                    height: 1,
+                };
+                // Line 0 is a static "Amounts in {currency}" label, never
+                // focusable — Estimated(2), Actual(4), Billable(6),
+                // Payment Status(8).
+                fields(popup, vec![line(2), line(4), line(6), line(8)])
+            }
+            ModalType::DailyReflection { .. } => {
+                let popup = pct(55, 45, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(4),
+                        Constraint::Length(4),
+                        Constraint::Min(2),
+                    ])
+                    .split(block_inner);
+                fields(popup, vec![chunks[1], chunks[2]])
+            }
+            ModalType::NewRitual { .. } => {
+                let popup = pct(55, 55, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(2),
+                    ])
+                    .split(block_inner);
+                fields(popup, vec![chunks[1], chunks[2], chunks[3], chunks[4]])
+            }
+            ModalType::InviteMember { .. } => {
+                let modal_height = term.height.saturating_sub(2).min(26);
+                let popup = fixed_h(68, modal_height, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(5),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(7),
+                        Constraint::Min(1),
+                    ])
+                    .split(block_inner);
+                // Project(0), Companion Key(1), Username(2), Role(3) — the
+                // permissions-description chunk after Role is informational
+                // only, never a focus stop.
+                fields(popup, vec![chunks[0], chunks[1], chunks[2], chunks[3]])
+            }
+            ModalType::HydrationSettings { .. } => {
+                let popup = pct(52, 55, content_area);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+                // Interval(0)..Pause-checkbox(4) are the 5 real, bordered
+                // focus stops. Tab can also reach focus_idx 5, but nothing
+                // renders for it (a pre-existing dead Tab stop, not
+                // something to invent a click target for).
+                fields(
+                    popup,
+                    vec![chunks[1], chunks[2], chunks[3], chunks[4], chunks[5]],
+                )
+            }
+            ModalType::NewCodex { .. } | ModalType::RenameCodex { .. } => outside_only(Rect {
+                x: term.width / 4,
+                y: term.height / 3,
+                width: term.width / 2,
+                height: 5,
+            }),
+            ModalType::NewJournalEntry { .. } => outside_only(pct(55, 30, term)),
+            ModalType::TreasuryCategory { .. } => outside_only(pct(52, 24, term)),
+            ModalType::CustomFocusDuration { .. } => outside_only(pct(40, 25, term)),
+            ModalType::EditServerUrl { .. } => outside_only(pct(50, 20, content_area)),
+            ModalType::RestoreIdentity { .. } => outside_only(pct(60, 35, content_area)),
+            ModalType::SearchMessages { .. } => outside_only(pct(55, 30, content_area)),
+            ModalType::PostMessage { .. } => outside_only(pct(50, 20, content_area)),
+            ModalType::ExportProfile { .. } => outside_only(pct(70, 46, content_area)),
+            ModalType::LocalMusicFolder { suggestions, .. } => {
+                let percent_y = if !suggestions.is_empty() { 40 } else { 20 };
+                outside_only(pct(60, percent_y, term))
+            }
+            ModalType::QuestCouncil { .. } => outside_only(pct(70, 66, term)),
+            // main.rs's own block renders after (so visually on top of)
+            // fellowship.rs's copy of this modal — its Rect (against the
+            // full terminal) is the one a click actually lands on.
+            ModalType::ProjectSharing { .. } => outside_only(fixed_h(60, 11, term)),
+            ModalType::AddReaction { .. } => outside_only(pct(40, 20, content_area)),
+            ModalType::SearchEverywhere { .. } => outside_only(pct(70, 45, term)),
+            ModalType::CommandPalette { .. } => outside_only(pct(70, 45, term)),
+
+            // ── List-select modals ────────────────────────────────────────────
+            ModalType::ThemeSelect { choices, .. } => rows(pct(40, 30, term), 0, choices.len(), 0),
+            ModalType::MentionSelect { usernames, .. } => rows(pct(35, 25, term), 0, usernames.len(), 0),
+            ModalType::SpecializationSelect { choices, .. } => {
+                rows(pct(50, 30, content_area), 3, choices.len(), 0)
+            }
+            ModalType::TreasuryCurrency { .. } => {
+                rows(pct(58, 34, term), 2, crate::models::Currency::ALL.len(), 0)
+            }
+            ModalType::CampaignTemplateSelect { .. } => {
+                let popup = pct(72, 72, term);
+                let count = crate::campaign_templates::TEMPLATES.len();
+                // The list has its own nested border inside the popup's
+                // first Layout chunk (Length(count+2)) — one more inset
+                // than the plain `inner()` helper accounts for.
+                let list_area = inner(popup);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Rows {
+                        area: Rect {
+                            x: list_area.x,
+                            y: list_area.y + 1,
+                            width: list_area.width,
+                            height: (count as u16).min(list_area.height.saturating_sub(1)),
+                        },
+                        count,
+                        first_visible_index: 0,
+                    }),
+                })
+            }
+            ModalType::MilestoneTierSelect { .. } => {
+                let popup = pct(60, 50, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .margin(1)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Min(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(block_inner);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Items(vec![chunks[1], chunks[3], chunks[5]])),
+                })
+            }
+            ModalType::MilestoneTemplateSelect { tier, .. } => {
+                let popup = pct(70, 80, term);
+                let block_inner = inner(popup);
+                let n = crate::milestone_templates::templates_for_tier(
+                    crate::milestone_templates::Tier::from_u8(*tier)
+                        .unwrap_or(crate::milestone_templates::Tier::Initiate),
+                )
+                .count();
+                let mut constraints: Vec<Constraint> = (0..n).map(|_| Constraint::Min(5)).collect();
+                constraints.push(Constraint::Length(2));
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints(constraints)
+                    .split(block_inner);
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Items(chunks[..n].to_vec())),
+                })
+            }
+            ModalType::AssignTask { .. } => {
+                let popup = pct(50, 40, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(5),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let proj_id = self.active_project_id?;
+                let count = self
+                    .db
+                    .get_project_members(&proj_id.to_string())
+                    .unwrap_or_default()
+                    .len();
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Rows {
+                        area: chunks[1],
+                        count,
+                        first_visible_index: 0,
+                    }),
+                })
+            }
+            ModalType::QuestDependencies { task_id, .. } => {
+                let popup = pct(68, 64, term);
+                let candidates_len = self
+                    .all_tasks
+                    .iter()
+                    .filter(|t| t.id != *task_id && t.parent_task_id.is_none())
+                    .count();
+                rows(popup, 0, candidates_len, 0)
+            }
+            ModalType::CouncilBriefing { .. } => {
+                let popup = pct(82, 82, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(7),
+                        Constraint::Percentage(27),
+                        Constraint::Percentage(23),
+                        Constraint::Min(4),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let Some(p_id) = self.active_project_id else {
+                    return None;
+                };
+                let members_len = self
+                    .db
+                    .get_presence_for_project(&p_id.to_string())
+                    .unwrap_or_default()
+                    .len();
+                // Both selectable lists have their own nested border — items
+                // start 1 row into each chunk. Sections chunk holds exactly
+                // 5 fixed items; workload chunk holds one row per member.
+                let sections_area = Rect {
+                    x: chunks[0].x + 1,
+                    y: chunks[0].y + 1,
+                    width: chunks[0].width.saturating_sub(2),
+                    height: 5,
+                };
+                let workload_area = Rect {
+                    x: chunks[1].x + 1,
+                    y: chunks[1].y + 1,
+                    width: chunks[1].width.saturating_sub(2),
+                    height: chunks[1].height.saturating_sub(2),
+                };
+                let mut items = Vec::new();
+                for row in 0..5 {
+                    items.push(Rect {
+                        x: sections_area.x,
+                        y: sections_area.y + row,
+                        width: sections_area.width,
+                        height: 1,
+                    });
+                }
+                for row in 0..members_len as u16 {
+                    if row >= workload_area.height {
+                        break;
+                    }
+                    items.push(Rect {
+                        x: workload_area.x,
+                        y: workload_area.y + row,
+                        width: workload_area.width,
+                        height: 1,
+                    });
+                }
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Items(items)),
+                })
+            }
+            ModalType::RefileCodex { codex_id, .. } => {
+                let count = self.refile_codex_targets(*codex_id).len() + 1;
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                rows(popup, 0, count, 0)
+            }
+            ModalType::RefileTask { task_id, selected_idx } => {
+                let count = self.refile_task_targets(*task_id).len() + 1;
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                let list_inner = inner(popup);
+                rows(
+                    popup,
+                    0,
+                    count,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
+            }
+            ModalType::RefileScroll {
+                destinations,
+                selected_idx,
+                ..
+            } => {
+                let count = destinations.len();
+                let height = (count as u16 + 4).min(term.height);
+                let popup = Rect {
+                    x: term.width / 6,
+                    y: term.height.saturating_sub(height) / 2,
+                    width: (term.width * 2 / 3).max(20),
+                    height,
+                };
+                let list_inner = inner(popup);
+                rows(
+                    popup,
+                    0,
+                    count,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
+            }
+            ModalType::TaskExpenseCompletion { .. } => {
+                let popup = pct(58, 38, term);
+                rows(popup, 3, 3, 0)
+            }
+            ModalType::SelectProjectForAction { selected_idx, .. } => {
+                let popup = pct(55, 50, term);
+                let list_inner = inner(popup);
+                let active_len = self
+                    .projects
+                    .iter()
+                    .filter(|p| !p.archived && !p.completed)
+                    .count();
+                rows(
+                    popup,
+                    0,
+                    active_len,
+                    list_state_offset(*selected_idx, list_inner.height),
+                )
+            }
+            ModalType::ShareNote { .. } => {
+                let popup = pct(50, 30, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                // 3 fixed choices on one horizontal line — approximated as
+                // equal thirds of the row's width rather than replicating
+                // each span's exact rendered text width.
+                let row = chunks[1];
+                let third = row.width / 3;
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Items(vec![
+                        Rect { x: row.x, y: row.y, width: third, height: row.height },
+                        Rect { x: row.x + third, y: row.y, width: third, height: row.height },
+                        Rect {
+                            x: row.x + third * 2,
+                            y: row.y,
+                            width: row.width - third * 2,
+                            height: row.height,
+                        },
+                    ])),
+                })
+            }
+            ModalType::JournalVisibility { .. } => {
+                let popup = pct(50, 30, term);
+                let block_inner = inner(popup);
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(3),
+                        Constraint::Length(2),
+                    ])
+                    .split(block_inner);
+                let row = chunks[1];
+                let third = row.width / 3;
+                Some(ModalHitRegions {
+                    popup_area: popup,
+                    confirm_key: None,
+                    buttons: None,
+                    focus_fields: None,
+                    list: Some(ModalListRegion::Items(vec![
+                        Rect { x: row.x, y: row.y, width: third, height: row.height },
+                        Rect { x: row.x + third, y: row.y, width: third, height: row.height },
+                        Rect {
+                            x: row.x + third * 2,
+                            y: row.y,
+                            width: row.width - third * 2,
+                            height: row.height,
+                        },
+                    ])),
+                })
+            }
+        }
+    }
+
+    /// Writes `idx` into whatever selection field the currently open
+    /// list-picker modal uses. Mirrors what clicking a row/item means
+    /// everywhere else in the app: select only, never confirm/activate —
+    /// the modal's own Enter/Space keybinding still owns that.
+    fn set_modal_list_selection(&mut self, idx: usize) {
+        let modal = if self.overlay_modal != ModalType::None {
+            &mut self.overlay_modal
+        } else {
+            &mut self.modal_state
+        };
+        match modal {
+            ModalType::ThemeSelect { selected_idx, .. }
+            | ModalType::MentionSelect { selected_idx, .. }
+            | ModalType::SpecializationSelect { selected_idx, .. }
+            | ModalType::TreasuryCurrency { selected_idx, .. }
+            | ModalType::CampaignTemplateSelect { selected_idx, .. }
+            | ModalType::RefileCodex { selected_idx, .. }
+            | ModalType::RefileTask { selected_idx, .. }
+            | ModalType::RefileScroll { selected_idx, .. }
+            | ModalType::TaskExpenseCompletion { selected_idx, .. }
+            | ModalType::SelectProjectForAction { selected_idx, .. }
+            | ModalType::MilestoneTierSelect { selected_idx, .. }
+            | ModalType::MilestoneTemplateSelect { selected_idx, .. } => {
+                *selected_idx = idx;
+            }
+            ModalType::AssignTask {
+                selected_member_idx, ..
+            } => {
+                *selected_member_idx = idx;
+            }
+            ModalType::QuestDependencies {
+                selected_quest_idx, ..
+            } => {
+                *selected_quest_idx = idx;
+            }
+            ModalType::CouncilBriefing {
+                selected_section_idx,
+                ..
+            } => {
+                *selected_section_idx = idx;
+            }
+            ModalType::ShareNote { permission_idx, .. } => {
+                *permission_idx = idx;
+            }
+            ModalType::JournalVisibility { visibility_idx, .. } => {
+                *visibility_idx = idx;
+            }
+            _ => {}
+        }
+    }
+
+    /// Writes `idx` into whatever multi-field form modal's `focus_idx`
+    /// currently has keyboard focus. Mirrors what clicking a field means
+    /// everywhere else in the app: focus only, same as Tab — never types
+    /// into or edits the field.
+    fn set_modal_focus_idx(&mut self, idx: usize) {
+        let modal = if self.overlay_modal != ModalType::None {
+            &mut self.overlay_modal
+        } else {
+            &mut self.modal_state
+        };
+        match modal {
+            ModalType::NewProject { focus_idx, .. }
+            | ModalType::EditProject { focus_idx, .. }
+            | ModalType::NewTask { focus_idx, .. }
+            | ModalType::EditTask { focus_idx, .. }
+            | ModalType::TreasuryEntry { focus_idx, .. }
+            | ModalType::TreasuryBudget { focus_idx, .. }
+            | ModalType::TaskFinancials { focus_idx, .. }
+            | ModalType::DailyReflection { focus_idx, .. }
+            | ModalType::NewRitual { focus_idx, .. }
+            | ModalType::InviteMember { focus_idx, .. }
+            | ModalType::HydrationSettings { focus_idx, .. } => {
+                *focus_idx = idx;
+            }
+            _ => {}
+        }
+    }
+
+    /// Converts a target character column (0-based, counted from the left
+    /// edge of a single line of text) into the UTF-8 byte offset it points
+    /// to — walking chars rather than assuming one byte each, the same
+    /// reasoning the button-label column math above already needs for
+    /// multi-byte text. A column at or past the end of the text clamps to
+    /// `text.len()` for free, since the walk simply runs out of chars.
+    fn byte_offset_for_col(text: &str, target_col: usize) -> usize {
+        let mut byte = 0;
+        let mut col = 0;
+        for ch in text.chars() {
+            if col >= target_col {
+                break;
+            }
+            byte += ch.len_utf8();
+            col += 1;
+        }
+        byte
+    }
+
+    /// Same as `byte_offset_for_col`, but for a field that's split across
+    /// several rows by literal `\n` only — no soft-wrap, no scroll — which
+    /// is exactly how `desc_lines_with_cursor` renders the Campaign
+    /// description field. A click past the last logical line clamps to the
+    /// end of the text, same as clicking past the last character of a
+    /// single-line field clamps to that field's end.
+    fn byte_offset_for_line_col(text: &str, target_line: usize, target_col: usize) -> usize {
+        let mut offset = 0;
+        for (i, line) in text.split('\n').enumerate() {
+            if i == target_line {
+                return offset + Self::byte_offset_for_col(line, target_col);
+            }
+            offset += line.len() + 1; // +1 for the '\n' this split() ate
+        }
+        text.len()
+    }
+
+    /// Click-to-position-cursor companion to `set_modal_focus_idx`: for the
+    /// handful of fields that carry real mid-string cursor state — as
+    /// opposed to the append-only fields click-to-focus already fully
+    /// serves — this also moves the cursor to the exact character the
+    /// click landed on, same as clicking mid-line already does in the
+    /// Notes editor. `field_rect` is the very Rect `handle_modal_mouse`
+    /// just hit-tested against `regions.focus_fields[idx]`.
+    ///
+    /// Deliberately not covered here: `NewTask`/`EditTask`'s Description
+    /// field. Unlike every other field, it has two divergent rendering/
+    /// scroll models of its own — a soft-wrapped-and-scrolled plain-text
+    /// fallback, and a separate vim-style `EditorState` overlay once it
+    /// matches the field's content — neither of which is the simple
+    /// "no-wrap" or "reuse `editor::screen_to_buffer_pos` verbatim" shape
+    /// every other field here has. Click-to-focus already works on it; only
+    /// repositioning the cursor mid-text is out of scope for this pass.
+    fn position_modal_field_cursor(
+        &mut self,
+        idx: usize,
+        field_rect: ratatui::layout::Rect,
+        mouse_col: u16,
+        mouse_row: u16,
+    ) {
+        let is_overlay = self.overlay_modal != ModalType::None;
+        let active = if is_overlay { &self.overlay_modal } else { &self.modal_state };
+
+        // Task title lives outside the ModalType enum entirely (in
+        // App::task_title_cursor/_editing rather than a field on the modal
+        // itself), so it's read here and written as plain self fields
+        // below — no mutable borrow of modal_state/overlay_modal needed.
+        if idx == 0 {
+            if let ModalType::NewTask { title, .. } | ModalType::EditTask { title, .. } = active {
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                self.task_title_cursor = Self::byte_offset_for_col(title, col);
+                self.task_title_editing = true;
+                return;
+            }
+        }
+
+        // TreasuryEntry's Title/Amount rows are plain unbordered lines with
+        // a `"{label:<12} "` prefix before the value — and Amount has a
+        // currency-symbol prefix after that, whose width varies by
+        // campaign currency, fetched the same way draw_treasury_entry_modal
+        // does. Both need `self` immutably, so resolved before taking any
+        // mutable borrow of modal_state/overlay_modal below.
+        let (treasury_title_prefix, treasury_amount_prefix) = if matches!(active, ModalType::TreasuryEntry { .. }) {
+            let currency = self
+                .active_project_id
+                .and_then(|id| crate::services::TreasuryService::new(&self.db).campaign_currency(id).ok())
+                .unwrap_or_default();
+            let title_label_len = "Title".chars().count().max(12) + 1;
+            let amount_label_len = format!("Amount ({})", currency.code()).chars().count().max(12) + 1;
+            (title_label_len, amount_label_len + currency.symbol().chars().count())
+        } else {
+            (0, 0)
+        };
+
+        let modal = if is_overlay { &mut self.overlay_modal } else { &mut self.modal_state };
+        match modal {
+            ModalType::NewProject { name, name_cursor, .. } | ModalType::EditProject { name, name_cursor, .. }
+                if idx == 0 =>
+            {
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                *name_cursor = Self::byte_offset_for_col(name, col);
+            }
+            ModalType::NewProject { desc, desc_cursor, .. } | ModalType::EditProject { desc, desc_cursor, .. }
+                if idx == 1 =>
+            {
+                let row = mouse_row.saturating_sub(field_rect.y + 1) as usize;
+                let col = mouse_col.saturating_sub(field_rect.x + 1) as usize;
+                *desc_cursor = Self::byte_offset_for_line_col(desc, row, col);
+            }
+            ModalType::TreasuryEntry { title, title_cursor, .. } if idx == 0 => {
+                let col = mouse_col.saturating_sub(field_rect.x + treasury_title_prefix as u16) as usize;
+                *title_cursor = Self::byte_offset_for_col(title, col);
+            }
+            ModalType::TreasuryEntry { amount, amount_cursor, .. } if idx == 1 => {
+                let col = mouse_col.saturating_sub(field_rect.x + treasury_amount_prefix as u16) as usize;
+                *amount_cursor = Self::byte_offset_for_col(amount, col);
+            }
+            _ => {}
+        }
+    }
+
+    /// Handles a mouse event while a modal (or overlay_modal) is open.
+    /// Click outside the popup cancels it (synthesizes Esc); click a list
+    /// row/item selects it; click anywhere else inside a confirm-style
+    /// dialog's popup confirms it (synthesizes that dialog's own primary
+    /// key). Reuses handle_key_event wholesale for both, rather than
+    /// re-deriving each modal's routing/side effects here, so keyboard and
+    /// mouse are guaranteed to agree.
+    fn handle_modal_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crate::screens::hit_test::{HitRegions, ModalListRegion};
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        let Some(regions) = self.compute_modal_hit_regions() else {
+            return Ok(());
+        };
+        if !HitRegions::contains(regions.popup_area, mouse.column, mouse.row) {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        if let Some(list) = &regions.list {
+            match list {
+                ModalListRegion::Rows {
+                    area,
+                    count,
+                    first_visible_index,
+                } => {
+                    if HitRegions::contains(*area, mouse.column, mouse.row) {
+                        let row = (mouse.row - area.y) as usize;
+                        let idx = first_visible_index + row;
+                        if idx < *count {
+                            self.set_modal_list_selection(idx);
+                        }
+                    }
+                }
+                ModalListRegion::Items(rects) => {
+                    if let Some(idx) = rects
+                        .iter()
+                        .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                    {
+                        self.set_modal_list_selection(idx);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        if let Some(fields) = &regions.focus_fields {
+            if let Some(idx) = fields
+                .iter()
+                .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+            {
+                let field_rect = fields[idx];
+                self.set_modal_focus_idx(idx);
+                self.position_modal_field_cursor(idx, field_rect, mouse.column, mouse.row);
+            }
+            return Ok(());
+        }
+        if let Some(buttons) = &regions.buttons {
+            // Real, distinct button regions — unlike the single-zone
+            // confirm_key case below, a click that misses every button
+            // (e.g. on the dialog's message text) does nothing.
+            if let Some((_, key)) = buttons
+                .iter()
+                .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+            {
+                return self.handle_key_event(KeyEvent::new(*key, KeyModifiers::NONE));
+            }
+            return Ok(());
+        }
+        if let Some(confirm_key) = regions.confirm_key {
+            return self.handle_key_event(KeyEvent::new(confirm_key, KeyModifiers::NONE));
+        }
+        Ok(())
+    }
+
+    /// Recomputes the task calendar's popup bounds and per-day cell Rects
+    /// fresh, mirroring `project_workspace::draw_task_calendar`'s exact
+    /// Layout calls — same recompute-on-demand approach as
+    /// compute_modal_hit_regions, and for the same reason (no draw() here
+    /// returns anything to stash this from).
+    fn compute_calendar_hit_regions(&self) -> Option<crate::screens::hit_test::CalendarHitRegions> {
+        use chrono::Datelike;
+        use crate::screens::hit_test::CalendarHitRegions;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        let calendar = self.task_calendar?;
+        let term = Rect {
+            x: 0,
+            y: 0,
+            width: self.terminal_width,
+            height: self.terminal_height,
+        };
+        let popup_area = crate::screens::intro::centered_rect(98, 94, term);
+        let inner = Rect {
+            x: popup_area.x + 1,
+            y: popup_area.y + 1,
+            width: popup_area.width.saturating_sub(2),
+            height: popup_area.height.saturating_sub(2),
+        };
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // header/status line
+                Constraint::Length(1), // weekday labels
+                Constraint::Min(12),   // the 6x7 day grid
+                Constraint::Length(1), // help line
+            ])
+            .split(inner);
+        let week_rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Ratio(1, 6); 6])
+            .split(rows[2]);
+
+        let selected = calendar.selected;
+        let first = chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month(), 1)?;
+        let leading = first.weekday().num_days_from_monday() as usize;
+        let next_month = if selected.month() == 12 {
+            chrono::NaiveDate::from_ymd_opt(selected.year() + 1, 1, 1)
+        } else {
+            chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month() + 1, 1)
+        }?;
+        let days_in_month = next_month.pred_opt()?.day() as usize;
+
+        let mut days = Vec::new();
+        for week in 0..6 {
+            let day_cells = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Ratio(1, 7); 7])
+                .split(week_rows[week]);
+            for weekday in 0..7 {
+                let slot = week * 7 + weekday;
+                let day_number = slot + 1;
+                if day_number <= leading || day_number > leading + days_in_month {
+                    continue; // blank padding cell
+                }
+                let number = (day_number - leading) as u32;
+                if let Some(date) = chrono::NaiveDate::from_ymd_opt(selected.year(), selected.month(), number) {
+                    days.push((day_cells[weekday], date));
+                }
+            }
+        }
+
+        Some(CalendarHitRegions { popup_area, days })
+    }
+
+    /// Handles a mouse event while the task calendar is open. Click outside
+    /// the popup cancels it, same as Esc. Click a day selects it, same as
+    /// the arrow keys (doesn't close the calendar). Double-click a day
+    /// confirms it, same as Enter/Space — reuses handle_key_event wholesale
+    /// for that so it can't drift from what Enter/Space actually do
+    /// (opening a new Quest seeded with that date in planner mode, or
+    /// writing the date back into the calling modal in date-picker mode).
+    fn handle_task_calendar_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        let Some(regions) = self.compute_calendar_hit_regions() else {
+            return Ok(());
+        };
+        if !HitRegions::contains(regions.popup_area, mouse.column, mouse.row) {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        }
+        let Some((_, date)) = regions
+            .days
+            .iter()
+            .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+        else {
+            return Ok(());
+        };
+        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+        if let Some(calendar) = self.task_calendar.as_mut() {
+            calendar.selected = *date;
+        }
+        if is_double_click {
+            return self.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        }
+        Ok(())
+    }
+
+    /// Recomputes the "Don't show this again" checkbox's Rect on the
+    /// Prologue's final page, mirroring `prologue::draw`'s own layout math
+    /// (header block + margin(1) split + bottom-anchored auto-scroll) —
+    /// same recompute-on-demand approach as the modal/calendar hit-testing
+    /// above, for the same reason (draw() here returns nothing to stash
+    /// this from). Returns None whenever the checkbox isn't actually on
+    /// screen: wrong screen/page, still typing, or (in an unusually short
+    /// terminal) scrolled out of the visible viewport. Like the render
+    /// code's own auto-scroll formula, this assumes no line soft-wraps —
+    /// true for every line in the story text at any reasonable terminal
+    /// width, and the same assumption `prologue::draw`'s scroll_y already
+    /// silently makes.
+    fn compute_prologue_checkbox_rect(&self) -> Option<ratatui::layout::Rect> {
+        use crate::screens::prologue::{self, LineKind};
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        if self.active_screen != ActiveScreen::Prologue || self.prologue_page != 1 {
+            return None;
+        }
+        let lines_def = prologue::page_lines(self.prologue_page);
+        if self.prologue_line_idx < lines_def.len() {
+            return None; // still typing — checkbox isn't rendered yet
+        }
+        let header_n = prologue::header_line_count(lines_def);
+        let body_def = &lines_def[header_n..];
+        let checkbox_row = body_def.iter().position(|sl| matches!(sl.kind, LineKind::Checkbox))?;
+
+        // Color doesn't affect how many lines the header wraps into — any
+        // placeholder works, since only .len() is used below.
+        let header_h = prologue::build_header_lines(lines_def, ratatui::style::Color::White, header_n).len() as u16;
+        let footer_h: u16 = 2;
+
+        let size = Rect { x: 0, y: 0, width: self.terminal_width, height: self.terminal_height };
+        let inner_area = Rect {
+            x: size.x + 1,
+            y: size.y + 1,
+            width: size.width.saturating_sub(2),
+            height: size.height.saturating_sub(2),
+        };
+        let inner_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(header_h),
+                Constraint::Min(1),
+                Constraint::Length(footer_h),
+            ])
+            .split(inner_area);
+        let body = inner_chunks[1];
+
+        let viewport = body.height as usize;
+        let scroll_y = body_def.len().saturating_sub(viewport);
+        let visual_row = checkbox_row.checked_sub(scroll_y)?;
+        if visual_row >= viewport {
+            return None;
+        }
+
+        Some(Rect {
+            x: body.x,
+            y: body.y + visual_row as u16,
+            width: body.width,
+            height: 1,
+        })
+    }
+
+    /// Handles a mouse click on the Prologue screen. Its only real
+    /// interactive element beyond "any key/click advances the typewriter"
+    /// is the final page's "Don't show this again" checkbox, which this
+    /// mirrors the same way `x` already does — see
+    /// `compute_prologue_checkbox_rect` for how its Rect is found.
+    fn handle_prologue_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        if let Some(rect) = self.compute_prologue_checkbox_rect() {
+            if HitRegions::contains(rect, mouse.column, mouse.row) {
+                self.prologue_skip_checked = !self.prologue_skip_checked;
+            }
+        }
+    }
+
+    // ── Mouse ─────────────────────────────────────────────────────────────────
+    //
+    // Phase 1: full click/drag/scroll support in the Notes editor, plus
+    // universal scroll-wheel support on a few screens that already track a
+    // scroll offset. Click-to-select for list/menu screens is a deferred
+    // follow-up — see handle_generic_scroll_mouse for the extension point.
+    pub fn handle_mouse_event(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        // Se invierte aquí arriba, una sola vez, y no en los ~27 sitios que miran ScrollUp/
+        // ScrollDown: así ninguna pantalla se queda fuera ni se va desincronizando conforme se
+        // agreguen más. Va antes de los guards de calendario y modal para que dentro de un modal
+        // con contenido largo se sienta igual que fuera.
+        let mouse = Self::with_natural_scroll(mouse);
+
+        // Dosifica la ráfaga del trackpad antes de repartir, por el mismo motivo que la
+        // inversión: que valga para toda la app y no pantalla por pantalla.
+        if self.throttle_vertical_scroll(&mouse) {
+            return Ok(());
+        }
+
+        if self.task_calendar.is_some() {
+            return self.handle_task_calendar_mouse(mouse);
+        }
+        if self.modal_state != ModalType::None || self.overlay_modal != ModalType::None {
+            return self.handle_modal_mouse(mouse);
+        }
+
+        // Swipe horizontal de dos dedos = panel anterior/siguiente. Va antes del dispatch por
+        // pantalla para que funcione igual en los 9 paneles, y después de los guards de modal y
+        // calendario: estando en un modal el swipe no debe mover el panel de abajo.
+        if self.handle_pane_swipe(mouse)? {
+            return Ok(());
+        }
+
+        match self.active_screen {
+            ActiveScreen::Editor => self.handle_editor_mouse(mouse),
+            ActiveScreen::Archive => self.handle_archive_mouse(mouse),
+            ActiveScreen::Gateway => self.handle_gateway_mouse(mouse),
+            ActiveScreen::GreatChronicle => self.handle_great_chronicle_mouse(mouse),
+            ActiveScreen::Onboarding => self.handle_onboarding_mouse(mouse),
+            ActiveScreen::Legends => self.handle_legends_mouse(mouse),
+            ActiveScreen::Focus => self.handle_focus_mouse(mouse),
+            ActiveScreen::Projects => self.handle_projects_mouse(mouse),
+            ActiveScreen::Dashboard => self.handle_dashboard_mouse(mouse),
+            ActiveScreen::Soundscapes => self.handle_soundscapes_mouse(mouse),
+            ActiveScreen::Library => self.handle_library_mouse(mouse),
+            ActiveScreen::Settings => self.handle_settings_mouse(mouse),
+            ActiveScreen::Character => self.handle_character_mouse(mouse),
+            ActiveScreen::SyncSettings => self.handle_sync_mouse(mouse),
+            ActiveScreen::Fellowship => self.handle_fellowship_mouse(mouse),
+            ActiveScreen::Workspace => self.handle_workspace_mouse(mouse),
+            ActiveScreen::Prologue => self.handle_prologue_mouse(mouse),
+            ActiveScreen::About => self.handle_about_mouse(mouse),
+            ActiveScreen::Intro => return self.handle_intro_mouse(mouse),
+            _ => self.handle_generic_scroll_mouse(mouse),
+        }
+        Ok(())
+    }
+
+    /// Ventana de silencio que da por terminado un gesto horizontal.
+    ///
+    /// macOS sigue mandando eventos de inercia después de que levantas los dedos, y esa cola dura
+    /// bastante más que cualquier cooldown fijo cómodo — por eso la primera versión se sentía
+    /// acelerada: la inercia del gesto anterior disparaba el siguiente panel sola. En vez de
+    /// contar desde que se cambió de panel, se mide el hueco entre eventos horizontales: mientras
+    /// sigan llegando seguidos es el mismo gesto (inercia incluida) y no cuenta de nuevo. Apoyar
+    /// los dedos en el trackpad corta la inercia en macOS, así que un swipe nuevo siempre empieza
+    /// después de un hueco real.
+    const SWIPE_GESTURE_GAP: std::time::Duration = std::time::Duration::from_millis(300);
+
+    /// Eventos en la misma dirección antes de mover el panel.
+    ///
+    /// Un swipe horizontal de verdad manda decenas de eventos, así que 3 se siente inmediato. Lo
+    /// que filtra es la deriva lateral de un scroll vertical de dos dedos, que suelta uno o dos
+    /// eventos horizontales sueltos y antes bastaba para saltar de panel sin querer.
+    const SWIPE_EVENTS_TO_FIRE: u8 = 3;
+
+    /// Los 9 paneles principales en el mismo orden que los atajos 1-9, que es el orden en que se
+    /// dibujan las pestañas. `handle_pane_swipe` se mueve por esta lista.
+    const SWIPEABLE_PANES: [(ActiveScreen, char); 9] = [
+        (ActiveScreen::Dashboard, '1'),
+        (ActiveScreen::Projects, '2'),
+        (ActiveScreen::Character, '3'),
+        (ActiveScreen::Library, '4'),
+        (ActiveScreen::Soundscapes, '5'),
+        (ActiveScreen::Fellowship, '6'),
+        (ActiveScreen::GreatChronicle, '7'),
+        (ActiveScreen::SyncSettings, '8'),
+        (ActiveScreen::Settings, '9'),
+    ];
+
+    /// Hueco a partir del cual un evento vertical cuenta como "notch suelto" y no como parte de
+    /// una racha. Por debajo de esto sólo puede venir de un trackpad: una rueda física no dispara
+    /// tan seguido, y un arrastre lento de dos dedos tampoco.
+    const SCROLL_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(120);
+
+    /// Dentro de una racha sólo pasa uno de cada N eventos. Es la perilla de velocidad: subirlo
+    /// hace el scroll más lento, bajarlo más rápido. No toca a la rueda, que al llegar espaciada
+    /// nunca entra en racha y sigue moviendo un paso por notch.
+    const SCROLL_BURST_DIVISOR: u8 = 3;
+
+    /// Dosifica el scroll vertical del trackpad dejando la rueda intacta.
+    ///
+    /// El trackpad manda una ráfaga densa por gesto y cada evento valía un paso entero, así que
+    /// un flick recorría el contenido de golpe. Aquí se mide el ritmo: eventos espaciados (una
+    /// rueda, o un arrastre lento y deliberado) pasan siempre, y sólo cuando llegan pegados —que
+    /// es justo el flick de trackpad— se deja pasar uno de cada `SCROLL_BURST_DIVISOR`.
+    ///
+    /// Así la velocidad se ajusta sola: despacio responde uno a uno, y rápido avanza suave en vez
+    /// de saltar. Devuelve `true` si el evento se traga.
+    fn throttle_vertical_scroll(&mut self, mouse: &crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::MouseEventKind;
+
+        let down = match mouse.kind {
+            MouseEventKind::ScrollDown => true,
+            MouseEventKind::ScrollUp => false,
+            // El eje horizontal ya lo agrupa handle_pane_swipe; el resto no se dosifica.
+            _ => return false,
+        };
+
+        let now = std::time::Instant::now();
+        let continuing = self.scroll_burst.filter(|burst| {
+            burst.down == down && now.duration_since(burst.last_event_at) <= Self::SCROLL_BURST_GAP
+        });
+
+        let Some(mut burst) = continuing else {
+            // Primer evento (o cambio de sentido): pasa entero, para que un notch suelto y el
+            // arranque del gesto respondan al instante.
+            self.scroll_burst = Some(ScrollBurst {
+                last_event_at: now,
+                down,
+                pending: 0,
+            });
+            return false;
+        };
+
+        burst.last_event_at = now;
+        burst.pending = burst.pending.saturating_add(1);
+        let swallow = burst.pending < Self::SCROLL_BURST_DIVISOR;
+        if !swallow {
+            burst.pending = 0;
+        }
+        self.scroll_burst = Some(burst);
+        swallow
+    }
+
+    /// Invierte la rueda vertical: mover los dedos hacia abajo empuja el contenido hacia abajo,
+    /// como el "natural scrolling" de macOS, en vez de mover el cursor hacia abajo.
+    ///
+    /// Sólo toca el eje vertical. `ScrollLeft`/`ScrollRight` pasan intactos porque el swipe de
+    /// panel ya se lee en la dirección correcta, y el resto de eventos (clics, arrastres) no
+    /// tienen sentido de eje.
+    fn with_natural_scroll(mouse: crossterm::event::MouseEvent) -> crossterm::event::MouseEvent {
+        use crossterm::event::MouseEventKind;
+
+        let kind = match mouse.kind {
+            MouseEventKind::ScrollUp => MouseEventKind::ScrollDown,
+            MouseEventKind::ScrollDown => MouseEventKind::ScrollUp,
+            other => other,
+        };
+        crossterm::event::MouseEvent { kind, ..mouse }
+    }
+
+    /// El splash de arranque avanza con cualquier tecla, así que un clic hace lo mismo.
+    ///
+    /// Se sintetiza Enter en vez de repetir la lógica de destino: según haya usuario, y según la
+    /// preferencia `prologue_skip`, la pantalla siguiente es el Gateway, el Prólogo o el
+    /// Dashboard — y esa decisión debe vivir en un solo lugar (ver el brazo `Intro` de
+    /// `handle_key_event`).
+    fn handle_intro_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<()> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        // Sólo el clic: la rueda/el trackpad no deben saltarse el splash sin querer.
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        self.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    /// Swipe horizontal de dos dedos (`ScrollLeft`/`ScrollRight`) para cambiar de panel.
+    ///
+    /// Los gestos de 3 y 4 dedos no se pueden usar aquí: macOS se los queda para Mission Control
+    /// y jamás llegan a la TTY — una app de terminal sólo ve bytes en stdin y no existe secuencia
+    /// de escape que los codifique. El swipe de dos dedos sí llega: crossterm lo decodifica de los
+    /// botones SGR 6/7 en Unix y de MOUSE_HWHEELED en Windows, así que este mismo camino sirve en
+    /// macOS, Linux y Windows. En terminales que no lo reportan simplemente nunca entra aquí.
+    ///
+    /// Devuelve `true` si consumió el evento.
+    fn handle_pane_swipe(&mut self, mouse: crossterm::event::MouseEvent) -> Result<bool> {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+
+        let forward = match mouse.kind {
+            MouseEventKind::ScrollRight => true,
+            MouseEventKind::ScrollLeft => false,
+            _ => return Ok(false),
+        };
+
+        // Fuera de los 9 paneles no hay nada que recorrer. En Workspace los 1-4 son sub-tabs y en
+        // el Editor se está escribiendo, así que ninguno entra en la lista a propósito.
+        let Some(current) = Self::SWIPEABLE_PANES
+            .iter()
+            .position(|(screen, _)| *screen == self.active_screen)
+        else {
+            return Ok(false);
+        };
+
+        // Continúa el gesto en curso si el evento llega pegado al anterior y en la misma
+        // dirección; si no, empieza uno nuevo. Cambiar de dirección a media ráfaga cuenta como
+        // gesto nuevo: es el usuario devolviéndose.
+        let now = std::time::Instant::now();
+        let mut gesture = match self.pane_swipe {
+            Some(previous)
+                if previous.forward == forward
+                    && now.duration_since(previous.last_event_at) <= Self::SWIPE_GESTURE_GAP =>
+            {
+                previous
+            }
+            _ => PaneSwipeGesture {
+                last_event_at: now,
+                forward,
+                events: 0,
+                fired: false,
+            },
+        };
+        gesture.events = gesture.events.saturating_add(1);
+        gesture.last_event_at = now;
+
+        // Ya se movió el panel en este gesto (o todavía no junta suficientes eventos): se consume
+        // el evento sin hacer nada. Aquí es donde muere la cola de inercia.
+        if gesture.fired || gesture.events < Self::SWIPE_EVENTS_TO_FIRE {
+            self.pane_swipe = Some(gesture);
+            return Ok(true);
+        }
+        gesture.fired = true;
+        self.pane_swipe = Some(gesture);
+
+        // Sin wrap: llegando a los extremos el swipe se queda ahí en vez de saltar de Settings a
+        // Dashboard, igual que los atajos 1-9 tampoco ciclan.
+        let target = if forward {
+            current.saturating_add(1)
+        } else {
+            match current.checked_sub(1) {
+                Some(index) => index,
+                None => return Ok(true),
+            }
+        };
+        let Some((_, shortcut)) = Self::SWIPEABLE_PANES.get(target) else {
+            return Ok(true);
+        };
+
+        // Se sintetiza el atajo en vez de asignar active_screen a mano: cada panel arrastra sus
+        // efectos (reload_data, pulls async, marcar Fellowship como visto) y duplicarlos aquí se
+        // desincronizaría en cuanto alguno cambie.
+        self.handle_key_event(KeyEvent::new(
+            KeyCode::Char(*shortcut),
+            KeyModifiers::NONE,
+        ))?;
+        Ok(true)
+    }
+
+    fn handle_generic_scroll_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        let _delta: i64 = match mouse.kind {
+            MouseEventKind::ScrollUp => -1,
+            MouseEventKind::ScrollDown => 1,
+            _ => return,
+        };
+
+        // Intro and Restore are the only screens left here — both are
+        // effectively keyboard-only (Intro is a splash any key dismisses;
+        // Restore is a single always-focused text field), so there's
+        // nothing to scroll. Every other screen with scroll support now
+        // gets its own dedicated handle_*_mouse so click and scroll share
+        // one dispatch arm; see handle_mouse_event. Add a screen back as a
+        // match arm (not an if) the moment a second one needs generic
+        // scroll-only support again.
+    }
+
+    /// Recomputes the two clickable spots in About's title bar — mirrors
+    /// `about::draw`'s own `Block` title, which is a fixed single line on
+    /// the top border of the left (55%) column, starting right after its
+    /// left corner. `ABOUT_TITLE_TEXT`/`ABOUT_SUPPORT_LABEL` are the exact
+    /// same string constants that title renders, so this never drifts out
+    /// of sync with what's actually on screen.
+    fn compute_about_hit_regions(&self) -> Option<crate::screens::hit_test::AboutHitRegions> {
+        use crate::screens::about::ABOUT_TITLE_TEXT;
+        use crate::screens::hit_test::AboutHitRegions;
+        use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+        if self.active_screen != ActiveScreen::About {
+            return None;
+        }
+        let term = Rect { x: 0, y: 0, width: self.terminal_width, height: self.terminal_height };
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(3)])
+            .split(term)[0];
+        let left = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
+            .split(content_area)[0];
+
+        let title_row = left.y;
+        let title_start_col = left.x + 1;
+        let r_offset = ABOUT_TITLE_TEXT.find("[R]")?;
+        let r_col = title_start_col + ABOUT_TITLE_TEXT[..r_offset].chars().count() as u16;
+        let r_width = (ABOUT_TITLE_TEXT.chars().count() - ABOUT_TITLE_TEXT[..r_offset].chars().count()) as u16;
+        let report_button = Rect { x: r_col, y: title_row, width: r_width, height: 1 };
+
+        // [Support], the label right after this one, isn't wired to any
+        // key on this screen today — that's a pre-existing gap independent
+        // of mouse support, not something to paper over by giving the
+        // mouse a power the keyboard doesn't have — so its Rect isn't
+        // exposed here at all.
+
+        Some(AboutHitRegions { report_button })
+    }
+
+    /// Handles a mouse event on the About screen: click "[R] Send Report"
+    /// in the title bar to open the Bug Report modal, same as pressing
+    /// `r`; otherwise, the scroll wheel moves both panels together, same
+    /// as the arrow keys already do.
+    fn handle_about_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(regions) = self.compute_about_hit_regions() {
+                    if HitRegions::contains(regions.report_button, mouse.column, mouse.row) {
+                        let _ = self.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+                    }
+                }
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) { -1 } else { 1 };
+                let content = self.about_content_lines.get();
+                let visible = self.terminal_height.saturating_sub(5);
+                let max_scroll = content.saturating_sub(visible);
+                self.about_scroll = (self.about_scroll as i64 + delta * 2).clamp(0, max_scroll as i64) as u16;
+            }
+            _ => {}
+        }
+    }
+
+    // Phase 2: click-to-select on the "easy batch" of list/menu screens —
+    // single Lists/static Rects with no separator rows or opaque
+    // auto-scrolling to fight. See handle_editor_mouse for the pattern this
+    // follows: hit-test against last frame's stashed Rects, then reuse the
+    // same field the keyboard handler for that screen already writes to.
+
+    /// Restores the selected archived/completed Campaign — un-archives and
+    /// un-completes it. Mirrors the 'r' key's Archive branch in
+    /// handle_key_event, and is shared with it so keyboard and mouse can't
+    /// drift apart. Deliberately not Delete's confirm-modal branch: 'r' is
+    /// the reversible, one-step action, so it's the one double-click mirrors
+    /// — a permanent delete stays a keyboard-only, two-step action.
+    fn restore_selected_archived_project(&mut self) -> Result<()> {
+        let archived: Vec<&Project> = self
+            .projects
+            .iter()
+            .filter(|p| p.archived || p.completed)
+            .collect();
+        if !archived.is_empty() && self.selected_archive_idx < archived.len() {
+            let mut p = archived[self.selected_archive_idx].clone();
+            p.archived = false;
+            p.completed = false;
+            self.db.update_project(&p)?;
+            self.mark_dirty();
+            self.apply_class_passive("project_restore", 0)?;
+            self.selected_archive_idx = 0;
+            self.reload_data()?;
+        }
+        Ok(())
+    }
+
+    fn handle_archive_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.archive else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                    return;
+                }
+                // The list renders from row 0 with no ListState/scroll
+                // offset, so the row offset inside the inner area is the
+                // item index directly.
+                let idx = (mouse.row - regions.list.y) as usize;
+                if idx < regions.item_count {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_archive_idx = idx;
+                    // Double-click restores the Campaign, same as 'r'.
+                    if is_double_click {
+                        if let Err(e) = self.restore_selected_archived_project() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't restore: {}", e)));
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Archive.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let archive_len = self
+                    .projects
+                    .iter()
+                    .filter(|p| p.archived || p.completed)
+                    .count();
+                if archive_len == 0 {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_archive_idx = if self.selected_archive_idx > 0 {
+                        self.selected_archive_idx - 1
+                    } else {
+                        archive_len - 1
+                    };
+                } else {
+                    self.selected_archive_idx = if self.selected_archive_idx < archive_len - 1 {
+                        self.selected_archive_idx + 1
+                    } else {
+                        0
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_gateway_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.gateway else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        // Unlike Archive's browse-then-act list, Gateway's two boxes are
+        // buttons — a click both selects and activates, same as Enter.
+        if HitRegions::contains(regions.option0, mouse.column, mouse.row) {
+            self.gateway_selected_idx = 0;
+            self.activate_gateway_selection();
+        } else if HitRegions::contains(regions.option1, mouse.column, mouse.row) {
+            self.gateway_selected_idx = 1;
+            self.activate_gateway_selection();
+        }
+    }
+
+    fn handle_great_chronicle_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(regions) = self.hit_regions.great_chronicle else {
+                    return;
+                };
+                if HitRegions::contains(regions.feed, mouse.column, mouse.row) {
+                    self.chapter_panel_focused = false;
+                } else if HitRegions::contains(regions.chapter_panel, mouse.column, mouse.row) {
+                    self.chapter_panel_focused = true;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                if self.chapter_panel_focused {
+                    self.chapter_panel_scroll =
+                        (self.chapter_panel_scroll as i64 + delta * 3).max(0) as usize;
+                } else {
+                    self.great_chronicle_scroll =
+                        (self.great_chronicle_scroll as i64 + delta * 3).max(0) as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_onboarding_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.onboarding else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.name_input, mouse.column, mouse.row) {
+                    self.onboarding_focus = OnboardingFocus::NameInput;
+                } else if HitRegions::contains(regions.class_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.class_list.y) as usize;
+                    if idx < regions.class_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.onboarding_class_idx = idx;
+                        self.onboarding_focus = OnboardingFocus::ClassSelect;
+                        // Double-click confirms the class and finishes
+                        // onboarding, same as Enter on ClassSelect.
+                        // complete_onboarding() already self-validates the
+                        // username, so this is safe to call regardless of
+                        // what step the user was on before this click.
+                        if is_double_click {
+                            if let Err(e) = self.complete_onboarding() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't finish onboarding: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm for OnboardingFocus::ClassSelect — the
+            // name field has no Up/Down binding either, so this is a no-op
+            // while it's focused, same as the keyboard.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if self.onboarding_focus != OnboardingFocus::ClassSelect
+                    || self.onboarding_classes.is_empty()
+                {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.onboarding_class_idx = if self.onboarding_class_idx > 0 {
+                        self.onboarding_class_idx - 1
+                    } else {
+                        self.onboarding_classes.len() - 1
+                    };
+                } else {
+                    self.onboarding_class_idx =
+                        if self.onboarding_class_idx < self.onboarding_classes.len() - 1 {
+                            self.onboarding_class_idx + 1
+                        } else {
+                            0
+                        };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_legends_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.legends else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.relic_list, mouse.column, mouse.row) {
+                    return;
+                }
+                // Fixed-height list, no scroll offset — a click past the
+                // last rendered row (or past the real relic count) is a
+                // no-op.
+                let idx = (mouse.row - regions.relic_list.y) as usize;
+                if idx < regions.item_count {
+                    self.selected_relic_idx = idx;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Legends.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let relics = self.db.get_relics().unwrap_or_default();
+                if relics.is_empty() {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_relic_idx = if self.selected_relic_idx > 0 {
+                        self.selected_relic_idx - 1
+                    } else {
+                        relics.len() - 1
+                    };
+                } else {
+                    self.selected_relic_idx = if self.selected_relic_idx < relics.len() - 1 {
+                        self.selected_relic_idx + 1
+                    } else {
+                        0
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Starts a Focus session using whatever duration/Campaign/Quest/
+    /// Soundscape is currently selected across all 4 fields — independent
+    /// of which field happens to be focused, same as Enter. Mirrors the
+    /// KeyCode::Enter arm in handle_focus_screen_key, and is shared with it
+    /// so keyboard and mouse can't drift apart.
+    fn start_selected_focus_session(&mut self) -> Result<()> {
+        if self.active_focus_session.is_some() {
+            // Mirrors handle_focus_screen_key's own guard — Enter (and so a
+            // double-click) means something else entirely once a session is
+            // already running (pause/cancel keys, not "start a new one").
+            return Ok(());
+        }
+
+        let active_projects: Vec<Project> = self
+            .projects
+            .iter()
+            .filter(|p| !p.completed && !p.archived)
+            .cloned()
+            .collect();
+
+        let mut active_tasks: Vec<Task> = Vec::new();
+        if self.selected_focus_project_idx > 0
+            && self.selected_focus_project_idx <= active_projects.len()
+        {
+            let selected_p_id = active_projects[self.selected_focus_project_idx - 1].id;
+            active_tasks = self
+                .all_tasks
+                .iter()
+                .filter(|t| t.project_id == Some(selected_p_id) && !t.completed)
+                .cloned()
+                .collect();
+        }
+
+        let duration_mins = match self.selected_focus_duration_idx {
+            0 => 15,
+            1 => 25,
+            2 => 45,
+            3 => 60,
+            4 => 90,
+            5 => -1,
+            _ => 25,
+        };
+
+        if duration_mins == -1 {
+            self.modal_state = ModalType::CustomFocusDuration {
+                input: String::new(),
+            };
+            return Ok(());
+        }
+
+        let project_id = if self.selected_focus_project_idx > 0
+            && self.selected_focus_project_idx <= active_projects.len()
+        {
+            Some(active_projects[self.selected_focus_project_idx - 1].id)
+        } else {
+            None
+        };
+
+        let task_id = if self.selected_focus_task_idx > 0
+            && self.selected_focus_task_idx <= active_tasks.len()
+        {
+            Some(active_tasks[self.selected_focus_task_idx - 1].id)
+        } else {
+            None
+        };
+
+        // If Local Folder is selected but no folder is configured, prompt first
+        use crate::audio::SOUNDSCAPES;
+        let is_local_folder = self.selected_focus_soundscape_idx > 0
+            && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name == "Local Folder";
+        if is_local_folder {
+            let folder = self
+                .db
+                .get_setting("local_music_folder")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if folder.trim().is_empty() {
+                self.modal_state = ModalType::LocalMusicFolder {
+                    input: String::new(),
+                    suggestions: vec![],
+                    selected: 0,
+                };
+                return Ok(());
+            }
+        }
+
+        self.start_focus_session(duration_mins, project_id, task_id)?;
+        Ok(())
+    }
+
+    fn handle_focus_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.focus else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = regions
+                    .cards
+                    .iter()
+                    .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_focus_field_idx = idx;
+                    if is_double_click {
+                        if let Err(e) = self.start_selected_focus_session() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't start: {}", e)));
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Cycles
+            // whichever card selected_focus_field_idx currently points at —
+            // same as Up/Down/'k'/'j' — regardless of where over the screen
+            // the wheel was used, same convention as Great Chronicle/Library.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cycle_selected_focus_field(matches!(mouse.kind, MouseEventKind::ScrollDown));
+            }
+            _ => {}
+        }
+    }
+
+    // Phase 2b: Projects and Dashboard both interleave non-selectable
+    // separator rows into an otherwise plain list, so — unlike the easy
+    // batch above — the rendered row index isn't the item index. Each
+    // draw() builds a row_targets map alongside its list_items/rows in
+    // lockstep, so the click handler just indexes into it instead of
+    // re-deriving where the separators land.
+
+    /// Opens the selected Campaign into its War Room (the Workspace screen).
+    /// Mirrors the KeyCode::Enter arm's Projects branch in handle_key_event,
+    /// and is shared with it so keyboard and mouse can't drift apart.
+    fn open_selected_campaign(&mut self) -> Result<()> {
+        let active = ordered_active_projects(&self.projects);
+        if !active.is_empty() && self.selected_project_idx < active.len() {
+            let proj = active[self.selected_project_idx];
+            let proj_is_shared = proj.is_shared;
+            self.active_project_id = Some(proj.id);
+            self.active_screen = ActiveScreen::Workspace;
+            self.workspace_tab_idx = 0;
+            // Campaign entry owns its initial view. Do not leak the
+            // previous Campaign's Ledger/Kanban toggle globally.
+            self.quest_board_open = self.quest_board_preference(proj.id, proj_is_shared);
+            self.viewing_step_for_task = None;
+            // Campaign-specific teamwork filters must not leak into the
+            // next Campaign or hide content in a revoked private copy.
+            self.task_filter = "All".to_string();
+            self.audio_player.play_open_tasks();
+            self.workspace_sidebar_focused = true;
+            self.selected_task_idx = 0;
+            self.selected_note_idx = 0;
+            self.selected_notes_flat_idx = 0;
+            self.selected_journal_idx = 0;
+            self.reload_data()?;
+            if proj_is_shared {
+                self.start_background_sync();
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_projects_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::{HitRegions, ProjectsRowTarget};
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.projects.clone() else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.list, mouse.column, mouse.row) {
+                    return;
+                }
+                let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                let row = (mouse.row - regions.list.y) as usize;
+                let Some(Some(target)) = regions.row_targets.get(row) else {
+                    return;
+                };
+                match target {
+                    ProjectsRowTarget::All => {
+                        self.projects_all_selected = true;
+                    }
+                    ProjectsRowTarget::Project(idx) => {
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = *idx;
+                        // Double-click does what Enter does — open the
+                        // Campaign into its War Room — same as every other
+                        // select-then-open screen.
+                        if is_double_click {
+                            if let Err(e) = self.open_selected_campaign() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't open: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Projects, including
+            // its wrap through the pinned "All Campaigns" row.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let active_len = ordered_active_projects(&self.projects).len();
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    if self.projects_all_selected {
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = active_len.saturating_sub(1);
+                    } else if self.selected_project_idx > 0 {
+                        self.selected_project_idx -= 1;
+                    } else {
+                        self.projects_all_selected = true;
+                    }
+                } else if self.projects_all_selected {
+                    self.projects_all_selected = false;
+                    self.selected_project_idx = 0;
+                } else if active_len > 0 {
+                    if self.selected_project_idx < active_len - 1 {
+                        self.selected_project_idx += 1;
+                    } else {
+                        self.projects_all_selected = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_dashboard_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.dashboard.clone() else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let list = regions.list();
+                if !HitRegions::contains(list, mouse.column, mouse.row) {
+                    return;
+                }
+                let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                // The list is ListState-driven and auto-scrolls, so the
+                // logical row is the visible offset stashed at render time
+                // plus the on-screen offset — not just the on-screen offset
+                // by itself.
+                let row = regions.visible_start() + (mouse.row - list.y) as usize;
+                let Some(Some(action_idx)) = regions.row_targets().get(row) else {
+                    return;
+                };
+                // action_idx came straight out of this exact frame's render,
+                // same as every other click handler trusting its stashed
+                // regions — no need to re-derive dashboard_command_targets()
+                // just to re-validate it.
+                self.dashboard_task_focus = true;
+                self.selected_dashboard_task_idx = *action_idx;
+                // Double-click does what Enter does — open the selected
+                // command — same as every other select-then-open screen's
+                // mouse handler.
+                if is_double_click {
+                    if let Err(e) = self.open_selected_dashboard_command() {
+                        self.notifications
+                            .push(Notification::warning(format!("Couldn't open: {}", e)));
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Mirrors
+            // the Up/Down key arm gated on ActiveScreen::Dashboard.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.dashboard_task_focus = true;
+                let targets = self.dashboard_command_targets();
+                if targets.is_empty() {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.selected_dashboard_task_idx = if self.selected_dashboard_task_idx > 0 {
+                        self.selected_dashboard_task_idx - 1
+                    } else {
+                        targets.len() - 1
+                    };
+                } else {
+                    self.selected_dashboard_task_idx =
+                        (self.selected_dashboard_task_idx + 1) % targets.len();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Plays the selected Soundscape (or toggles the OS media player, or
+    /// opens the Local Folder picker/track browser for that special entry).
+    /// Mirrors the KeyCode::Enter arm's Soundscapes branch in
+    /// handle_key_event, and is shared with it so keyboard and mouse can't
+    /// drift apart.
+    fn play_selected_soundscape(&mut self) -> Result<()> {
+        use crate::audio::SOUNDSCAPES;
+        let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
+        if s_name == "Media Player" {
+            crate::audio::mpris_player::play_pause();
+            return Ok(());
+        }
+        if s_name == "Local Folder" {
+            let folder = self
+                .db
+                .get_setting("local_music_folder")
+                .unwrap_or_default()
+                .unwrap_or_default();
+            if folder.trim().is_empty() {
+                self.modal_state = ModalType::LocalMusicFolder {
+                    input: String::new(),
+                    suggestions: vec![],
+                    selected: 0,
+                };
+                return Ok(());
+            }
+            self.play_selected_local_choice();
+            return Ok(());
+        }
+        let _ = self.db.set_setting("last_music_source", s_name);
+        self.audio_player.play(s_name);
+        Ok(())
+    }
+
+    fn handle_soundscapes_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.soundscapes else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(tracks) = regions.local_tracks
+                    && HitRegions::contains(tracks.area, mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    let line = (mouse.row - tracks.area.y) as usize;
+                    if line == tracks.row_start {
+                        self.selected_local_track_idx = 0; // "Random shuffle"
+                    } else if line > tracks.row_start
+                        && line <= tracks.row_start + tracks.track_count
+                    {
+                        self.selected_local_track_idx = line - tracks.row_start;
+                    } else {
+                        return;
+                    }
+                    if is_double_click {
+                        self.play_selected_local_choice();
+                    }
+                    return;
+                }
+
+                if HitRegions::contains(regions.source_list, mouse.column, mouse.row) {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    // Fixed 4-line-tall rows, no scroll offset.
+                    let idx = (mouse.row - regions.source_list.y) as usize / 4;
+                    if idx < regions.item_count {
+                        self.selected_soundscape_idx = idx;
+                        // Double-click plays the source, same as Enter.
+                        if is_double_click {
+                            if let Err(e) = self.play_selected_soundscape() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't play: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The Local
+            // Folder track browser (when open) takes priority, same as
+            // clicks — it's an overlay on top of the source list, so only
+            // one of the two is ever the intended scroll target. Both reuse
+            // the same select_previous_*/select_next_* helpers the 'b'/'n'
+            // keys and Up/Down already call.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if regions.local_tracks.is_some() {
+                    if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                        self.select_previous_local_track();
+                    } else {
+                        self.select_next_local_track();
+                    }
+                } else if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    self.select_previous_soundscape();
+                } else {
+                    self.select_next_soundscape();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_library_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.library else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.cat_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.cat_list.y) as usize;
+                    if idx < regions.cat_count {
+                        self.library_active_col = 0;
+                        if self.selected_library_cat_idx != idx {
+                            self.selected_library_cat_idx = idx;
+                            self.reset_library_item_view();
+                        }
+                    }
+                } else if HitRegions::contains(regions.item_list, mouse.column, mouse.row) {
+                    // item_start_idx is the scroll window's top row, computed
+                    // at draw time via .skip(start_idx).take(visible_rows) —
+                    // not a ListState offset, but the same idea.
+                    let idx = regions.item_start_idx + (mouse.row - regions.item_list.y) as usize;
+                    if idx < regions.item_count {
+                        let is_double_click =
+                            self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.library_active_col = 1;
+                        self.selected_library_item_idx = idx;
+                        self.update_library_item_scroll();
+                        // Double-click does what Space does — start/complete
+                        // the quest — same as every other select-then-open
+                        // screen. handle_library_action already no-ops
+                        // outside the Class Quests category, so this is safe
+                        // to call unconditionally.
+                        if is_double_click {
+                            if let Err(e) = self.handle_library_action() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't update quest: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                } else if HitRegions::contains(regions.detail_panel, mouse.column, mouse.row) {
+                    self.library_active_col = 2;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta: i64 = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
+                    -1
+                } else {
+                    1
+                };
+                if self.library_active_col == 2 {
+                    self.library_scroll_offset =
+                        (self.library_scroll_offset as i64 + delta).max(0) as u16;
+                } else {
+                    self.library_item_scroll_offset =
+                        (self.library_item_scroll_offset as i64 + delta).max(0) as usize;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Activates whatever the currently focused Settings row's Enter action
+    /// is — applies the selected theme (focus 0), or toggles External
+    /// Notifications/Task Notifications/Sound Effects (focus 1/2/3). Every
+    /// other row (Sound Volume, the Oath Calendar rows) has no Enter action
+    /// at all — those are adjusted with +/- instead — so this is a no-op
+    /// for them, same as Enter already is. Mirrors the KeyCode::Enter arm
+    /// gated on ActiveScreen::Settings in handle_key_event, and is shared
+    /// with it so keyboard and mouse can't drift apart.
+    fn activate_selected_settings_row(&mut self) -> Result<()> {
+        match self.selected_settings_focus_idx {
+            0 => {
+                if let Some(choice) = crate::theme::Theme::all_choices()
+                    .get(self.selected_settings_theme_idx)
+                    .copied()
+                {
+                    self.apply_theme_choice(choice)?;
+                    self.reload_data()?;
+                }
+            }
+            1 => self.toggle_external_notifications()?,
+            2 => self.toggle_task_notifications()?,
+            3 => self.toggle_sound_effects()?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Cycles Settings' current row/theme by one step, wrapping — mirrors
+    /// the Up/Down/'k'/'j' arms gated on ActiveScreen::Settings, and is
+    /// shared with them so keyboard and mouse can't drift apart.
+    fn cycle_selected_settings_row(&mut self, forward: bool) {
+        if self.selected_settings_focus_idx == 0 {
+            let choices_len = crate::theme::Theme::all_choices().len();
+            if choices_len == 0 {
+                return;
+            }
+            self.selected_settings_theme_idx = if forward {
+                (self.selected_settings_theme_idx + 1) % choices_len
+            } else if self.selected_settings_theme_idx > 0 {
+                self.selected_settings_theme_idx - 1
+            } else {
+                choices_len - 1
+            };
+        } else {
+            self.selected_settings_focus_idx = if forward {
+                Self::next_settings_option_focus(self.selected_settings_focus_idx)
+            } else {
+                Self::previous_settings_option_focus(self.selected_settings_focus_idx)
+            };
+        }
+    }
+
+    fn handle_settings_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.settings else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                // A single click only moves focus, same as Projects/
+                // Dashboard/Library — see SettingsHitRegions for why a
+                // click doesn't also flip a toggle. A double-click, though,
+                // is a deliberate enough gesture that it now activates the
+                // row, same as Enter — see activate_selected_settings_row
+                // for which rows that's a no-op on.
+                if HitRegions::contains(regions.theme_list, mouse.column, mouse.row) {
+                    let idx = (mouse.row - regions.theme_list.y) as usize;
+                    if idx < regions.theme_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.selected_settings_focus_idx = 0;
+                        self.selected_settings_theme_idx = idx;
+                        if is_double_click {
+                            if let Err(e) = self.activate_selected_settings_row() {
+                                self.notifications
+                                    .push(Notification::warning(format!("Couldn't apply: {}", e)));
+                            }
+                        }
+                    }
+                } else if HitRegions::contains(regions.alerts_panel, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.alerts_panel.y) as usize;
+                    if row < regions.alerts_row_count {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.selected_settings_focus_idx = 1 + row;
+                        if is_double_click {
+                            if let Err(e) = self.activate_selected_settings_row() {
+                                self.notifications.push(Notification::warning(format!(
+                                    "Couldn't toggle: {}",
+                                    e
+                                )));
+                            }
+                        }
+                    }
+                } else if HitRegions::contains(regions.oath_panel, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.oath_panel.y) as usize;
+                    if row < regions.oath_row_count {
+                        self.selected_settings_focus_idx = 6 + row;
+                    }
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Cycles
+            // whichever row/theme is currently focused — same as Up/Down —
+            // regardless of where over the screen the wheel was used, same
+            // convention as Great Chronicle/Library.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                self.cycle_selected_settings_row(matches!(mouse.kind, MouseEventKind::ScrollDown));
+            }
+            _ => {}
+        }
+    }
+
+    /// Confirms the Sync screen's "Press [Enter] to Sync Now" CTA — shared
+    /// by the Enter keybinding and a click on that row.
+    fn activate_sync_now(&mut self) {
+        if self.config.sync_enabled {
+            self.start_forced_sync();
+        } else {
+            self.sync_status_msg = "Cloud Sync disabled — local data only".to_string();
+        }
+    }
+
+    /// Toggles Cloud Sync — shared by the s/S keybinding and a click on the
+    /// "Cloud Sync: ... [s] toggle" row.
+    fn toggle_cloud_sync_enabled(&mut self) -> Result<()> {
+        self.config.sync_enabled = !self.config.sync_enabled;
+        #[cfg(not(test))]
+        self.config.save()?;
+        self.sync_status_msg = if self.config.sync_enabled {
+            "Cloud Sync Enabled — press Enter to sync".to_string()
+        } else {
+            "Cloud Sync Disabled — Questline is local-only".to_string()
+        };
+        self.notifications
+            .push(Notification::info(self.sync_status_msg.clone()));
+        Ok(())
+    }
+
+    /// Toggles Auto Sync — shared by the a/A keybinding and a click on the
+    /// "Auto Sync: ... [a] toggle" row.
+    fn toggle_auto_sync(&mut self) {
+        self.auto_sync = !self.auto_sync;
+        let _ = self
+            .db
+            .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
+        self.sync_status_msg = format!(
+            "Auto Sync {}",
+            if self.auto_sync { "Enabled" } else { "Disabled" }
+        );
+    }
+
+    /// Cycles whichever Character pane `character_focus` currently points
+    /// at (Adventure Log entry, Reflection row, or the Reflection detail
+    /// scroll) by one step. Mirrors the Up/Down key arm gated on
+    /// ActiveScreen::Character, and is shared with it so keyboard and
+    /// mouse can't drift apart.
+    fn cycle_character_focus_pane(&mut self, forward: bool) {
+        match self.character_focus {
+            0 => {
+                let entries = self.db.get_chronicle_entries().unwrap_or_default();
+                if entries.is_empty() {
+                    return;
+                }
+                self.selected_chronicle_idx = if forward {
+                    (self.selected_chronicle_idx + 1) % entries.len()
+                } else if self.selected_chronicle_idx > 0 {
+                    self.selected_chronicle_idx - 1
+                } else {
+                    entries.len() - 1
+                };
+            }
+            1 => {
+                let reflections = self.db.get_reflections().unwrap_or_default();
+                if reflections.is_empty() {
+                    return;
+                }
+                self.selected_reflection_idx = if forward {
+                    (self.selected_reflection_idx + 1) % reflections.len()
+                } else if self.selected_reflection_idx > 0 {
+                    self.selected_reflection_idx - 1
+                } else {
+                    reflections.len() - 1
+                };
+                self.reflection_detail_scroll = 0;
+            }
+            2 => {
+                if forward {
+                    self.reflection_detail_scroll += 1;
+                } else if self.reflection_detail_scroll > 0 {
+                    self.reflection_detail_scroll -= 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_character_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.character.clone() else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
+                    let row = (mouse.row - regions.adventure_log.y) as usize;
+                    if let Some(entry_idx) = regions.adventure_log_rows.get(row) {
+                        self.character_focus = 0;
+                        self.selected_chronicle_idx = *entry_idx;
+                    }
+                    return;
+                }
+                if let Some(list) = regions.reflections_list
+                    && HitRegions::contains(list, mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    let idx = (mouse.row - list.y) as usize;
+                    if idx < regions.reflections_count {
+                        self.character_focus = if is_double_click { 2 } else { 1 };
+                        self.selected_reflection_idx = idx;
+                    }
+                    return;
+                }
+                if let Some(detail) = regions.reflection_detail
+                    && HitRegions::contains(detail, mouse.column, mouse.row)
+                {
+                    self.character_focus = 2;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. Unlike
+            // Focus/Settings, Character's 3 panes are disjoint screen
+            // areas, so the wheel targets whichever one the cursor is over
+            // — moving focus there first, same as a click would — then
+            // cycles it exactly like Up/Down/'k'/'j' already do.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if HitRegions::contains(regions.adventure_log, mouse.column, mouse.row) {
+                    self.character_focus = 0;
+                } else if let Some(list) = regions.reflections_list
+                    && HitRegions::contains(list, mouse.column, mouse.row)
+                {
+                    self.character_focus = 1;
+                } else if let Some(detail) = regions.reflection_detail
+                    && HitRegions::contains(detail, mouse.column, mouse.row)
+                {
+                    self.character_focus = 2;
+                } else {
+                    return;
+                }
+                self.cycle_character_focus_pane(matches!(mouse.kind, MouseEventKind::ScrollDown));
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sync_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.sync else {
+            return;
+        };
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        // Each of these activates immediately, same as its keybinding — see
+        // SyncHitRegions for why (unlike Settings) that's fine here.
+        if HitRegions::contains(regions.sync_now, mouse.column, mouse.row) {
+            self.activate_sync_now();
+        } else if HitRegions::contains(regions.cloud_sync_toggle, mouse.column, mouse.row) {
+            if let Err(e) = self.toggle_cloud_sync_enabled() {
+                self.notifications.push(Notification::warning(format!(
+                    "Failed to save Cloud Sync setting: {}",
+                    e
+                )));
+            }
+        } else if HitRegions::contains(regions.auto_sync_toggle, mouse.column, mouse.row) {
+            self.toggle_auto_sync();
+        }
+    }
+
+    /// Opens the target of the selected Quest Council notice — jumps to the
+    /// mentioning Chronicle, the Invites tab, the onboarding Campaign, or
+    /// the mentioned Quest, depending on notice type. Mirrors the
+    /// KeyCode::Enter arm's Fellowship tab-6 branch in handle_key_event, and
+    /// is shared with that arm so keyboard and mouse can't drift apart.
+    fn open_selected_council_notice(&mut self) -> Result<()> {
+        let notices = self.council_notices();
+        if let Some(notice) = notices.get(self.selected_notification_idx) {
+            self.db.mark_notification_read(&notice.0)?;
+            match notice.1.as_str() {
+                "chronicle_mention" => {
+                    if let Some(project_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        let shared = self
+                            .projects
+                            .iter()
+                            .filter(|project| project.is_shared)
+                            .collect::<Vec<_>>();
+                        if let Some(index) =
+                            shared.iter().position(|project| project.id == project_id)
+                        {
+                            self.selected_fellowship_project_idx = index;
+                            self.selected_fellowship_tab = 0;
+                            self.fellowship_focus_left = false;
+                        }
+                    }
+                }
+                "invitation" => {
+                    self.selected_fellowship_tab = 1;
+                    self.selected_invitation_idx = 0;
+                }
+                "onboarding" => {
+                    if let Some(project_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        self.active_project_id = Some(project_id);
+                        self.active_screen = ActiveScreen::Workspace;
+                        self.workspace_tab_idx = 0;
+                        self.workspace_sidebar_focused = false;
+                        self.reload_data()?;
+                    }
+                }
+                _ => {
+                    if let Some(task_id) = notice
+                        .4
+                        .as_deref()
+                        .and_then(|target| Uuid::parse_str(target).ok())
+                    {
+                        let _ = self.open_quest_in_workspace(task_id)?;
+                    } else {
+                        self.reload_data()?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens the selected "My Quests" row's task in the Workspace. Mirrors
+    /// the KeyCode::Enter arm's Fellowship tab-5 branch in handle_key_event.
+    fn open_selected_my_quest(&mut self) -> Result<()> {
+        let assigned = self
+            .db
+            .get_task_ids_assigned_to(&self.identity.public_key)
+            .unwrap_or_default();
+        if let Some(task_id) = assigned.get(self.selected_my_quest_idx) {
+            if let Ok(task_uuid) = Uuid::parse_str(task_id) {
+                let _ = self.open_quest_in_workspace(task_uuid)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Accepts the selected Fellowship invitation if it's still Pending:
+    /// decrypts its envelope, confirms acceptance with the server, and
+    /// inserts the resulting shared project locally. Mirrors the
+    /// KeyCode::Enter arm's Fellowship tab-1 branch in handle_key_event.
+    fn accept_selected_fellowship_invitation(&mut self) -> Result<()> {
+        let invites = self.db.get_invitations().unwrap_or_default();
+        if invites.is_empty() || self.selected_invitation_idx >= invites.len() {
+            return Ok(());
+        }
+        let invite = invites[self.selected_invitation_idx].clone();
+        if invite.7 != "Pending" {
+            return Ok(());
+        }
+        if !self.config.sync_enabled {
+            self.notifications.push(Notification::warning(
+                "Enable Cloud Sync before accepting a Fellowship invitation.".to_string(),
+            ));
+            return Ok(());
+        }
+
+        // Authenticate and decrypt the locally cached envelope before the
+        // server changes its state. A corrupt invitation therefore remains
+        // Pending and can be retried after a clean download.
+        let validated = (|| -> Result<_> {
+            let encrypted = self
+                .db
+                .get_encrypted_invitation(&invite.0)?
+                .ok_or_else(|| anyhow::anyhow!("Invitation is missing locally"))?;
+            if encrypted.routing_id.is_empty()
+                || encrypted.inviter_encryption_key.is_empty()
+                || encrypted.key_nonce.is_empty()
+                || encrypted.key_ciphertext.is_empty()
+                || encrypted.project_name_nonce.is_empty()
+                || encrypted.project_name_ciphertext.is_empty()
+                || encrypted.project_id_nonce.is_empty()
+                || encrypted.project_id_ciphertext.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Invitation does not contain a complete encrypted envelope"
+                ));
+            }
+            let key = crate::services::encryption::unwrap_project_key(
+                &self.identity,
+                &encrypted.inviter_encryption_key,
+                &encrypted.routing_id,
+                &encrypted.key_nonce,
+                &encrypted.key_ciphertext,
+            )?;
+            let project_id = crate::services::encryption::decrypt_project_payload(
+                &key,
+                &encrypted.project_id_nonce,
+                &encrypted.project_id_ciphertext,
+                &format!("questline/fellowship/id/v1/{}", encrypted.routing_id),
+            )?;
+            let project_uuid = Uuid::parse_str(&project_id)
+                .map_err(|_| anyhow::anyhow!("Invitation contains an invalid project ID"))?;
+            let project_name = crate::services::encryption::decrypt_project_payload(
+                &key,
+                &encrypted.project_name_nonce,
+                &encrypted.project_name_ciphertext,
+                &format!("questline/fellowship/name/v1/{}", encrypted.routing_id),
+            )?;
+            if project_name.trim().is_empty() {
+                return Err(anyhow::anyhow!("Invitation contains an empty project name"));
+            }
+            Ok((encrypted, key, project_uuid, project_name))
+        })();
+        let (encrypted, project_key, project_uuid, restored_project_name) = match validated {
+            Ok(value) => value,
+            Err(error) => {
+                self.notifications.push(Notification::warning(format!(
+                    "Invitation remains pending: {error}"
+                )));
+                return Ok(());
+            }
+        };
+        let restored_project_id = project_uuid.to_string();
+
+        let client = crate::services::api_client::ApiClient::new(
+            &self.server_url,
+            self.identity.clone(),
+            &self.device_id,
+        );
+        let my_username = self
+            .user
+            .as_ref()
+            .map(|u| u.username.clone())
+            .unwrap_or_default();
+        let body = serde_json::json!({
+            "invite_id": invite.0,
+            "username": my_username
+        })
+        .to_string();
+        let response = client.send_request("POST", "accept", &body)?;
+        let accepted: serde_json::Value = serde_json::from_str(&response)?;
+        if accepted["status"].as_str() != Some("success") {
+            return Err(anyhow::anyhow!(
+                "Server did not confirm invitation acceptance"
+            ));
+        }
+
+        let new_proj = Project {
+            id: project_uuid,
+            name: restored_project_name.clone(),
+            description: Some("Fellowship shared project".to_string()),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: Some(invite.3.clone()),
+            owner_username: Some(invite.4.clone()),
+            is_shared: true,
+        };
+        if let Some(mut existing) = self
+            .db
+            .get_projects()?
+            .into_iter()
+            .find(|project| project.id == project_uuid)
+        {
+            existing.name = restored_project_name.clone();
+            existing.owner_identity = Some(invite.3.clone());
+            existing.owner_username = Some(invite.4.clone());
+            existing.is_shared = true;
+            self.db.update_project(&existing)?;
+        } else {
+            self.db.insert_project(&new_proj)?;
+        }
+        self.db.save_project_encryption_key(
+            &restored_project_id,
+            &encrypted.routing_id,
+            &project_key,
+        )?;
+        self.db.add_project_member(
+            &restored_project_id,
+            &invite.3,
+            &invite.4,
+            "Owner",
+        )?;
+        self.db.add_project_member(
+            &restored_project_id,
+            &self.identity.public_key,
+            &my_username,
+            &invite.6,
+        )?;
+        self.db.update_invitation_status(&invite.0, "Accepted")?;
+
+        if self
+            .db
+            .get_setting("fellowship_onboarding_offered")?
+            .is_none()
+        {
+            self.db.create_notification_once(
+                "fellowship:onboarding:first-campaign",
+                "onboarding",
+                "Fellowship Field Guide",
+                "Verify Companion Keys · assign a Quest · choose its stance · convene the Quest Council · test offline sync.",
+                Some(&restored_project_id),
+            )?;
+            self.db
+                .set_setting("fellowship_onboarding_offered", "true")?;
+        }
+
+        let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
+
+        self.notifications.push(Notification::info(format!(
+            "Accepted invitation to '{}'",
+            restored_project_name
+        )));
+
+        let shared_projs_count = self.projects.iter().filter(|p| p.is_shared).count() + 1;
+        if shared_projs_count >= 25 {
+            let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'alliance_builder' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
+        }
+
+        self.mark_dirty();
+        self.reload_data()?;
+        // Pull the inviter's encrypted snapshot immediately instead of
+        // leaving an accepted Campaign empty until the next auto-sync.
+        self.start_background_sync();
+        Ok(())
+    }
+
+    /// Marks the selected notification read on Fellowship's Chat-tab
+    /// no-shared-campaigns fallback list. Mirrors the KeyCode::Enter arm's
+    /// Fellowship tab-0 branch in handle_key_event.
+    fn open_selected_fellowship_notification(&mut self) -> Result<()> {
+        let notifications = self.db.get_notifications().unwrap_or_default();
+        if !notifications.is_empty() && self.selected_notification_idx < notifications.len() {
+            let notif = &notifications[self.selected_notification_idx];
+            self.db.mark_notification_read(&notif.0)?;
+            self.reload_data()?;
+        }
+        Ok(())
+    }
+
+    /// Cycles Fellowship's currently visible sub-list — the active tab's
+    /// own list (Invitations/Companions/My Quests/Council), or (for tabs
+    /// without one of their own — Chat when no Campaign is shared yet,
+    /// Activity, Search, Treasury) the shared Campaign list, delegated to
+    /// cycle_fellowship_project_selection. Mirrors the Up/Down key arm
+    /// gated on ActiveScreen::Fellowship in handle_key_event (excluding
+    /// Chat message browsing, which cycle_fellowship_chat_message owns
+    /// separately), and is shared with it so keyboard and mouse can't
+    /// drift apart.
+    fn cycle_fellowship_selection(&mut self, forward: bool) {
+        if self.selected_fellowship_tab == 6 {
+            let notices = self.council_notices();
+            if notices.is_empty() {
+                return;
+            }
+            self.selected_notification_idx = if forward {
+                (self.selected_notification_idx + 1) % notices.len()
+            } else {
+                self.selected_notification_idx
+                    .checked_sub(1)
+                    .unwrap_or(notices.len() - 1)
+            };
+        } else if self.selected_fellowship_tab == 5 {
+            let assigned = self
+                .db
+                .get_task_ids_assigned_to(&self.identity.public_key)
+                .unwrap_or_default();
+            if assigned.is_empty() {
+                return;
+            }
+            self.selected_my_quest_idx = if forward {
+                (self.selected_my_quest_idx + 1) % assigned.len()
+            } else {
+                self.selected_my_quest_idx
+                    .checked_sub(1)
+                    .unwrap_or(assigned.len() - 1)
+            };
+        } else if self.selected_fellowship_tab == 1 {
+            let invites = self.db.get_invitations().unwrap_or_default();
+            if invites.is_empty() {
+                return;
+            }
+            self.selected_invitation_idx = if forward {
+                (self.selected_invitation_idx + 1) % invites.len()
+            } else if self.selected_invitation_idx > 0 {
+                self.selected_invitation_idx - 1
+            } else {
+                invites.len() - 1
+            };
+        } else if self.selected_fellowship_tab == 2 {
+            let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+            if let Some(project) = shared.get(self.selected_fellowship_project_idx) {
+                let members = self
+                    .db
+                    .get_presence_for_project(&project.id.to_string())
+                    .unwrap_or_default();
+                if members.is_empty() {
+                    return;
+                }
+                self.selected_fellowship_member_idx = if forward {
+                    (self.selected_fellowship_member_idx + 1) % members.len()
+                } else {
+                    self.selected_fellowship_member_idx
+                        .checked_sub(1)
+                        .unwrap_or(members.len() - 1)
+                };
+            }
+        } else if self.projects.iter().any(|p| p.is_shared) {
+            self.cycle_fellowship_project_selection(forward);
+        } else if self.selected_fellowship_tab == 0 {
+            let notifications = self.db.get_notifications().unwrap_or_default();
+            if notifications.is_empty() {
+                return;
+            }
+            self.selected_notification_idx = if forward {
+                (self.selected_notification_idx + 1) % notifications.len()
+            } else if self.selected_notification_idx > 0 {
+                self.selected_notification_idx - 1
+            } else {
+                notifications.len() - 1
+            };
+        }
+    }
+
+    /// Cycles the shared Campaign list on Fellowship's left panel —
+    /// tab-independent, since that list is always visible regardless of
+    /// which tab is active. Mirrors the Up/Down key arm's fallback branch
+    /// (tabs without their own sub-list) in handle_key_event, and is
+    /// shared with it — via cycle_fellowship_selection — so keyboard and
+    /// mouse can't drift apart.
+    fn cycle_fellowship_project_selection(&mut self, forward: bool) {
+        let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+        if shared_projects.is_empty() {
+            return;
+        }
+        let new_idx = if forward {
+            (self.selected_fellowship_project_idx + 1) % shared_projects.len()
+        } else if self.selected_fellowship_project_idx > 0 {
+            self.selected_fellowship_project_idx - 1
+        } else {
+            shared_projects.len() - 1
+        };
+        if new_idx != self.selected_fellowship_project_idx {
+            self.fellowship_selected_msg_idx = usize::MAX;
+            self.fellowship_chat_input.clear();
+            self.fellowship_composing = false;
+        }
+        self.selected_fellowship_project_idx = new_idx;
+    }
+
+    /// Moves the Chat tab's browsed-message cursor, entering "browsing"
+    /// from the bottom on Up, and leaving it (back to "not browsing" / stick
+    /// to the latest message) on Down past the last message. Down/scroll-
+    /// down while not browsing is a no-op, same as the keyboard. Mirrors
+    /// the Up/Down arm in handle_fellowship_chat_key, and is shared with it
+    /// so keyboard and mouse can't drift apart.
+    fn cycle_fellowship_chat_message(&mut self, forward: bool) {
+        let msgs = self.fellowship_current_messages();
+        if msgs.is_empty() {
+            return;
+        }
+        let browsing = self.fellowship_selected_msg_idx != usize::MAX;
+        if forward {
+            if browsing {
+                if self.fellowship_selected_msg_idx + 1 >= msgs.len() {
+                    self.fellowship_selected_msg_idx = usize::MAX;
+                } else {
+                    self.fellowship_selected_msg_idx += 1;
+                }
+            }
+        } else {
+            self.fellowship_selected_msg_idx = if browsing && self.fellowship_selected_msg_idx > 0
+            {
+                self.fellowship_selected_msg_idx - 1
+            } else {
+                msgs.len() - 1
+            };
+        }
+    }
+
+    fn handle_fellowship_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Non-Copy (holds a Vec) — clone the small per-frame snapshot out
+        // rather than holding a borrow of self across the mutations below.
+        let Some(regions) = self.hit_regions.fellowship.clone() else {
+            return;
+        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = regions
+                    .tabs
+                    .iter()
+                    .position(|r| HitRegions::contains(*r, mouse.column, mouse.row))
+                {
+                    self.activate_fellowship_tab(idx);
+                    return;
+                }
+
+                // The active tab's sub-list takes priority when both it and
+                // the left campaign list could contain the click — in
+                // practice they never overlap (left panel vs. right panel),
+                // but check sub_list first anyway since it's what the user
+                // is more likely aiming at.
+                if let Some(sub_list) = &regions.sub_list {
+                    use crate::screens::hit_test::FellowshipSubList;
+                    match sub_list {
+                        FellowshipSubList::Uniform(list) => {
+                            if let Some(idx) = list.row_index(mouse.column, mouse.row) {
+                                let is_double_click =
+                                    self.register_click_run(mouse.column, mouse.row) >= 2;
+                                self.select_fellowship_sub_list_row(idx);
+                                // Mirrors the KeyCode::Enter arm's Fellowship
+                                // dispatch in handle_key_event — tabs with no
+                                // keyboard "open" action (Companions, and
+                                // Chat once a Campaign is shared) fall
+                                // through to Ok(()), a no-op beyond select.
+                                if is_double_click {
+                                    let result = match self.selected_fellowship_tab {
+                                        6 => self.open_selected_council_notice(),
+                                        5 => self.open_selected_my_quest(),
+                                        1 => self.accept_selected_fellowship_invitation(),
+                                        0 if self.projects.iter().filter(|p| p.is_shared).count()
+                                            == 0 =>
+                                        {
+                                            self.open_selected_fellowship_notification()
+                                        }
+                                        _ => Ok(()),
+                                    };
+                                    if let Err(e) = result {
+                                        self.notifications.push(Notification::warning(format!(
+                                            "Couldn't open: {}",
+                                            e
+                                        )));
+                                    }
+                                }
+                            }
+                            return;
+                        }
+                        FellowshipSubList::Chat(chat) => {
+                            if HitRegions::contains(chat.area, mouse.column, mouse.row) {
+                                let logical_line = chat.scroll + (mouse.row - chat.area.y);
+                                // Largest message index whose start line is
+                                // still <= the clicked line —
+                                // partition_point finds the first index
+                                // where the predicate flips false, so
+                                // subtracting 1 gives the last index where
+                                // it held.
+                                let msg_idx = chat
+                                    .msg_start_lines
+                                    .partition_point(|&start| start <= logical_line);
+                                if msg_idx > 0 && msg_idx <= chat.message_count {
+                                    self.fellowship_selected_msg_idx = msg_idx - 1;
+                                }
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                if let Some(list) = regions.left_list
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.fellowship_focus_left = true;
+                    self.selected_fellowship_project_idx = idx;
+                }
+            }
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The left
+            // Campaign list is always visible regardless of tab, so it
+            // takes priority (same as clicks effectively do, since the two
+            // panels never overlap) and always cycles the Campaign list
+            // itself, tab-independent — never whatever the active tab's own
+            // sub-list happens to be.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let forward = matches!(mouse.kind, MouseEventKind::ScrollDown);
+                if let Some(list) = regions.left_list
+                    && HitRegions::contains(list.area, mouse.column, mouse.row)
+                {
+                    self.cycle_fellowship_project_selection(forward);
+                    return;
+                }
+                if let Some(sub_list) = &regions.sub_list {
+                    use crate::screens::hit_test::FellowshipSubList;
+                    match sub_list {
+                        FellowshipSubList::Uniform(_) => self.cycle_fellowship_selection(forward),
+                        FellowshipSubList::Chat(chat) => {
+                            if HitRegions::contains(chat.area, mouse.column, mouse.row) {
+                                self.cycle_fellowship_chat_message(forward);
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Applies a click on the active Fellowship tab's uniform-row sub-list
+    /// to whichever selection index that tab uses.
+    fn select_fellowship_sub_list_row(&mut self, idx: usize) {
+        match self.selected_fellowship_tab {
+            0 | 6 => self.selected_notification_idx = idx, // Chat's no-campaigns fallback shares this field with Council
+            1 => self.selected_invitation_idx = idx,
+            2 => self.selected_fellowship_member_idx = idx,
+            5 => self.selected_my_quest_idx = idx,
+            _ => {}
+        }
+    }
+
+    /// Switches to Fellowship tab `idx`, resetting whatever that tab's own
+    /// keyboard shortcut (c/i/p/a//,y,b,t) resets when it switches there —
+    /// except 'a', whose shortcut doubles as "mark all read" when already on
+    /// an empty Chat tab. That's a context-dependent overload of the *key*,
+    /// not something a click on the Activity tab should also trigger, so
+    /// this only ever switches tabs, deliberately not sharing code with that
+    /// keybinding's handler.
+    fn activate_fellowship_tab(&mut self, idx: usize) {
+        self.selected_fellowship_tab = idx;
+        match idx {
+            0 => {
+                self.fellowship_focus_left = false;
+                self.fellowship_composing = false;
+            }
+            4 => {
+                self.modal_state = ModalType::SearchMessages {
+                    query: String::new(),
+                };
+            }
+            5 => self.selected_my_quest_idx = 0,
+            6 => self.selected_notification_idx = 0,
+            _ => {}
+        }
+    }
+
+    /// Opens the selected Ledger/Kanban task — drilling into its subtasks
+    /// if it's a top-level task with the Kanban board open and no step
+    /// already open, otherwise opening its edit modal. `allow_drill` mirrors
+    /// the `key.code == KeyCode::Enter` gate in handle_workspace_key's
+    /// Enter/'e' arm ('e' never drills; only Enter and double-click can).
+    fn open_or_drill_selected_workspace_task(&mut self, allow_drill: bool) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let all_tasks = self.all_tasks.clone();
+        let mut proj_tasks = visible_workspace_tasks(
+            &all_tasks,
+            p_id,
+            self.viewing_step_for_task,
+            &self.task_filter,
+            &self.task_sort,
+            &self.search_query,
+            Some(&self.db),
+            &self.identity.public_key,
+        );
+        if self.quest_board_open && self.viewing_step_for_task.is_none() {
+            proj_tasks.retain(|task| task.parent_task_id.is_none());
+        }
+        if proj_tasks.is_empty() || self.selected_task_idx >= proj_tasks.len() {
+            return Ok(());
+        }
+        // A step focused inline on a Kanban card (`kanban_step_idx`) has
+        // nothing further to drill into — Enter opens its edit modal
+        // directly, same as Enter on any step in the Ledger list view.
+        let focused_step = if self.quest_board_open && self.viewing_step_for_task.is_none() {
+            self.kanban_step_idx.and_then(|idx| {
+                self.all_tasks
+                    .iter()
+                    .filter(|task| task.parent_task_id == Some(proj_tasks[self.selected_task_idx].id))
+                    .nth(idx)
+                    .cloned()
+            })
+        } else {
+            None
+        };
+        let t = focused_step
+            .as_ref()
+            .unwrap_or(&proj_tasks[self.selected_task_idx]);
+        if allow_drill
+            && self.quest_board_open
+            && self.viewing_step_for_task.is_none()
+            && t.parent_task_id.is_none()
+        {
+            self.viewing_step_for_task = Some(t.id);
+            self.selected_task_idx = 0;
+            self.kanban_step_idx = None;
+        } else {
+            self.modal_state = edit_task_modal_from_task(t);
+        }
+        Ok(())
+    }
+
+    /// Opens the selected Scrolls/Notes-tab row: an actual note opens it in
+    /// the Editor (unless it's a read-only shared note, which surfaces the
+    /// existing sealed-note warning instead), a codex header toggles its
+    /// collapsed state. Mirrors what pressing Enter does in
+    /// handle_workspace_key's tab-1 branch — renaming a codex header via 'e'
+    /// stays a separate, keyboard-only action there, since a double-click
+    /// should behave like Enter, not 'e'.
+    fn open_selected_workspace_scroll(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let proj_notes: Vec<Note> = self
+            .all_notes
+            .iter()
+            .filter(|n| {
+                n.project_id == Some(p_id)
+                    || (n.project_id.is_none()
+                        && n.codex_id
+                            .map(|codex_id| {
+                                self.codices
+                                    .iter()
+                                    .any(|c| c.id == codex_id && c.project_id == p_id)
+                            })
+                            .unwrap_or(true))
+            })
+            .filter(|n| {
+                if !self.search_query.is_empty() {
+                    n.title
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+        match flat.get(self.selected_notes_flat_idx) {
+            Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
+                let n = &proj_notes[*note_idx];
+                let is_mine = n
+                    .owner_identity
+                    .as_deref()
+                    .map(|oi| oi == self.identity.public_key.as_str())
+                    .unwrap_or(true);
+                if n.sharing_permission == "read_only" && !is_mine {
+                    self.notifications.push(Notification::warning(
+                        "This scroll is sealed — you may read but not inscribe.".to_string(),
+                    ));
+                    return Ok(());
+                }
+                let mut state =
+                    EditorState::new(p_id, Some(n.id), n.title.clone(), n.markdown_content.clone());
+                state.codex_id = n.codex_id;
+                self.editor_state = Some(state);
+                self.active_screen = ActiveScreen::Editor;
+            }
+            Some((Some(codex_id), None)) => {
+                let cid = *codex_id;
+                if let Some(codex) = self.codices.iter_mut().find(|c| c.id == cid) {
+                    codex.collapsed = !codex.collapsed;
+                    let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
+                }
+                let new_flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                if self.selected_notes_flat_idx >= new_flat.len() {
+                    self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Opens the selected Chronicle-tab (journal) entry's edit modal — 'e'
+    /// is this tab's only keyboard "open" key, plain Enter does nothing here,
+    /// same convention as Treasury below. Only the entry's own author may
+    /// edit it (there's no owner_identity on JournalEntry, only
+    /// author_username, since shared-project collaborators can each write
+    /// their own entries) — anyone else gets a warning and the modal stays
+    /// closed, mirroring the read_only Notes guard in
+    /// open_selected_workspace_scroll above.
+    fn open_selected_journal_entry(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let proj_journals: Vec<JournalEntry> = self
+            .all_journals
+            .iter()
+            .filter(|j| j.project_id == p_id)
+            .filter(|j| {
+                if !self.search_query.is_empty() {
+                    j.content
+                        .to_lowercase()
+                        .contains(&self.search_query.to_lowercase())
+                } else {
+                    true
+                }
+            })
+            .cloned()
+            .collect();
+        let Some(entry) = proj_journals.get(self.selected_journal_idx) else {
+            return Ok(());
+        };
+        let my_username = self.user.as_ref().map(|u| u.username.as_str()).unwrap_or("");
+        if entry.author_username != my_username {
+            self.notifications.push(Notification::warning(
+                "This chronicle entry isn't yours to rewrite.".to_string(),
+            ));
+            return Ok(());
+        }
+        self.modal_state = ModalType::NewJournalEntry {
+            entry_id: Some(entry.id),
+            content: entry.content.clone(),
+        };
+        Ok(())
+    }
+
+    /// Opens the selected Treasury-tab ledger entry's edit modal, subject to
+    /// the same permission check as the keyboard path. Mirrors the
+    /// KeyCode::Char('e') arm's tab-4 branch in handle_workspace_key — 'e'
+    /// is Treasury's only keyboard "open" key (plain Enter does nothing on
+    /// this tab), so double-click mirrors 'e' here rather than Enter.
+    fn open_selected_treasury_entry(&mut self) -> Result<()> {
+        let Some(p_id) = self.active_project_id else {
+            return Ok(());
+        };
+        let selected = crate::services::TreasuryService::new(&self.db)
+            .entries(p_id, &self.treasury_filter, self.treasury_sort)?
+            .get(self.selected_treasury_idx)
+            .cloned();
+        let Some(entry) = selected else {
+            return Ok(());
+        };
+        let (mine, status) = crate::services::treasury_policy::TreasuryAction::for_entry(
+            &entry,
+            &self.identity.public_key,
+        );
+        if !self.treasury_allows(
+            p_id,
+            crate::services::treasury_policy::TreasuryAction::EditEntry { mine, status },
+        ) {
+            return Ok(());
+        }
+        let categories = crate::services::TreasuryService::new(&self.db).categories(p_id)?;
+        let amount = crate::services::treasury::format_minor(entry.amount_minor);
+        self.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(entry.id),
+            title_cursor: entry.title.len(),
+            title: entry.title.clone(),
+            amount_cursor: amount.len(),
+            amount,
+            entry_type_idx: match entry.entry_type {
+                crate::models::LedgerEntryType::Income => 0,
+                crate::models::LedgerEntryType::Expense => 1,
+                crate::models::LedgerEntryType::Transfer => 2,
+                crate::models::LedgerEntryType::Adjustment => 3,
+            },
+            status_idx: match entry.status {
+                crate::models::LedgerStatus::Planned => 0,
+                crate::models::LedgerStatus::Approved => 1,
+                crate::models::LedgerStatus::Paid => 2,
+                crate::models::LedgerStatus::Cancelled => 3,
+            },
+            category_idx: categories
+                .iter()
+                .position(|category| category.id == entry.category_id)
+                .unwrap_or(0),
+            date_val: entry
+                .created_at
+                .with_timezone(&Local)
+                .format("%Y-%m-%d")
+                .to_string(),
+            focus_idx: 0,
+        };
+        Ok(())
+    }
+
+    /// Abre en el navegador un enlace clickeado en el preview de un scroll.
+    ///
+    /// El spawn real se omite bajo `cfg(test)`: los tests de mouse hacen clicks de
+    /// verdad y no deberían abrir ventanas del navegador durante `cargo test`. Fuera
+    /// de test, el toast refleja si algún lanzador realmente se pudo ejecutar en vez
+    /// de asumir éxito — `open_url` puede fallar silenciosamente (p. ej. WSL sin
+    /// `xdg-open`) y antes eso quedaba invisible para el usuario.
+    fn open_scroll_link(&mut self, url: &str) {
+        #[cfg(not(test))]
+        {
+            if open_url(url) {
+                self.notifications
+                    .push(Notification::info(format!("Opening {}", url)));
+            } else {
+                self.notifications.push(Notification::warning(format!(
+                    "Couldn't open {} — no browser launcher found",
+                    url
+                )));
+            }
+        }
+        #[cfg(test)]
+        self.notifications
+            .push(Notification::info(format!("Opening {}", url)));
+    }
+
+    fn handle_workspace_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        // Mirrors handle_workspace_key: while the shortcut codex overlay is
+        // open, only Esc/'?' do anything — a click shouldn't reach the
+        // sidebar or content underneath it.
+        if self.workspace_help_open {
+            return;
+        }
+        // Non-Copy (each per-tab list holds a Vec) — clone the small
+        // per-frame snapshot out rather than holding a borrow of self
+        // across the mutations below.
+        let Some(regions) = self.hit_regions.workspace.clone() else {
+            return;
+        };
+
+        if let MouseEventKind::ScrollUp | MouseEventKind::ScrollDown = mouse.kind {
+            // Moved here (instead of handle_generic_scroll_mouse) so click
+            // and scroll share one dispatch arm for this screen. The
+            // sidebar and the Scrolls tab's preview pane are their own
+            // scroll targets (moving focus there first, same as a click
+            // would); anywhere else scrolls whichever list the active tab
+            // is currently showing — same as Up/Down/'k'/'j' already do.
+            let forward = matches!(mouse.kind, MouseEventKind::ScrollDown);
+            if HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+                self.workspace_sidebar_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
+            if let Some(notes) = &regions.notes
+                && let Some(preview) = notes.preview
+                && HitRegions::contains(preview, mouse.column, mouse.row)
+            {
+                self.note_preview_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
+            if let Some(ledger) = regions.ledger
+                && HitRegions::contains(ledger, mouse.column, mouse.row)
+            {
+                self.quest_ledger_focused = true;
+                self.cycle_workspace_selection(forward);
+                return;
+            }
+            self.workspace_sidebar_focused = false;
+            self.note_preview_focused = false;
+            self.quest_ledger_focused = false;
+            self.cycle_workspace_selection(forward);
+            return;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+
+        if HitRegions::contains(regions.sidebar, mouse.column, mouse.row) {
+            let row = (mouse.row - regions.sidebar.y) as usize;
+            if let Some(&tab_idx) = regions.sidebar_tab_order.get(row) {
+                self.activate_workspace_tab(tab_idx);
+            }
+            return;
+        }
+
+        // Each tab's own content list, active_tab-gated the same way
+        // selected_item_idx is picked in project_workspace::draw — a click
+        // both selects the row and moves focus off the sidebar, mirroring
+        // every other content click in this file.
+        match self.workspace_tab_idx {
+            // Kanban mode (quest_board_open) and the list view are mutually
+            // exclusive per frame — at most one of the two fields is Some.
+            0 => {
+                if let Some(kanban) = &regions.kanban
+                    && let Some(row) = kanban
+                        .columns
+                        .iter()
+                        .find_map(|col| col.row_at(mouse.column, mouse.row))
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_task_idx = row.task_idx;
+                    self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = false;
+                    self.quest_ledger_scroll = 0;
+                    // A click lands on either the card's header or one of
+                    // its step rows — `row.step_idx` already carries exactly
+                    // what `kanban_step_idx` means, so assign it straight
+                    // through instead of always focusing the header.
+                    self.kanban_step_idx = row.step_idx;
+                    if is_double_click {
+                        if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
+                } else if let Some(list) = &regions.tasks
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_task_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = false;
+                    self.quest_ledger_scroll = 0;
+                    if is_double_click {
+                        if let Err(e) = self.open_or_drill_selected_workspace_task(true) {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
+                } else if let Some(ledger) = regions.ledger
+                    && HitRegions::contains(ledger, mouse.column, mouse.row)
+                {
+                    self.workspace_sidebar_focused = false;
+                    self.quest_ledger_focused = true;
+                }
+            }
+            1 => {
+                if let Some(notes) = &regions.notes {
+                    if let Some(idx) = notes.list.row_index(mouse.column, mouse.row) {
+                        let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                        self.selected_notes_flat_idx = idx;
+                        self.workspace_sidebar_focused = false;
+                        self.note_preview_focused = false;
+                        if is_double_click {
+                            if let Err(e) = self.open_selected_workspace_scroll() {
+                                self.notifications
+                                    .push(Notification::warning(format!("Couldn't open: {}", e)));
+                            }
+                        }
+                    } else if let Some(preview) = notes.preview
+                        && HitRegions::contains(preview, mouse.column, mouse.row)
+                    {
+                        self.workspace_sidebar_focused = false;
+                        self.note_preview_focused = true;
+                        // Un link sí se activa con un solo click, a diferencia del
+                        // resto del pane: viene subrayado y con la URL al lado, así
+                        // que es un blanco explícito, no una fila más de una lista.
+                        if let Some((_, url)) = notes
+                            .preview_links
+                            .iter()
+                            .find(|(rect, _)| HitRegions::contains(*rect, mouse.column, mouse.row))
+                        {
+                            let url = url.clone();
+                            self.open_scroll_link(&url);
+                        }
+                    }
+                }
+            }
+            2 => {
+                if let Some(list) = &regions.journal
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_journal_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            3 => {
+                if let Some(list) = &regions.milestones
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    self.selected_milestone_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                }
+            }
+            4 => {
+                if let Some(list) = &regions.treasury
+                    && let Some(idx) = list.row_index(mouse.column, mouse.row)
+                {
+                    let is_double_click = self.register_click_run(mouse.column, mouse.row) >= 2;
+                    self.selected_treasury_idx = idx;
+                    self.workspace_sidebar_focused = false;
+                    if is_double_click {
+                        if let Err(e) = self.open_selected_treasury_entry() {
+                            self.notifications
+                                .push(Notification::warning(format!("Couldn't open: {}", e)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
@@ -2685,6 +6703,49 @@ impl App {
             return Ok(());
         }
 
+        // Fellowship sharing must be handled before chat/navigation remapping.
+        // Lowercase `j` remains vim-style Down; v/V are the unambiguous
+        // invitation shortcuts advertised by the Fellowship UI.
+        if self.active_screen == ActiveScreen::Fellowship
+            && self.modal_state == ModalType::None
+            && matches!(key.code, KeyCode::Char('v') | KeyCode::Char('V'))
+        {
+            self.open_fellowship_sharing();
+            return Ok(());
+        }
+
+        // Open the selected Fellowship campaign directly in its Quest Board.
+        // Uppercase K is intentional: lowercase k remains universal Up navigation.
+        if self.active_screen == ActiveScreen::Fellowship
+            && self.modal_state == ModalType::None
+            && !self.fellowship_composing
+            && key.code == KeyCode::Char('K')
+        {
+            let project_id = self
+                .projects
+                .iter()
+                .filter(|project| project.is_shared)
+                .nth(self.selected_fellowship_project_idx)
+                .map(|project| project.id);
+            if let Some(project_id) = project_id {
+                self.active_project_id = Some(project_id);
+                self.active_screen = ActiveScreen::Workspace;
+                self.workspace_tab_idx = 0;
+                self.workspace_sidebar_focused = false;
+                self.quest_board_open = true;
+                self.save_quest_board_preference(project_id);
+                self.viewing_step_for_task = None;
+                self.task_filter = "All".to_string();
+                self.selected_task_idx = 0;
+                self.reload_data()?;
+            } else {
+                self.notifications.push(Notification::info(
+                    "Select a shared Campaign before opening Kanban.".to_string(),
+                ));
+            }
+            return Ok(());
+        }
+
         if self.bug_report_modal.is_some() {
             return self.handle_bug_report_key(key);
         }
@@ -2698,12 +6759,7 @@ impl App {
             }
         }
 
-        let in_text_entry = self.searching
-            || self.modal_state != ModalType::None
-            || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding
-            || self.active_screen == ActiveScreen::Gateway
-            || self.active_screen == ActiveScreen::Restore;
+        let in_text_entry = self.is_in_text_entry();
 
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
@@ -2798,12 +6854,7 @@ impl App {
             return Ok(());
         }
 
-        let in_text_entry = self.searching
-            || self.modal_state != ModalType::None
-            || self.active_screen == ActiveScreen::Editor
-            || self.active_screen == ActiveScreen::Onboarding
-            || self.active_screen == ActiveScreen::Gateway
-            || self.active_screen == ActiveScreen::Restore;
+        let in_text_entry = self.is_in_text_entry();
 
         if !in_text_entry {
             match key.code {
@@ -2872,9 +6923,15 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
-                    // 'm' en Workspace milestones y Fellowship ya está tomado — no cambiar pantalla
+                    // 'm' en el Dashboard cicla el layout en vez de cambiar de pantalla —
+                    // mismo patrón que 'p' unas líneas más abajo.
+                    if self.active_screen == ActiveScreen::Dashboard {
+                        self.cycle_dashboard_layout();
+                        return Ok(());
+                    }
+                    // 'm' en Workspace quests/milestones y Fellowship ya está tomado — no cambiar pantalla
                     if !(self.active_screen == ActiveScreen::Workspace
-                        && self.workspace_tab_idx == 3)
+                        && (self.workspace_tab_idx == 0 || self.workspace_tab_idx == 3))
                         && self.active_screen != ActiveScreen::Fellowship
                     {
                         self.active_screen = ActiveScreen::Soundscapes;
@@ -2890,6 +6947,9 @@ impl App {
                         return Ok(());
                     } else if self.active_screen != ActiveScreen::Fellowship
                         && self.active_screen != ActiveScreen::SyncSettings
+                        // 'p' en la Treasury ya está tomado para saldar un pago
+                        && !(self.active_screen == ActiveScreen::Workspace
+                            && self.workspace_tab_idx == 4)
                     {
                         use crate::audio::SOUNDSCAPES;
                         if self.active_screen == ActiveScreen::Soundscapes
@@ -2903,13 +6963,14 @@ impl App {
                     }
                 }
                 KeyCode::Char('s') => {
-                    // 's' en Character y en Workspace tareas ya está tomado — no detener audio
+                    // 's' en Character y en Workspace tareas/tesorería ya está tomado — no detener audio
                     let is_character_spec = self.active_screen == ActiveScreen::Character;
                     let is_task_sort = self.active_screen == ActiveScreen::Workspace
-                        && self.workspace_tab_idx == 0;
+                        && matches!(self.workspace_tab_idx, 0 | 4);
                     if !is_character_spec
                         && !is_task_sort
                         && self.active_screen != ActiveScreen::Settings
+                        && self.active_screen != ActiveScreen::SyncSettings
                     {
                         self.audio_player.stop();
                         let _ = self.db.set_setting("last_music_source", "Silent");
@@ -3112,6 +7173,17 @@ impl App {
             }
             ActiveScreen::Editor => {
                 self.handle_editor_key(key)?;
+                if let Some(err) = self
+                    .editor_state
+                    .as_mut()
+                    .and_then(|state| state.clipboard_error.take())
+                {
+                    self.sync_status_msg = format!("Yank did not reach clipboard: {}", err);
+                    self.notifications.push(Notification::warning(format!(
+                        "Yank saved in-editor only — couldn't reach the system clipboard: {}",
+                        err
+                    )));
+                }
             }
             ActiveScreen::Workspace => {
                 self.handle_workspace_key(key)?;
@@ -3170,6 +7242,36 @@ impl App {
 
         match self.modal_state {
             ModalType::None => Ok(false),
+            ModalType::CampaignTemplateSelect { selected_idx } => {
+                let count = crate::campaign_templates::TEMPLATES.len();
+                let mut selected = selected_idx.min(count.saturating_sub(1));
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Up => {
+                        selected = selected.checked_sub(1).unwrap_or(count.saturating_sub(1));
+                        self.modal_state = ModalType::CampaignTemplateSelect {
+                            selected_idx: selected,
+                        };
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1) % count.max(1);
+                        self.modal_state = ModalType::CampaignTemplateSelect {
+                            selected_idx: selected,
+                        };
+                    }
+                    KeyCode::Enter if count > 0 => {
+                        let project_id = self.create_campaign_from_template(selected)?;
+                        self.modal_state = ModalType::None;
+                        self.projects_all_selected = false;
+                        self.selected_project_idx = ordered_active_projects(&self.projects)
+                            .iter()
+                            .position(|project| project.id == project_id)
+                            .unwrap_or(0);
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::HydrationReminder => {
                 match key.code {
                     // d = drink and dismiss
@@ -3293,6 +7395,7 @@ impl App {
                                 "hydration_pause_focus",
                                 if chosen_pause { "true" } else { "false" },
                             );
+                            let _ = self.db.queue_hydration_settings_sync();
 
                             // Arm first reminder
                             self.hydration_next_reminder_at = Some(
@@ -3308,6 +7411,7 @@ impl App {
                             self.hydration_enabled = false;
                             self.hydration_next_reminder_at = None;
                             let _ = self.db.set_setting("hydration_enabled", "false");
+                            let _ = self.db.queue_hydration_settings_sync();
                             self.modal_state = ModalType::None;
                             self.notifications
                                 .push(Notification::info("Hydration reminders disabled."));
@@ -3337,6 +7441,29 @@ impl App {
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::EncryptionMigrationPrompt => {
+                match key.code {
+                    KeyCode::Char('m') | KeyCode::Char('M') | KeyCode::Enter => {
+                        self.modal_state = ModalType::None;
+                        self.start_cloud_sync_reset();
+                    }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        self.config.sync_enabled = false;
+                        self.config.save()?;
+                        self.modal_state = ModalType::None;
+                        self.sync_status_msg =
+                            "Cloud Sync Disabled — Questline is local-only".to_string();
+                    }
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                        self.sync_status_msg =
+                            "Encrypted migration deferred; Cloud Sync remains available."
+                                .to_string();
                     }
                     _ => {}
                 }
@@ -3391,6 +7518,34 @@ impl App {
                         self.selected_archive_idx = 0;
                         self.reload_data()?;
                         self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::ConfirmRemoveFellowshipMember {
+                ref project_id,
+                ref member_identity,
+                ..
+            } => {
+                let project_id = project_id.clone();
+                let member_identity = member_identity.clone();
+                match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => {
+                        self.modal_state = ModalType::None;
+                        match self
+                            .rotate_and_remove_fellowship_member(&project_id, &member_identity)
+                        {
+                            Ok(()) => self.notifications.push(Notification::info(
+                                "Companion removed; Fellowship key and route rotated.".to_string(),
+                            )),
+                            Err(error) => self.notifications.push(Notification::warning(format!(
+                                "Member removal cancelled: {error}"
+                            ))),
+                        }
                     }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         self.modal_state = ModalType::None;
@@ -3591,6 +7746,61 @@ impl App {
                 }
                 Ok(true)
             }
+            ModalType::RefileTask {
+                task_id,
+                selected_idx,
+            } => {
+                let tid = task_id;
+                let mut sel = selected_idx;
+                let targets = self.refile_task_targets(tid);
+                let total = targets.len() + 1; // 0 = Top-level (no parent)
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        sel = if sel > 0 { sel - 1 } else { total - 1 };
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: tid,
+                            selected_idx: sel,
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        sel = (sel + 1) % total;
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: tid,
+                            selected_idx: sel,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let new_parent = if sel == 0 {
+                            None
+                        } else {
+                            targets.get(sel - 1).copied()
+                        };
+                        if let Some(orig) = self.all_tasks.iter().find(|t| t.id == tid) {
+                            let mut t = orig.clone();
+                            t.parent_task_id = new_parent;
+                            self.db.update_task(&t)?;
+                            self.mark_dirty();
+                            self.selected_task_idx = 0;
+                            self.reload_data()?;
+                            let message = match new_parent.and_then(|pid| {
+                                self.all_tasks.iter().find(|p| p.id == pid)
+                            }) {
+                                Some(parent) => {
+                                    format!("Quest is now a step of \"{}\".", parent.title)
+                                }
+                                None => "Quest returned to the top level.".to_string(),
+                            };
+                            self.notifications.push(Notification::info(message));
+                        }
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
             ModalType::CustomFocusDuration { ref input } => {
                 let mut val = input.clone();
                 match key.code {
@@ -3759,57 +7969,28 @@ impl App {
                                     let _ = std::fs::write(&key_path, json_str);
                                 }
                                 self.identity = new_identity;
-                                // Fetch the full cloud backup snapshot first for instant restoration,
-                                // then sync() will pull any incremental events on top of it
                                 if self.config.sync_enabled {
-                                    self.sync_status_msg = "Fetching cloud backup...".to_string();
-                                    let client = crate::services::api_client::ApiClient::new(
-                                        &self.server_url,
-                                        self.identity.clone(),
+                                    self.sync_status_msg =
+                                        "Restoring encrypted chronicle...".to_string();
+                                    crate::services::sync_engine::SyncEngine::new(
+                                        &self.db,
+                                        &self.identity,
                                         &self.device_id,
+                                        Some(&self.server_url),
+                                    )?
+                                    .sync()?;
+                                    self.pause_auto_sync(
+                                        "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
                                     );
-                                    if let Ok(json) =
-                                        client.send_request("GET", "recovery/latest", "")
-                                    {
-                                        if !json.trim().is_empty() {
-                                            use base64::{
-                                                Engine as _, engine::general_purpose::STANDARD,
-                                            };
-                                            let decoded = STANDARD
-                                                .decode(json.trim())
-                                                .ok()
-                                                .and_then(|b| String::from_utf8(b).ok())
-                                                .unwrap_or(json);
-                                            if self.db.import_from_json(&decoded).is_ok() {
-                                                let _ = App::anchor_restore_to_sync_head(
-                                                    &self.db,
-                                                    &self.identity,
-                                                    &self.device_id,
-                                                    &self.server_url,
-                                                );
-                                                self.pause_auto_sync(
-                                                    "Restore complete. Auto Sync disabled; toggle [a] when ready.",
-                                                );
-                                                self.notifications.push(Notification::info(
-                                                    "Data restored from cloud backup!".to_string(),
-                                                ));
-                                                // If we had a 32-byte code (where we didn't know the user_uuid beforehand),
-                                                // now that the database has been imported, we can extract the correct
-                                                // user_uuid and update identity.key so they match!
-                                                if let Ok(Some(u)) = self.db.get_user() {
-                                                    self.identity.user_uuid = u.id;
-                                                    if let Ok(json_str) =
-                                                        serde_json::to_string_pretty(&self.identity)
-                                                    {
-                                                        let _ = std::fs::write(&key_path, json_str);
-                                                    }
-                                                }
-                                            }
+                                    if let Ok(Some(u)) = self.db.get_user() {
+                                        self.identity.user_uuid = u.id;
+                                        if let Ok(json_str) =
+                                            serde_json::to_string_pretty(&self.identity)
+                                        {
+                                            let _ = std::fs::write(&key_path, json_str);
                                         }
                                     }
                                 }
-                                // Reset conflict counter only. If a cloud backup was imported, the pull
-                                // cursor was moved to server HEAD so stale history cannot replay over it.
                                 let _ = self.db.set_setting("conflict_count", "0");
                                 self.modal_state = ModalType::None;
                                 self.sync_status_msg = "Identity restored.".to_string();
@@ -4381,20 +8562,8 @@ impl App {
                         self.modal_state = ModalType::None;
                     }
                     KeyCode::Tab => {
-                        if f_idx == 1
-                            && id_str.len() == 64
-                            && name_str.is_empty()
-                            && self.config.sync_enabled
-                        {
-                            let client = crate::services::api_client::ApiClient::new(
-                                &self.server_url,
-                                self.identity.clone(),
-                                &self.device_id,
-                            );
-                            if let Some(found) = client.lookup_username(&id_str) {
-                                name_str = found;
-                            }
-                        }
+                        let lookup_identity =
+                            (f_idx == 1 && id_str.len() == 64).then(|| id_str.clone());
                         f_idx = (f_idx + 1) % 4;
                         self.modal_state = ModalType::InviteMember {
                             identity: id_str,
@@ -4403,22 +8572,13 @@ impl App {
                             project_idx: p_idx,
                             focus_idx: f_idx,
                         };
+                        if let Some(identity) = lookup_identity {
+                            self.start_companion_lookup(&identity);
+                        }
                     }
                     KeyCode::BackTab => {
-                        if f_idx == 1
-                            && id_str.len() == 64
-                            && name_str.is_empty()
-                            && self.config.sync_enabled
-                        {
-                            let client = crate::services::api_client::ApiClient::new(
-                                &self.server_url,
-                                self.identity.clone(),
-                                &self.device_id,
-                            );
-                            if let Some(found) = client.lookup_username(&id_str) {
-                                name_str = found;
-                            }
-                        }
+                        let lookup_identity =
+                            (f_idx == 1 && id_str.len() == 64).then(|| id_str.clone());
                         f_idx = if f_idx > 0 { f_idx - 1 } else { 3 };
                         self.modal_state = ModalType::InviteMember {
                             identity: id_str,
@@ -4427,11 +8587,13 @@ impl App {
                             project_idx: p_idx,
                             focus_idx: f_idx,
                         };
+                        if let Some(identity) = lookup_identity {
+                            self.start_companion_lookup(&identity);
+                        }
                     }
                     KeyCode::Left => {
                         if f_idx == 0 {
-                            let active_projects: Vec<_> =
-                                self.projects.iter().filter(|p| !p.archived).collect();
+                            let active_projects = ordered_active_projects(&self.projects);
                             if !active_projects.is_empty() {
                                 p_idx = if p_idx > 0 {
                                     p_idx - 1
@@ -4447,7 +8609,7 @@ impl App {
                                 focus_idx: f_idx,
                             };
                         } else if f_idx == 3 {
-                            r_idx = if r_idx > 0 { r_idx - 1 } else { 3 };
+                            r_idx = if r_idx > 0 { r_idx - 1 } else { 2 };
                             self.modal_state = ModalType::InviteMember {
                                 identity: id_str,
                                 username: name_str,
@@ -4459,8 +8621,7 @@ impl App {
                     }
                     KeyCode::Right => {
                         if f_idx == 0 {
-                            let active_projects: Vec<_> =
-                                self.projects.iter().filter(|p| !p.archived).collect();
+                            let active_projects = ordered_active_projects(&self.projects);
                             if !active_projects.is_empty() {
                                 p_idx = (p_idx + 1) % active_projects.len();
                             }
@@ -4472,7 +8633,7 @@ impl App {
                                 focus_idx: f_idx,
                             };
                         } else if f_idx == 3 {
-                            r_idx = (r_idx + 1) % 4;
+                            r_idx = (r_idx + 1) % 3;
                             self.modal_state = ModalType::InviteMember {
                                 identity: id_str,
                                 username: name_str,
@@ -4484,24 +8645,14 @@ impl App {
                     }
                     KeyCode::Char(c) => {
                         if f_idx == 1 {
-                            if id_str.len() < 64 {
-                                id_str.push(c);
-                            }
-                            // Auto-fill companion name when key is complete
-                            if id_str.len() == 64 && name_str.is_empty() && self.config.sync_enabled
-                            {
-                                let client = crate::services::api_client::ApiClient::new(
-                                    &self.server_url,
-                                    self.identity.clone(),
-                                    &self.device_id,
-                                );
-                                if let Some(found) = client.lookup_username(&id_str) {
-                                    name_str = found;
-                                }
+                            if id_str.len() < 64 && c.is_ascii_hexdigit() {
+                                id_str.push(c.to_ascii_lowercase());
                             }
                         } else if f_idx == 2 && name_str.len() < 24 {
                             name_str.push(c);
                         }
+                        let lookup_identity =
+                            (f_idx == 1 && id_str.len() == 64).then(|| id_str.clone());
                         self.modal_state = ModalType::InviteMember {
                             identity: id_str,
                             username: name_str,
@@ -4509,6 +8660,9 @@ impl App {
                             project_idx: p_idx,
                             focus_idx: f_idx,
                         };
+                        if let Some(identity) = lookup_identity {
+                            self.start_companion_lookup(&identity);
+                        }
                     }
                     KeyCode::Backspace => {
                         if f_idx == 1 {
@@ -4534,20 +8688,8 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if f_idx < 3 {
-                            if f_idx == 1
-                                && id_str.len() == 64
-                                && name_str.is_empty()
-                                && self.config.sync_enabled
-                            {
-                                let client = crate::services::api_client::ApiClient::new(
-                                    &self.server_url,
-                                    self.identity.clone(),
-                                    &self.device_id,
-                                );
-                                if let Some(found) = client.lookup_username(&id_str) {
-                                    name_str = found;
-                                }
-                            }
+                            let lookup_identity =
+                                (f_idx == 1 && id_str.len() == 64).then(|| id_str.clone());
                             f_idx += 1;
                             self.modal_state = ModalType::InviteMember {
                                 identity: id_str,
@@ -4556,52 +8698,152 @@ impl App {
                                 project_idx: p_idx,
                                 focus_idx: f_idx,
                             };
+                            if let Some(identity) = lookup_identity {
+                                self.start_companion_lookup(&identity);
+                            }
                         } else {
                             // Enforce member invitation
-                            let active_projects: Vec<_> =
-                                self.projects.iter().filter(|p| !p.archived).collect();
+                            let normalized_key =
+                                match crate::services::identity::normalize_companion_key(&id_str) {
+                                    Ok(key) => key,
+                                    Err(error) => {
+                                        self.notifications
+                                            .push(Notification::warning(error.to_string()));
+                                        self.modal_state = ModalType::InviteMember {
+                                            identity: id_str,
+                                            username: name_str,
+                                            role_idx: r_idx,
+                                            project_idx: p_idx,
+                                            focus_idx: 1,
+                                        };
+                                        return Ok(true);
+                                    }
+                                };
+                            if normalized_key == self.identity.public_key.to_ascii_lowercase() {
+                                self.notifications.push(Notification::warning(
+                                    "Your own Companion Key cannot be invited.".to_string(),
+                                ));
+                                self.modal_state = ModalType::InviteMember {
+                                    identity: normalized_key,
+                                    username: name_str,
+                                    role_idx: r_idx,
+                                    project_idx: p_idx,
+                                    focus_idx: 1,
+                                };
+                                return Ok(true);
+                            }
+                            id_str = normalized_key;
+                            let recipient_key = if self.config.sync_enabled {
+                                self.companion_lookup_cache
+                                    .as_ref()
+                                    .filter(|result| result.identity == id_str)
+                                    .and_then(|result| result.encryption_key.clone())
+                            } else {
+                                None
+                            };
+                            if self.config.sync_enabled && recipient_key.is_none() {
+                                self.start_companion_lookup(&id_str);
+                                self.notifications.push(Notification::warning(
+                                    "Verifying this Companion Key in the background. Try invite again in a moment."
+                                        .to_string(),
+                                ));
+                                return Ok(true);
+                            }
+                            if name_str.trim().is_empty() {
+                                let fingerprint =
+                                    crate::services::identity::companion_key_fingerprint(&id_str)
+                                        .unwrap_or_else(|_| "UNKNOWN".to_string());
+                                name_str = format!(
+                                    "Companion {}",
+                                    fingerprint.split('-').next().unwrap_or("UNKNOWN")
+                                );
+                            }
+                            let active_projects = ordered_active_projects(&self.projects);
                             if !active_projects.is_empty() && p_idx < active_projects.len() {
                                 let proj = active_projects[p_idx];
 
-                                // Ensure project is shared when inviting someone
-                                if !proj.is_shared {
-                                    let mut updated = proj.clone();
-                                    updated.is_shared = true;
-                                    self.db.update_project(&updated)?;
-
-                                    // Add current user as owner
-                                    self.db.add_project_member(
-                                        &proj.id.to_string(),
-                                        &self.identity.public_key,
-                                        &self.user.as_ref().unwrap().username,
-                                        "Owner",
-                                    )?;
-                                }
-
-                                let roles = ["Owner", "Steward", "Companion", "Observer"];
+                                let roles = ["Steward", "Companion", "Observer"];
                                 let selected_role = roles[r_idx];
 
-                                self.db.add_project_member(
-                                    &proj.id.to_string(),
-                                    &id_str,
-                                    &name_str,
-                                    selected_role,
-                                )?;
                                 if self.config.sync_enabled {
                                     let client = crate::services::api_client::ApiClient::new(
                                         &self.server_url,
                                         self.identity.clone(),
                                         &self.device_id,
                                     );
+                                    let recipient_key = recipient_key
+                                        .as_deref()
+                                        .expect("recipient key was verified above");
+                                    let (routing_id, project_key) = self
+                                        .db
+                                        .ensure_project_encryption_key(&proj.id.to_string())?;
+                                    let (key_nonce, key_ciphertext) =
+                                        crate::services::encryption::wrap_project_key(
+                                            &self.identity,
+                                            recipient_key,
+                                            &routing_id,
+                                            &project_key,
+                                        )?;
+                                    let (project_name_nonce, project_name_ciphertext) =
+                                        crate::services::encryption::encrypt_project_payload(
+                                            &project_key,
+                                            &proj.name,
+                                            &format!("questline/fellowship/name/v1/{}", routing_id),
+                                        )?;
+                                    let (project_id_nonce, project_id_ciphertext) =
+                                        crate::services::encryption::encrypt_project_payload(
+                                            &project_key,
+                                            &proj.id.to_string(),
+                                            &format!("questline/fellowship/id/v1/{}", routing_id),
+                                        )?;
+                                    let inviter_encryption_key =
+                                        crate::services::encryption::fellowship_public_key(
+                                            &self.identity,
+                                        )?;
                                     let body = serde_json::json!({
                                         "project_id": proj.id.to_string(),
-                                        "project_name": proj.name.clone(),
+                                        "project_name": "[encrypted]",
                                         "invitee_identity": id_str.clone(),
-                                        "role": selected_role.to_string()
+                                        "role": selected_role.to_string(),
+                                        "routing_id": routing_id,
+                                        "inviter_encryption_key": inviter_encryption_key,
+                                        "key_nonce": key_nonce,
+                                        "key_ciphertext": key_ciphertext,
+                                        "project_name_nonce": project_name_nonce,
+                                        "project_name_ciphertext": project_name_ciphertext,
+                                        "project_id_nonce": project_id_nonce,
+                                        "project_id_ciphertext": project_id_ciphertext
                                     })
                                     .to_string();
                                     match client.send_request("POST", "invite", &body) {
                                         Ok(_) => {
+                                            // Do not expose a Campaign as shared until the server
+                                            // has durably accepted its first invitation.
+                                            if !proj.is_shared {
+                                                let mut updated = proj.clone();
+                                                updated.is_shared = true;
+                                                self.db.update_project(&updated)?;
+                                                self.db.add_project_member(
+                                                    &proj.id.to_string(),
+                                                    &self.identity.public_key,
+                                                    &self.user.as_ref().unwrap().username,
+                                                    "Owner",
+                                                )?;
+                                            }
+                                            self.db.add_project_member(
+                                                &proj.id.to_string(),
+                                                &id_str,
+                                                &name_str,
+                                                selected_role,
+                                            )?;
+                                            self.db.queue_full_state_sync()?;
+                                            crate::services::sync_engine::SyncEngine::new(
+                                                &self.db,
+                                                &self.identity,
+                                                &self.device_id,
+                                                Some(&self.server_url),
+                                            )?
+                                            .replace_with_pending_snapshot()?;
                                             self.notifications.push(Notification::info(format!(
                                                 "Invitation sent to {}!",
                                                 name_str
@@ -4611,6 +8853,7 @@ impl App {
                                             self.notifications.push(Notification::warning(
                                                 format!("Failed to send invitation: {}", e),
                                             ));
+                                            return Ok(true);
                                         }
                                     }
                                 } else {
@@ -4683,31 +8926,14 @@ impl App {
                                 && self.selected_fellowship_project_idx < shared_projects.len()
                             {
                                 let proj = shared_projects[self.selected_fellowship_project_idx];
-                                let msg_id = self.db.add_chronicle_message(
+                                self.db.add_chronicle_message(
                                     &proj.id.to_string(),
                                     &self.identity.public_key,
                                     &self.user.as_ref().unwrap().username,
                                     val.trim(),
                                     "text",
                                 )?;
-                                if self.config.sync_enabled {
-                                    let client = crate::services::api_client::ApiClient::new(
-                                        &self.server_url,
-                                        self.identity.clone(),
-                                        &self.device_id,
-                                    );
-                                    let body = serde_json::json!({
-                                        "id": msg_id,
-                                        "project_id": proj.id.to_string(),
-                                        "content": val.trim().to_string(),
-                                        "message_type": "text"
-                                    })
-                                    .to_string();
-                                    let _ = std::thread::spawn(move || {
-                                        let _ =
-                                            client.send_request("POST", "chronicle/message", &body);
-                                    });
-                                }
+                                // The local outbox sends this as a project-v1 encrypted sync event.
 
                                 self.db.log_activity(
                                     Some(&proj.id.to_string()),
@@ -4794,6 +9020,21 @@ impl App {
                     }
                     KeyCode::Char('s') => {
                         if let Some(proj) = self.projects.iter().find(|p| p.id == project_id) {
+                            if proj.is_shared {
+                                let companion_count = self
+                                    .db
+                                    .get_project_members(&project_id.to_string())?
+                                    .iter()
+                                    .filter(|member| member.0 != self.identity.public_key)
+                                    .count();
+                                if companion_count > 0 {
+                                    self.notifications.push(Notification::warning(format!(
+                                        "Remove the remaining {companion_count} companion(s) from Fellowship before making this project local."
+                                    )));
+                                    self.modal_state = ModalType::None;
+                                    return Ok(true);
+                                }
+                            }
                             let mut updated = proj.clone();
                             updated.is_shared = !proj.is_shared;
                             self.db.update_project(&updated)?;
@@ -4918,6 +9159,18 @@ impl App {
                                     };
                                 }
                                 KeyCode::Enter => {
+                                    let my_role = self.db.get_member_role(
+                                        &proj_id.to_string(),
+                                        &self.identity.public_key,
+                                    )?;
+                                    if !matches!(my_role.as_deref(), Some("Owner" | "Steward")) {
+                                        self.notifications.push(Notification::warning(
+                                            "Only the Campaign Owner or a Steward may assign Quest bearers."
+                                                .to_string(),
+                                        ));
+                                        self.modal_state = ModalType::None;
+                                        return Ok(true);
+                                    }
                                     let member = &members[sel];
                                     let existing = self
                                         .db
@@ -4931,23 +9184,39 @@ impl App {
                                             &compound_id,
                                             "delete",
                                         );
+                                        let actor = self
+                                            .user
+                                            .as_ref()
+                                            .map(|user| user.username.as_str())
+                                            .unwrap_or("Companion");
+                                        let _ = self.db.log_activity(
+                                            Some(&proj_id.to_string()),
+                                            "quest_unassigned",
+                                            &format!(
+                                                "released {} from '{}'.",
+                                                member.1, task.title
+                                            ),
+                                            &self.identity.public_key,
+                                            actor,
+                                        );
                                     } else {
                                         self.db.assign_task(
                                             &task_id.to_string(),
                                             &member.0,
                                             &member.1,
                                         )?;
-                                        if member.0 != self.identity.public_key {
-                                            self.db.create_notification(
-                                                "task_assignment",
-                                                "Quest Assigned",
-                                                &format!(
-                                                    "You have been assigned to quest: {}",
-                                                    task.title
-                                                ),
-                                                Some(&proj_id.to_string()),
-                                            )?;
-                                        }
+                                        let actor = self
+                                            .user
+                                            .as_ref()
+                                            .map(|user| user.username.as_str())
+                                            .unwrap_or("Companion");
+                                        let _ = self.db.log_activity(
+                                            Some(&proj_id.to_string()),
+                                            "quest_assigned",
+                                            &format!("entrusted '{}' to {}.", task.title, member.1),
+                                            &self.identity.public_key,
+                                            actor,
+                                        );
                                     }
                                     self.modal_state = ModalType::None;
                                     self.reload_data()?;
@@ -4961,6 +9230,142 @@ impl App {
                     _ => {
                         self.modal_state = ModalType::None;
                     }
+                }
+                Ok(true)
+            }
+            ModalType::QuestDependencies {
+                task_id,
+                selected_quest_idx,
+            } => {
+                let Some(task) = self.db.get_task_by_id(task_id).ok() else {
+                    self.modal_state = ModalType::None;
+                    return Ok(true);
+                };
+                let candidates = self
+                    .all_tasks
+                    .iter()
+                    .filter(|candidate| {
+                        candidate.project_id == task.project_id
+                            && candidate.parent_task_id.is_none()
+                            && candidate.id != task_id
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if candidates.is_empty() {
+                    self.modal_state = ModalType::None;
+                    return Ok(true);
+                }
+                let mut selected = selected_quest_idx.min(candidates.len() - 1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Enter => self.modal_state = ModalType::None,
+                    KeyCode::Up => {
+                        selected = selected.checked_sub(1).unwrap_or(candidates.len() - 1);
+                        self.modal_state = ModalType::QuestDependencies {
+                            task_id,
+                            selected_quest_idx: selected,
+                        };
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1) % candidates.len();
+                        self.modal_state = ModalType::QuestDependencies {
+                            task_id,
+                            selected_quest_idx: selected,
+                        };
+                    }
+                    KeyCode::Char(' ') => {
+                        let project_id = task.project_id.unwrap().to_string();
+                        let is_shared = self
+                            .projects
+                            .iter()
+                            .find(|project| project.id.to_string() == project_id)
+                            .is_some_and(|project| project.is_shared);
+                        if is_shared
+                            && self
+                                .db
+                                .get_member_role(&project_id, &self.identity.public_key)?
+                                .as_deref()
+                                == Some("Observer")
+                        {
+                            self.notifications.push(Notification::warning(
+                                "Observers may inspect Quest links, but cannot alter them."
+                                    .to_string(),
+                            ));
+                            return Ok(true);
+                        }
+                        let blocker = &candidates[selected];
+                        let existing = self.db.get_task_dependencies(&task_id.to_string())?;
+                        let result = if existing.iter().any(|id| id == &blocker.id.to_string()) {
+                            self.db.remove_task_dependency(
+                                &task_id.to_string(),
+                                &blocker.id.to_string(),
+                            )
+                        } else {
+                            self.db.add_task_dependency(
+                                &task_id.to_string(),
+                                &blocker.id.to_string(),
+                                &project_id,
+                                &self.identity.public_key,
+                                self.user
+                                    .as_ref()
+                                    .map(|user| user.username.as_str())
+                                    .unwrap_or("Companion"),
+                            )
+                        };
+                        if let Err(error) = result {
+                            self.notifications
+                                .push(Notification::warning(error.to_string()));
+                        } else {
+                            self.mark_dirty();
+                        }
+                        self.modal_state = ModalType::QuestDependencies {
+                            task_id,
+                            selected_quest_idx: selected,
+                        };
+                    }
+                    _ => {}
+                }
+                Ok(true)
+            }
+            ModalType::CouncilBriefing {
+                selected_section_idx,
+            } => {
+                let members = self
+                    .active_project_id
+                    .and_then(|project_id| {
+                        self.db
+                            .get_presence_for_project(&project_id.to_string())
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                let item_count = 5 + members.len();
+                let mut selected = selected_section_idx.min(item_count - 1);
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('B') => self.modal_state = ModalType::None,
+                    KeyCode::Up => {
+                        selected = selected.checked_sub(1).unwrap_or(item_count - 1);
+                        self.modal_state = ModalType::CouncilBriefing {
+                            selected_section_idx: selected,
+                        };
+                    }
+                    KeyCode::Down => {
+                        selected = (selected + 1) % item_count;
+                        self.modal_state = ModalType::CouncilBriefing {
+                            selected_section_idx: selected,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        self.task_filter = if selected < 5 {
+                            ["Blocked", "Review", "Overdue", "DueSoon", "Unassigned"][selected]
+                                .to_string()
+                        } else {
+                            format!("Assignee:{}", members[selected - 5].0)
+                        };
+                        self.workspace_tab_idx = 0;
+                        self.quest_board_open = false;
+                        self.selected_task_idx = 0;
+                        self.modal_state = ModalType::None;
+                    }
+                    _ => {}
                 }
                 Ok(true)
             }
@@ -5328,6 +9733,9 @@ impl App {
         let nav_code = Self::navigation_key_code(key);
 
         match nav_code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 if self.gateway_selected_idx > 0 {
                     self.gateway_selected_idx -= 1;
@@ -5339,29 +9747,38 @@ impl App {
                 }
             }
             KeyCode::Enter | KeyCode::Char(' ') => {
-                if self.gateway_selected_idx == 0 {
-                    // Nuevo aventurero → pantalla de selección de clase
-                    self.onboarding_from_gateway = true;
-                    self.onboarding_username = String::new();
-                    self.onboarding_class_idx = 0;
-                    self.onboarding_focus = OnboardingFocus::NameInput;
-                    self.onboarding_error = None;
-                    self.active_screen = ActiveScreen::Onboarding;
-                } else {
-                    // Exiliado con código → portal de restauración de identidad
-                    self.restore_input = String::new();
-                    self.restore_error = None;
-                    self.active_screen = ActiveScreen::Restore;
-                }
+                self.activate_gateway_selection();
             }
             _ => {}
         }
         Ok(())
     }
 
+    /// Confirms whichever Gateway option is currently selected — shared by
+    /// the Enter/Space keybinding and a click on either option box.
+    fn activate_gateway_selection(&mut self) {
+        if self.gateway_selected_idx == 0 {
+            // Nuevo aventurero → pantalla de selección de clase
+            self.onboarding_from_gateway = true;
+            self.onboarding_username = String::new();
+            self.onboarding_class_idx = 0;
+            self.onboarding_focus = OnboardingFocus::NameInput;
+            self.onboarding_error = None;
+            self.active_screen = ActiveScreen::Onboarding;
+        } else {
+            // Exiliado con código → portal de restauración de identidad
+            self.restore_input = String::new();
+            self.restore_error = None;
+            self.active_screen = ActiveScreen::Restore;
+        }
+    }
+
     /// Maneja las teclas del portal de restauración — procesa el código de transferencia al presionar Enter.
     fn handle_restore_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
+            KeyCode::Char('q') => {
+                self.should_quit = true;
+            }
             KeyCode::Esc => {
                 self.restore_error = None;
                 self.active_screen = ActiveScreen::Gateway;
@@ -5429,38 +9846,33 @@ impl App {
 
                         let mut restored_from_cloud = false;
                         if self.config.sync_enabled {
-                            let client = crate::services::api_client::ApiClient::new(
-                                &self.server_url,
-                                self.identity.clone(),
+                            let encrypted_restore = crate::services::sync_engine::SyncEngine::new(
+                                &self.db,
+                                &self.identity,
                                 &self.device_id,
-                            );
-                            if let Ok(json) = client.send_request("GET", "recovery/latest", "") {
-                                if !json.trim().is_empty() {
-                                    use base64::{Engine as _, engine::general_purpose::STANDARD};
-                                    let decoded = STANDARD
-                                        .decode(json.trim())
-                                        .ok()
-                                        .and_then(|b| String::from_utf8(b).ok())
-                                        .unwrap_or(json);
-                                    if self.db.import_from_json(&decoded).is_ok() {
-                                        let _ = App::anchor_restore_to_sync_head(
-                                            &self.db,
-                                            &self.identity,
-                                            &self.device_id,
-                                            &self.server_url,
-                                        );
-                                        self.pause_auto_sync(
-                                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
-                                        );
-                                        restored_from_cloud = true;
-                                        if let Ok(Some(u)) = self.db.get_user() {
-                                            self.identity.user_uuid = u.id;
-                                            if let Ok(json_str) =
-                                                serde_json::to_string_pretty(&self.identity)
-                                            {
-                                                let _ = std::fs::write(&key_path, json_str);
-                                            }
-                                        }
+                                Some(&self.server_url),
+                            )
+                            .and_then(|engine| engine.sync());
+                            match encrypted_restore {
+                                Ok((_pushed, pulled, _conflicts)) => {
+                                    restored_from_cloud = pulled > 0;
+                                }
+                                Err(error) => {
+                                    self.restore_error =
+                                        Some(format!("Encrypted restore failed: {}", error));
+                                    return Ok(());
+                                }
+                            }
+                            if restored_from_cloud {
+                                self.pause_auto_sync(
+                                    "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
+                                );
+                                if let Ok(Some(u)) = self.db.get_user() {
+                                    self.identity.user_uuid = u.id;
+                                    if let Ok(json_str) =
+                                        serde_json::to_string_pretty(&self.identity)
+                                    {
+                                        let _ = std::fs::write(&key_path, json_str);
                                     }
                                 }
                             }
@@ -5469,9 +9881,9 @@ impl App {
                         let _ = self.db.set_setting("conflict_count", "0");
                         self.reload_data()?;
                         let message = if restored_from_cloud {
-                            "Welcome back! Your chronicle has been restored from cloud backup."
+                            "Welcome back! Your chronicle has been restored from encrypted sync."
                         } else {
-                            "Identity restored. No cloud backup was found; sync will only pull future changes."
+                            "Identity restored, but no encrypted sync data was restored."
                         };
                         self.notifications
                             .push(Notification::info(message.to_string()));
@@ -5612,6 +10024,7 @@ impl App {
         }
 
         self.reload_data()?;
+        self.publish_fellowship_identity_async();
         // Si el héroe llegó por el Gateway, muestra el prólogo antes del tablero
         if self.onboarding_from_gateway {
             self.onboarding_from_gateway = false;
@@ -5629,6 +10042,110 @@ impl App {
         }
 
         Ok(())
+    }
+
+    fn publish_fellowship_identity_async(&self) {
+        if !self.config.sync_enabled {
+            return;
+        }
+        let Ok(public_key) = crate::services::encryption::fellowship_public_key(&self.identity)
+        else {
+            return;
+        };
+        let client = crate::services::api_client::ApiClient::new(
+            &self.server_url,
+            self.identity.clone(),
+            &self.device_id,
+        );
+        let username = self
+            .user
+            .as_ref()
+            .map(|user| user.username.clone())
+            .unwrap_or_default();
+        let device_name = crate::services::identity::get_local_device_name();
+        let _ = std::thread::spawn(move || {
+            let register_body = serde_json::json!({ "public_key": public_key }).to_string();
+            let _ = client.send_request("POST", "encryption/register", &register_body);
+            let device_body = serde_json::json!({
+                "device_name": device_name,
+                "username": username,
+            })
+            .to_string();
+            let _ = client.send_request("POST", "devices/register", &device_body);
+        });
+    }
+
+    fn start_companion_lookup(&mut self, identity: &str) {
+        if !self.config.sync_enabled || identity.len() != 64 {
+            return;
+        }
+        if self.companion_lookup_in_flight.as_deref() == Some(identity) {
+            return;
+        }
+        if self
+            .companion_lookup_cache
+            .as_ref()
+            .is_some_and(|result| result.identity == identity && result.encryption_key.is_some())
+        {
+            return;
+        }
+
+        let lookup_identity = identity.to_string();
+        self.companion_lookup_in_flight = Some(lookup_identity.clone());
+        let result_slot = std::sync::Arc::clone(&self.companion_lookup_result);
+        let client = crate::services::api_client::ApiClient::new(
+            &self.server_url,
+            self.identity.clone(),
+            &self.device_id,
+        );
+        let _ = std::thread::spawn(move || {
+            let key_response = client
+                .send_request(
+                    "GET",
+                    &format!("encryption/key?identity={lookup_identity}"),
+                    "",
+                )
+                .ok()
+                .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok());
+            let encryption_key = key_response
+                .as_ref()
+                .and_then(|value| value["public_key"].as_str().map(str::to_string));
+            let username = key_response
+                .as_ref()
+                .and_then(|value| value["username"].as_str().map(str::to_string))
+                .or_else(|| client.lookup_username(&lookup_identity));
+            if let Ok(mut slot) = result_slot.lock() {
+                *slot = Some(CompanionLookupResult {
+                    identity: lookup_identity,
+                    username,
+                    encryption_key,
+                });
+            }
+        });
+    }
+
+    pub fn tick_companion_lookup(&mut self) {
+        let result = self
+            .companion_lookup_result
+            .try_lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let Some(result) = result else {
+            return;
+        };
+        if self.companion_lookup_in_flight.as_deref() == Some(&result.identity) {
+            self.companion_lookup_in_flight = None;
+        }
+        if let ModalType::InviteMember {
+            identity, username, ..
+        } = &mut self.modal_state
+            && *identity == result.identity
+            && username.trim().is_empty()
+            && let Some(found) = result.username.as_ref()
+        {
+            *username = found.clone();
+        }
+        self.companion_lookup_cache = Some(result);
     }
 
     pub fn trigger_sync(&mut self) -> Result<()> {
@@ -5671,102 +10188,34 @@ impl App {
                         {
                             if let Some(arr) = server_invites.as_array() {
                                 for inv_val in arr {
-                                    // check mapping fields
-                                    let id = inv_val["id"].as_str().unwrap_or_default().to_string();
-                                    let project_id = inv_val["project_id"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let project_name = inv_val["project_name"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let inviter_identity = inv_val["inviter_identity"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let inviter_username = inv_val["inviter_username"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let invitee_identity = inv_val["invitee_identity"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-                                    let role =
-                                        inv_val["role"].as_str().unwrap_or_default().to_string();
-                                    let status =
-                                        inv_val["status"].as_str().unwrap_or("Pending").to_string();
-                                    let created_at = inv_val["created_at"]
-                                        .as_str()
-                                        .unwrap_or_default()
-                                        .to_string();
-
-                                    let _ = self.db.conn.execute(
-                                        "INSERT OR IGNORE INTO invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                        rusqlite::params![id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at]
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    if let Ok(projs) = self.db.get_projects() {
-                        let shared_projs: Vec<_> =
-                            projs.into_iter().filter(|p| p.is_shared).collect();
-                        for p in shared_projs {
-                            let path = format!("chronicle/messages?project_id={}", p.id);
-                            if let Ok(resp_str) = client.send_request("GET", &path, "") {
-                                if let Ok(server_msgs) =
-                                    serde_json::from_str::<serde_json::Value>(&resp_str)
-                                {
-                                    if let Some(arr) = server_msgs.as_array() {
-                                        for msg_val in arr {
-                                            let id = msg_val["id"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            let project_id = msg_val["project_id"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            let sender_identity = msg_val["sender_identity"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            let sender_username = msg_val["sender_username"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            let content = msg_val["content"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-                                            let message_type = msg_val["message_type"]
-                                                .as_str()
-                                                .unwrap_or("text")
-                                                .to_string();
-                                            let timestamp = msg_val["timestamp"]
-                                                .as_str()
-                                                .unwrap_or_default()
-                                                .to_string();
-
-                                            let _ = self.db.conn.execute(
-                                                "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                                                rusqlite::params![id, project_id, sender_identity, sender_username, content, message_type, timestamp]
-                                            );
-                                        }
+                                    if let Err(error) = Self::store_validated_server_invitation(
+                                        &self.db,
+                                        &self.identity,
+                                        inv_val,
+                                    ) {
+                                        self.notifications.push(Notification::warning(format!(
+                                            "Ignored an invalid Fellowship invitation: {error}"
+                                        )));
                                     }
                                 }
                             }
                         }
                     }
+
+                    // Fellowship messages are sync-v2 project events. Never fetch their
+                    // plaintext through the legacy Chronicle endpoint.
                     let _ = self.refresh_companions(&client);
                     self.submit_chapter_contribution(&client);
                     self.refresh_chapter_progress_sync(&client);
-                } else {
-                    let _ = self.simulate_fellowship_sync();
                 }
+                // Local-only mode (sync_enabled == false) has nothing to
+                // contact and used to fall back to simulate_fellowship_sync()
+                // here — a demo fixture that wrote fake companions ("Alex",
+                // "Fiona", "Diana"), a fake invitation, and fake chronicle
+                // messages straight into the real database on every manual
+                // sync trigger (Ctrl+Y / the command palette's "sync"
+                // action). Removed: local-only mode simply has nothing to do
+                // once sync_engine.sync()'s local bookkeeping above is done.
 
                 let sync_count = self
                     .db
@@ -5834,7 +10283,7 @@ impl App {
             .map(|u| u.username.clone())
             .unwrap_or_default();
 
-        let msg_id = self.db.add_chronicle_message(
+        self.db.add_chronicle_message(
             &proj.id.to_string(),
             &self.identity.public_key,
             &my_name,
@@ -5842,21 +10291,7 @@ impl App {
             "text",
         )?;
 
-        if self.config.sync_enabled {
-            let client = crate::services::api_client::ApiClient::new(
-                &self.server_url,
-                self.identity.clone(),
-                &self.device_id,
-            );
-            let body = serde_json::json!({
-                "id": msg_id,
-                "project_id": proj.id.to_string(),
-                "content": content,
-                "message_type": "text"
-            })
-            .to_string();
-            let _ = client.send_request("POST", "chronicle/message", &body);
-        }
+        // The local outbox sends this as a project-v1 encrypted sync event.
 
         self.fellowship_chat_input.clear();
         self.fellowship_selected_msg_idx = usize::MAX;
@@ -5868,8 +10303,16 @@ impl App {
     fn handle_fellowship_chat_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        // Vim navigation is universal while browsing. Compose mode below keeps
+        // h/j/k/l as text input, as expected.
+        let nav_code = if self.fellowship_composing {
+            key.code
+        } else {
+            Self::navigation_key_code(key)
+        };
+
         if self.fellowship_focus_left {
-            match key.code {
+            match nav_code {
                 KeyCode::Enter | KeyCode::Right => {
                     self.fellowship_focus_left = false;
                     return Ok(true);
@@ -5880,30 +10323,25 @@ impl App {
 
         let browsing = self.fellowship_selected_msg_idx != usize::MAX;
 
-        match key.code {
+        match nav_code {
             KeyCode::Up => {
                 let msgs = self.fellowship_current_messages();
                 if msgs.is_empty() {
                     return Ok(false);
                 }
-                self.fellowship_selected_msg_idx =
-                    if browsing && self.fellowship_selected_msg_idx > 0 {
-                        self.fellowship_selected_msg_idx - 1
-                    } else {
-                        msgs.len() - 1
-                    };
+                self.cycle_fellowship_chat_message(false);
                 return Ok(true);
             }
             KeyCode::Down => {
                 if browsing {
-                    let msgs = self.fellowship_current_messages();
-                    if self.fellowship_selected_msg_idx + 1 >= msgs.len() {
-                        self.fellowship_selected_msg_idx = usize::MAX;
-                    } else {
-                        self.fellowship_selected_msg_idx += 1;
-                    }
+                    self.cycle_fellowship_chat_message(true);
                     return Ok(true);
                 }
+            }
+            KeyCode::Left if !self.fellowship_composing => {
+                self.fellowship_selected_msg_idx = usize::MAX;
+                self.fellowship_focus_left = true;
+                return Ok(true);
             }
             KeyCode::Char('r') if browsing => {
                 let msgs = self.fellowship_current_messages();
@@ -6024,6 +10462,32 @@ impl App {
         Ok(false)
     }
 
+    fn open_fellowship_sharing(&mut self) {
+        let active_projects = ordered_active_projects(&self.projects);
+        if active_projects.is_empty() {
+            self.notifications.push(Notification::warning(
+                "Create an active campaign before inviting a companion.".to_string(),
+            ));
+            return;
+        }
+        let shared_projects: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+        let default_proj_idx = shared_projects
+            .get(self.selected_fellowship_project_idx)
+            .and_then(|selected| {
+                active_projects
+                    .iter()
+                    .position(|project| project.id == selected.id)
+            })
+            .unwrap_or(0);
+        self.modal_state = ModalType::InviteMember {
+            identity: String::new(),
+            username: String::new(),
+            role_idx: 1,
+            project_idx: default_proj_idx,
+            focus_idx: 0,
+        };
+    }
+
     pub fn refresh_companions(
         &self,
         client: &crate::services::api_client::ApiClient,
@@ -6057,6 +10521,134 @@ impl App {
                 }
             }
         }
+        Ok(())
+    }
+
+    pub fn rotate_and_remove_fellowship_member(
+        &mut self,
+        project_id: &str,
+        removed_identity: &str,
+    ) -> Result<()> {
+        if !self.config.sync_enabled {
+            return Err(anyhow::anyhow!(
+                "Encrypted member removal requires Cloud Sync"
+            ));
+        }
+        if self
+            .db
+            .get_member_role(project_id, &self.identity.public_key)?
+            .as_deref()
+            != Some("Owner")
+        {
+            return Err(anyhow::anyhow!(
+                "Only the Fellowship project owner may remove members"
+            ));
+        }
+        if removed_identity == self.identity.public_key {
+            return Err(anyhow::anyhow!(
+                "The project owner cannot remove themselves"
+            ));
+        }
+        let (old_route, _) = self
+            .db
+            .get_project_encryption_key(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("Project does not have an encryption key"))?;
+        let client = crate::services::api_client::ApiClient::new(
+            &self.server_url,
+            self.identity.clone(),
+            &self.device_id,
+        );
+        let members_response = client.send_request(
+            "GET",
+            &format!("project/rotation-members?routing_id={old_route}"),
+            "",
+        )?;
+        let members: serde_json::Value = serde_json::from_str(&members_response)?;
+        let members = members
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("Invalid encrypted membership response"))?;
+        if !members
+            .iter()
+            .any(|member| member["identity"].as_str() == Some(removed_identity))
+        {
+            return Err(anyhow::anyhow!("Companion is not a member of this route"));
+        }
+
+        use rand::RngCore;
+        let mut new_key = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut new_key);
+        let new_route = Uuid::new_v4().to_string();
+        let mut envelopes = Vec::new();
+        for member in members {
+            let identity = member["identity"].as_str().unwrap_or_default();
+            if identity == removed_identity {
+                continue;
+            }
+            let public_key = member["encryption_public_key"]
+                .as_str()
+                .filter(|key| !key.is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Remaining companion {} has no Fellowship encryption key",
+                        &identity[..identity.len().min(12)]
+                    )
+                })?;
+            let (key_nonce, key_ciphertext) = crate::services::encryption::wrap_project_key(
+                &self.identity,
+                public_key,
+                &new_route,
+                &new_key,
+            )?;
+            envelopes.push(serde_json::json!({
+                "recipient_identity": identity,
+                "key_nonce": key_nonce,
+                "key_ciphertext": key_ciphertext,
+            }));
+        }
+        let sender_encryption_key =
+            crate::services::encryption::fellowship_public_key(&self.identity)?;
+        let body = serde_json::json!({
+            "old_routing_id": old_route,
+            "new_routing_id": new_route,
+            "removed_identity": removed_identity,
+            "sender_encryption_key": sender_encryption_key,
+            "envelopes": envelopes,
+        })
+        .to_string();
+        client.send_request("POST", "project/remove-member", &body)?;
+
+        self.db.commit_project_key_rotation_and_member_removal(
+            project_id,
+            removed_identity,
+            &new_route,
+            &new_key,
+        )?;
+        let remaining_companions = self
+            .db
+            .get_project_members(project_id)?
+            .iter()
+            .filter(|member| member.0 != self.identity.public_key)
+            .count();
+        if remaining_companions == 0 {
+            if let Some(project) = self
+                .projects
+                .iter()
+                .find(|project| project.id.to_string() == project_id)
+            {
+                let mut local_project = project.clone();
+                local_project.is_shared = false;
+                self.db.update_project(&local_project)?;
+            }
+        }
+        self.db.queue_full_state_sync()?;
+        crate::services::sync_engine::SyncEngine::new(
+            &self.db,
+            &self.identity,
+            &self.device_id,
+            Some(&self.server_url),
+        )?
+        .sync()?;
+        self.reload_data()?;
         Ok(())
     }
 
@@ -6275,24 +10867,113 @@ impl App {
         true
     }
 
+    fn paste_into_task_title(
+        modal: &mut ModalType,
+        text: &str,
+        cursor: &mut usize,
+        editing: &mut bool,
+    ) -> bool {
+        let title = match modal {
+            ModalType::NewTask {
+                title,
+                focus_idx: 0,
+                ..
+            }
+            | ModalType::EditTask {
+                title,
+                focus_idx: 0,
+                ..
+            } => title,
+            _ => return false,
+        };
+
+        // Titles are single-line fields. Preserve ordinary spacing while making
+        // multi-line/tabular clipboard content safe to display in the modal.
+        let pasted = text
+            .replace("\r\n", " ")
+            .replace('\r', " ")
+            .replace('\n', " ")
+            .replace('\t', " ");
+        let remaining = TASK_TITLE_CHAR_LIMIT.saturating_sub(title.chars().count());
+        let pasted: String = pasted.chars().take(remaining).collect();
+        if !*editing {
+            *cursor = title.len();
+        }
+        *cursor = (*cursor).min(title.len());
+        while *cursor > 0 && !title.is_char_boundary(*cursor) {
+            *cursor -= 1;
+        }
+        title.insert_str(*cursor, &pasted);
+        *cursor += pasted.len();
+        *editing = true;
+        true
+    }
+
+    fn paste_into_task_modal(
+        modal: &mut ModalType,
+        editor: &mut Option<EditorState>,
+        title_cursor: &mut usize,
+        title_editing: &mut bool,
+        project_id: Uuid,
+        text: &str,
+    ) -> bool {
+        Self::paste_into_task_title(modal, text, title_cursor, title_editing)
+            || Self::paste_into_task_description(modal, editor, project_id, text)
+    }
+
     pub fn handle_paste(&mut self, text: &str) {
+        // Bracketed paste arrives as Event::Paste rather than a stream of Char events.
+        // Transfer Codes are Base64, so terminal-added newlines/spaces are never meaningful.
+        let transfer_code_text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+        if self.active_screen == ActiveScreen::Restore {
+            self.restore_input.push_str(&transfer_code_text);
+            self.restore_error = None;
+            return;
+        }
+        if let ModalType::RestoreIdentity { input } = &mut self.modal_state {
+            input.push_str(&transfer_code_text);
+            return;
+        }
+        if let ModalType::InviteMember {
+            identity,
+            focus_idx: 1,
+            ..
+        } = &mut self.modal_state
+        {
+            match crate::services::identity::normalize_companion_key(text) {
+                Ok(pasted_key) => *identity = pasted_key,
+                Err(error) => {
+                    self.notifications
+                        .push(Notification::warning(error.to_string()));
+                    return;
+                }
+            }
+            let pasted_identity = identity.clone();
+            self.start_companion_lookup(&pasted_identity);
+            return;
+        }
+
         let project_id = self.active_project_id.unwrap_or_else(Uuid::nil);
 
         // A new-step overlay sits above the parent quest modal and must receive
         // the paste exclusively, just like regular key events do.
         if self.overlay_modal != ModalType::None {
-            Self::paste_into_task_description(
+            Self::paste_into_task_modal(
                 &mut self.overlay_modal,
                 &mut self.task_desc_editor,
+                &mut self.task_title_cursor,
+                &mut self.task_title_editing,
                 project_id,
                 text,
             );
             return;
         }
 
-        if Self::paste_into_task_description(
+        if Self::paste_into_task_modal(
             &mut self.modal_state,
             &mut self.task_desc_editor,
+            &mut self.task_title_cursor,
+            &mut self.task_title_editing,
             project_id,
             text,
         ) {
@@ -6321,6 +11002,148 @@ impl App {
         } else {
             self.active_screen = ActiveScreen::Workspace;
             self.workspace_tab_idx = 1;
+        }
+    }
+
+    /// Registers a Down(Left) click at (col, row) against the shared
+    /// same-cell click tracker and returns the resulting run length: 1 for a
+    /// single click, 2 for a double, capped at 3 for a triple. Shared by the
+    /// Notes editor (single/double/triple distinguish cursor-place /
+    /// word-select / line-select) and every select-then-open screen's mouse
+    /// handler, where only run >= 2 (double-click-to-open) matters.
+    fn register_click_run(&mut self, col: u16, row: u16) -> u8 {
+        let now = std::time::Instant::now();
+        let click_run = match self.last_click {
+            Some((t, c, r, run))
+                if t.elapsed() < std::time::Duration::from_millis(400) && c == col && r == row =>
+            {
+                (run + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.last_click = Some((now, col, row, click_run));
+        click_run
+    }
+
+    fn handle_editor_mouse(&mut self, mouse: crossterm::event::MouseEvent) {
+        use crate::screens::editor;
+        use crate::screens::hit_test::HitRegions;
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let Some(regions) = self.hit_regions.editor else {
+            return;
+        };
+        let overlay_active = self
+            .editor_state
+            .as_ref()
+            .map(|s| s.editing_title || s.editing_project || s.confirm_close || s.show_help)
+            .unwrap_or(true);
+        if overlay_active {
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !HitRegions::contains(regions.body, mouse.column, mouse.row) {
+                    return;
+                }
+                let (line, x) = {
+                    let state = self.editor_state.as_ref().unwrap();
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row)
+                };
+
+                let click_run = self.register_click_run(mouse.column, mouse.row);
+
+                // Shift+click extends the existing selection (or starts one
+                // anchored at the pre-click cursor) to the click point,
+                // regardless of click_run — matches the usual GUI convention
+                // and is simpler than also tracking shift-double/triple-click.
+                if mouse.modifiers.contains(KeyModifiers::SHIFT) {
+                    let state = self.editor_state.as_mut().unwrap();
+                    if state.visual_range().is_none() {
+                        state.enter_visual_char();
+                    }
+                    state.cursor_y = line;
+                    state.cursor_x = x;
+                    self.mouse_drag_anchor = Some((line, x));
+                    return;
+                }
+
+                let state = self.editor_state.as_mut().unwrap();
+                state.cursor_y = line;
+                state.cursor_x = x;
+                match click_run {
+                    3 => {
+                        state.enter_visual_line();
+                        self.mouse_drag_anchor = None;
+                    }
+                    2 => {
+                        state.select_word_at_cursor();
+                        self.mouse_drag_anchor = None;
+                    }
+                    _ => {
+                        state.enter_visual_char();
+                        self.mouse_drag_anchor = Some((line, x));
+                    }
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if self.mouse_drag_anchor.is_none() {
+                    return;
+                }
+                let Some(state) = self.editor_state.as_mut() else {
+                    return;
+                };
+                let (line, x) =
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row);
+                state.cursor_y = line;
+                state.cursor_x = x;
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                // Selection (EditorMode::Visual) stays active after a drag so the
+                // existing 'y' yank / Esc-to-cancel keybindings keep working.
+                self.mouse_drag_anchor = None;
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                if !HitRegions::contains(regions.body, mouse.column, mouse.row) {
+                    return;
+                }
+                let (line, x) = {
+                    let state = self.editor_state.as_ref().unwrap();
+                    editor::screen_to_buffer_pos(state, regions.body, mouse.column, mouse.row)
+                };
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.cursor_y = line;
+                    state.cursor_x = x;
+                }
+                self.editor_paste_at_cursor();
+            }
+            MouseEventKind::ScrollUp => {
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.scroll_offset = state.scroll_offset.saturating_sub(3);
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(state) = self.editor_state.as_mut() {
+                    state.scroll_offset = state.scroll_offset.saturating_add(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Right-click paste in the editor. Right-click (not middle-click) because
+    // middle-click-paste is an X11 primary-selection convention that doesn't
+    // map to "the clipboard" on Windows/macOS.
+    fn editor_paste_at_cursor(&mut self) {
+        let Some(state) = self.editor_state.as_mut() else {
+            return;
+        };
+        if state.editing_title || state.editing_project || state.confirm_close {
+            return;
+        }
+        if let Ok(text) = crate::services::identity::paste_from_clipboard() {
+            state.insert_text(&text);
         }
     }
 
@@ -6587,6 +11410,13 @@ impl App {
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => state.redo(),
             KeyCode::Home | KeyCode::End => {
                 Self::apply_editor_home_end(state, key.code, home_end_whole_text.unwrap_or(false));
+            }
+            KeyCode::BackTab => {
+                if state.quick_note {
+                    state.editing_project = true;
+                } else {
+                    state.editing_title = true;
+                }
             }
 
             KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -7098,26 +11928,15 @@ impl App {
         if self.active_screen == ActiveScreen::SyncSettings {
             match key.code {
                 KeyCode::Enter => {
-                    if self.config.sync_enabled {
-                        self.start_forced_sync();
-                    } else {
-                        let _ = self.trigger_sync();
-                    }
+                    self.activate_sync_now();
                     return Ok(());
                 }
-                KeyCode::Char('a') => {
-                    self.auto_sync = !self.auto_sync;
-                    let _ = self
-                        .db
-                        .set_setting("auto_sync", if self.auto_sync { "true" } else { "false" });
-                    self.sync_status_msg = format!(
-                        "Auto Sync {}",
-                        if self.auto_sync {
-                            "Enabled"
-                        } else {
-                            "Disabled"
-                        }
-                    );
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    self.toggle_cloud_sync_enabled()?;
+                    return Ok(());
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.toggle_auto_sync();
                     return Ok(());
                 }
                 KeyCode::Char('n') => {
@@ -7162,15 +11981,16 @@ impl App {
                 KeyCode::Char('c') => {
                     match crate::services::identity::copy_to_clipboard(&self.identity.public_key) {
                         Ok(_) => {
-                            self.sync_status_msg = "Share Key copied to clipboard!".to_string();
+                            self.sync_status_msg = "Companion Key copied to clipboard!".to_string();
                             self.notifications.push(Notification::info(
-                                "Share Key copied to clipboard.".to_string(),
+                                "Companion Key copied to clipboard.".to_string(),
                             ));
                         }
                         Err(e) => {
-                            self.sync_status_msg = format!("Failed to copy Share Key: {}", e);
+                            self.sync_status_msg = format!("Failed to copy Companion Key: {}", e);
                             self.notifications.push(Notification::warning(
-                                "Could not copy Share Key. Clipboard utility missing.".to_string(),
+                                "Could not copy Companion Key. Clipboard utility missing."
+                                    .to_string(),
                             ));
                         }
                     }
@@ -7200,22 +12020,6 @@ impl App {
                                 let db_path = storage_dir.join("questline.db");
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
-                                let json = db
-                                    .export_to_recovery_json()
-                                    .map_err(|e| format!("Export failed: {}", e))?;
-                                let client = crate::services::api_client::ApiClient::new(
-                                    &server_url,
-                                    identity.clone(),
-                                    &device_id,
-                                );
-                                client
-                                    .send_request("POST", "recovery", &json)
-                                    .map_err(|e| format!("Upload failed: {}", e))?;
-                                let _ = db.set_setting(
-                                    "last_auto_backup",
-                                    &chrono::Utc::now().to_rfc3339(),
-                                );
-
                                 let sync_result = db.queue_full_state_sync().and_then(|_| {
                                     crate::services::sync_engine::SyncEngine::new(
                                         &db,
@@ -7223,7 +12027,7 @@ impl App {
                                         &device_id,
                                         Some(&server_url),
                                     )?
-                                    .push_pending_only()
+                                    .replace_with_pending_snapshot()
                                     .map(|_| ())
                                 });
                                 match sync_result {
@@ -7264,23 +12068,28 @@ impl App {
                         let device_id = self.device_id.clone();
                         std::thread::spawn(move || {
                             let outcome: Result<String, String> = (|| {
-                                let client = crate::services::api_client::ApiClient::new(
-                                    &server_url,
-                                    identity,
-                                    &device_id,
-                                );
-                                let json = client.send_request("GET", "recovery/latest", "")
-                                    .map_err(|e| {
-                                        if e.to_string().contains("404") {
-                                            "No backup found for this identity. On a new device, use [i] Restore Identity first, then [r].".to_string()
-                                        } else {
-                                            format!("Download failed: {}", e)
-                                        }
-                                    })?;
-                                if json.trim().is_empty() {
-                                    return Err("Backup content is empty".to_string());
+                                let storage_dir = crate::storage::get_storage_dir()
+                                    .map_err(|e| format!("Storage error: {}", e))?;
+                                let db = crate::database::Database::new(
+                                    &storage_dir.join("questline.db"),
+                                )
+                                .map_err(|e| format!("Database error: {}", e))?;
+                                db.set_setting("last_pull_seq_v2", "0")
+                                    .map_err(|e| format!("Cursor reset failed: {}", e))?;
+                                let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
+                                let (_pushed, pulled, _conflicts) =
+                                    crate::services::sync_engine::SyncEngine::new(
+                                        &db,
+                                        &identity,
+                                        &device_id,
+                                        Some(&server_url),
+                                    )
+                                    .and_then(|engine| engine.sync())
+                                    .map_err(|e| format!("Encrypted restore failed: {}", e))?;
+                                if pulled == 0 {
+                                    return Err("No encrypted snapshot was found".to_string());
                                 }
-                                Ok(json)
+                                Ok(format!("{} encrypted events restored", pulled))
                             })();
                             if let Ok(mut slot) = result_slot.lock() {
                                 *slot = Some(outcome);
@@ -7330,17 +12139,6 @@ impl App {
                                         let db_path = storage_dir.join("questline.db");
                                         let db = crate::database::Database::new(&db_path)
                                             .map_err(|e| format!("Database error: {}", e))?;
-                                        let fresh_json = db
-                                            .export_to_recovery_json()
-                                            .map_err(|e| format!("Export failed: {}", e))?;
-                                        let client = crate::services::api_client::ApiClient::new(
-                                            &server_url,
-                                            identity.clone(),
-                                            &device_id,
-                                        );
-                                        client
-                                            .send_request("POST", "recovery", &fresh_json)
-                                            .map_err(|e| format!("Upload failed: {}", e))?;
                                         let sync_result =
                                             db.queue_full_state_sync().and_then(|_| {
                                                 crate::services::sync_engine::SyncEngine::new(
@@ -7349,7 +12147,7 @@ impl App {
                                                     &device_id,
                                                     Some(&server_url),
                                                 )?
-                                                .push_pending_only()
+                                                .replace_with_pending_snapshot()
                                                 .map(|_| ())
                                             });
                                         let warning = sync_result
@@ -7507,8 +12305,7 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
-                    let active: Vec<&Project> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
+                    let active = ordered_active_projects(&self.projects);
                     if !active.is_empty() && self.selected_project_idx < active.len() {
                         let p = active[self.selected_project_idx];
                         self.modal_state = ModalType::ConfirmArchiveProject {
@@ -7579,11 +12376,7 @@ impl App {
                 self.active_tab_idx = 10;
             }
             KeyCode::Char('C') if self.active_screen == ActiveScreen::Projects => {
-                let active: Vec<&Project> = self
-                    .projects
-                    .iter()
-                    .filter(|project| !project.archived && !project.completed)
-                    .collect();
+                let active = ordered_active_projects(&self.projects);
                 if self.projects_all_selected {
                     self.active_project_id = None;
                     self.task_calendar =
@@ -7632,9 +12425,11 @@ impl App {
                 if self.active_screen == ActiveScreen::Dashboard =>
             {
                 let today = chrono::Local::now().date_naive();
-                if let Some(task) =
-                    crate::services::planner::find_main_quest(&self.all_tasks, today)
-                {
+                if let Some(task) = crate::services::planner::find_main_quest(
+                    &self.all_tasks,
+                    today,
+                    self.quest_visibility_horizon_days(),
+                ) {
                     if let Some(p_id) = task.project_id {
                         self.active_project_id = Some(p_id);
                         self.refresh_stats_cache();
@@ -7692,6 +12487,7 @@ impl App {
                         5 => self.adjust_sound_effects_volume(-0.05)?,
                         13 => self.adjust_streak_active_from(-1)?,
                         14 => self.adjust_streak_active_to(-1)?,
+                        15 => self.adjust_quest_visibility_horizon(-1)?,
                         _ => {}
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -7719,6 +12515,7 @@ impl App {
                         5 => self.adjust_sound_effects_volume(0.05)?,
                         13 => self.adjust_streak_active_from(1)?,
                         14 => self.adjust_streak_active_to(1)?,
+                        15 => self.adjust_quest_visibility_horizon(1)?,
                         _ => {}
                     }
                 } else if self.active_screen == ActiveScreen::Dashboard {
@@ -7738,7 +12535,12 @@ impl App {
                 }
             }
             KeyCode::Char('t') | KeyCode::Char('T') => {
-                if self.active_screen == ActiveScreen::Settings {
+                if self.active_screen == ActiveScreen::Fellowship {
+                    // Tesorería de la campaña seleccionada, según el rol propio
+                    self.selected_fellowship_tab = 7;
+                } else if self.active_screen == ActiveScreen::Projects {
+                    self.modal_state = ModalType::CampaignTemplateSelect { selected_idx: 0 };
+                } else if self.active_screen == ActiveScreen::Settings {
                     self.toggle_task_notifications()?;
                 } else if self.active_screen == ActiveScreen::Character {
                     let achievements = self.db.get_achievements()?;
@@ -7804,8 +12606,7 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Projects
                     && !self.projects_all_selected
                 {
-                    let active: Vec<&Project> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
+                    let active = ordered_active_projects(&self.projects);
                     if !active.is_empty() && self.selected_project_idx < active.len() {
                         self.modal_state = ModalType::InviteMember {
                             identity: String::new(),
@@ -7860,46 +12661,13 @@ impl App {
                     Self::previous_settings_block_focus(self.selected_settings_focus_idx);
             }
             KeyCode::Up | KeyCode::Char('k') if self.active_screen == ActiveScreen::Settings => {
-                if self.selected_settings_focus_idx == 0 {
-                    let choices_len = crate::theme::Theme::all_choices().len();
-                    self.selected_settings_theme_idx = if self.selected_settings_theme_idx > 0 {
-                        self.selected_settings_theme_idx - 1
-                    } else {
-                        choices_len.saturating_sub(1)
-                    };
-                } else {
-                    self.selected_settings_focus_idx =
-                        Self::previous_settings_option_focus(self.selected_settings_focus_idx);
-                }
+                self.cycle_selected_settings_row(false);
             }
             KeyCode::Down | KeyCode::Char('j') if self.active_screen == ActiveScreen::Settings => {
-                if self.selected_settings_focus_idx == 0 {
-                    let choices_len = crate::theme::Theme::all_choices().len();
-                    if choices_len > 0 {
-                        self.selected_settings_theme_idx =
-                            (self.selected_settings_theme_idx + 1) % choices_len;
-                    }
-                } else {
-                    self.selected_settings_focus_idx =
-                        Self::next_settings_option_focus(self.selected_settings_focus_idx);
-                }
+                self.cycle_selected_settings_row(true);
             }
             KeyCode::Enter if self.active_screen == ActiveScreen::Settings => {
-                match self.selected_settings_focus_idx {
-                    0 => {
-                        if let Some(choice) = crate::theme::Theme::all_choices()
-                            .get(self.selected_settings_theme_idx)
-                            .copied()
-                        {
-                            self.apply_theme_choice(choice)?;
-                            self.reload_data()?;
-                        }
-                    }
-                    1 => self.toggle_external_notifications()?,
-                    2 => self.toggle_task_notifications()?,
-                    3 => self.toggle_sound_effects()?,
-                    _ => {}
-                }
+                self.activate_selected_settings_row()?;
             }
             KeyCode::Char('n') if self.active_screen == ActiveScreen::Settings => {
                 self.toggle_external_notifications()?;
@@ -7909,6 +12677,7 @@ impl App {
                     5 => self.adjust_sound_effects_volume(0.05)?,
                     13 => self.adjust_streak_active_from(1)?,
                     14 => self.adjust_streak_active_to(1)?,
+                    15 => self.adjust_quest_visibility_horizon(1)?,
                     _ => {}
                 }
             }
@@ -7917,38 +12686,16 @@ impl App {
                     5 => self.adjust_sound_effects_volume(-0.05)?,
                     13 => self.adjust_streak_active_from(-1)?,
                     14 => self.adjust_streak_active_to(-1)?,
+                    15 => self.adjust_quest_visibility_horizon(-1)?,
                     _ => {}
                 }
             }
             // Screen specific arrows and edits
             KeyCode::Up => {
                 if self.active_screen == ActiveScreen::Character {
-                    if self.character_focus == 0 {
-                        let entries = self.db.get_chronicle_entries().unwrap_or_default();
-                        if !entries.is_empty() {
-                            if self.selected_chronicle_idx > 0 {
-                                self.selected_chronicle_idx -= 1;
-                            } else {
-                                self.selected_chronicle_idx = entries.len() - 1;
-                            }
-                        }
-                    } else if self.character_focus == 1 {
-                        let reflections = self.db.get_reflections().unwrap_or_default();
-                        if !reflections.is_empty() {
-                            if self.selected_reflection_idx > 0 {
-                                self.selected_reflection_idx -= 1;
-                            } else {
-                                self.selected_reflection_idx = reflections.len() - 1;
-                            }
-                            self.reflection_detail_scroll = 0;
-                        }
-                    } else if self.character_focus == 2 {
-                        if self.reflection_detail_scroll > 0 {
-                            self.reflection_detail_scroll -= 1;
-                        }
-                    }
+                    self.cycle_character_focus_pane(false);
                 } else if self.active_screen == ActiveScreen::Projects {
-                    let active_len = self.projects.iter().filter(|p| !p.archived).count();
+                    let active_len = ordered_active_projects(&self.projects).len();
                     if self.projects_all_selected {
                         // wrap from "All" to last real project
                         self.projects_all_selected = false;
@@ -7993,42 +12740,7 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     self.select_previous_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() {
-                            self.selected_invitation_idx = if self.selected_invitation_idx > 0 {
-                                self.selected_invitation_idx - 1
-                            } else {
-                                invites.len() - 1
-                            };
-                        }
-                    } else {
-                        let shared_projects: Vec<_> =
-                            self.projects.iter().filter(|p| p.is_shared).collect();
-                        if !shared_projects.is_empty() {
-                            let new_idx = if self.selected_fellowship_project_idx > 0 {
-                                self.selected_fellowship_project_idx - 1
-                            } else {
-                                shared_projects.len() - 1
-                            };
-                            if new_idx != self.selected_fellowship_project_idx {
-                                self.fellowship_selected_msg_idx = usize::MAX;
-                                self.fellowship_chat_input.clear();
-                                self.fellowship_composing = false;
-                            }
-                            self.selected_fellowship_project_idx = new_idx;
-                        } else if self.selected_fellowship_tab == 0 {
-                            let notifications = self.db.get_notifications().unwrap_or_default();
-                            if !notifications.is_empty() {
-                                self.selected_notification_idx =
-                                    if self.selected_notification_idx > 0 {
-                                        self.selected_notification_idx - 1
-                                    } else {
-                                        notifications.len() - 1
-                                    };
-                            }
-                        }
-                    }
+                    self.cycle_fellowship_selection(false);
                 } else if self.active_screen == ActiveScreen::Library {
                     if self.library_active_col == 0 {
                         self.selected_library_cat_idx = if self.selected_library_cat_idx > 0 {
@@ -8064,24 +12776,9 @@ impl App {
             }
             KeyCode::Down => {
                 if self.active_screen == ActiveScreen::Character {
-                    if self.character_focus == 0 {
-                        let entries = self.db.get_chronicle_entries().unwrap_or_default();
-                        if !entries.is_empty() {
-                            self.selected_chronicle_idx =
-                                (self.selected_chronicle_idx + 1) % entries.len();
-                        }
-                    } else if self.character_focus == 1 {
-                        let reflections = self.db.get_reflections().unwrap_or_default();
-                        if !reflections.is_empty() {
-                            self.selected_reflection_idx =
-                                (self.selected_reflection_idx + 1) % reflections.len();
-                            self.reflection_detail_scroll = 0;
-                        }
-                    } else if self.character_focus == 2 {
-                        self.reflection_detail_scroll += 1;
-                    }
+                    self.cycle_character_focus_pane(true);
                 } else if self.active_screen == ActiveScreen::Projects {
-                    let active_len = self.projects.iter().filter(|p| !p.archived).count();
+                    let active_len = ordered_active_projects(&self.projects).len();
                     if self.projects_all_selected {
                         // move from "All" into first real project
                         self.projects_all_selected = false;
@@ -8128,32 +12825,7 @@ impl App {
                 } else if self.active_screen == ActiveScreen::Soundscapes {
                     self.select_next_soundscape();
                 } else if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() {
-                            self.selected_invitation_idx =
-                                (self.selected_invitation_idx + 1) % invites.len();
-                        }
-                    } else {
-                        let shared_projects: Vec<_> =
-                            self.projects.iter().filter(|p| p.is_shared).collect();
-                        if !shared_projects.is_empty() {
-                            let new_idx =
-                                (self.selected_fellowship_project_idx + 1) % shared_projects.len();
-                            if new_idx != self.selected_fellowship_project_idx {
-                                self.fellowship_selected_msg_idx = usize::MAX;
-                                self.fellowship_chat_input.clear();
-                                self.fellowship_composing = false;
-                            }
-                            self.selected_fellowship_project_idx = new_idx;
-                        } else if self.selected_fellowship_tab == 0 {
-                            let notifications = self.db.get_notifications().unwrap_or_default();
-                            if !notifications.is_empty() {
-                                self.selected_notification_idx =
-                                    (self.selected_notification_idx + 1) % notifications.len();
-                            }
-                        }
-                    }
+                    self.cycle_fellowship_selection(true);
                 } else if self.active_screen == ActiveScreen::Library {
                     if self.library_active_col == 0 {
                         self.selected_library_cat_idx = (self.selected_library_cat_idx + 1) % 6;
@@ -8181,136 +12853,29 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
-                    let active: Vec<&Project> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
-                    if !active.is_empty() && self.selected_project_idx < active.len() {
-                        let proj = active[self.selected_project_idx];
-                        let proj_is_shared = proj.is_shared;
-                        self.active_project_id = Some(proj.id);
-                        self.active_screen = ActiveScreen::Workspace;
-                        self.workspace_tab_idx = 0;
-                        self.audio_player.play_open_tasks();
-                        self.workspace_sidebar_focused = true;
-                        self.selected_task_idx = 0;
-                        self.selected_note_idx = 0;
-                        self.selected_notes_flat_idx = 0;
-                        self.selected_journal_idx = 0;
-                        self.reload_data()?;
-                        if proj_is_shared {
-                            self.start_background_sync();
-                        }
-                    }
+                    self.open_selected_campaign()?;
                 } else if self.active_screen == ActiveScreen::Dashboard {
                     self.open_selected_dashboard_command()?;
                 } else if self.active_screen == ActiveScreen::Soundscapes {
-                    use crate::audio::SOUNDSCAPES;
-                    let s_name = SOUNDSCAPES[self.selected_soundscape_idx].name;
-                    if s_name == "Media Player" {
-                        crate::audio::mpris_player::play_pause();
-                        return Ok(());
-                    }
-                    if s_name == "Local Folder" {
-                        let folder = self
-                            .db
-                            .get_setting("local_music_folder")
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                        if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder {
-                                input: String::new(),
-                                suggestions: vec![],
-                                selected: 0,
-                            };
-                            return Ok(());
-                        }
-                        self.play_selected_local_choice();
-                        return Ok(());
-                    }
-                    let _ = self.db.set_setting("last_music_source", s_name);
-                    self.audio_player.play(s_name);
+                    self.play_selected_soundscape()?;
                 } else if self.active_screen == ActiveScreen::Fellowship {
-                    if self.selected_fellowship_tab == 1 {
-                        let invites = self.db.get_invitations().unwrap_or_default();
-                        if !invites.is_empty() && self.selected_invitation_idx < invites.len() {
-                            let invite = &invites[self.selected_invitation_idx];
-                            if invite.7 == "Pending" {
-                                self.db.update_invitation_status(&invite.0, "Accepted")?;
-                                if self.config.sync_enabled {
-                                    let client = crate::services::api_client::ApiClient::new(
-                                        &self.server_url,
-                                        self.identity.clone(),
-                                        &self.device_id,
-                                    );
-                                    let invite_id_clone = invite.0.clone();
-                                    let my_username = self
-                                        .user
-                                        .as_ref()
-                                        .map(|u| u.username.clone())
-                                        .unwrap_or_default();
-                                    let _ = std::thread::spawn(move || {
-                                        let body = serde_json::json!({
-                                            "invite_id": invite_id_clone,
-                                            "username": my_username
-                                        })
-                                        .to_string();
-                                        let _ = client.send_request("POST", "accept", &body);
-                                    });
-                                }
-                                if let Ok(proj_uuid) = Uuid::parse_str(&invite.1) {
-                                    let new_proj = Project {
-                                        id: proj_uuid,
-                                        name: invite.2.clone(),
-                                        description: Some("Fellowship shared project".to_string()),
-                                        created_at: Utc::now(),
-                                        updated_at: Utc::now(),
-                                        archived: false,
-                                        completed: false,
-                                        owner_identity: Some(invite.3.clone()),
-                                        owner_username: Some(invite.4.clone()),
-                                        is_shared: true,
-                                    };
-                                    let _ = self.db.insert_project(&new_proj);
-
-                                    let _ = self.db.add_project_member(
-                                        &invite.1, &invite.3, &invite.4, "Owner",
-                                    );
-                                    let _ = self.db.add_project_member(
-                                        &invite.1,
-                                        &self.identity.public_key,
-                                        &self.user.as_ref().unwrap().username,
-                                        &invite.6,
-                                    );
-                                }
-
-                                let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'first_companion' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
-
-                                self.notifications.push(Notification::info(format!(
-                                    "Accepted invitation to '{}'",
-                                    invite.2
-                                )));
-
-                                let shared_projs_count =
-                                    self.projects.iter().filter(|p| p.is_shared).count() + 1;
-                                if shared_projs_count >= 25 {
-                                    let _ = self.db.conn.execute("UPDATE achievements SET unlocked_at = ?1 WHERE id = 'alliance_builder' AND unlocked_at IS NULL", params![Utc::now().to_rfc3339()]);
-                                }
-
-                                self.mark_dirty();
-                                self.reload_data()?;
-                            }
-                        }
-                    }
-                } else if self.active_screen == ActiveScreen::Fellowship
-                    && self.selected_fellowship_tab == 0
-                    && self.projects.iter().filter(|p| p.is_shared).count() == 0
-                {
-                    let notifications = self.db.get_notifications().unwrap_or_default();
-                    if !notifications.is_empty()
-                        && self.selected_notification_idx < notifications.len()
+                    if self.selected_fellowship_tab == 6 {
+                        self.open_selected_council_notice()?;
+                    } else if self.selected_fellowship_tab == 5 {
+                        self.open_selected_my_quest()?;
+                    } else if self.selected_fellowship_tab == 1 {
+                        self.accept_selected_fellowship_invitation()?;
+                    } else if self.selected_fellowship_tab == 0
+                        && self.projects.iter().filter(|p| p.is_shared).count() == 0
                     {
-                        let notif = &notifications[self.selected_notification_idx];
-                        self.db.mark_notification_read(&notif.0)?;
-                        self.reload_data()?;
+                        // NB: this branch used to live as a separate, unreachable
+                        // `else if self.active_screen == ActiveScreen::Fellowship && ...`
+                        // arm below this one — since this outer arm's condition
+                        // (active_screen == Fellowship) is a superset of that one's,
+                        // it always matched first and the tab-0 branch could never
+                        // run. Folded in here so Enter on Chat's no-Campaigns
+                        // notification fallback actually marks it read.
+                        self.open_selected_fellowship_notification()?;
                     }
                 }
             }
@@ -8411,6 +12976,43 @@ impl App {
                     self.great_chronicle_entries.len()
                 )));
             }
+            KeyCode::Char('x') => {
+                if self.active_screen == ActiveScreen::Fellowship
+                    && self.selected_fellowship_tab == 2
+                {
+                    let shared: Vec<_> = self.projects.iter().filter(|p| p.is_shared).collect();
+                    if let Some(project) = shared.get(self.selected_fellowship_project_idx) {
+                        if self
+                            .db
+                            .get_member_role(&project.id.to_string(), &self.identity.public_key)?
+                            .as_deref()
+                            != Some("Owner")
+                        {
+                            self.notifications.push(Notification::warning(
+                                "Only the project owner may remove companions.".to_string(),
+                            ));
+                        } else {
+                            let members = self
+                                .db
+                                .get_presence_for_project(&project.id.to_string())
+                                .unwrap_or_default();
+                            if let Some(member) = members.get(self.selected_fellowship_member_idx) {
+                                if member.0 == self.identity.public_key {
+                                    self.notifications.push(Notification::warning(
+                                        "The project owner cannot remove themselves.".to_string(),
+                                    ));
+                                } else {
+                                    self.modal_state = ModalType::ConfirmRemoveFellowshipMember {
+                                        project_id: project.id.to_string(),
+                                        member_identity: member.0.clone(),
+                                        member_username: member.1.clone(),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             KeyCode::Char('r') => {
                 if self.active_screen == ActiveScreen::Fellowship
                     && self.selected_fellowship_tab == 2
@@ -8444,21 +13046,7 @@ impl App {
                         };
                     }
                 } else if self.active_screen == ActiveScreen::Archive {
-                    let archived: Vec<&Project> = self
-                        .projects
-                        .iter()
-                        .filter(|p| p.archived || p.completed)
-                        .collect();
-                    if !archived.is_empty() && self.selected_archive_idx < archived.len() {
-                        let mut p = archived[self.selected_archive_idx].clone();
-                        p.archived = false;
-                        p.completed = false;
-                        self.db.update_project(&p)?;
-                        self.mark_dirty();
-                        self.apply_class_passive("project_restore", 0)?;
-                        self.selected_archive_idx = 0;
-                        self.reload_data()?;
-                    }
+                    self.restore_selected_archived_project()?;
                 } else if self.active_screen == ActiveScreen::Fellowship
                     && self.selected_fellowship_tab == 0
                 {
@@ -8494,8 +13082,7 @@ impl App {
             }
             KeyCode::Char('e') => {
                 if self.active_screen == ActiveScreen::Projects && !self.projects_all_selected {
-                    let active: Vec<&Project> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
+                    let active = ordered_active_projects(&self.projects);
                     if !active.is_empty() && self.selected_project_idx < active.len() {
                         let p = active[self.selected_project_idx];
                         let name_len = p.name.len();
@@ -8536,6 +13123,51 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('y') => {
+                if self.active_screen == ActiveScreen::Fellowship {
+                    self.selected_fellowship_tab = 5;
+                    self.selected_my_quest_idx = 0;
+                }
+            }
+            KeyCode::Char('b') => {
+                if self.active_screen == ActiveScreen::Fellowship {
+                    self.selected_fellowship_tab = 6;
+                    self.selected_notification_idx = 0;
+                }
+            }
+            KeyCode::Char('f') if self.active_screen == ActiveScreen::Fellowship => {
+                if self.selected_fellowship_tab == 6 {
+                    self.council_notice_filter = match self.council_notice_filter.as_str() {
+                        "All" => "Unread".to_string(),
+                        "Unread" => "Mentions".to_string(),
+                        _ => "All".to_string(),
+                    };
+                    self.selected_notification_idx = 0;
+                }
+            }
+            KeyCode::Char('u') => {
+                if self.active_screen == ActiveScreen::Fellowship
+                    && self.selected_fellowship_tab == 6
+                {
+                    let notices = self.council_notices();
+                    if let Some(notice) = notices.get(self.selected_notification_idx) {
+                        if notice.5 {
+                            self.db.mark_notification_unread(&notice.0)?;
+                        } else {
+                            self.db.mark_notification_read(&notice.0)?;
+                        }
+                        self.reload_data()?;
+                    }
+                }
+            }
+            KeyCode::Char('A') => {
+                if self.active_screen == ActiveScreen::Fellowship
+                    && self.selected_fellowship_tab == 6
+                {
+                    self.db.mark_all_notifications_read()?;
+                    self.reload_data()?;
+                }
+            }
             KeyCode::Char('/') => {
                 if self.active_screen == ActiveScreen::Fellowship {
                     self.selected_fellowship_tab = 4;
@@ -8544,68 +13176,11 @@ impl App {
                     };
                 }
             }
+            // 'm' on Dashboard is handled earlier, in the global preamble's
+            // KeyCode::Char('m') arm (next to 'p') — it returns before
+            // reaching here, so this arm is unreachable for Dashboard and
+            // stays a no-op for every other screen.
             KeyCode::Char('m') => {}
-            KeyCode::Char('v') => {
-                if self.active_screen == ActiveScreen::Fellowship
-                    && self.selected_fellowship_tab == 0
-                {
-                    let active_projects: Vec<_> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
-                    let shared_projects: Vec<_> =
-                        self.projects.iter().filter(|p| p.is_shared).collect();
-
-                    let mut default_proj_idx = 0;
-                    if !shared_projects.is_empty()
-                        && self.selected_fellowship_project_idx < shared_projects.len()
-                    {
-                        let selected_shared_id =
-                            shared_projects[self.selected_fellowship_project_idx].id;
-                        if let Some(pos) = active_projects
-                            .iter()
-                            .position(|p| p.id == selected_shared_id)
-                        {
-                            default_proj_idx = pos;
-                        }
-                    }
-
-                    self.modal_state = ModalType::InviteMember {
-                        identity: String::new(),
-                        username: String::new(),
-                        role_idx: 0,
-                        project_idx: default_proj_idx,
-                        focus_idx: 0,
-                    };
-                }
-            }
-            KeyCode::Char('k') => {
-                if self.active_screen == ActiveScreen::Soundscapes && self.local_folder_selected() {
-                    self.select_previous_local_track();
-                }
-            }
-            KeyCode::Char('j') => {
-                if self.active_screen == ActiveScreen::Soundscapes && self.local_folder_selected() {
-                    self.select_next_local_track();
-                } else if self.active_screen == ActiveScreen::Fellowship {
-                    let shared_projects: Vec<_> =
-                        self.projects.iter().filter(|p| p.is_shared).collect();
-                    if !shared_projects.is_empty()
-                        && self.selected_fellowship_project_idx < shared_projects.len()
-                    {
-                        let p = shared_projects[self.selected_fellowship_project_idx];
-                        self.modal_state = ModalType::ProjectSharing { project_id: p.id };
-                    }
-                } else if self.active_screen == ActiveScreen::Projects
-                    && !self.projects_all_selected
-                {
-                    let active: Vec<&Project> =
-                        self.projects.iter().filter(|p| !p.archived).collect();
-                    if !active.is_empty() && self.selected_project_idx < active.len() {
-                        let p = active[self.selected_project_idx];
-                        self.modal_state = ModalType::ProjectSharing { project_id: p.id };
-                    }
-                }
-            }
-
             KeyCode::Delete => {
                 if self.active_screen == ActiveScreen::Archive {
                     let archived: Vec<&Project> =
@@ -8712,11 +13287,9 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                if is_edit {
-                    // en edición ESC guarda automáticamente antes de cerrar; en creación
-                    // (New Realm Quest) ESC sigue cancelando sin crear el proyecto
-                    self.save_project_modal(&name, &desc, p_id)?;
-                }
+                // The dialog promises save & close for both new and existing campaigns.
+                // An empty new name still closes without creating anything.
+                self.save_project_modal(&name, &desc, p_id)?;
                 self.modal_state = ModalType::None;
             }
             KeyCode::Tab => {
@@ -9077,6 +13650,52 @@ impl App {
         Ok(())
     }
 
+    fn create_campaign_from_template(&mut self, template_idx: usize) -> Result<Uuid> {
+        let template = crate::campaign_templates::get(template_idx)
+            .ok_or_else(|| anyhow::anyhow!("Unknown Campaign template"))?;
+        let existing_names = self
+            .projects
+            .iter()
+            .map(|project| project.name.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        let campaign_name =
+            crate::campaign_templates::unique_campaign_name(template.name, &existing_names);
+
+        let owner_username = self
+            .user
+            .as_ref()
+            .map(|user| user.username.clone())
+            .unwrap_or_else(|| "Adventurer".to_string());
+        let portable = template.portable();
+        let (project, task_trees) = portable.materialize(
+            campaign_name.clone(),
+            self.identity.public_key.clone(),
+            owner_username,
+        )?;
+        let project_id = project.id;
+
+        self.db.insert_campaign_template(&project, &task_trees)?;
+        self.mark_dirty();
+        self.apply_class_passive("project_create", 0)?;
+        if let Some(ref user) = self.user {
+            let day_number = (Utc::now() - user.created_at).num_days() as i32 + 1;
+            self.db.add_chronicle_entry(
+                day_number,
+                &format!(
+                    "Opened Campaign Arc from the {} blueprint: {}.",
+                    template.name, campaign_name
+                ),
+            )?;
+        }
+        self.reload_data()?;
+        self.notifications.push(Notification::info(format!(
+            "Campaign '{}' created from template with {} Quests.",
+            campaign_name,
+            task_trees.len()
+        )));
+        Ok(project_id)
+    }
+
     // Lista plana para el tab de notas: (Some, None)=encabezado codex | (_, Some)=nota | (None, None)=divisor
     // Árbol DFS completo — todos los codices y sus hijos a cualquier profundidad, siempre expandidos
     fn build_notes_flat(
@@ -9181,6 +13800,32 @@ impl App {
             .collect()
     }
 
+    // True cuando la tarea tiene steps propios — no se le permite volverse step de otra
+    // tarea porque este tablero solo soporta un nivel de anidamiento (steps no tienen steps)
+    pub fn task_has_children(&self, task_id: Uuid) -> bool {
+        self.all_tasks
+            .iter()
+            .any(|t| t.parent_task_id == Some(task_id))
+    }
+
+    // Destinos elegibles para "mover" una tarea: otras tareas top-level del mismo proyecto,
+    // sin completar y sin steps propios. No incluye la tarea en sí.
+    pub fn refile_task_targets(&self, task_id: Uuid) -> Vec<Uuid> {
+        let Some(task) = self.all_tasks.iter().find(|t| t.id == task_id) else {
+            return Vec::new();
+        };
+        self.all_tasks
+            .iter()
+            .filter(|t| {
+                t.id != task_id
+                    && t.project_id == task.project_id
+                    && t.parent_task_id.is_none()
+                    && !t.completed
+            })
+            .map(|t| t.id)
+            .collect()
+    }
+
     pub fn build_scroll_destinations(
         projects: &[Project],
         codices: &[crate::models::Codex],
@@ -9229,12 +13874,44 @@ impl App {
     fn reset_workspace_pane_focus(&mut self) {
         self.workspace_sidebar_focused = false;
         self.note_preview_focused = false;
+        self.quest_ledger_focused = false;
+    }
+
+    /// Jumps straight to workspace tab `idx` and focuses its content —
+    /// shared by the 1-5 number-key shortcuts and a click on that sidebar
+    /// row (both are "go to this tab" gestures, not just a selection move).
+    fn activate_workspace_tab(&mut self, idx: usize) {
+        self.workspace_tab_idx = idx;
+        self.reset_workspace_pane_focus();
     }
 
     fn cycle_workspace_pane_focus(&mut self, reverse: bool) {
         match self.workspace_tab_idx {
-            // Quests and Overview have two focusable panes: workspace menu and content.
-            0 | 3 => {
+            // Quests has three focusable panes in the list view — workspace menu,
+            // quest list, and the Quest Ledger details pane — same shape as Scrolls
+            // below. Kanban mode has no ledger pane, so it falls through to the
+            // two-pane arm underneath instead.
+            0 if !self.quest_board_open => {
+                let current = if self.workspace_sidebar_focused {
+                    0
+                } else if self.quest_ledger_focused {
+                    2
+                } else {
+                    1
+                };
+                let next = if reverse {
+                    if current == 0 { 2 } else { current - 1 }
+                } else {
+                    (current + 1) % 3
+                };
+                self.workspace_sidebar_focused = next == 0;
+                self.quest_ledger_focused = next == 2;
+                if self.quest_ledger_focused {
+                    self.quest_ledger_scroll = 0;
+                }
+            }
+            // Quests-in-Kanban and Overview have two focusable panes: workspace menu and content.
+            0 | 3 | 4 => {
                 self.note_preview_focused = false;
                 self.workspace_sidebar_focused = !self.workspace_sidebar_focused;
             }
@@ -9264,6 +13941,493 @@ impl App {
                 self.note_preview_focused = false;
             }
         }
+    }
+
+    /// Cycles Workspace's currently focused list/pane by one step — the
+    /// sidebar's tab order, the Scrolls tab's preview pane scroll, or the
+    /// active tab's own content list (Ledger/Kanban, Scrolls, Journal,
+    /// Milestones, Treasury). Mirrors the Up/Down key arm in
+    /// handle_workspace_key, and is shared with it so keyboard and mouse
+    /// can't drift apart.
+    fn cycle_workspace_selection(&mut self, forward: bool) {
+        if self.workspace_sidebar_focused {
+            self.workspace_tab_idx = if forward {
+                match self.workspace_tab_idx {
+                    3 => 0,
+                    0 => 1,
+                    1 => 4,
+                    4 => 2,
+                    _ => 3,
+                }
+            } else {
+                match self.workspace_tab_idx {
+                    3 => 2,
+                    0 => 3,
+                    1 => 0,
+                    4 => 1,
+                    _ => 4,
+                }
+            };
+            self.note_preview_focused = false;
+            self.quest_ledger_focused = false;
+            return;
+        }
+        if self.note_preview_focused {
+            if forward {
+                self.note_preview_scroll = self
+                    .note_preview_scroll
+                    .saturating_add(1)
+                    .min(self.note_preview_max_scroll.get());
+            } else {
+                self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
+            }
+            return;
+        }
+        if self.quest_ledger_focused {
+            if forward {
+                self.quest_ledger_scroll = self
+                    .quest_ledger_scroll
+                    .saturating_add(1)
+                    .min(self.quest_ledger_max_scroll.get());
+            } else {
+                self.quest_ledger_scroll = self.quest_ledger_scroll.saturating_sub(1);
+            }
+            return;
+        }
+
+        let Some(p_id) = self.active_project_id else {
+            return;
+        };
+
+        match self.workspace_tab_idx {
+            0 => {
+                let all_tasks = self.all_tasks.clone();
+                let mut proj_tasks = visible_workspace_tasks(
+                    &all_tasks,
+                    p_id,
+                    self.viewing_step_for_task,
+                    &self.task_filter,
+                    &self.task_sort,
+                    &self.search_query,
+                    Some(&self.db),
+                    &self.identity.public_key,
+                );
+                if self.quest_board_open && self.viewing_step_for_task.is_none() {
+                    proj_tasks.retain(|task| task.parent_task_id.is_none());
+                }
+                if self.quest_board_open {
+                    let statuses = proj_tasks
+                        .iter()
+                        .map(|task| {
+                            self.db
+                                .get_quest_status(&task.id.to_string(), task.completed)
+                                .unwrap_or(QuestStatus::Backlog)
+                        })
+                        .collect::<Vec<_>>();
+                    // Steps render nested under their card in the board now,
+                    // so Up/Down walk through them too — card header, then
+                    // each of its steps in order, then on to the next/prev
+                    // card's header — instead of jumping straight card to
+                    // card. Only meaningful in the board itself: a step never
+                    // has steps of its own, so this is a no-op while drilled
+                    // into a parent's step list (`viewing_step_for_task`).
+                    let step_count = if self.viewing_step_for_task.is_none() {
+                        proj_tasks
+                            .get(self.selected_task_idx)
+                            .map(|task| {
+                                self.all_tasks
+                                    .iter()
+                                    .filter(|step| step.parent_task_id == Some(task.id))
+                                    .count()
+                            })
+                            .unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    if forward {
+                        match self.kanban_step_idx {
+                            None if step_count > 0 => self.kanban_step_idx = Some(0),
+                            Some(i) if i + 1 < step_count => self.kanban_step_idx = Some(i + 1),
+                            _ => {
+                                self.selected_task_idx = move_quest_board_selection(
+                                    &statuses,
+                                    self.selected_task_idx,
+                                    0,
+                                    1,
+                                );
+                                self.kanban_step_idx = None;
+                            }
+                        }
+                    } else {
+                        match self.kanban_step_idx {
+                            Some(0) => self.kanban_step_idx = None,
+                            Some(i) => self.kanban_step_idx = Some(i - 1),
+                            None => {
+                                self.selected_task_idx = move_quest_board_selection(
+                                    &statuses,
+                                    self.selected_task_idx,
+                                    0,
+                                    -1,
+                                );
+                                // Land on the newly-selected card's last step
+                                // (if it has any) so Up walks up off the top
+                                // of a card the same way Down walks off the
+                                // bottom, instead of always landing on a
+                                // header.
+                                self.kanban_step_idx = if self.viewing_step_for_task.is_none() {
+                                    proj_tasks
+                                        .get(self.selected_task_idx)
+                                        .map(|task| {
+                                            self.all_tasks
+                                                .iter()
+                                                .filter(|step| {
+                                                    step.parent_task_id == Some(task.id)
+                                                })
+                                                .count()
+                                        })
+                                        .filter(|count| *count > 0)
+                                        .map(|count| count - 1)
+                                } else {
+                                    None
+                                };
+                            }
+                        }
+                    }
+                } else if !proj_tasks.is_empty() {
+                    self.selected_task_idx = if forward {
+                        if self.selected_task_idx < proj_tasks.len() - 1 {
+                            self.selected_task_idx + 1
+                        } else {
+                            0
+                        }
+                    } else if self.selected_task_idx > 0 {
+                        self.selected_task_idx - 1
+                    } else {
+                        proj_tasks.len() - 1
+                    };
+                }
+                self.quest_ledger_scroll = 0;
+            }
+            1 => {
+                let proj_notes: Vec<Note> = self
+                    .all_notes
+                    .iter()
+                    .filter(|n| {
+                        n.project_id == Some(p_id)
+                            || (n.project_id.is_none()
+                                && n.codex_id
+                                    .map(|codex_id| {
+                                        self.codices
+                                            .iter()
+                                            .any(|c| c.id == codex_id && c.project_id == p_id)
+                                    })
+                                    .unwrap_or(true))
+                    })
+                    .filter(|n| {
+                        if !self.search_query.is_empty() {
+                            n.title
+                                .to_lowercase()
+                                .contains(&self.search_query.to_lowercase())
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
+                if !flat.is_empty() {
+                    let len = flat.len();
+                    let mut idx = if forward {
+                        (self.selected_notes_flat_idx + 1) % len
+                    } else if self.selected_notes_flat_idx > 0 {
+                        self.selected_notes_flat_idx - 1
+                    } else {
+                        len - 1
+                    };
+                    // Los divisores (None, None) no son navegables — saltarlos
+                    while flat[idx] == (None, None) {
+                        idx = if forward {
+                            (idx + 1) % len
+                        } else if idx > 0 {
+                            idx - 1
+                        } else {
+                            len - 1
+                        };
+                    }
+                    self.selected_notes_flat_idx = idx;
+                    if let Some(note_idx) = flat[idx].1 {
+                        self.selected_note_idx = note_idx;
+                    }
+                    self.note_preview_scroll = 0;
+                    self.note_preview_focused = false;
+                }
+            }
+            2 => {
+                let proj_journals: Vec<JournalEntry> = self
+                    .all_journals
+                    .iter()
+                    .filter(|j| j.project_id == p_id)
+                    .filter(|j| {
+                        if !self.search_query.is_empty() {
+                            j.content
+                                .to_lowercase()
+                                .contains(&self.search_query.to_lowercase())
+                        } else {
+                            true
+                        }
+                    })
+                    .cloned()
+                    .collect();
+                if !proj_journals.is_empty() {
+                    self.selected_journal_idx = if forward {
+                        (self.selected_journal_idx + 1) % proj_journals.len()
+                    } else if self.selected_journal_idx > 0 {
+                        self.selected_journal_idx - 1
+                    } else {
+                        proj_journals.len() - 1
+                    };
+                }
+            }
+            3 => {
+                if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
+                    if !milestones.is_empty() {
+                        self.selected_milestone_idx = if forward {
+                            (self.selected_milestone_idx + 1) % milestones.len()
+                        } else if self.selected_milestone_idx > 0 {
+                            self.selected_milestone_idx - 1
+                        } else {
+                            milestones.len() - 1
+                        };
+                    }
+                }
+            }
+            4 => {
+                let count = crate::services::TreasuryService::new(&self.db)
+                    .entries(p_id, &self.treasury_filter, self.treasury_sort)
+                    .map(|entries| entries.len())
+                    .unwrap_or(0);
+                if count > 0 {
+                    self.selected_treasury_idx = if forward {
+                        (self.selected_treasury_idx + 1) % count
+                    } else if self.selected_treasury_idx > 0 {
+                        self.selected_treasury_idx - 1
+                    } else {
+                        count - 1
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn cycle_quest_stance(&mut self, task: &Task, project_id: Uuid, reverse: bool) -> Result<()> {
+        if task.parent_task_id.is_some() {
+            self.notifications.push(Notification::info(
+                "Trials inherit the stance of their parent quest.".to_string(),
+            ));
+            return Ok(());
+        }
+        let project_id = project_id.to_string();
+        let project_shared = self
+            .projects
+            .iter()
+            .find(|project| project.id.to_string() == project_id)
+            .map(|project| project.is_shared)
+            .unwrap_or(false);
+        let assigned_to_me = self
+            .db
+            .get_task_assignments(&task.id.to_string())
+            .unwrap_or_default()
+            .iter()
+            .any(|(identity, _)| identity == &self.identity.public_key);
+        let role = self
+            .db
+            .get_member_role(&project_id, &self.identity.public_key)?;
+        if project_shared
+            && !assigned_to_me
+            && !matches!(role.as_deref(), Some("Owner" | "Steward"))
+        {
+            self.notifications.push(Notification::warning(
+                "The Council has not entrusted this quest's stance to you.".to_string(),
+            ));
+            return Ok(());
+        }
+        if task.completed {
+            self.notifications.push(Notification::info(
+                "This quest is Conquered. Press [Space] to reopen it first.".to_string(),
+            ));
+            return Ok(());
+        }
+        let current = self.db.get_quest_status(&task.id.to_string(), false)?;
+        let next = if reverse {
+            current.previous_active()
+        } else {
+            current.next_active()
+        };
+        let actor_name = self
+            .user
+            .as_ref()
+            .map(|user| user.username.as_str())
+            .unwrap_or("Adventurer");
+        self.db.set_quest_status(
+            &task.id.to_string(),
+            &project_id,
+            next,
+            &self.identity.public_key,
+            actor_name,
+        )?;
+        self.db.log_activity(
+            Some(&project_id),
+            "quest_status_changed",
+            &format!("{} entered stance: {}.", task.title, next.display_name()),
+            &self.identity.public_key,
+            actor_name,
+        )?;
+        self.mark_dirty();
+        self.notifications.push(Notification::info(format!(
+            "Council decree: '{}' is now {}.",
+            task.title,
+            next.display_name()
+        )));
+        self.reload_data()?;
+        Ok(())
+    }
+
+    /// Opens a Quest at its exact Ledger row. Fellowship views and Council
+    /// notices use this so "open" never drops a Companion at the Campaign gate.
+    fn open_quest_in_workspace(&mut self, task_id: Uuid) -> Result<bool> {
+        let Some(project_id) = self
+            .all_tasks
+            .iter()
+            .find(|task| task.id == task_id)
+            .and_then(|task| task.project_id)
+        else {
+            self.notifications.push(Notification::warning(
+                "That Quest is no longer present in your local Chronicle.".to_string(),
+            ));
+            return Ok(false);
+        };
+
+        self.active_project_id = Some(project_id);
+        self.active_screen = ActiveScreen::Workspace;
+        self.workspace_tab_idx = 0;
+        self.workspace_sidebar_focused = false;
+        self.quest_board_open = false;
+        self.viewing_step_for_task = None;
+        self.task_filter = "All".to_string();
+        self.searching = false;
+        self.search_query.clear();
+        self.reload_data()?;
+
+        let visible = visible_workspace_tasks(
+            &self.all_tasks,
+            project_id,
+            None,
+            &self.task_filter,
+            &self.task_sort,
+            "",
+            Some(&self.db),
+            &self.identity.public_key,
+        );
+        self.selected_task_idx = visible
+            .iter()
+            .position(|task| task.id == task_id)
+            .unwrap_or(0);
+        Ok(true)
+    }
+
+    fn quest_board_preference(&self, project_id: Uuid, default_to_kanban: bool) -> bool {
+        self.db
+            .get_setting(&format!("campaign_view_mode:{}", project_id))
+            .ok()
+            .flatten()
+            .map(|mode| mode == "kanban")
+            .unwrap_or(default_to_kanban)
+    }
+
+    fn save_quest_board_preference(&self, project_id: Uuid) {
+        let _ = self.db.set_setting(
+            &format!("campaign_view_mode:{}", project_id),
+            if self.quest_board_open {
+                "kanban"
+            } else {
+                "ledger"
+            },
+        );
+    }
+
+    /// Advances the Dashboard to its next layout (Default → Journey Map →
+    /// Today's Agenda → Deadline Timeline → Default …) and persists the
+    /// choice — a global preference, unlike `campaign_view_mode:{project_id}`
+    /// above, since the dashboard isn't project-scoped.
+    fn cycle_dashboard_layout(&mut self) {
+        self.dashboard_layout = self.dashboard_layout.next();
+        let _ = self
+            .db
+            .set_setting("dashboard_layout", self.dashboard_layout.key());
+    }
+
+    fn project_is_shared(&self, project_id: Uuid) -> bool {
+        self.projects
+            .iter()
+            .find(|project| project.id == project_id)
+            .map(|project| project.is_shared)
+            .or_else(|| {
+                self.db
+                    .get_projects()
+                    .ok()?
+                    .into_iter()
+                    .find(|project| project.id == project_id)
+                    .map(|project| project.is_shared)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Rol de tesorería de la identidad activa en esta campaña.
+    pub fn treasury_role(
+        &self,
+        project_id: Uuid,
+    ) -> crate::services::treasury_policy::TreasuryRole {
+        let role = self
+            .db
+            .get_member_role(&project_id.to_string(), &self.identity.public_key)
+            .ok()
+            .flatten();
+        crate::services::treasury_policy::TreasuryRole::resolve(
+            self.project_is_shared(project_id),
+            role.as_deref(),
+        )
+    }
+
+    /// Comprueba la acción contra la matriz de la Fellowship antes de tocar la tesorería.
+    /// Un rechazo del servidor revierte el lote completo de sync, así que el cliente no
+    /// debe siquiera registrar el cambio local.
+    fn treasury_allows(
+        &mut self,
+        project_id: Uuid,
+        action: crate::services::treasury_policy::TreasuryAction,
+    ) -> bool {
+        let role = self.treasury_role(project_id);
+        if crate::services::treasury_policy::allows(role, action) {
+            return true;
+        }
+        self.notifications.push(Notification::warning(
+            crate::services::treasury_policy::denial(role, action),
+        ));
+        false
+    }
+
+    fn council_notices(&self) -> Vec<CouncilNotice> {
+        self.db
+            .get_notifications()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|notice| match self.council_notice_filter.as_str() {
+                "Unread" => !notice.5,
+                "Mentions" => notice.1 == "mention",
+                _ => true,
+            })
+            .collect()
     }
 
     fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
@@ -9314,14 +14478,19 @@ impl App {
         }
 
         let all_tasks = self.all_tasks.clone();
-        let proj_tasks = visible_workspace_tasks(
+        let mut proj_tasks = visible_workspace_tasks(
             &all_tasks,
             p_id,
             self.viewing_step_for_task,
             &self.task_filter,
             &self.task_sort,
             &self.search_query,
+            Some(&self.db),
+            &self.identity.public_key,
         );
+        if self.quest_board_open && self.viewing_step_for_task.is_none() {
+            proj_tasks.retain(|task| task.parent_task_id.is_none());
+        }
 
         // Evita que el índice quede fuera de rango cuando se completan pasos y la lista se encoge
         if !proj_tasks.is_empty() && self.selected_task_idx >= proj_tasks.len() {
@@ -9376,6 +14545,8 @@ impl App {
             KeyCode::Esc => {
                 if self.note_preview_focused {
                     self.note_preview_focused = false;
+                } else if self.quest_ledger_focused {
+                    self.quest_ledger_focused = false;
                 } else if self.viewing_step_for_task.is_some() {
                     self.viewing_step_for_task = None;
                     self.selected_task_idx = 0;
@@ -9395,27 +14566,159 @@ impl App {
                 self.task_calendar =
                     Some(TaskCalendarState::month_planner(Local::now().date_naive()));
             }
-            KeyCode::Char('1') => {
-                self.workspace_tab_idx = 0;
-                self.reset_workspace_pane_focus();
+            KeyCode::Char('B') => {
+                if self.workspace_tab_idx == 4 {
+                    if !self.treasury_allows(
+                        p_id,
+                        crate::services::treasury_policy::TreasuryAction::SetOverallBudget,
+                    ) {
+                        return Ok(());
+                    }
+                    self.modal_state = ModalType::TreasuryBudget {
+                        amount: String::new(),
+                        target_idx: 0,
+                        focus_idx: 0,
+                    };
+                    return Ok(());
+                }
+                let is_shared = self
+                    .projects
+                    .iter()
+                    .find(|project| project.id == p_id)
+                    .is_some_and(|project| project.is_shared);
+                if is_shared {
+                    self.modal_state = ModalType::CouncilBriefing {
+                        selected_section_idx: 0,
+                    };
+                } else {
+                    self.notifications.push(Notification::info(
+                        "Council Briefings are available in shared Campaigns.".to_string(),
+                    ));
+                }
             }
-            KeyCode::Char('2') => {
-                self.workspace_tab_idx = 1;
-                self.reset_workspace_pane_focus();
+            KeyCode::Char('K') if self.workspace_tab_idx == 0 => {
+                let selected_task_id = proj_tasks.get(self.selected_task_idx).map(|task| task.id);
+                self.quest_board_open = !self.quest_board_open;
+                self.save_quest_board_preference(p_id);
+                self.viewing_step_for_task = None;
+                self.kanban_step_idx = None;
+                let mut next_tasks = visible_workspace_tasks(
+                    &all_tasks,
+                    p_id,
+                    None,
+                    &self.task_filter,
+                    &self.task_sort,
+                    &self.search_query,
+                    Some(&self.db),
+                    &self.identity.public_key,
+                );
+                if self.quest_board_open {
+                    next_tasks.retain(|task| task.parent_task_id.is_none());
+                }
+                self.selected_task_idx = selected_task_id
+                    .and_then(|id| next_tasks.iter().position(|task| task.id == id))
+                    .unwrap_or(0);
             }
-            KeyCode::Char('3') => {
-                self.workspace_tab_idx = 2;
-                self.reset_workspace_pane_focus();
+            KeyCode::Char('$') if self.workspace_tab_idx == 4 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::SwitchCurrency,
+                ) {
+                    return Ok(());
+                }
+                let selected_idx = crate::services::TreasuryService::new(&self.db)
+                    .campaign_currency(p_id)
+                    .unwrap_or_default()
+                    .index();
+                self.modal_state = ModalType::TreasuryCurrency { selected_idx };
             }
-            KeyCode::Char('4') => {
-                self.workspace_tab_idx = 3;
-                self.reset_workspace_pane_focus();
+            KeyCode::Char('$') if self.workspace_tab_idx == 0 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::SetTaskCost,
+                ) {
+                    return Ok(());
+                }
+                if let Some(task) = proj_tasks.get(self.selected_task_idx) {
+                    let financials = crate::services::TreasuryService::new(&self.db)
+                        .get_task_financials(task.id)?;
+                    self.modal_state = ModalType::TaskFinancials {
+                        task_id: task.id,
+                        estimated: financials
+                            .as_ref()
+                            .and_then(|value| value.estimated_cost_minor)
+                            .map(crate::services::treasury::format_minor)
+                            .unwrap_or_default(),
+                        actual: financials
+                            .as_ref()
+                            .and_then(|value| value.actual_cost_minor)
+                            .map(crate::services::treasury::format_minor)
+                            .unwrap_or_default(),
+                        billable: financials
+                            .as_ref()
+                            .and_then(|value| value.billable_amount_minor)
+                            .map(crate::services::treasury::format_minor)
+                            .unwrap_or_default(),
+                        payment_status_idx: financials
+                            .as_ref()
+                            .and_then(|value| value.payment_status)
+                            .map(|status| match status {
+                                crate::models::TaskPaymentStatus::NotBillable => 0,
+                                crate::models::TaskPaymentStatus::Unbilled => 1,
+                                crate::models::TaskPaymentStatus::Invoiced => 2,
+                                crate::models::TaskPaymentStatus::Paid => 3,
+                            })
+                            .unwrap_or(0),
+                        focus_idx: 0,
+                    };
+                }
             }
+            KeyCode::Char('1') => self.activate_workspace_tab(3),
+            KeyCode::Char('2') => self.activate_workspace_tab(0),
+            KeyCode::Char('3') => self.activate_workspace_tab(1),
+            KeyCode::Char('4') => self.activate_workspace_tab(4),
+            KeyCode::Char('5') => self.activate_workspace_tab(2),
             KeyCode::Tab => {
                 self.cycle_workspace_pane_focus(false);
             }
             KeyCode::BackTab => {
                 self.cycle_workspace_pane_focus(true);
+            }
+            KeyCode::Left
+                if self.quest_board_open
+                    && self.workspace_tab_idx == 0
+                    && !self.workspace_sidebar_focused =>
+            {
+                let statuses = proj_tasks
+                    .iter()
+                    .map(|task| {
+                        self.db
+                            .get_quest_status(&task.id.to_string(), task.completed)
+                            .unwrap_or(QuestStatus::Backlog)
+                    })
+                    .collect::<Vec<_>>();
+                self.selected_task_idx =
+                    move_quest_board_selection(&statuses, self.selected_task_idx, -1, 0);
+                // A different column always lands on that card's header —
+                // `move_quest_board_selection` has no notion of steps.
+                self.kanban_step_idx = None;
+            }
+            KeyCode::Right
+                if self.quest_board_open
+                    && self.workspace_tab_idx == 0
+                    && !self.workspace_sidebar_focused =>
+            {
+                let statuses = proj_tasks
+                    .iter()
+                    .map(|task| {
+                        self.db
+                            .get_quest_status(&task.id.to_string(), task.completed)
+                            .unwrap_or(QuestStatus::Backlog)
+                    })
+                    .collect::<Vec<_>>();
+                self.selected_task_idx =
+                    move_quest_board_selection(&statuses, self.selected_task_idx, 1, 0);
+                self.kanban_step_idx = None;
             }
             KeyCode::Left
                 if self.viewing_step_for_task.is_some()
@@ -9424,6 +14727,7 @@ impl App {
             {
                 self.viewing_step_for_task = None;
                 self.selected_task_idx = 0;
+                self.kanban_step_idx = None;
             }
             // → en tab de tareas entra al drill-down de pasos solo si es tarea padre (no inline step)
             KeyCode::Right
@@ -9437,134 +14741,92 @@ impl App {
                         let task_id = task.id;
                         self.viewing_step_for_task = Some(task_id);
                         self.selected_task_idx = 0;
+                        self.kanban_step_idx = None;
                     }
                 }
             }
-            KeyCode::Up if self.workspace_sidebar_focused => {
-                self.workspace_tab_idx = if self.workspace_tab_idx > 0 {
-                    self.workspace_tab_idx - 1
-                } else {
-                    3
-                };
-                self.note_preview_focused = false;
-            }
-            KeyCode::Down if self.workspace_sidebar_focused => {
-                self.workspace_tab_idx = (self.workspace_tab_idx + 1) % 4;
-                self.note_preview_focused = false;
-            }
-            KeyCode::Up if self.note_preview_focused => {
-                self.note_preview_scroll = self.note_preview_scroll.saturating_sub(1);
-            }
-            KeyCode::Down if self.note_preview_focused => {
-                self.note_preview_scroll = self
-                    .note_preview_scroll
-                    .saturating_add(1)
-                    .min(self.note_preview_max_scroll.get());
-            }
-            KeyCode::Up => match self.workspace_tab_idx {
-                0 => {
-                    if !proj_tasks.is_empty() {
-                        if self.selected_task_idx > 0 {
-                            self.selected_task_idx -= 1;
-                        } else {
-                            self.selected_task_idx = proj_tasks.len() - 1;
-                        }
-                    }
+            KeyCode::Up => self.cycle_workspace_selection(false),
+            KeyCode::Down => self.cycle_workspace_selection(true),
+            KeyCode::Char('g') if self.workspace_tab_idx == 0 => {
+                if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
+                    let task = proj_tasks[self.selected_task_idx].clone();
+                    self.cycle_quest_stance(&task, p_id, false)?;
                 }
-                1 => {
-                    let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    if !flat.is_empty() {
-                        let len = flat.len();
-                        let mut idx = if self.selected_notes_flat_idx > 0 {
-                            self.selected_notes_flat_idx - 1
-                        } else {
-                            len - 1
+            }
+            KeyCode::Char('G') if self.workspace_tab_idx == 0 => {
+                if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
+                    let task = proj_tasks[self.selected_task_idx].clone();
+                    self.cycle_quest_stance(&task, p_id, true)?;
+                }
+            }
+            KeyCode::Char('m') if self.workspace_tab_idx == 0 => {
+                if !proj_tasks.is_empty() && self.selected_task_idx < proj_tasks.len() {
+                    let task = proj_tasks[self.selected_task_idx].clone();
+                    if self.task_has_children(task.id) {
+                        self.notifications.push(Notification::warning(
+                            "This quest still holds its own steps. Clear or move them first."
+                                .to_string(),
+                        ));
+                    } else {
+                        let targets = self.refile_task_targets(task.id);
+                        let default_idx = task
+                            .parent_task_id
+                            .and_then(|pid| targets.iter().position(|t| *t == pid))
+                            .map(|pos| pos + 1)
+                            .unwrap_or(0);
+                        self.modal_state = ModalType::RefileTask {
+                            task_id: task.id,
+                            selected_idx: default_idx,
                         };
-                        // Los divisores (None, None) no son navegables — saltarlos
-                        while flat[idx] == (None, None) {
-                            idx = if idx > 0 { idx - 1 } else { len - 1 };
-                        }
-                        self.selected_notes_flat_idx = idx;
-                        if let Some(note_idx) = flat[idx].1 {
-                            self.selected_note_idx = note_idx;
-                        }
-                        self.note_preview_scroll = 0;
-                        self.note_preview_focused = false;
                     }
                 }
-                2 => {
-                    if !proj_journals.is_empty() {
-                        if self.selected_journal_idx > 0 {
-                            self.selected_journal_idx -= 1;
-                        } else {
-                            self.selected_journal_idx = proj_journals.len() - 1;
-                        }
+            }
+            KeyCode::Char('c') if self.workspace_tab_idx == 0 => {
+                if !self.project_is_shared(p_id) {
+                    return Ok(());
+                }
+                if let Some(task) = proj_tasks.get(self.selected_task_idx) {
+                    let role = self
+                        .db
+                        .get_member_role(&p_id.to_string(), &self.identity.public_key)?;
+                    if role.as_deref() == Some("Observer") {
+                        self.notifications.push(Notification::warning(
+                            "Observers may witness this Council, but cannot issue messages."
+                                .to_string(),
+                        ));
+                    } else if task.parent_task_id.is_none() {
+                        self.modal_state = ModalType::QuestCouncil {
+                            task_id: task.id,
+                            content: String::new(),
+                            selected_comment_idx: 0,
+                            selected_member_idx: 0,
+                            editing_comment_id: None,
+                        };
                     }
                 }
-                3 => {
-                    if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
-                        if !milestones.is_empty() {
-                            self.selected_milestone_idx = if self.selected_milestone_idx > 0 {
-                                self.selected_milestone_idx - 1
-                            } else {
-                                milestones.len() - 1
-                            };
-                        }
-                    }
-                }
-                _ => {}
-            },
-            KeyCode::Down => match self.workspace_tab_idx {
-                0 => {
-                    if !proj_tasks.is_empty() {
-                        if self.selected_task_idx < proj_tasks.len() - 1 {
-                            self.selected_task_idx += 1;
-                        } else {
-                            self.selected_task_idx = 0;
-                        }
-                    }
-                }
-                1 => {
-                    let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    if !flat.is_empty() {
-                        let len = flat.len();
-                        let mut idx = (self.selected_notes_flat_idx + 1) % len;
-                        while flat[idx] == (None, None) {
-                            idx = (idx + 1) % len;
-                        }
-                        self.selected_notes_flat_idx = idx;
-                        if let Some(note_idx) = flat[idx].1 {
-                            self.selected_note_idx = note_idx;
-                        }
-                        self.note_preview_scroll = 0;
-                        self.note_preview_focused = false;
-                    }
-                }
-                2 => {
-                    if !proj_journals.is_empty() {
-                        if self.selected_journal_idx < proj_journals.len() - 1 {
-                            self.selected_journal_idx += 1;
-                        } else {
-                            self.selected_journal_idx = 0;
-                        }
-                    }
-                }
-                3 => {
-                    if let Ok(milestones) = self.db.get_milestones_for_project(p_id) {
-                        if !milestones.is_empty() {
-                            self.selected_milestone_idx =
-                                (self.selected_milestone_idx + 1) % milestones.len();
-                        }
-                    }
-                }
-                _ => {}
-            },
+            }
             KeyCode::Char(' ') => {
                 if self.workspace_tab_idx == 0
                     && !proj_tasks.is_empty()
                     && self.selected_task_idx < proj_tasks.len()
                 {
-                    let task = proj_tasks[self.selected_task_idx].clone();
+                    let card = &proj_tasks[self.selected_task_idx];
+                    // A step focused inline on a Kanban card (`kanban_step_idx`)
+                    // is what Space should toggle, not the card itself.
+                    let kanban_step = if self.quest_board_open
+                        && self.viewing_step_for_task.is_none()
+                    {
+                        self.kanban_step_idx.and_then(|idx| {
+                            self.all_tasks
+                                .iter()
+                                .filter(|t| t.parent_task_id == Some(card.id))
+                                .nth(idx)
+                                .cloned()
+                        })
+                    } else {
+                        None
+                    };
+                    let task = kanban_step.unwrap_or_else(|| card.clone());
                     let is_step = task.parent_task_id.is_some();
 
                     if is_step {
@@ -9577,6 +14839,18 @@ impl App {
                             self.notifications.push(Notification::info("Trial reopened. XP already claimed — face it again with fresh resolve.".to_string()));
                             self.reload_data()?;
                         } else {
+                            let bypass_financial_prompt =
+                                self.pending_financial_completion_bypass.take() == Some(task.id);
+                            let has_estimate = crate::services::TreasuryService::new(&self.db)
+                                .get_task_financials(task.id)?
+                                .is_some_and(|value| value.estimated_cost_minor.is_some());
+                            if has_estimate && !bypass_financial_prompt {
+                                self.modal_state = ModalType::TaskExpenseCompletion {
+                                    task_id: task.id,
+                                    selected_idx: 0,
+                                };
+                                return Ok(());
+                            }
                             let mut t = task.clone();
                             t.completed = true;
                             t.xp_awarded = true;
@@ -9625,6 +14899,9 @@ impl App {
                             self.notifications.push(Notification::info("Quest unsealed. XP already claimed — the path forward is yours to walk again.".to_string()));
                             self.reload_data()?;
                         } else {
+                            if self.warn_if_quest_has_unresolved_blockers(task.id)? {
+                                return Ok(());
+                            }
                             let incomplete_steps: Vec<Task> = self
                                 .all_tasks
                                 .iter()
@@ -9643,6 +14920,19 @@ impl App {
                                 };
                                 self.notifications.push(Notification::warning(msg));
                             } else {
+                                let bypass_financial_prompt =
+                                    self.pending_financial_completion_bypass.take()
+                                        == Some(task.id);
+                                let has_estimate = crate::services::TreasuryService::new(&self.db)
+                                    .get_task_financials(task.id)?
+                                    .is_some_and(|value| value.estimated_cost_minor.is_some());
+                                if has_estimate && !bypass_financial_prompt {
+                                    self.modal_state = ModalType::TaskExpenseCompletion {
+                                        task_id: task.id,
+                                        selected_idx: 0,
+                                    };
+                                    return Ok(());
+                                }
                                 let total_steps = self
                                     .all_tasks
                                     .iter()
@@ -9726,6 +15016,32 @@ impl App {
                             self.toggle_milestone(m_id)?;
                         }
                     }
+                } else if self.workspace_tab_idx == 4 {
+                    let entries = crate::services::TreasuryService::new(&self.db).entries(
+                        p_id,
+                        &self.treasury_filter,
+                        self.treasury_sort,
+                    )?;
+                    if let Some(entry) = entries.get(self.selected_treasury_idx) {
+                        let (mine, status) =
+                            crate::services::treasury_policy::TreasuryAction::for_entry(
+                                entry,
+                                &self.identity.public_key,
+                            );
+                        let entry_id = entry.id;
+                        if !self.treasury_allows(
+                            p_id,
+                            crate::services::treasury_policy::TreasuryAction::DeleteEntry {
+                                mine,
+                                status,
+                            },
+                        ) {
+                            return Ok(());
+                        }
+                        crate::services::TreasuryService::new(&self.db).delete_entry(entry_id)?;
+                        self.mark_dirty();
+                        self.selected_treasury_idx = self.selected_treasury_idx.saturating_sub(1);
+                    }
                 }
             }
             KeyCode::Char('d') if self.workspace_tab_idx == 1 => {
@@ -9790,6 +15106,116 @@ impl App {
                     _ => {}
                 }
             }
+            KeyCode::Char('a') if self.workspace_tab_idx == 4 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::ApproveEntry,
+                ) {
+                    return Ok(());
+                }
+                let entries = crate::services::TreasuryService::new(&self.db).entries(
+                    p_id,
+                    &self.treasury_filter,
+                    self.treasury_sort,
+                )?;
+                if let Some(entry) = entries.get(self.selected_treasury_idx) {
+                    match crate::services::TreasuryService::new(&self.db).approve_entry(entry.id) {
+                        Ok(_) => {
+                            self.mark_dirty();
+                            self.notifications
+                                .push(Notification::info("Treasury entry approved.".to_string()));
+                        }
+                        Err(error) => self
+                            .notifications
+                            .push(Notification::warning(error.to_string())),
+                    }
+                }
+            }
+            KeyCode::Char('c') if self.workspace_tab_idx == 4 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::ManageCategories,
+                ) {
+                    return Ok(());
+                }
+                self.modal_state = ModalType::TreasuryCategory {
+                    name: String::new(),
+                };
+            }
+            KeyCode::Char('p') if self.workspace_tab_idx == 4 => {
+                if !self.treasury_allows(
+                    p_id,
+                    crate::services::treasury_policy::TreasuryAction::MarkPaid,
+                ) {
+                    return Ok(());
+                }
+                let entries = crate::services::TreasuryService::new(&self.db).entries(
+                    p_id,
+                    &self.treasury_filter,
+                    self.treasury_sort,
+                )?;
+                if let Some(entry) = entries.get(self.selected_treasury_idx) {
+                    match crate::services::TreasuryService::new(&self.db)
+                        .mark_paid(entry.id, Utc::now())
+                    {
+                        Ok(_) => {
+                            self.mark_dirty();
+                            self.notifications
+                                .push(Notification::info("Payment marked as paid.".to_string()));
+                        }
+                        Err(error) => self
+                            .notifications
+                            .push(Notification::warning(error.to_string())),
+                    }
+                }
+            }
+            KeyCode::Char('d') if self.workspace_tab_idx == 4 => {
+                let entries = crate::services::TreasuryService::new(&self.db).entries(
+                    p_id,
+                    &self.treasury_filter,
+                    self.treasury_sort,
+                )?;
+                if let Some(entry) = entries.get(self.selected_treasury_idx) {
+                    let (mine, status) =
+                        crate::services::treasury_policy::TreasuryAction::for_entry(
+                            entry,
+                            &self.identity.public_key,
+                        );
+                    let entry_id = entry.id;
+                    if !self.treasury_allows(
+                        p_id,
+                        crate::services::treasury_policy::TreasuryAction::DeleteEntry {
+                            mine,
+                            status,
+                        },
+                    ) {
+                        return Ok(());
+                    }
+                    crate::services::TreasuryService::new(&self.db).delete_entry(entry_id)?;
+                    self.mark_dirty();
+                    self.selected_treasury_idx = self.selected_treasury_idx.saturating_sub(1);
+                    self.notifications
+                        .push(Notification::info("Treasury entry deleted.".to_string()));
+                }
+            }
+            KeyCode::Char('x') if self.workspace_tab_idx == 4 => {
+                let service = crate::services::TreasuryService::new(&self.db);
+                let directory = crate::storage::get_storage_dir()?.join("exports");
+                std::fs::create_dir_all(&directory)?;
+                let base = format!("treasury-{}-{}", p_id, Utc::now().format("%Y%m%d-%H%M%S"));
+                std::fs::write(
+                    directory.join(format!("{base}.csv")),
+                    service.export_csv(p_id)?,
+                )?;
+                std::fs::write(
+                    directory.join(format!("{base}.json")),
+                    service.export_json(p_id)?,
+                )?;
+                self.notifications.push(Notification::info(format!(
+                    "Treasury reports exported to {}.",
+                    directory.display()
+                )));
+            }
             KeyCode::Char('+')
                 if self.workspace_tab_idx == 0 && self.viewing_step_for_task.is_none() =>
             {
@@ -9836,12 +15262,35 @@ impl App {
                     self.active_screen = ActiveScreen::Editor;
                 } else if self.workspace_tab_idx == 2 && key.code == KeyCode::Char('n') {
                     self.modal_state = ModalType::NewJournalEntry {
+                        entry_id: None,
                         content: String::new(),
                     };
                 } else if self.workspace_tab_idx == 3 {
                     self.modal_state = ModalType::MilestoneTierSelect {
                         project_id: p_id,
                         selected_idx: 0,
+                    };
+                } else if self.workspace_tab_idx == 4 && key.code == KeyCode::Char('n') {
+                    if !self.treasury_allows(
+                        p_id,
+                        crate::services::treasury_policy::TreasuryAction::RecordEntry,
+                    ) {
+                        return Ok(());
+                    }
+                    self.modal_state = ModalType::TreasuryEntry {
+                        entry_id: None,
+                        title: String::new(),
+                        title_cursor: 0,
+                        // Amount nace vacío: prellenarlo con "0.00" obligaba a borrar el
+                        // relleno antes de teclear (escribir "321" dejaba "3210.00"). Al
+                        // guardar, una parte decimal ausente ya vale cero centavos.
+                        amount_cursor: 0,
+                        amount: String::new(),
+                        entry_type_idx: 1,
+                        status_idx: 0,
+                        category_idx: 0,
+                        date_val: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+                        focus_idx: 0,
                     };
                 }
             }
@@ -9850,64 +15299,29 @@ impl App {
                     && !proj_tasks.is_empty()
                     && self.selected_task_idx < proj_tasks.len()
                 {
-                    let t = &proj_tasks[self.selected_task_idx];
-                    self.modal_state = edit_task_modal_from_task(t);
+                    self.open_or_drill_selected_workspace_task(key.code == KeyCode::Enter)?;
                 } else if self.workspace_tab_idx == 1 {
                     let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                    match flat.get(self.selected_notes_flat_idx) {
-                        Some((_, Some(note_idx))) if *note_idx < proj_notes.len() => {
-                            let n = &proj_notes[*note_idx];
-                            let is_mine = n
-                                .owner_identity
-                                .as_deref()
-                                .map(|oi| oi == self.identity.public_key.as_str())
-                                .unwrap_or(true);
-                            if n.sharing_permission == "read_only" && !is_mine {
-                                self.notifications.push(Notification::warning(
-                                    "This scroll is sealed — you may read but not inscribe."
-                                        .to_string(),
-                                ));
-                                return Ok(());
-                            }
-                            let mut state = EditorState::new(
-                                p_id,
-                                Some(n.id),
-                                n.title.clone(),
-                                n.markdown_content.clone(),
-                            );
-                            state.codex_id = n.codex_id;
-                            self.editor_state = Some(state);
-                            self.active_screen = ActiveScreen::Editor;
-                        }
-                        Some((Some(codex_id), None)) => {
+                    match (key.code, flat.get(self.selected_notes_flat_idx)) {
+                        (KeyCode::Char('e'), Some((Some(codex_id), None))) => {
                             let cid = *codex_id;
-                            if key.code == KeyCode::Char('e') {
-                                let current_name = self
-                                    .codices
-                                    .iter()
-                                    .find(|c| c.id == cid)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_default();
-                                self.modal_state = ModalType::RenameCodex {
-                                    codex_id: cid,
-                                    name: current_name,
-                                };
-                            } else if key.code == KeyCode::Enter {
-                                // Toggle collapse state — persists to DB and syncs via log_change
-                                if let Some(codex) = self.codices.iter_mut().find(|c| c.id == cid) {
-                                    codex.collapsed = !codex.collapsed;
-                                    let _ = self.db.set_codex_collapsed(cid, codex.collapsed);
-                                }
-                                // Clamp selection in case previously visible items are now hidden
-                                let new_flat =
-                                    Self::build_notes_flat(&proj_notes, &self.codices, p_id);
-                                if self.selected_notes_flat_idx >= new_flat.len() {
-                                    self.selected_notes_flat_idx = new_flat.len().saturating_sub(1);
-                                }
-                            }
+                            let current_name = self
+                                .codices
+                                .iter()
+                                .find(|c| c.id == cid)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            self.modal_state = ModalType::RenameCodex {
+                                codex_id: cid,
+                                name: current_name,
+                            };
                         }
-                        _ => {}
+                        _ => self.open_selected_workspace_scroll()?,
                     }
+                } else if self.workspace_tab_idx == 2 && key.code == KeyCode::Char('e') {
+                    self.open_selected_journal_entry()?;
+                } else if self.workspace_tab_idx == 4 && key.code == KeyCode::Char('e') {
+                    self.open_selected_treasury_entry()?;
                 }
             }
             // Delete: Slay Note / Task / Codex / Milestone
@@ -9929,6 +15343,8 @@ impl App {
                         &self.task_filter,
                         &self.task_sort,
                         &self.search_query,
+                        Some(&self.db),
+                        &self.identity.public_key,
                     );
                     self.selected_task_idx = if remaining.is_empty() {
                         0
@@ -9976,23 +15392,37 @@ impl App {
                     }
                 }
             }
-            // j: New journal entry
-            KeyCode::Char('j') => {
-                if self.workspace_tab_idx == 2 {
-                    self.modal_state = ModalType::NewJournalEntry {
-                        content: String::new(),
-                    };
-                }
-            }
             // f: filter tasks
             KeyCode::Char('f') => {
                 if self.workspace_tab_idx == 0 {
                     self.task_filter = match self.task_filter.as_str() {
                         "All" => "Incomplete".to_string(),
                         "Incomplete" => "Completed".to_string(),
+                        "Completed" => "MyQuests".to_string(),
+                        "MyQuests" => "Unassigned".to_string(),
+                        "Unassigned" => "Blocked".to_string(),
+                        "Blocked" => "Review".to_string(),
+                        "Review" => "Overdue".to_string(),
+                        "Overdue" => "HighPriority".to_string(),
+                        "HighPriority" => "DueSoon".to_string(),
                         _ => "All".to_string(),
                     };
                     self.selected_task_idx = 0;
+                } else if self.workspace_tab_idx == 4 {
+                    self.treasury_filter.status = match self.treasury_filter.status {
+                        None => Some(crate::models::LedgerStatus::Planned),
+                        Some(crate::models::LedgerStatus::Planned) => {
+                            Some(crate::models::LedgerStatus::Approved)
+                        }
+                        Some(crate::models::LedgerStatus::Approved) => {
+                            Some(crate::models::LedgerStatus::Paid)
+                        }
+                        Some(crate::models::LedgerStatus::Paid) => {
+                            Some(crate::models::LedgerStatus::Cancelled)
+                        }
+                        _ => None,
+                    };
+                    self.selected_treasury_idx = 0;
                 }
             }
             // s: sort tasks or share note
@@ -10005,6 +15435,18 @@ impl App {
                         _ => "CreatedDate".to_string(),
                     };
                     self.selected_task_idx = 0;
+                } else if self.workspace_tab_idx == 4 {
+                    self.treasury_sort = match self.treasury_sort {
+                        crate::models::LedgerSort::Newest => crate::models::LedgerSort::Oldest,
+                        crate::models::LedgerSort::Oldest => crate::models::LedgerSort::Largest,
+                        crate::models::LedgerSort::Largest => crate::models::LedgerSort::Smallest,
+                        crate::models::LedgerSort::Smallest => crate::models::LedgerSort::DueDate,
+                        crate::models::LedgerSort::DueDate => {
+                            crate::models::LedgerSort::PaymentDate
+                        }
+                        crate::models::LedgerSort::PaymentDate => crate::models::LedgerSort::Newest,
+                    };
+                    self.selected_treasury_idx = 0;
                 } else if self.workspace_tab_idx == 1 && !proj_notes.is_empty() {
                     let flat = Self::build_notes_flat(&proj_notes, &self.codices, p_id);
                     if let Some((_, Some(note_idx))) = flat.get(self.selected_notes_flat_idx) {
@@ -10025,17 +15467,54 @@ impl App {
                     .iter()
                     .find(|p| p.id == p_id)
                     .map(|p| p.is_shared)
+                    .or_else(|| {
+                        self.db
+                            .get_projects()
+                            .ok()?
+                            .into_iter()
+                            .find(|project| project.id == p_id)
+                            .map(|project| project.is_shared)
+                    })
                     .unwrap_or(false);
-                if is_shared
-                    && self.workspace_tab_idx == 0
-                    && !proj_tasks.is_empty()
-                    && self.selected_task_idx < proj_tasks.len()
-                {
-                    let t = &proj_tasks[self.selected_task_idx];
+                if self.workspace_tab_idx != 0 {
+                    return Ok(());
+                }
+                if !is_shared {
+                    self.notifications.push(Notification::info(
+                        "Assignments are available only in shared Campaigns.".to_string(),
+                    ));
+                    return Ok(());
+                }
+                let role = self
+                    .db
+                    .get_member_role(&p_id.to_string(), &self.identity.public_key)?;
+                if !matches!(role.as_deref(), Some("Owner" | "Steward")) {
+                    self.notifications.push(Notification::warning(
+                        "Only the Campaign Owner or a Steward may assign Quest bearers."
+                            .to_string(),
+                    ));
+                    return Ok(());
+                }
+                if let Some(task) = proj_tasks.get(self.selected_task_idx) {
                     self.modal_state = ModalType::AssignTask {
-                        task_id: t.id,
+                        task_id: task.id,
                         selected_member_idx: 0,
                     };
+                } else {
+                    self.notifications.push(Notification::info(
+                        "Select a Quest or step before assigning a Companion.".to_string(),
+                    ));
+                }
+            }
+            // v: journal visibility
+            KeyCode::Char('L') if self.workspace_tab_idx == 0 => {
+                if let Some(task) = proj_tasks.get(self.selected_task_idx) {
+                    if task.parent_task_id.is_none() {
+                        self.modal_state = ModalType::QuestDependencies {
+                            task_id: task.id,
+                            selected_quest_idx: 0,
+                        };
+                    }
                 }
             }
             // v: journal visibility
@@ -10338,8 +15817,352 @@ impl App {
                     recurrence,
                 )?;
             }
-            ModalType::NewJournalEntry { ref content } => {
-                self.handle_journal_modal_key(key, project_id, content.clone())?;
+            ModalType::NewJournalEntry { entry_id, ref content } => {
+                self.handle_journal_modal_key(key, project_id, entry_id, content.clone())?;
+            }
+            ModalType::TreasuryEntry {
+                entry_id,
+                ref title,
+                title_cursor,
+                ref amount,
+                amount_cursor,
+                entry_type_idx,
+                status_idx,
+                category_idx,
+                ref date_val,
+                focus_idx,
+            } => {
+                self.handle_treasury_entry_modal_key(
+                    key,
+                    project_id,
+                    entry_id,
+                    title.clone(),
+                    title_cursor,
+                    amount.clone(),
+                    amount_cursor,
+                    entry_type_idx,
+                    status_idx,
+                    category_idx,
+                    date_val.clone(),
+                    focus_idx,
+                )?;
+            }
+            ModalType::TaskExpenseCompletion {
+                task_id,
+                selected_idx,
+            } => {
+                let mut selected_idx = selected_idx;
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Up | KeyCode::Left => {
+                        selected_idx = (selected_idx + 2) % 3;
+                        self.modal_state = ModalType::TaskExpenseCompletion {
+                            task_id,
+                            selected_idx,
+                        };
+                    }
+                    KeyCode::Down | KeyCode::Right | KeyCode::Tab => {
+                        selected_idx = (selected_idx + 1) % 3;
+                        self.modal_state = ModalType::TaskExpenseCompletion {
+                            task_id,
+                            selected_idx,
+                        };
+                    }
+                    KeyCode::Enter => {
+                        let service = crate::services::TreasuryService::new(&self.db);
+                        let task = self.db.get_task_by_id(task_id)?;
+                        if let Some(mut financials) = service.get_task_financials(task_id)? {
+                            if selected_idx == 0 {
+                                let amount = financials
+                                    .actual_cost_minor
+                                    .or(financials.estimated_cost_minor)
+                                    .unwrap_or(0);
+                                financials.actual_cost_minor = Some(amount);
+                                service.set_task_financials(&financials)?;
+                                let category = service
+                                    .categories(project_id)?
+                                    .into_iter()
+                                    .find(|category| category.name == "Other")
+                                    .context("Default treasury category is missing")?;
+                                let now = Utc::now();
+                                service.create_entry(crate::models::LedgerEntry {
+                                    id: Uuid::new_v4(),
+                                    campaign_id: project_id,
+                                    title: format!("Task expense: {}", task.title),
+                                    description: task.description.clone().unwrap_or_default(),
+                                    entry_type: crate::models::LedgerEntryType::Expense,
+                                    category_id: category.id,
+                                    amount_minor: amount,
+                                    currency_code: financials.currency_code.clone(),
+                                    status: crate::models::LedgerStatus::Paid,
+                                    due_date: None,
+                                    payment_date: Some(now),
+                                    vendor_source: None,
+                                    related_task_id: Some(task_id),
+                                    notes: None,
+                                    attachment_ref: None,
+                                    recurrence: crate::models::LedgerRecurrence::None,
+                                    custom_recurrence: None,
+                                    version: 0,
+                                    created_at: now,
+                                    updated_at: now,
+                                    created_by_identity: Some(self.identity.public_key.clone()),
+                                })?;
+                            } else if selected_idx == 2 {
+                                financials.estimated_cost_minor = None;
+                                service.set_task_financials(&financials)?;
+                            }
+                        }
+                        self.pending_financial_completion_bypass = Some(task_id);
+                        self.modal_state = ModalType::None;
+                        self.handle_workspace_key(KeyEvent::new(
+                            KeyCode::Char(' '),
+                            KeyModifiers::NONE,
+                        ))?;
+                    }
+                    _ => {}
+                }
+            }
+            ModalType::TreasuryBudget {
+                ref amount,
+                target_idx,
+                focus_idx,
+            } => {
+                let mut amount = amount.clone();
+                let mut target_idx = target_idx;
+                let mut focus_idx = focus_idx;
+                let service = crate::services::TreasuryService::new(&self.db);
+                let categories = service.categories(project_id)?;
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Tab | KeyCode::Up | KeyCode::Down => focus_idx = (focus_idx + 1) % 2,
+                    KeyCode::Left if focus_idx == 1 => {
+                        target_idx = (target_idx + categories.len()) % (categories.len() + 1)
+                    }
+                    KeyCode::Right if focus_idx == 1 => {
+                        target_idx = (target_idx + 1) % (categories.len() + 1)
+                    }
+                    KeyCode::Backspace if focus_idx == 0 => {
+                        amount.pop();
+                    }
+                    KeyCode::Char(character)
+                        if focus_idx == 0
+                            && (character.is_ascii_digit() || character == '.')
+                            && amount.len() < 16 =>
+                    {
+                        amount.push(character)
+                    }
+                    KeyCode::Enter if focus_idx == 0 => focus_idx = 1,
+                    KeyCode::Enter => match crate::services::treasury::parse_minor(&amount) {
+                        Ok(value) => {
+                            if target_idx == 0 {
+                                service.set_overall_budget(project_id, value)?;
+                            } else if let Some(category) = categories.get(target_idx - 1) {
+                                service.set_category_budget(project_id, category.id, value)?;
+                            }
+                            self.mark_dirty();
+                            self.modal_state = ModalType::None;
+                            self.notifications
+                                .push(Notification::info("Treasury budget updated.".to_string()));
+                            return Ok(());
+                        }
+                        Err(error) => self
+                            .notifications
+                            .push(Notification::warning(error.to_string())),
+                    },
+                    _ => {}
+                }
+                if self.modal_state != ModalType::None {
+                    self.modal_state = ModalType::TreasuryBudget {
+                        amount,
+                        target_idx,
+                        focus_idx,
+                    };
+                }
+            }
+            ModalType::TaskFinancials {
+                task_id,
+                ref estimated,
+                ref actual,
+                ref billable,
+                payment_status_idx,
+                focus_idx,
+            } => {
+                let mut values = [estimated.clone(), actual.clone(), billable.clone()];
+                let mut payment_status_idx = payment_status_idx;
+                let mut focus_idx = focus_idx;
+                match key.code {
+                    KeyCode::Esc => {
+                        self.modal_state = ModalType::None;
+                        return Ok(());
+                    }
+                    KeyCode::Tab | KeyCode::Down => focus_idx = (focus_idx + 1) % 4,
+                    KeyCode::BackTab | KeyCode::Up => focus_idx = (focus_idx + 3) % 4,
+                    KeyCode::Left | KeyCode::Right if focus_idx == 3 => {
+                        if self.treasury_allows(
+                            project_id,
+                            crate::services::treasury_policy::TreasuryAction::SetTaskBilling,
+                        ) {
+                            payment_status_idx = if key.code == KeyCode::Left {
+                                (payment_status_idx + 3) % 4
+                            } else {
+                                (payment_status_idx + 1) % 4
+                            };
+                        }
+                    }
+                    KeyCode::Backspace if focus_idx < 3 => {
+                        // El importe facturable es una decisión de cobro, no de registro.
+                        if focus_idx < 2
+                            || self.treasury_allows(
+                                project_id,
+                                crate::services::treasury_policy::TreasuryAction::SetTaskBilling,
+                            )
+                        {
+                            values[focus_idx].pop();
+                        }
+                    }
+                    KeyCode::Char(character)
+                        if focus_idx < 3
+                            && (character.is_ascii_digit() || character == '.')
+                            && values[focus_idx].len() < 16 =>
+                    {
+                        if focus_idx < 2
+                            || self.treasury_allows(
+                                project_id,
+                                crate::services::treasury_policy::TreasuryAction::SetTaskBilling,
+                            )
+                        {
+                            values[focus_idx].push(character);
+                        }
+                    }
+                    KeyCode::Enter if focus_idx < 3 => focus_idx += 1,
+                    KeyCode::Enter => {
+                        let parse = |value: &str| -> Result<Option<i64>> {
+                            if value.trim().is_empty() {
+                                Ok(None)
+                            } else {
+                                crate::services::treasury::parse_minor(value).map(Some)
+                            }
+                        };
+                        let task = self.db.get_task_by_id(task_id)?;
+                        let campaign_id = task
+                            .project_id
+                            .context("Task is not assigned to a campaign")?;
+                        let service = crate::services::TreasuryService::new(&self.db);
+                        let previous = service.get_task_financials(task_id)?;
+                        let now = Utc::now();
+                        let statuses = [
+                            crate::models::TaskPaymentStatus::NotBillable,
+                            crate::models::TaskPaymentStatus::Unbilled,
+                            crate::models::TaskPaymentStatus::Invoiced,
+                            crate::models::TaskPaymentStatus::Paid,
+                        ];
+                        // Aunque la UI ya bloquea los campos, el guardado vuelve a comprobarlo:
+                        // si no hay permiso de cobro se conserva lo que ya estaba.
+                        let may_bill = crate::services::treasury_policy::allows(
+                            self.treasury_role(campaign_id),
+                            crate::services::treasury_policy::TreasuryAction::SetTaskBilling,
+                        );
+                        service.set_task_financials(&crate::models::TaskFinancials {
+                            task_id,
+                            campaign_id,
+                            estimated_cost_minor: parse(&values[0])?,
+                            actual_cost_minor: parse(&values[1])?,
+                            billable_amount_minor: if may_bill {
+                                parse(&values[2])?
+                            } else {
+                                previous
+                                    .as_ref()
+                                    .and_then(|value| value.billable_amount_minor)
+                            },
+                            payment_status: if may_bill {
+                                Some(statuses[payment_status_idx])
+                            } else {
+                                previous.as_ref().and_then(|value| value.payment_status)
+                            },
+                            currency_code: previous
+                                .as_ref()
+                                .map(|value| value.currency_code.clone())
+                                .unwrap_or_else(|| {
+                                    service
+                                        .campaign_currency(campaign_id)
+                                        .unwrap_or_default()
+                                        .code()
+                                        .to_string()
+                                }),
+                            version: previous.as_ref().map_or(1, |value| value.version),
+                            created_at: previous.as_ref().map_or(now, |value| value.created_at),
+                            updated_at: now,
+                        })?;
+                        self.mark_dirty();
+                        self.modal_state = ModalType::None;
+                        self.notifications.push(Notification::info(
+                            "Task financial details updated.".to_string(),
+                        ));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.modal_state = ModalType::TaskFinancials {
+                    task_id,
+                    estimated: values[0].clone(),
+                    actual: values[1].clone(),
+                    billable: values[2].clone(),
+                    payment_status_idx,
+                    focus_idx,
+                };
+            }
+            ModalType::TreasuryCategory { ref name } => {
+                let mut name = name.clone();
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Backspace => {
+                        name.pop();
+                    }
+                    KeyCode::Char(character) if name.chars().count() < 40 => name.push(character),
+                    KeyCode::Enter if !name.trim().is_empty() => {
+                        crate::services::TreasuryService::new(&self.db)
+                            .create_category(project_id, &name)?;
+                        self.mark_dirty();
+                        self.modal_state = ModalType::None;
+                        self.notifications
+                            .push(Notification::info("Treasury category created.".to_string()));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if self.modal_state != ModalType::None {
+                    self.modal_state = ModalType::TreasuryCategory { name };
+                }
+            }
+            ModalType::TreasuryCurrency { selected_idx } => {
+                let options = crate::models::Currency::ALL;
+                let mut selected_idx = selected_idx.min(options.len() - 1);
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Left | KeyCode::Up => {
+                        selected_idx = (selected_idx + options.len() - 1) % options.len()
+                    }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        selected_idx = (selected_idx + 1) % options.len()
+                    }
+                    KeyCode::Enter => {
+                        let currency = options[selected_idx];
+                        crate::services::TreasuryService::new(&self.db)
+                            .set_currency(project_id, currency)?;
+                        self.mark_dirty();
+                        self.modal_state = ModalType::None;
+                        self.notifications.push(Notification::info(format!(
+                            "Treasury now works in {}.",
+                            currency.code()
+                        )));
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                if self.modal_state != ModalType::None {
+                    self.modal_state = ModalType::TreasuryCurrency { selected_idx };
+                }
             }
             ModalType::NewCodex {
                 ref name,
@@ -10431,6 +16254,241 @@ impl App {
                     _ => {}
                 }
             }
+            ModalType::QuestCouncil {
+                task_id,
+                ref content,
+                selected_comment_idx,
+                selected_member_idx,
+                ref editing_comment_id,
+            } => {
+                let mut body = content.clone();
+                let comments = self
+                    .db
+                    .get_task_comments(&task_id.to_string())
+                    .unwrap_or_default();
+                let members = self
+                    .db
+                    .get_project_members(&project_id.to_string())
+                    .unwrap_or_default();
+                let rebuild = |content: String,
+                               comment_idx: usize,
+                               member_idx: usize,
+                               editing: Option<String>| {
+                    ModalType::QuestCouncil {
+                        task_id,
+                        content,
+                        selected_comment_idx: comment_idx,
+                        selected_member_idx: member_idx,
+                        editing_comment_id: editing,
+                    }
+                };
+                let mention_candidates = council_mention_candidates(&body, &members);
+                let mention_active = council_mention_query(&body).is_some();
+                match key.code {
+                    KeyCode::Esc => self.modal_state = ModalType::None,
+                    KeyCode::Up if mention_active && !mention_candidates.is_empty() => {
+                        let position = mention_candidates
+                            .iter()
+                            .position(|index| *index == selected_member_idx)
+                            .unwrap_or(0);
+                        let next = if position > 0 {
+                            position - 1
+                        } else {
+                            mention_candidates.len() - 1
+                        };
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            mention_candidates[next],
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Down | KeyCode::Tab
+                        if mention_active && !mention_candidates.is_empty() =>
+                    {
+                        let position = mention_candidates
+                            .iter()
+                            .position(|index| *index == selected_member_idx)
+                            .unwrap_or(mention_candidates.len() - 1);
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            mention_candidates[(position + 1) % mention_candidates.len()],
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Enter if mention_active && !mention_candidates.is_empty() => {
+                        let member_index = if mention_candidates.contains(&selected_member_idx) {
+                            selected_member_idx
+                        } else {
+                            mention_candidates[0]
+                        };
+                        let username = &members[member_index].1;
+                        let token_start = body
+                            .char_indices()
+                            .rev()
+                            .find(|(_, character)| character.is_whitespace())
+                            .map(|(index, character)| index + character.len_utf8())
+                            .unwrap_or(0);
+                        body.truncate(token_start);
+                        body.push_str(&format!("@{} ", username));
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            member_index,
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Enter if mention_active => {
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            selected_member_idx,
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Up if !comments.is_empty() => {
+                        let idx = selected_comment_idx
+                            .checked_sub(1)
+                            .unwrap_or(comments.len() - 1);
+                        self.modal_state =
+                            rebuild(body, idx, selected_member_idx, editing_comment_id.clone());
+                    }
+                    KeyCode::Down if !comments.is_empty() => {
+                        self.modal_state = rebuild(
+                            body,
+                            (selected_comment_idx + 1) % comments.len(),
+                            selected_member_idx,
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Char('@') if !members.is_empty() => {
+                        if !body.is_empty() && !body.ends_with(char::is_whitespace) {
+                            body.push(' ');
+                        }
+                        body.push('@');
+                        self.modal_state =
+                            rebuild(body, selected_comment_idx, 0, editing_comment_id.clone());
+                    }
+                    KeyCode::Char('e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !comments.is_empty() =>
+                    {
+                        let comment = &comments[selected_comment_idx.min(comments.len() - 1)];
+                        if comment.author_identity == self.identity.public_key
+                            && comment.deleted_at.is_none()
+                        {
+                            self.modal_state = rebuild(
+                                comment.content.clone(),
+                                selected_comment_idx,
+                                selected_member_idx,
+                                Some(comment.id.clone()),
+                            );
+                        } else {
+                            self.notifications.push(Notification::warning(
+                                "Only the author may revise a Council message.".to_string(),
+                            ));
+                        }
+                    }
+                    KeyCode::Char('d')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !comments.is_empty() =>
+                    {
+                        let comment = &comments[selected_comment_idx.min(comments.len() - 1)];
+                        match self
+                            .db
+                            .withdraw_task_comment(&comment.id, &self.identity.public_key)
+                        {
+                            Ok(()) => {
+                                self.mark_dirty();
+                                self.reload_data()?;
+                                self.modal_state =
+                                    rebuild(String::new(), 0, selected_member_idx, None);
+                            }
+                            Err(error) => self
+                                .notifications
+                                .push(Notification::warning(error.to_string())),
+                        }
+                    }
+                    KeyCode::Enter if !body.trim().is_empty() => {
+                        let mentioned = members
+                            .iter()
+                            .filter(|(_, username, _)| {
+                                body.split_whitespace().any(|word| {
+                                    word.strip_prefix('@').is_some_and(|name| {
+                                        name.trim_matches(|c: char| {
+                                            !c.is_alphanumeric() && c != '_'
+                                        })
+                                        .eq_ignore_ascii_case(username)
+                                    })
+                                })
+                            })
+                            .map(|(identity, _, _)| identity.clone())
+                            .collect::<Vec<_>>();
+                        let username = self
+                            .user
+                            .as_ref()
+                            .map(|user| user.username.as_str())
+                            .unwrap_or("Companion");
+                        if let Some(comment_id) = editing_comment_id.as_deref() {
+                            self.db.edit_task_comment(
+                                comment_id,
+                                &self.identity.public_key,
+                                &body,
+                                &mentioned,
+                            )?;
+                        } else {
+                            self.db.add_task_comment(
+                                &task_id.to_string(),
+                                &project_id.to_string(),
+                                &self.identity.public_key,
+                                username,
+                                &body,
+                                &mentioned,
+                            )?;
+                        }
+                        self.db.log_activity(
+                            Some(&project_id.to_string()),
+                            "quest_comment_added",
+                            "convened the Quest Council.",
+                            &self.identity.public_key,
+                            username,
+                        )?;
+                        self.mark_dirty();
+                        self.modal_state = ModalType::None;
+                        self.reload_data()?;
+                    }
+                    KeyCode::Backspace => {
+                        if is_ctrl_backspace(key) {
+                            delete_last_word(&mut body);
+                        } else {
+                            body.pop();
+                        }
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            selected_member_idx,
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    KeyCode::Char(character) if body.len() < 1000 => {
+                        body.push(character);
+                        let candidates = council_mention_candidates(&body, &members);
+                        let member_idx = if candidates.contains(&selected_member_idx) {
+                            selected_member_idx
+                        } else {
+                            candidates.first().copied().unwrap_or(selected_member_idx)
+                        };
+                        self.modal_state = rebuild(
+                            body,
+                            selected_comment_idx,
+                            member_idx,
+                            editing_comment_id.clone(),
+                        );
+                    }
+                    _ => {}
+                }
+            }
             _ => {}
         }
         Ok(())
@@ -10477,6 +16535,21 @@ impl App {
         };
         let next_focus = |idx: usize| -> usize { (idx + 1) % (max_fields + 1) };
         let prev_focus = |idx: usize| -> usize { if idx > 0 { idx - 1 } else { max_fields } };
+
+        let mut title_cursor = if self.task_title_editing {
+            self.task_title_cursor.min(title.len())
+        } else {
+            title.len()
+        };
+        while title_cursor > 0 && !title.is_char_boundary(title_cursor) {
+            title_cursor -= 1;
+        }
+        if focus_idx == 0 {
+            self.task_title_cursor = title_cursor;
+            self.task_title_editing = true;
+        } else {
+            self.task_title_editing = false;
+        }
 
         if key.code == KeyCode::Char('c') && matches!(focus_idx, 3 | 4) {
             let selected = if due_date_type == DueDateType::Specific {
@@ -10592,6 +16665,7 @@ impl App {
                 self.reload_data()?;
                 self.modal_state = ModalType::None;
                 self.task_desc_editor = None;
+                self.task_title_editing = false;
             }
             return Ok(());
         }
@@ -10616,6 +16690,13 @@ impl App {
                 Self::handle_task_desc_editor_key(editor, key, home_end_whole_text);
                 desc = editor.get_content();
                 desc_cursor = Self::task_desc_cursor_from_editor(editor);
+                if let Some(err) = editor.clipboard_error.take() {
+                    self.sync_status_msg = format!("Yank did not reach clipboard: {}", err);
+                    self.notifications.push(Notification::warning(format!(
+                        "Yank saved in-editor only — couldn't reach the system clipboard: {}",
+                        err
+                    )));
+                }
             }
             self.update_task_modal_state(
                 task_id,
@@ -10639,6 +16720,7 @@ impl App {
             KeyCode::Esc => {
                 self.modal_state = ModalType::None;
                 self.task_desc_editor = None;
+                self.task_title_editing = false;
             }
             KeyCode::Tab => {
                 focus_idx = next_focus(focus_idx);
@@ -10646,6 +16728,10 @@ impl App {
                     self.ensure_task_desc_editor(project_id, &desc, desc_cursor, desc.is_empty());
                 } else {
                     self.task_desc_editor = None;
+                }
+                self.task_title_editing = focus_idx == 0;
+                if self.task_title_editing {
+                    self.task_title_cursor = title.len();
                 }
                 self.update_task_modal_state(
                     task_id,
@@ -10670,6 +16756,10 @@ impl App {
                 } else {
                     self.task_desc_editor = None;
                 }
+                self.task_title_editing = focus_idx == 0;
+                if self.task_title_editing {
+                    self.task_title_cursor = title.len();
+                }
                 self.update_task_modal_state(
                     task_id,
                     title,
@@ -10687,7 +16777,16 @@ impl App {
                 );
             }
             KeyCode::Left => {
-                if focus_idx == 1 {
+                if focus_idx == 0 {
+                    if title_cursor > 0 {
+                        title_cursor = title[..title_cursor]
+                            .char_indices()
+                            .next_back()
+                            .map(|(idx, _)| idx)
+                            .unwrap_or(0);
+                    }
+                    self.task_title_cursor = title_cursor;
+                } else if focus_idx == 1 {
                     // Move cursor left in description
                     if desc_cursor > 0 {
                         desc_cursor -= 1;
@@ -10741,7 +16840,16 @@ impl App {
                 );
             }
             KeyCode::Right => {
-                if focus_idx == 1 {
+                if focus_idx == 0 {
+                    if title_cursor < title.len() {
+                        title_cursor = title[title_cursor..]
+                            .char_indices()
+                            .nth(1)
+                            .map(|(idx, _)| title_cursor + idx)
+                            .unwrap_or(title.len());
+                    }
+                    self.task_title_cursor = title_cursor;
+                } else if focus_idx == 1 {
                     // Move cursor right in description
                     if desc_cursor < desc.len() {
                         desc_cursor += 1;
@@ -10863,7 +16971,24 @@ impl App {
                 // For other fields: Down does nothing
             }
             KeyCode::Home => {
-                if focus_idx == 1 {
+                if focus_idx == 0 {
+                    self.task_title_cursor = 0;
+                    self.update_task_modal_state(
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
+                    );
+                } else if focus_idx == 1 {
                     // Jump to start of current line
                     desc_cursor = desc[..desc_cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
                     self.update_task_modal_state(
@@ -10884,7 +17009,24 @@ impl App {
                 }
             }
             KeyCode::End => {
-                if focus_idx == 1 {
+                if focus_idx == 0 {
+                    self.task_title_cursor = title.len();
+                    self.update_task_modal_state(
+                        task_id,
+                        title,
+                        desc,
+                        desc_cursor,
+                        priority,
+                        due_date_type,
+                        due_date_val,
+                        set_date_val,
+                        focus_idx,
+                        parent_task_id,
+                        step_selected_idx,
+                        is_step,
+                        recurrence,
+                    );
+                } else if focus_idx == 1 {
                     // Jump to end of current line
                     desc_cursor = desc[desc_cursor..]
                         .find('\n')
@@ -10910,8 +17052,10 @@ impl App {
             KeyCode::Char(c) => {
                 match focus_idx {
                     0 => {
-                        if title.len() < 100 {
-                            title.push(c);
+                        if title.chars().count() < TASK_TITLE_CHAR_LIMIT {
+                            title.insert(title_cursor, c);
+                            title_cursor += c.len_utf8();
+                            self.task_title_cursor = title_cursor;
                         }
                     }
                     1 => {
@@ -10975,10 +17119,17 @@ impl App {
                 match focus_idx {
                     0 => {
                         if is_ctrl_backspace(key) {
-                            delete_last_word(&mut title);
-                        } else {
-                            title.pop();
+                            title_cursor = delete_word_before_cursor(&mut title, title_cursor);
+                        } else if title_cursor > 0 {
+                            let previous = title[..title_cursor]
+                                .char_indices()
+                                .next_back()
+                                .map(|(idx, _)| idx)
+                                .unwrap_or(0);
+                            title.remove(previous);
+                            title_cursor = previous;
                         }
+                        self.task_title_cursor = title_cursor;
                     }
                     1 => {
                         if is_ctrl_backspace(key) {
@@ -11004,6 +17155,27 @@ impl App {
                     }
                     _ => {}
                 }
+                self.update_task_modal_state(
+                    task_id,
+                    title,
+                    desc,
+                    desc_cursor,
+                    priority,
+                    due_date_type,
+                    due_date_val,
+                    set_date_val,
+                    focus_idx,
+                    parent_task_id,
+                    step_selected_idx,
+                    is_step,
+                    recurrence,
+                );
+            }
+            KeyCode::Delete if focus_idx == 0 => {
+                if title_cursor < title.len() {
+                    title.remove(title_cursor);
+                }
+                self.task_title_cursor = title_cursor;
                 self.update_task_modal_state(
                     task_id,
                     title,
@@ -11160,6 +17332,7 @@ impl App {
                     } else {
                         self.modal_state = ModalType::None;
                         self.task_desc_editor = None;
+                        self.task_title_editing = false;
                     }
                 }
             }
@@ -11221,6 +17394,7 @@ impl App {
         &mut self,
         key: KeyEvent,
         project_id: Uuid,
+        entry_id: Option<Uuid>,
         mut content: String,
     ) -> Result<()> {
         match key.code {
@@ -11231,7 +17405,7 @@ impl App {
                 if content.chars().count() < JOURNAL_ENTRY_CHAR_LIMIT {
                     content.push(c);
                 }
-                self.modal_state = ModalType::NewJournalEntry { content };
+                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
             }
             KeyCode::Backspace => {
                 if is_ctrl_backspace(key) {
@@ -11239,7 +17413,17 @@ impl App {
                 } else {
                     content.pop();
                 }
-                self.modal_state = ModalType::NewJournalEntry { content };
+                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
+            }
+            // Editing an existing entry only rewrites its content — no XP/
+            // achievement/daily-adventure credit a second time for the same
+            // entry, unlike the brand-new-entry branch below.
+            KeyCode::Enter if !content.trim().is_empty() && entry_id.is_some() => {
+                let id = entry_id.unwrap();
+                self.db.update_journal_entry(id, content.trim())?;
+                self.mark_dirty();
+                self.reload_data()?;
+                self.modal_state = ModalType::None;
             }
             KeyCode::Enter if !content.trim().is_empty() => {
                 let author = self
@@ -11272,6 +17456,300 @@ impl App {
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn handle_treasury_entry_modal_key(
+        &mut self,
+        key: KeyEvent,
+        project_id: Uuid,
+        entry_id: Option<Uuid>,
+        mut title: String,
+        mut title_cursor: usize,
+        mut amount: String,
+        mut amount_cursor: usize,
+        mut entry_type_idx: usize,
+        mut status_idx: usize,
+        mut category_idx: usize,
+        mut date_val: String,
+        mut focus_idx: usize,
+    ) -> Result<()> {
+        let categories = crate::services::TreasuryService::new(&self.db).categories(project_id)?;
+        title_cursor = title_cursor.min(title.len());
+        amount_cursor = amount_cursor.min(amount.len());
+        // El campo Date siempre está disponible — al crear nace en "hoy", al editar en la
+        // fecha ya guardada. Se mueve un día a la vez con ←/→ (step_date_val); reasentar el
+        // día de un movimiento existente sigue exigiendo permiso de Owner/Steward al guardar.
+        let field_count = 6;
+        match key.code {
+            KeyCode::Esc => {
+                self.modal_state = ModalType::None;
+                return Ok(());
+            }
+            KeyCode::Tab | KeyCode::Down => focus_idx = (focus_idx + 1) % field_count,
+            KeyCode::BackTab | KeyCode::Up => {
+                focus_idx = (focus_idx + field_count - 1) % field_count
+            }
+            KeyCode::Left if focus_idx == 2 => entry_type_idx = (entry_type_idx + 3) % 4,
+            KeyCode::Right if focus_idx == 2 => entry_type_idx = (entry_type_idx + 1) % 4,
+            KeyCode::Left if focus_idx == 3 => status_idx = (status_idx + 3) % 4,
+            KeyCode::Right if focus_idx == 3 => status_idx = (status_idx + 1) % 4,
+            KeyCode::Left if focus_idx == 4 && !categories.is_empty() => {
+                category_idx = (category_idx + categories.len() - 1) % categories.len();
+            }
+            KeyCode::Right if focus_idx == 4 && !categories.is_empty() => {
+                category_idx = (category_idx + 1) % categories.len();
+            }
+            KeyCode::Left if focus_idx == 5 => date_val = step_date_val(&date_val, -1),
+            KeyCode::Right if focus_idx == 5 => date_val = step_date_val(&date_val, 1),
+            KeyCode::Left if focus_idx == 0 => {
+                if title_cursor > 0 {
+                    title_cursor -= 1;
+                    while title_cursor > 0 && !title.is_char_boundary(title_cursor) {
+                        title_cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Right if focus_idx == 0 => {
+                if title_cursor < title.len() {
+                    title_cursor += 1;
+                    while title_cursor < title.len() && !title.is_char_boundary(title_cursor) {
+                        title_cursor += 1;
+                    }
+                }
+            }
+            KeyCode::Home if focus_idx == 0 => title_cursor = 0,
+            KeyCode::End if focus_idx == 0 => title_cursor = title.len(),
+            // Amount solo contiene ASCII (dígitos y un punto), así que no hace falta
+            // cuidar fronteras de UTF-8 como en Title.
+            KeyCode::Left if focus_idx == 1 => amount_cursor = amount_cursor.saturating_sub(1),
+            KeyCode::Right if focus_idx == 1 => {
+                amount_cursor = (amount_cursor + 1).min(amount.len())
+            }
+            KeyCode::Home if focus_idx == 1 => amount_cursor = 0,
+            KeyCode::End if focus_idx == 1 => amount_cursor = amount.len(),
+            KeyCode::Backspace if focus_idx == 0 => {
+                if is_ctrl_backspace(key) {
+                    title_cursor = delete_word_before_cursor(&mut title, title_cursor);
+                } else if title_cursor > 0 {
+                    let mut prev = title_cursor - 1;
+                    while prev > 0 && !title.is_char_boundary(prev) {
+                        prev -= 1;
+                    }
+                    title.remove(prev);
+                    title_cursor = prev;
+                }
+            }
+            KeyCode::Backspace if focus_idx == 1 => {
+                if amount_cursor > 0 {
+                    amount.remove(amount_cursor - 1);
+                    amount_cursor -= 1;
+                }
+            }
+            KeyCode::Delete if focus_idx == 0 => {
+                if title_cursor < title.len() {
+                    title.remove(title_cursor);
+                }
+            }
+            KeyCode::Delete if focus_idx == 1 => {
+                if amount_cursor < amount.len() {
+                    amount.remove(amount_cursor);
+                }
+            }
+            KeyCode::Char(character) if focus_idx == 0 && title.chars().count() < 100 => {
+                title.insert(title_cursor, character);
+                title_cursor += character.len_utf8();
+            }
+            KeyCode::Char(character)
+                if focus_idx == 1
+                    && (character.is_ascii_digit() || character == '.')
+                    && amount.len() < 16 =>
+            {
+                amount.insert(amount_cursor, character);
+                amount_cursor += 1;
+            }
+            KeyCode::Enter if focus_idx < field_count - 1 => focus_idx += 1,
+            KeyCode::Enter if !title.trim().is_empty() && !categories.is_empty() => {
+                let amount_minor = match crate::services::treasury::parse_minor(&amount) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        self.notifications
+                            .push(Notification::warning(error.to_string()));
+                        self.modal_state = ModalType::TreasuryEntry {
+                            entry_id,
+                            title,
+                            title_cursor,
+                            amount,
+                            amount_cursor,
+                            entry_type_idx,
+                            status_idx,
+                            category_idx,
+                            date_val,
+                            focus_idx: 1,
+                        };
+                        return Ok(());
+                    }
+                };
+                let entry_types = [
+                    crate::models::LedgerEntryType::Income,
+                    crate::models::LedgerEntryType::Expense,
+                    crate::models::LedgerEntryType::Transfer,
+                    crate::models::LedgerEntryType::Adjustment,
+                ];
+                let statuses = [
+                    crate::models::LedgerStatus::Planned,
+                    crate::models::LedgerStatus::Approved,
+                    crate::models::LedgerStatus::Paid,
+                    crate::models::LedgerStatus::Cancelled,
+                ];
+                let status = statuses[status_idx.min(3)];
+                // El campo de estado no puede ser una puerta trasera a aprobar o pagar:
+                // quien no tiene esos permisos solo puede dejar el movimiento en Planned.
+                if !status.is_open() {
+                    let action = if status == crate::models::LedgerStatus::Paid {
+                        crate::services::treasury_policy::TreasuryAction::MarkPaid
+                    } else {
+                        crate::services::treasury_policy::TreasuryAction::ApproveEntry
+                    };
+                    if !self.treasury_allows(project_id, action) {
+                        self.modal_state = ModalType::TreasuryEntry {
+                            entry_id,
+                            title,
+                            title_cursor,
+                            amount,
+                            amount_cursor,
+                            entry_type_idx,
+                            status_idx: 0,
+                            category_idx,
+                            date_val,
+                            focus_idx: 3,
+                        };
+                        return Ok(());
+                    }
+                }
+                let now = Utc::now();
+                let service = crate::services::TreasuryService::new(&self.db);
+                if let Some(entry_id) = entry_id {
+                    let mut entry = service
+                        .get_entry(entry_id)?
+                        .context("Treasury entry is no longer available")?;
+                    entry.title = title.trim().to_string();
+                    entry.entry_type = entry_types[entry_type_idx.min(3)];
+                    entry.category_id = categories[category_idx.min(categories.len() - 1)].id;
+                    entry.amount_minor = amount_minor;
+                    entry.status = status;
+                    entry.payment_date = if status == crate::models::LedgerStatus::Paid {
+                        entry.payment_date.or(Some(now))
+                    } else {
+                        None
+                    };
+                    // Cambiar la fecha del movimiento (la columna "Date" del Ledger) es un
+                    // acto de gobierno — solo el Owner o un Steward pueden reasentar cuándo
+                    // ocurrió. Si no se tocó el campo (mismo día que ya tenía), no hace falta
+                    // permiso ni se reescribe nada.
+                    let trimmed_date = date_val.trim();
+                    if !trimmed_date.is_empty() {
+                        match self.parse_due_date_input(trimmed_date) {
+                            Some(requested) => {
+                                let changed_day = requested.with_timezone(&Local).date_naive()
+                                    != entry.created_at.with_timezone(&Local).date_naive();
+                                if changed_day {
+                                    if !self.treasury_allows(
+                                        project_id,
+                                        crate::services::treasury_policy::TreasuryAction::ChangeEntryDate,
+                                    ) {
+                                        self.modal_state = ModalType::TreasuryEntry {
+                                            entry_id: Some(entry_id),
+                                            title,
+                                            title_cursor,
+                                            amount,
+                                            amount_cursor,
+                                            entry_type_idx,
+                                            status_idx,
+                                            category_idx,
+                                            date_val: entry
+                                                .created_at
+                                                .with_timezone(&Local)
+                                                .format("%Y-%m-%d")
+                                                .to_string(),
+                                            focus_idx: 5,
+                                        };
+                                        return Ok(());
+                                    }
+                                    entry.created_at = requested;
+                                }
+                            }
+                            None => {
+                                self.notifications.push(Notification::warning(
+                                    "Could not read that date. Try YYYY-MM-DD, \"today\", or \"in 3 days\"."
+                                        .to_string(),
+                                ));
+                                self.modal_state = ModalType::TreasuryEntry {
+                                    entry_id: Some(entry_id),
+                                    title,
+                                    title_cursor,
+                                    amount,
+                                    amount_cursor,
+                                    entry_type_idx,
+                                    status_idx,
+                                    category_idx,
+                                    date_val,
+                                    focus_idx: 5,
+                                };
+                                return Ok(());
+                            }
+                        }
+                    }
+                    crate::services::TreasuryService::new(&self.db).update_entry(entry)?;
+                } else {
+                    // Un movimiento nuevo respeta la fecha elegida en el campo Date (que ya
+                    // nace en "hoy" y solo se mueve con ←/→, nunca se teclea) — no hace falta
+                    // permiso especial porque no hay una fecha previa que se esté reescribiendo.
+                    let created_at = self.parse_due_date_input(&date_val).unwrap_or(now);
+                    service.create_entry(crate::models::LedgerEntry {
+                        id: Uuid::new_v4(),
+                        campaign_id: project_id,
+                        title: title.trim().to_string(),
+                        description: String::new(),
+                        entry_type: entry_types[entry_type_idx.min(3)],
+                        category_id: categories[category_idx.min(categories.len() - 1)].id,
+                        amount_minor,
+                        currency_code: service.campaign_currency(project_id)?.code().to_string(),
+                        status,
+                        due_date: None,
+                        payment_date: (status == crate::models::LedgerStatus::Paid).then_some(now),
+                        vendor_source: None,
+                        related_task_id: None,
+                        notes: None,
+                        attachment_ref: None,
+                        recurrence: crate::models::LedgerRecurrence::None,
+                        custom_recurrence: None,
+                        version: 0,
+                        created_at,
+                        updated_at: now,
+                        created_by_identity: Some(self.identity.public_key.clone()),
+                    })?;
+                }
+                self.mark_dirty();
+                self.modal_state = ModalType::None;
+                self.notifications
+                    .push(Notification::info("Treasury entry recorded.".to_string()));
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.modal_state = ModalType::TreasuryEntry {
+            entry_id,
+            title,
+            title_cursor,
+            amount,
+            amount_cursor,
+            entry_type_idx,
+            status_idx,
+            category_idx,
+            date_val,
+            focus_idx,
+        };
         Ok(())
     }
 
@@ -11531,12 +18009,13 @@ impl App {
 
         let mut streak = self.db.get_streak()?;
 
-        let existing_adventures = self.db.get_daily_adventures()?;
-        let needs_regeneration =
-            existing_adventures.is_empty() || existing_adventures[0].created_date != today;
+        // Sólo los de HOY. Antes se leía la tabla entera y se miraba existing_adventures[0], que
+        // sale de un SELECT sin ORDER BY: en cuanto la tabla tenía varios días mezclados,
+        // regenerar o no dependía del orden arbitrario que devolviera SQLite.
+        let existing_adventures = self.db.get_daily_adventures_for(today)?;
+        let needs_regeneration = existing_adventures.is_empty();
 
         if needs_regeneration {
-            self.db.clear_daily_adventures()?;
             let new_quests = DailyAdventure::generate_daily_quests(today);
             for q in new_quests {
                 self.db.insert_daily_adventure(&q)?;
@@ -11841,6 +18320,9 @@ impl App {
     }
 
     fn complete_dashboard_task(&mut self, task: Task) -> Result<()> {
+        if self.warn_if_quest_has_unresolved_blockers(task.id)? {
+            return Ok(());
+        }
         let all_tasks = self.db.get_tasks().unwrap_or_default();
         let already_awarded = task.xp_awarded;
         let total_steps = all_tasks
@@ -11909,6 +18391,32 @@ impl App {
         self.reload_data()?;
         self.maybe_show_support_realm_prompt()?;
         Ok(())
+    }
+
+    fn warn_if_quest_has_unresolved_blockers(&mut self, task_id: Uuid) -> Result<bool> {
+        let blockers = self
+            .db
+            .get_unresolved_task_dependency_titles(&task_id.to_string())?;
+        if blockers.is_empty() {
+            return Ok(false);
+        }
+
+        let named_blockers = blockers
+            .iter()
+            .map(|title| format!("“{title}”"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let message = if blockers.len() == 1 {
+            format!(
+                "This Quest remains blocked by {named_blockers}. Complete that blocker before claiming this Quest."
+            )
+        } else {
+            format!(
+                "This Quest remains blocked by {named_blockers}. Complete those blockers before claiming this Quest."
+            )
+        };
+        self.notifications.push(Notification::warning(message));
+        Ok(true)
     }
 
     pub fn grow_tree(&mut self, amount: i32) -> Result<()> {
@@ -11993,7 +18501,10 @@ impl App {
     }
 
     pub fn update_daily_adventure_progress(&mut self, quest_type: &str, amount: i32) -> Result<()> {
-        let mut advs = self.db.get_daily_adventures()?;
+        // Acotado a hoy: con historial en la tabla, iterar todas las filas hacía que completar una
+        // tarea avanzara además el "Complete 5 Tasks" de días pasados y regalara 75 XP por cada uno.
+        let today = chrono::Local::now().date_naive();
+        let mut advs = self.db.get_daily_adventures_for(today)?;
         let mut completed_any = false;
         let was_all_completed = advs.iter().all(|a| a.completed);
 
@@ -12039,7 +18550,8 @@ impl App {
         }
 
         if completed_any {
-            let new_advs = self.db.get_daily_adventures()?;
+            self.trigger_task_completion_particles();
+            let new_advs = self.db.get_daily_adventures_for(today)?;
             let is_all_completed = new_advs.iter().all(|a| a.completed);
             if is_all_completed && !was_all_completed {
                 self.notifications.push(Notification::info(
@@ -13013,6 +19525,72 @@ impl App {
         }
 
         // Ordena por puntaje y limita a 40 resultados
+        for project in projects.iter().filter(|project| project.is_shared) {
+            if let Ok(members) = self.db.get_project_members(&project.id.to_string()) {
+                for (identity, username, role) in members {
+                    if let Some(score) = score_match(&username, Some(&identity)) {
+                        scored.push((
+                            score,
+                            SearchResult {
+                                result_type: SearchResultType::Companion,
+                                title: format!("@{}", username),
+                                details: format!("{} · {}", project.name, role),
+                                project_id: Some(project.id),
+                                item_id: identity,
+                            },
+                        ));
+                    }
+                }
+            }
+            if let Ok(messages) = self.db.get_chronicle_messages(&project.id.to_string()) {
+                for message in messages {
+                    if let Some(score) = score_match(&message.3, Some(&message.4)) {
+                        scored.push((
+                            score,
+                            SearchResult {
+                                result_type: SearchResultType::CampaignChronicleMessage,
+                                title: format!("@{} in Chronicle", message.3),
+                                details: format!(
+                                    "{} · {}",
+                                    project.name,
+                                    match_snippet(&message.4)
+                                ),
+                                project_id: Some(project.id),
+                                item_id: message.0,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+        if let Ok(tasks) = self.db.get_tasks() {
+            for task in tasks.iter().filter(|task| task.parent_task_id.is_none()) {
+                for comment in self
+                    .db
+                    .get_task_comments(&task.id.to_string())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|comment| comment.deleted_at.is_none())
+                {
+                    if let Some(score) =
+                        score_match(&comment.author_username, Some(&comment.content))
+                    {
+                        scored.push((
+                            score,
+                            SearchResult {
+                                result_type: SearchResultType::QuestCouncilMessage,
+                                title: format!("@{} on {}", comment.author_username, task.title),
+                                details: match_snippet(&comment.content),
+                                project_id: task.project_id,
+                                item_id: format!("{}__{}", task.id, comment.id),
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Ordena por puntaje y limita a 40 resultados
         scored.sort_by(|a, b| b.0.cmp(&a.0));
         scored.into_iter().map(|(_, r)| r).take(40).collect()
     }
@@ -13035,6 +19613,7 @@ impl App {
                     self.refresh_stats_cache();
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.quest_board_open = false;
                     self.audio_player.play_open_tasks();
                     // Resetea filtro y modo drill-down para que la tarea sea visible
                     self.task_filter = "All".to_string();
@@ -13106,6 +19685,7 @@ impl App {
                     self.refresh_stats_cache();
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
+                    self.quest_board_open = false;
                     self.audio_player.play_open_tasks();
                     self.task_filter = "All".to_string();
                     self.viewing_step_for_task = None;
@@ -13263,6 +19843,63 @@ impl App {
                     }
                 }
             }
+            SearchResultType::QuestCouncilMessage => {
+                let parts = result.item_id.splitn(2, "__").collect::<Vec<_>>();
+                if parts.len() == 2
+                    && let Ok(task_id) = Uuid::parse_str(parts[0])
+                    && self.open_quest_in_workspace(task_id)?
+                {
+                    let comments = self.db.get_task_comments(parts[0]).unwrap_or_default();
+                    let selected_comment_idx = comments
+                        .iter()
+                        .position(|comment| comment.id == parts[1])
+                        .unwrap_or(0);
+                    self.modal_state = ModalType::QuestCouncil {
+                        task_id,
+                        content: String::new(),
+                        selected_comment_idx,
+                        selected_member_idx: 0,
+                        editing_comment_id: None,
+                    };
+                }
+            }
+            SearchResultType::CampaignChronicleMessage => {
+                if let Some(project_id) = result.project_id {
+                    self.active_screen = ActiveScreen::Fellowship;
+                    self.active_tab_idx = 8;
+                    self.selected_fellowship_tab = 0;
+                    let shared = self
+                        .projects
+                        .iter()
+                        .filter(|project| project.is_shared)
+                        .collect::<Vec<_>>();
+                    self.selected_fellowship_project_idx = shared
+                        .iter()
+                        .position(|project| project.id == project_id)
+                        .unwrap_or(0);
+                    let messages = self
+                        .db
+                        .get_chronicle_messages(&project_id.to_string())
+                        .unwrap_or_default();
+                    self.fellowship_selected_msg_idx = messages
+                        .iter()
+                        .position(|message| message.0 == result.item_id)
+                        .unwrap_or(0);
+                    self.reload_data()?;
+                }
+            }
+            SearchResultType::Companion => {
+                if let Some(project_id) = result.project_id {
+                    self.active_project_id = Some(project_id);
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 0;
+                    self.quest_board_open = false;
+                    self.viewing_step_for_task = None;
+                    self.task_filter = format!("Assignee:{}", result.item_id);
+                    self.selected_task_idx = 0;
+                    self.reload_data()?;
+                }
+            }
             SearchResultType::Ritual => {
                 self.active_screen = ActiveScreen::Dashboard;
                 if let Ok(rituals) = self.db.get_rituals() {
@@ -13370,7 +20007,7 @@ impl App {
     }
 
     pub fn get_available_command_actions(&self, filter: &str) -> Vec<CommandAction> {
-        let all_actions = vec![
+        let mut all_actions = vec![
             CommandAction {
                 name: "Open Dashboard",
                 description: "Navigate to your Dashboard",
@@ -13505,6 +20142,54 @@ impl App {
             },
         ];
 
+        all_actions.push(CommandAction {
+            name: "Show My Quests",
+            description: "Open assigned work across Fellowship Campaigns",
+            shortcut: "y",
+            id: "show_my_quests",
+        });
+        if self.active_screen == ActiveScreen::Workspace && self.active_project_id.is_some() {
+            let is_shared = self
+                .active_project_id
+                .is_some_and(|project_id| self.project_is_shared(project_id));
+            all_actions.extend([
+                CommandAction {
+                    name: "Open Quest Kanban",
+                    description: "Open this Campaign's stance board",
+                    shortcut: "k",
+                    id: "open_quest_kanban",
+                },
+                CommandAction {
+                    name: "Show Blocked Quests",
+                    description: "Filter this Campaign to obstructed paths",
+                    shortcut: "f",
+                    id: "show_blocked_quests",
+                },
+                CommandAction {
+                    name: "Show Review Queue",
+                    description: "Filter this Campaign to Quests awaiting judgment",
+                    shortcut: "f",
+                    id: "show_review_queue",
+                },
+            ]);
+            if is_shared {
+                all_actions.extend([
+                    CommandAction {
+                        name: "Convene Selected Quest Council",
+                        description: "Discuss the selected Quest with its Fellowship",
+                        shortcut: "c",
+                        id: "convene_quest_council",
+                    },
+                    CommandAction {
+                        name: "Open Council Briefing",
+                        description: "Review team attention, workload, presence, and activity",
+                        shortcut: "B",
+                        id: "open_council_briefing",
+                    },
+                ]);
+            }
+        }
+
         if filter.is_empty() {
             all_actions
         } else {
@@ -13599,6 +20284,84 @@ impl App {
                     .db
                     .set_setting("last_viewed_fellowship", &chrono::Utc::now().to_rfc3339());
                 self.reload_data()?;
+            }
+            "show_my_quests" => {
+                self.active_screen = ActiveScreen::Fellowship;
+                self.active_tab_idx = 8;
+                self.selected_fellowship_tab = 5;
+                self.selected_my_quest_idx = 0;
+                self.reload_data()?;
+            }
+            "open_council_briefing" => {
+                if self.active_screen == ActiveScreen::Workspace && self.active_project_id.is_some()
+                {
+                    self.modal_state = ModalType::CouncilBriefing {
+                        selected_section_idx: 0,
+                    };
+                }
+            }
+            "open_quest_kanban" => {
+                if self.active_screen == ActiveScreen::Workspace {
+                    self.workspace_tab_idx = 0;
+                    self.quest_board_open = true;
+                    self.viewing_step_for_task = None;
+                    self.selected_task_idx = 0;
+                }
+            }
+            "show_blocked_quests" | "show_review_queue" => {
+                if self.active_screen == ActiveScreen::Workspace {
+                    self.workspace_tab_idx = 0;
+                    self.quest_board_open = false;
+                    self.viewing_step_for_task = None;
+                    self.task_filter = if action_id == "show_blocked_quests" {
+                        "Blocked"
+                    } else {
+                        "Review"
+                    }
+                    .to_string();
+                    self.selected_task_idx = 0;
+                }
+            }
+            "convene_quest_council" => {
+                if let Some(project_id) = self.active_project_id {
+                    if !self.project_is_shared(project_id) {
+                        return Ok(());
+                    }
+                    let mut tasks = visible_workspace_tasks(
+                        &self.all_tasks,
+                        project_id,
+                        self.viewing_step_for_task,
+                        &self.task_filter,
+                        &self.task_sort,
+                        &self.search_query,
+                        Some(&self.db),
+                        &self.identity.public_key,
+                    );
+                    if self.quest_board_open {
+                        tasks.retain(|task| task.parent_task_id.is_none());
+                    }
+                    if let Some(task) = tasks.get(self.selected_task_idx)
+                        && task.parent_task_id.is_none()
+                    {
+                        let role = self
+                            .db
+                            .get_member_role(&project_id.to_string(), &self.identity.public_key)?;
+                        if role.as_deref() == Some("Observer") {
+                            self.notifications.push(Notification::warning(
+                                "Observers may witness this Council, but cannot issue messages."
+                                    .to_string(),
+                            ));
+                        } else {
+                            self.modal_state = ModalType::QuestCouncil {
+                                task_id: task.id,
+                                content: String::new(),
+                                selected_comment_idx: 0,
+                                selected_member_idx: 0,
+                                editing_comment_id: None,
+                            };
+                        }
+                    }
+                }
             }
             "open_chronicle" => {
                 self.active_screen = ActiveScreen::GreatChronicle;
@@ -13882,6 +20645,9 @@ impl App {
         if effect == 0 {
             return;
         }
+        // Do not mix particles from the dashboard ambient effect into the selected
+        // completion effect. The completion burst should start with a clean canvas.
+        self.ambient_particles.clear();
         self.ambient_particles_ticks_remaining = 90;
         self.ambient_burst_effect = effect;
         self.ambient_burst_overrides_active = true;
@@ -13937,14 +20703,19 @@ impl App {
         }
 
         let burst_active = self.ambient_particles_ticks_remaining > 0;
+        // Once a burst's spawn window closes, its particles are still mid-flight —
+        // let them keep falling/drifting off-screen on their own instead of wiping
+        // the whole canvas mid-animation, which read as the effect cutting off abruptly.
+        let winding_down = !burst_active
+            && self.active_ambient_effect == 0
+            && !self.ambient_particles.is_empty();
         let effect = if burst_active && self.ambient_burst_overrides_active {
             self.ambient_burst_effect.max(1)
         } else if self.active_ambient_effect > 0 {
             self.active_ambient_effect
-        } else if burst_active {
+        } else if burst_active || winding_down {
             self.ambient_burst_effect.max(1)
         } else {
-            self.ambient_particles.clear();
             self.ambient_burst_effect = 0;
             self.ambient_burst_overrides_active = false;
             return;
@@ -13954,9 +20725,6 @@ impl App {
             self.ambient_particles_ticks_remaining -= 1;
             if self.ambient_particles_ticks_remaining == 0 {
                 self.ambient_burst_overrides_active = false;
-                if self.active_ambient_effect == 0 {
-                    self.ambient_burst_effect = 0;
-                }
             }
         }
 
@@ -13979,7 +20747,9 @@ impl App {
             max_particles
         };
 
-        let spawn_prob = if burst_active {
+        let spawn_prob = if winding_down {
+            0.0
+        } else if burst_active {
             1.0
         } else {
             match effect {
@@ -13988,7 +20758,9 @@ impl App {
             }
         };
 
-        let spawn_count = if burst_active && effect == 7 {
+        let spawn_count = if winding_down {
+            0
+        } else if burst_active && effect == 7 {
             7
         } else if burst_active {
             3
@@ -14002,6 +20774,50 @@ impl App {
             if self.ambient_particles.len() >= max_particles || !rng.gen_bool(spawn_prob) {
                 continue;
             }
+
+            // Matrix rain is rendered as coherent vertical streams rather than unrelated glyphs.
+            // A pale head leads each column while the older characters fade into dark green.
+            if effect == 6 {
+                let matrix_glyphs = [
+                    '0', '1', 'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ', 'ｻ', 'ｼ', 'ｽ', 'ｾ',
+                    'ｿ', 'ﾀ', 'ﾁ', 'ﾂ', 'ﾃ', 'ﾄ', 'ﾅ', 'ﾆ', 'ﾇ', 'ﾈ', 'ﾉ', 'ﾊ', 'ﾋ', 'ﾌ', 'ﾍ', 'ﾎ',
+                    'ﾏ', 'ﾐ', 'ﾑ', 'ﾒ', 'ﾓ', 'ﾔ', 'ﾕ', 'ﾖ', 'ﾗ', 'ﾘ', 'ﾙ', 'ﾚ', 'ﾛ', 'ﾜ', 'ﾝ', ':',
+                    '+', '*', '=', '<', '>',
+                ];
+                let x = rng.gen_range(0..spawn_width);
+                let head_y = if burst_active {
+                    rng.gen_range(1.0..burst_y_max)
+                } else {
+                    rng.gen_range(0.0..spawn_height.min(8) as f32)
+                };
+                let speed = rng.gen_range(0.45..0.9);
+                let stream_len = rng.gen_range(5..=11);
+
+                for trail_idx in 0..stream_len {
+                    if self.ambient_particles.len() >= max_particles {
+                        break;
+                    }
+                    let y = head_y - trail_idx as f32;
+                    if y < 0.0 {
+                        continue;
+                    }
+                    let color = match trail_idx {
+                        0 => ratatui::style::Color::Rgb(220, 255, 225),
+                        1..=2 => ratatui::style::Color::Rgb(74, 222, 128),
+                        3..=5 => ratatui::style::Color::Rgb(22, 163, 74),
+                        _ => ratatui::style::Color::Rgb(12, 83, 45),
+                    };
+                    self.ambient_particles.push(Particle {
+                        x,
+                        y,
+                        speed,
+                        symbol: *matrix_glyphs.choose(&mut rng).unwrap_or(&'1'),
+                        color,
+                    });
+                }
+                continue;
+            }
+
             let symbol = match effect {
                 1 => *['*', 'o', '~', 's'].choose(&mut rng).unwrap_or(&'*'),
                 2 => *['.', '*', '+'].choose(&mut rng).unwrap_or(&'.'),
@@ -14084,6 +20900,14 @@ impl App {
         let mut active_particles = Vec::new();
         for mut p in self.ambient_particles.drain(..) {
             p.y += p.speed;
+
+            // The code in the film never looks entirely static; occasional mutations make
+            // a stream shimmer without destroying its vertical shape.
+            if effect == 6 && rng.gen_bool(0.08) {
+                p.symbol = *['0', '1', 'ｱ', 'ｶ', 'ｻ', 'ﾀ', 'ﾅ', 'ﾏ', 'ﾗ', ':', '+']
+                    .choose(&mut rng)
+                    .unwrap_or(&'1');
+            }
 
             if effect == 1 || effect == 4 {
                 let drift = rng.gen_range(-1..=1);
@@ -14485,6 +21309,11 @@ impl App {
             return Ok(());
         }
 
+        // Local-only mode must not contact HTTP or the file-simulated provider.
+        if !self.config.sync_enabled {
+            return Ok(());
+        }
+
         if !self.auto_sync {
             return Ok(());
         }
@@ -14506,34 +21335,40 @@ impl App {
             .map(|t| t.elapsed() >= debounce)
             .unwrap_or(false);
 
-        // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días
-        let last_cleanup = self
-            .db
-            .get_setting("last_sync_cleanup")
-            .ok()
-            .flatten()
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
-            .map(|d| d.with_timezone(&chrono::Utc));
-        let cleanup_due = last_cleanup
-            .map(|d| (chrono::Utc::now() - d).num_seconds() > 86400)
+        // Limpieza diaria del sync_log — borramos entradas synced=1 de más de 30 días.
+        // Checking "is it due yet" only actually needs to happen a few times
+        // an hour, not on every ~50ms render tick — gate the settings read +
+        // date parse behind an in-memory cooldown first, same idea as
+        // last_task_notification_tick elsewhere in this file.
+        let cleanup_check_due = self
+            .last_sync_cleanup_check
+            .map(|t| t.elapsed().as_secs() >= 300)
             .unwrap_or(true);
-        if cleanup_due {
-            let _ = self.db.cleanup_old_sync_logs(30);
-            let _ = self
+        if cleanup_check_due {
+            self.last_sync_cleanup_check = Some(std::time::Instant::now());
+            let last_cleanup = self
                 .db
-                .set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+                .get_setting("last_sync_cleanup")
+                .ok()
+                .flatten()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&chrono::Utc));
+            let cleanup_due = last_cleanup
+                .map(|d| (chrono::Utc::now() - d).num_seconds() > 86400)
+                .unwrap_or(true);
+            if cleanup_due {
+                let _ = self.db.cleanup_old_sync_logs(30);
+                let _ = self
+                    .db
+                    .set_setting("last_sync_cleanup", &chrono::Utc::now().to_rfc3339());
+            }
         }
 
         if mutation_ready || self.last_auto_sync.elapsed() >= interval {
             self.last_mutation = None;
             self.last_auto_sync = std::time::Instant::now();
-            if self.config.sync_enabled {
-                // Network sync: spawn background thread so la UI se queda responsive
-                self.start_background_sync();
-            } else {
-                // Local-only sync (FileCloudProvider): fast, safe to run on main thread
-                let _ = self.trigger_sync();
-            }
+            // Network sync: spawn background thread so la UI se queda responsive
+            self.start_background_sync();
         }
         Ok(())
     }
@@ -14858,50 +21693,23 @@ impl App {
                     message: msg,
                 };
             }
-            Ok(json) => {
-                // Step 1: importing
+            Ok(message) => {
                 self.modal_state = ModalType::CloudRestoreProgress {
                     step: 1,
-                    message: "Importing chronicle data...".to_string(),
+                    message: "Loading decrypted chronicle data...".to_string(),
                 };
-                let decoded_json = {
-                    use base64::{Engine as _, engine::general_purpose::STANDARD};
-                    STANDARD
-                        .decode(json.trim())
-                        .ok()
-                        .and_then(|b| String::from_utf8(b).ok())
-                        .unwrap_or(json)
+                let _ = self.db.set_setting("conflict_count", "0");
+                self.pause_auto_sync(
+                    "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
+                );
+                self.reload_data()?;
+                self.notifications.push(Notification::info(
+                    "Chronicle restored from encrypted sync!".to_string(),
+                ));
+                self.modal_state = ModalType::CloudRestoreProgress {
+                    step: 2,
+                    message: format!("{}. Automatic sync remains paused.", message),
                 };
-                match self.db.import_from_json(&decoded_json) {
-                    Ok(_) => {
-                        let _ = App::anchor_restore_to_sync_head(
-                            &self.db,
-                            &self.identity,
-                            &self.device_id,
-                            &self.server_url,
-                        );
-                        let _ = self.db.set_setting("conflict_count", "0");
-                        self.pause_auto_sync(
-                            "Restore complete. Auto Sync disabled; toggle [a] when ready.",
-                        );
-                        self.reload_data()?;
-                        self.notifications.push(Notification::info(
-                            "Chronicle restored from cloud!".to_string(),
-                        ));
-                        self.modal_state = ModalType::CloudRestoreProgress {
-                            step: 2,
-                            message:
-                                "Restore complete. Automatic sync is paused until you manually sync."
-                                    .to_string(),
-                        };
-                    }
-                    Err(e) => {
-                        self.modal_state = ModalType::CloudRestoreProgress {
-                            step: 3,
-                            message: format!("Import failed: {}", e),
-                        };
-                    }
-                }
             }
         }
         Ok(())
@@ -14991,22 +21799,16 @@ impl App {
             return Ok(());
         }
 
-        // Get the `since` timestamp — from our map, or seed from the DB max
-        let since = match self.last_chat_timestamp.get(&proj_id) {
-            Some(ts) => ts.clone(),
-            None => {
-                let max_ts: String = self.db.conn.query_row(
-                    "SELECT COALESCE(MAX(timestamp), '') FROM chronicle_messages WHERE project_id = ?1",
-                    rusqlite::params![proj_id],
-                    |r| r.get(0),
-                ).unwrap_or_default();
-                if !max_ts.is_empty() {
-                    self.last_chat_timestamp
-                        .insert(proj_id.clone(), max_ts.clone());
-                }
-                max_ts
-            }
+        let routing_id = match self.db.get_project_encryption_key(&proj_id)? {
+            Some((routing_id, _)) => routing_id,
+            None => return Ok(()),
         };
+
+        // Content refresh uses encrypted sync-v2. Presence is the only lightweight
+        // Fellowship metadata request made by this poll.
+        if !self.sync_in_progress {
+            self.start_background_sync();
+        }
 
         let (tx, rx) = std::sync::mpsc::channel();
         self.chat_rx = Some(rx);
@@ -15017,7 +21819,7 @@ impl App {
         let device_id = self.device_id.clone();
         let server_url = self.server_url.clone();
         let proj_id_thread = proj_id.clone();
-        let since_thread = since.clone();
+        let routing_id_thread = routing_id;
 
         let _ = std::thread::spawn(move || {
             let make_result = || -> anyhow::Result<ChatPollResult> {
@@ -15027,56 +21829,8 @@ impl App {
                 let db = crate::database::Database::new(&storage_dir.join("questline.db"))?;
                 let _ = db.conn.execute_batch("PRAGMA busy_timeout = 1000;");
 
-                // Fetch new messages (only those after `since`)
-                let since_encoded = since_thread.replace('+', "%2B");
-                let path = if since_thread.is_empty() {
-                    format!("chronicle/messages?project_id={}", proj_id_thread)
-                } else {
-                    format!(
-                        "chronicle/messages?project_id={}&since={}",
-                        proj_id_thread, since_encoded
-                    )
-                };
-
-                let mut new_count = 0usize;
-                let mut last_ts: Option<String> = None;
-
-                if let Ok(resp) = client.send_request("GET", &path, "") {
-                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if let Some(msgs) = arr.as_array() {
-                            new_count = msgs.len();
-                            for msg in msgs {
-                                let id = msg["id"].as_str().unwrap_or_default().to_string();
-                                let pid =
-                                    msg["project_id"].as_str().unwrap_or_default().to_string();
-                                let sender_identity = msg["sender_identity"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let sender_username = msg["sender_username"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let content =
-                                    msg["content"].as_str().unwrap_or_default().to_string();
-                                let message_type =
-                                    msg["message_type"].as_str().unwrap_or("text").to_string();
-                                let timestamp =
-                                    msg["timestamp"].as_str().unwrap_or_default().to_string();
-                                if !timestamp.is_empty() {
-                                    last_ts = Some(timestamp.clone());
-                                }
-                                let _ = db.conn.execute(
-                                    "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                                    rusqlite::params![id, pid, sender_identity, sender_username, content, message_type, timestamp],
-                                );
-                            }
-                        }
-                    }
-                }
-
                 // Fetch real-time presence for this project
-                let presence_path = format!("chronicle/presence?project_id={}", proj_id_thread);
+                let presence_path = format!("chronicle/presence?project_id={}", routing_id_thread);
                 if let Ok(resp) = client.send_request("GET", &presence_path, "") {
                     if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if let Some(members) = arr.as_array() {
@@ -15110,8 +21864,8 @@ impl App {
 
                 Ok(ChatPollResult {
                     project_id: proj_id_thread,
-                    new_message_count: new_count,
-                    last_timestamp: last_ts,
+                    new_message_count: 0,
+                    last_timestamp: None,
                     error: None,
                 })
             };
@@ -15125,40 +21879,6 @@ impl App {
             let _ = tx.send(result);
         });
 
-        Ok(())
-    }
-
-    fn anchor_restore_to_sync_head(
-        db: &crate::database::Database,
-        identity: &Identity,
-        device_id: &str,
-        server_url: &str,
-    ) -> Result<()> {
-        let client =
-            crate::services::api_client::ApiClient::new(server_url, identity.clone(), device_id);
-        let response =
-            client.send_request("POST", "sync/pull?since_seq=0&limit=1&include_meta=1", "")?;
-        let value: serde_json::Value = serde_json::from_str(&response)?;
-        let head_seq = value
-            .get("head_seq")
-            .and_then(|v| v.as_i64())
-            .or_else(|| {
-                value.as_array().and_then(|events| {
-                    events
-                        .iter()
-                        .filter_map(|event| event.get("seq").and_then(|seq| seq.as_i64()))
-                        .max()
-                })
-            })
-            .unwrap_or(0);
-
-        db.set_setting("last_pull_seq", &head_seq.to_string())?;
-        db.set_setting("last_remote_head_seq", &head_seq.to_string())?;
-        db.set_setting("last_sync_lag", "0")?;
-        db.set_setting("sync_restore_hold", "1")?;
-        db.set_setting("auto_sync", "false")?;
-        let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
-        let _ = db.conn.execute("UPDATE sync_log SET synced = 1", []);
         Ok(())
     }
 
@@ -15338,27 +22058,6 @@ impl App {
 
                 Self::local_db_is_safe_for_cloud_reset(&db)?;
 
-                let client = crate::services::api_client::ApiClient::new(
-                    &server_url,
-                    identity.clone(),
-                    &device_id,
-                );
-                client.send_request("POST", "sync/reset", "{}")?;
-                if let Ok(status_resp) = client.send_request("GET", "sync/status", "") {
-                    if let Ok(status) = serde_json::from_str::<serde_json::Value>(&status_resp) {
-                        let total = status
-                            .get("total_events")
-                            .and_then(|v| v.as_i64())
-                            .unwrap_or(-1);
-                        if total != 0 {
-                            return Err(anyhow::anyhow!(
-                                "Cloud reset verification failed: {} sync events remain",
-                                total
-                            ));
-                        }
-                    }
-                }
-
                 let queued = db.queue_full_state_sync()?;
                 let sync_engine = crate::services::sync_engine::SyncEngine::new(
                     &db,
@@ -15366,39 +22065,14 @@ impl App {
                     &device_id,
                     Some(&server_url),
                 )?;
-                let pushed = sync_engine.push_pending_only()?;
-
-                match db.export_to_recovery_json() {
-                    Ok(json) => match client.send_request("POST", "recovery", &json) {
-                        Ok(_) => {
-                            let _ = db
-                                .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
-                        }
-                        Err(e) => {
-                            let _ = db.set_setting(
-                                "last_recovery_upload_error",
-                                &format!("Cloud sync reset reseeded sync, but recovery upload failed: {}", e),
-                            );
-                        }
-                    },
-                    Err(e) => {
-                        let _ = db.set_setting(
-                            "last_recovery_upload_error",
-                            &format!(
-                                "Cloud sync reset reseeded sync, but recovery export failed: {}",
-                                e
-                            ),
-                        );
-                    }
-                }
-
-                if let Ok(head_resp) = client.send_request("GET", "sync/head", "") {
-                    if let Ok(value) = serde_json::from_str::<serde_json::Value>(&head_resp) {
-                        if let Some(seq) = value.get("seq").and_then(|v| v.as_i64()) {
-                            let _ = db.set_setting("last_pull_seq", &seq.to_string());
-                            let _ = db.set_setting("last_remote_head_seq", &seq.to_string());
-                            let _ = db.set_setting("last_sync_lag", "0");
-                        }
+                let pushed = sync_engine.replace_with_pending_snapshot()?;
+                if pushed > 0 {
+                    let remote_head_seq = sync_engine.verify_remote_has_events()?;
+                    if remote_head_seq <= 0 {
+                        return Err(anyhow::anyhow!(
+                            "Cloud reset verification failed: server reports no events after replacing {} pending changes",
+                            pushed
+                        ));
                     }
                 }
                 let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
@@ -15508,78 +22182,30 @@ impl App {
                     if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                         if let Some(list) = arr.as_array() {
                             for inv in list {
-                                let id = inv["id"].as_str().unwrap_or_default().to_string();
-                                let project_id =
-                                    inv["project_id"].as_str().unwrap_or_default().to_string();
-                                let project_name =
-                                    inv["project_name"].as_str().unwrap_or_default().to_string();
-                                let inviter_identity = inv["inviter_identity"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let inviter_username = inv["inviter_username"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let invitee_identity = inv["invitee_identity"]
-                                    .as_str()
-                                    .unwrap_or_default()
-                                    .to_string();
-                                let role = inv["role"].as_str().unwrap_or_default().to_string();
-                                let status =
-                                    inv["status"].as_str().unwrap_or("Pending").to_string();
-                                let created_at =
-                                    inv["created_at"].as_str().unwrap_or_default().to_string();
-                                let _ = db.conn.execute(
-                                    "INSERT OR IGNORE INTO invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
-                                    rusqlite::params![id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at],
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Pull chronicle messages for shared projects
-                if let Ok(projs) = db.get_projects() {
-                    for p in projs.into_iter().filter(|p| p.is_shared) {
-                        let path = format!("chronicle/messages?project_id={}", p.id);
-                        if let Ok(resp) = client.send_request("GET", &path, "") {
-                            if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
-                                if let Some(msgs) = arr.as_array() {
-                                    for msg in msgs {
-                                        let id = msg["id"].as_str().unwrap_or_default().to_string();
-                                        let proj_id = msg["project_id"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let sender_identity = msg["sender_identity"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let sender_username = msg["sender_username"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let content =
-                                            msg["content"].as_str().unwrap_or_default().to_string();
-                                        let message_type = msg["message_type"]
-                                            .as_str()
-                                            .unwrap_or("text")
-                                            .to_string();
-                                        let timestamp = msg["timestamp"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let _ = db.conn.execute(
-                                            "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                                            rusqlite::params![id, proj_id, sender_identity, sender_username, content, message_type, timestamp],
+                                if let Err(error) =
+                                    App::store_validated_server_invitation(&db, &identity, inv)
+                                {
+                                    let invite_id = inv["id"].as_str().unwrap_or("unknown");
+                                    let warning_key =
+                                        format!("invalid_invitation_warning_{invite_id}");
+                                    if db.get_setting(&warning_key).ok().flatten().is_none() {
+                                        let _ = db.create_notification(
+                                            "fellowship_invitation_error",
+                                            "Invalid Fellowship invitation",
+                                            &format!(
+                                                "An invitation was left pending because its encrypted envelope could not be verified: {error}"
+                                            ),
+                                            Some(invite_id),
                                         );
+                                        let _ = db.set_setting(&warning_key, "1");
                                     }
                                 }
                             }
                         }
                     }
                 }
+
+                // Fellowship messages arrive as encrypted project-v1 sync events.
 
                 // Refresh companion presence
                 if let Ok(resp) = client.send_request("GET", "project/companions", "") {
@@ -15714,31 +22340,6 @@ impl App {
                         "conflict_count",
                         &(conflict_count + conflicts.len() as i32).to_string(),
                     );
-                }
-
-                // Auto-backup once every 24 h so [r] Restore always has something to fetch.
-                // Without this the server only has a backup if the user manually pressed [e].
-                let should_backup = {
-                    let last_ts = db.get_setting("last_auto_backup")?.unwrap_or_default();
-                    if include_contributions || last_ts.is_empty() {
-                        true
-                    } else {
-                        chrono::DateTime::parse_from_rfc3339(&last_ts)
-                            .map(|t| {
-                                let age = chrono::Utc::now()
-                                    .signed_duration_since(t.with_timezone(&chrono::Utc));
-                                age > chrono::Duration::hours(24)
-                            })
-                            .unwrap_or(true)
-                    }
-                };
-                if should_backup && conflicts.is_empty() {
-                    if let Ok(json) = db.export_to_recovery_json() {
-                        if client.send_request("POST", "recovery", &json).is_ok() {
-                            let _ = db
-                                .set_setting("last_auto_backup", &chrono::Utc::now().to_rfc3339());
-                        }
-                    }
                 }
 
                 Ok((pushed, pulled, conflicts))
@@ -15960,6 +22561,25 @@ impl App {
         self.save_streak_schedule()
     }
 
+    // Días adelante que puede competir una quest por Main Quest / Next Quest / Quick Win /
+    // Upcoming Threats — None significa "All" (sin límite).
+    pub(crate) fn quest_visibility_horizon_days(&self) -> Option<i64> {
+        let idx = self
+            .quest_visibility_horizon_idx
+            .min(QUEST_VISIBILITY_HORIZON_PRESETS.len() - 1);
+        QUEST_VISIBILITY_HORIZON_PRESETS[idx].1
+    }
+
+    fn adjust_quest_visibility_horizon(&mut self, delta: i32) -> Result<()> {
+        let len = QUEST_VISIBILITY_HORIZON_PRESETS.len() as i32;
+        self.quest_visibility_horizon_idx =
+            (self.quest_visibility_horizon_idx as i32 + delta).rem_euclid(len) as usize;
+        let days = QUEST_VISIBILITY_HORIZON_PRESETS[self.quest_visibility_horizon_idx].1;
+        self.db.set_quest_visibility_horizon_days(days)?;
+        self.db.queue_quest_visibility_horizon_sync()?;
+        Ok(())
+    }
+
     fn pywal_colors_modified() -> Option<std::time::SystemTime> {
         let home = std::env::var("HOME").ok()?;
         std::fs::metadata(std::path::Path::new(&home).join(".cache/wal/colors.json"))
@@ -16087,6 +22707,56 @@ impl App {
     }
 
     fn notify_task_completed(&self, task: &Task, is_step: bool) {
+        if !is_step {
+            for dependent_id in self
+                .db
+                .get_tasks_blocked_by(&task.id.to_string())
+                .unwrap_or_default()
+            {
+                let assigned_to_me = self
+                    .db
+                    .get_task_assignments(&dependent_id)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|(identity, _)| identity == &self.identity.public_key);
+                if assigned_to_me {
+                    let dependent_title = uuid::Uuid::parse_str(&dependent_id)
+                        .ok()
+                        .and_then(|id| self.db.get_task_by_id(id).ok())
+                        .map(|dependent| dependent.title)
+                        .unwrap_or_else(|| "A dependent Quest".to_string());
+                    let notice_id = format!(
+                        "fellowship:dependency_resolved:{}__{}",
+                        task.id, dependent_id
+                    );
+                    let is_new_notice = !self
+                        .db
+                        .get_notifications()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|notice| notice.0 == notice_id);
+                    let _ = self.db.create_notification_once(
+                        &notice_id,
+                        "dependency_resolved",
+                        "The path has opened",
+                        &format!("{} no longer blocks {}.", task.title, dependent_title),
+                        Some(&dependent_id),
+                    );
+                    if is_new_notice && let Some(project_id) = task.project_id {
+                        let _ = self.db.log_activity(
+                            Some(&project_id.to_string()),
+                            "quest_dependency_resolved",
+                            &format!("{} opened the path for {}.", task.title, dependent_title),
+                            &self.identity.public_key,
+                            self.user
+                                .as_ref()
+                                .map(|user| user.username.as_str())
+                                .unwrap_or("Companion"),
+                        );
+                    }
+                }
+            }
+        }
         if !self.external_notifications {
             return;
         }
@@ -16211,6 +22881,25 @@ impl App {
             Utc::now(),
         )?;
         for event in events {
+            if self.external_notifications {
+                crate::services::notifications::send_system_notification_with_icon(
+                    &event.title,
+                    &event.message,
+                    event.urgent,
+                    event.icon,
+                );
+            }
+            self.notifications.push(Notification::info(format!(
+                "{}: {}",
+                event.title, event.message
+            )));
+        }
+        let treasury_events =
+            crate::services::treasury_notifications::collect_treasury_notifications(
+                &self.db,
+                Utc::now(),
+            )?;
+        for event in treasury_events {
             if self.external_notifications {
                 crate::services::notifications::send_system_notification_with_icon(
                     &event.title,
@@ -16595,6 +23284,94 @@ impl App {
         });
     }
 
+    fn store_validated_server_invitation(
+        db: &crate::database::Database,
+        identity: &crate::services::identity::Identity,
+        value: &serde_json::Value,
+    ) -> Result<()> {
+        let field = |name: &str| value[name].as_str().unwrap_or_default().to_string();
+        let invitation_id = field("id");
+        let routing_id = field("routing_id");
+        let mut project_id = field("project_id");
+        let mut project_name = field("project_name");
+        let inviter_encryption_key = field("inviter_encryption_key");
+        let key_nonce = field("key_nonce");
+        let key_ciphertext = field("key_ciphertext");
+        let project_name_nonce = field("project_name_nonce");
+        let project_name_ciphertext = field("project_name_ciphertext");
+        let project_id_nonce = field("project_id_nonce");
+        let project_id_ciphertext = field("project_id_ciphertext");
+        let invitee_identity = field("invitee_identity");
+        if invitation_id.is_empty() {
+            return Err(anyhow::anyhow!("Invitation ID is missing"));
+        }
+        if invitee_identity != identity.public_key {
+            return Err(anyhow::anyhow!("Invitation recipient identity mismatch"));
+        }
+        if !routing_id.is_empty() {
+            Uuid::parse_str(&routing_id)
+                .map_err(|_| anyhow::anyhow!("Encrypted invitation routing ID is invalid"))?;
+            if inviter_encryption_key.is_empty()
+                || key_nonce.is_empty()
+                || key_ciphertext.is_empty()
+                || project_name_nonce.is_empty()
+                || project_name_ciphertext.is_empty()
+                || project_id_nonce.is_empty()
+                || project_id_ciphertext.is_empty()
+            {
+                return Err(anyhow::anyhow!(
+                    "Encrypted invitation envelope is incomplete"
+                ));
+            }
+            let project_key = crate::services::encryption::unwrap_project_key(
+                identity,
+                &inviter_encryption_key,
+                &routing_id,
+                &key_nonce,
+                &key_ciphertext,
+            )?;
+            project_id = crate::services::encryption::decrypt_project_payload(
+                &project_key,
+                &project_id_nonce,
+                &project_id_ciphertext,
+                &format!("questline/fellowship/id/v1/{routing_id}"),
+            )?;
+            Uuid::parse_str(&project_id).map_err(|_| {
+                anyhow::anyhow!("Encrypted invitation contains an invalid project ID")
+            })?;
+            project_name = crate::services::encryption::decrypt_project_payload(
+                &project_key,
+                &project_name_nonce,
+                &project_name_ciphertext,
+                &format!("questline/fellowship/name/v1/{routing_id}"),
+            )?;
+            if project_name.trim().is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Encrypted invitation has an empty project name"
+                ));
+            }
+        }
+        db.upsert_encrypted_invitation(&crate::database::EncryptedInvitationRecord {
+            id: invitation_id,
+            project_id,
+            project_name,
+            inviter_identity: field("inviter_identity"),
+            inviter_username: field("inviter_username"),
+            invitee_identity,
+            role: field("role"),
+            status: value["status"].as_str().unwrap_or("Pending").to_string(),
+            created_at: field("created_at"),
+            routing_id,
+            inviter_encryption_key,
+            key_nonce,
+            key_ciphertext,
+            project_name_nonce,
+            project_name_ciphertext,
+            project_id_nonce,
+            project_id_ciphertext,
+        })
+    }
+
     pub fn pull_invitations_async(&self) {
         if self.config.sync_enabled {
             let client = crate::services::api_client::ApiClient::new(
@@ -16610,46 +23387,12 @@ impl App {
                             serde_json::from_str::<serde_json::Value>(&resp_str)
                         {
                             if let Some(arr) = server_invites.as_array() {
-                                if let Ok(conn) = rusqlite::Connection::open(&db_path) {
+                                if let Ok(db) = crate::database::Database::new(&db_path) {
                                     for inv_val in arr {
-                                        let id =
-                                            inv_val["id"].as_str().unwrap_or_default().to_string();
-                                        let project_id = inv_val["project_id"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let project_name = inv_val["project_name"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let inviter_identity = inv_val["inviter_identity"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let inviter_username = inv_val["inviter_username"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let invitee_identity = inv_val["invitee_identity"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let role = inv_val["role"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let status = inv_val["status"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-                                        let created_at = inv_val["created_at"]
-                                            .as_str()
-                                            .unwrap_or_default()
-                                            .to_string();
-
-                                        let _ = conn.execute(
-                                            "INSERT OR IGNORE INTO invitations (id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                                            rusqlite::params![id, project_id, project_name, inviter_identity, inviter_username, invitee_identity, role, status, created_at]
+                                        let _ = Self::store_validated_server_invitation(
+                                            &db,
+                                            &client.identity,
+                                            inv_val,
                                         );
                                     }
                                 }
@@ -16754,6 +23497,7 @@ impl App {
                     "Focus Completed! Gained +{} XP",
                     xp
                 )));
+                self.trigger_task_completion_particles();
 
                 // Every completed focus session restores a point of tree health
                 {
@@ -16902,6 +23646,35 @@ impl App {
             return Ok(());
         }
 
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                self.selected_focus_field_idx = if self.selected_focus_field_idx > 0 {
+                    self.selected_focus_field_idx - 1
+                } else {
+                    3
+                };
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                self.selected_focus_field_idx = (self.selected_focus_field_idx + 1) % 4;
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.cycle_selected_focus_field(false),
+            KeyCode::Down | KeyCode::Char('j') => self.cycle_selected_focus_field(true),
+            KeyCode::Enter => {
+                self.start_selected_focus_session()?;
+            }
+            _ => {
+                self.handle_top_screen_key(key)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Cycles whichever Focus field is currently selected (duration/
+    /// Campaign/Quest/Soundscape) by one step, wrapping. `forward` mirrors
+    /// Down/'j' (true) vs Up/'k' (false). Shared by those keyboard arms in
+    /// handle_focus_screen_key and the mouse wheel over the Focus screen,
+    /// so they can't drift apart.
+    fn cycle_selected_focus_field(&mut self, forward: bool) {
         let active_projects: Vec<Project> = self
             .projects
             .iter()
@@ -16922,137 +23695,50 @@ impl App {
                 .collect();
         }
 
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') => {
-                self.selected_focus_field_idx = if self.selected_focus_field_idx > 0 {
-                    self.selected_focus_field_idx - 1
+        match self.selected_focus_field_idx {
+            0 => {
+                self.selected_focus_duration_idx = if forward {
+                    (self.selected_focus_duration_idx + 1) % 6
+                } else if self.selected_focus_duration_idx > 0 {
+                    self.selected_focus_duration_idx - 1
                 } else {
-                    3
+                    5
                 };
             }
-            KeyCode::Right | KeyCode::Char('l') => {
-                self.selected_focus_field_idx = (self.selected_focus_field_idx + 1) % 4;
-            }
-            KeyCode::Up | KeyCode::Char('k') => match self.selected_focus_field_idx {
-                0 => {
-                    self.selected_focus_duration_idx = if self.selected_focus_duration_idx > 0 {
-                        self.selected_focus_duration_idx - 1
-                    } else {
-                        5
-                    };
-                }
-                1 => {
-                    let max_proj_idx = active_projects.len();
-                    self.selected_focus_project_idx = if self.selected_focus_project_idx > 0 {
-                        self.selected_focus_project_idx - 1
-                    } else {
-                        max_proj_idx
-                    };
-                    self.selected_focus_task_idx = 0;
-                }
-                2 => {
-                    let max_task_idx = active_tasks.len();
-                    self.selected_focus_task_idx = if self.selected_focus_task_idx > 0 {
-                        self.selected_focus_task_idx - 1
-                    } else {
-                        max_task_idx
-                    };
-                }
-                3 => {
-                    use crate::audio::SOUNDSCAPES;
-                    let total = SOUNDSCAPES.len() + 1;
-                    self.selected_focus_soundscape_idx = if self.selected_focus_soundscape_idx == 0
-                    {
-                        total - 1
-                    } else {
-                        self.selected_focus_soundscape_idx - 1
-                    };
-                }
-                _ => {}
-            },
-            KeyCode::Down | KeyCode::Char('j') => match self.selected_focus_field_idx {
-                0 => {
-                    self.selected_focus_duration_idx = (self.selected_focus_duration_idx + 1) % 6;
-                }
-                1 => {
-                    let max_proj_idx = active_projects.len();
-                    self.selected_focus_project_idx =
-                        (self.selected_focus_project_idx + 1) % (max_proj_idx + 1);
-                    self.selected_focus_task_idx = 0;
-                }
-                2 => {
-                    let max_task_idx = active_tasks.len();
-                    self.selected_focus_task_idx =
-                        (self.selected_focus_task_idx + 1) % (max_task_idx + 1);
-                }
-                3 => {
-                    use crate::audio::SOUNDSCAPES;
-                    self.selected_focus_soundscape_idx =
-                        (self.selected_focus_soundscape_idx + 1) % (SOUNDSCAPES.len() + 1);
-                }
-                _ => {}
-            },
-            KeyCode::Enter => {
-                let duration_mins = match self.selected_focus_duration_idx {
-                    0 => 15,
-                    1 => 25,
-                    2 => 45,
-                    3 => 60,
-                    4 => 90,
-                    5 => -1,
-                    _ => 25,
-                };
-
-                if duration_mins == -1 {
-                    self.modal_state = ModalType::CustomFocusDuration {
-                        input: String::new(),
-                    };
+            1 => {
+                let max_proj_idx = active_projects.len();
+                self.selected_focus_project_idx = if forward {
+                    (self.selected_focus_project_idx + 1) % (max_proj_idx + 1)
+                } else if self.selected_focus_project_idx > 0 {
+                    self.selected_focus_project_idx - 1
                 } else {
-                    let project_id = if self.selected_focus_project_idx > 0
-                        && self.selected_focus_project_idx <= active_projects.len()
-                    {
-                        Some(active_projects[self.selected_focus_project_idx - 1].id)
-                    } else {
-                        None
-                    };
-
-                    let task_id = if self.selected_focus_task_idx > 0
-                        && self.selected_focus_task_idx <= active_tasks.len()
-                    {
-                        Some(active_tasks[self.selected_focus_task_idx - 1].id)
-                    } else {
-                        None
-                    };
-
-                    // If Local Folder is selected but no folder is configured, prompt first
-                    use crate::audio::SOUNDSCAPES;
-                    let is_local_folder = self.selected_focus_soundscape_idx > 0
-                        && SOUNDSCAPES[self.selected_focus_soundscape_idx - 1].name
-                            == "Local Folder";
-                    if is_local_folder {
-                        let folder = self
-                            .db
-                            .get_setting("local_music_folder")
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                        if folder.trim().is_empty() {
-                            self.modal_state = ModalType::LocalMusicFolder {
-                                input: String::new(),
-                                suggestions: vec![],
-                                selected: 0,
-                            };
-                            return Ok(());
-                        }
-                    }
-
-                    self.start_focus_session(duration_mins, project_id, task_id)?;
-                }
+                    max_proj_idx
+                };
+                self.selected_focus_task_idx = 0;
             }
-            _ => {
-                self.handle_top_screen_key(key)?;
+            2 => {
+                let max_task_idx = active_tasks.len();
+                self.selected_focus_task_idx = if forward {
+                    (self.selected_focus_task_idx + 1) % (max_task_idx + 1)
+                } else if self.selected_focus_task_idx > 0 {
+                    self.selected_focus_task_idx - 1
+                } else {
+                    max_task_idx
+                };
             }
+            3 => {
+                use crate::audio::SOUNDSCAPES;
+                let total = SOUNDSCAPES.len() + 1;
+                self.selected_focus_soundscape_idx = if forward {
+                    (self.selected_focus_soundscape_idx + 1) % total
+                } else if self.selected_focus_soundscape_idx == 0 {
+                    total - 1
+                } else {
+                    self.selected_focus_soundscape_idx - 1
+                };
+            }
+            _ => {}
         }
-        Ok(())
     }
 
     pub fn check_traits(&mut self) -> Result<()> {
@@ -17289,7 +23975,7 @@ impl App {
                 let milestone_name = m.name.clone();
                 self.grant_xp(&format!("Milestone Met: {}", milestone_name), milestone_xp)?;
                 self.increment_quest_progress(80, 1)?;
-                self.trigger_ambient_particles();
+                self.trigger_task_completion_particles();
 
                 if let Some(ref u) = self.user {
                     let day_number = (Utc::now() - u.created_at).num_days() as i32 + 1;
@@ -17331,7 +24017,7 @@ impl App {
                 self.db.update_project(&existing)?;
                 self.mark_dirty();
                 self.audio_player.play_task_complete();
-                self.trigger_ambient_particles();
+                self.trigger_task_completion_particles();
 
                 let proj_name = existing.name.clone();
                 self.grant_xp(&format!("Complete Campaign: {}", proj_name), 200)?;
@@ -17541,14 +24227,38 @@ impl App {
         }
     }
 
+    /// True while the user is actively typing somewhere outside a modal —
+    /// searching, the Editor screen (writing/editing a Scroll/Note), or one
+    /// of the pre-gameplay text-entry screens. `handle_key_event` uses this
+    /// to gate a few global shortcuts that would otherwise steal keystrokes
+    /// meant as literal text; `tick_hydration` below uses the same check so
+    /// the reminder can't pop up (and then swallow keystrokes) mid-typing.
+    fn is_in_text_entry(&self) -> bool {
+        self.searching
+            || self.modal_state != ModalType::None
+            || self.active_screen == ActiveScreen::Editor
+            || self.active_screen == ActiveScreen::Onboarding
+            || self.active_screen == ActiveScreen::Gateway
+            || self.active_screen == ActiveScreen::Restore
+    }
+
     pub fn tick_hydration(&mut self) -> Result<()> {
         if !self.hydration_enabled {
             return Ok(());
         }
 
-        // Refresh today's count (handles midnight rollover)
-        if let Ok((count, _)) = self.db.hydration_get_today() {
-            self.hydration_glasses = count;
+        // Refresh today's count (handles midnight rollover) — only needs to
+        // notice a day boundary, not run on every ~50ms render tick, so gate
+        // it the same way tick_task_notifications gates its own DB work.
+        let day_check_due = self
+            .last_hydration_day_check
+            .map(|t| t.elapsed().as_secs() >= 60)
+            .unwrap_or(true);
+        if day_check_due {
+            self.last_hydration_day_check = Some(std::time::Instant::now());
+            if let Ok((count, _)) = self.db.hydration_get_today() {
+                self.hydration_glasses = count;
+            }
         }
 
         let now = chrono::Local::now();
@@ -17579,11 +24289,18 @@ impl App {
             return Ok(());
         }
 
-        // Fire popup if timer elapsed
+        // Fire popup if timer elapsed — but not while the user is typing
+        // somewhere (a modal, the Editor, search, ...): is_in_text_entry()
+        // covers all of that, not just modal_state, so a reminder can't pop
+        // up over a Scroll/Note mid-edit and swallow the next keystroke.
+        // Clearing the timer here (rather than nudging it a few minutes)
+        // means it rearms for a full fresh interval once the user is free —
+        // same "quietly defer" behavior this already had for other modals,
+        // now covering Editor too.
         if let Some(at) = self.hydration_next_reminder_at {
             if std::time::Instant::now() >= at {
                 self.hydration_next_reminder_at = None; // cleared until dismissed
-                if matches!(self.modal_state, ModalType::None) {
+                if !self.is_in_text_entry() {
                     self.audio_player.play_water_alert();
                     if self.external_notifications {
                         crate::services::notifications::send_system_notification_with_icon(
@@ -17710,7 +24427,97 @@ fn build_project_stats(
 mod app_tests {
     use super::*;
     use crate::models::{Codex, Season};
+    use crate::services::identity::Identity;
     use std::path::Path;
+
+    #[test]
+    fn encrypted_invitation_is_decrypted_before_it_is_stored() {
+        let db_path = std::env::temp_dir().join(format!(
+            "questline-invitation-validation-{}.db",
+            Uuid::new_v4()
+        ));
+        let db = crate::database::Database::new(&db_path).unwrap();
+        let sender = Identity {
+            user_uuid: Uuid::new_v4(),
+            public_key: "aa".repeat(32),
+            secret_key: "01".repeat(32),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let recipient = Identity {
+            user_uuid: Uuid::new_v4(),
+            public_key: "bb".repeat(32),
+            secret_key: "02".repeat(32),
+            created_at: Utc::now().to_rfc3339(),
+        };
+        let route = Uuid::new_v4().to_string();
+        let project_id = Uuid::new_v4().to_string();
+        let project_key = [42u8; 32];
+        let sender_encryption_key =
+            crate::services::encryption::fellowship_public_key(&sender).unwrap();
+        let recipient_encryption_key =
+            crate::services::encryption::fellowship_public_key(&recipient).unwrap();
+        let (key_nonce, key_ciphertext) = crate::services::encryption::wrap_project_key(
+            &sender,
+            &recipient_encryption_key,
+            &route,
+            &project_key,
+        )
+        .unwrap();
+        let (project_id_nonce, project_id_ciphertext) =
+            crate::services::encryption::encrypt_project_payload(
+                &project_key,
+                &project_id,
+                &format!("questline/fellowship/id/v1/{route}"),
+            )
+            .unwrap();
+        let (project_name_nonce, project_name_ciphertext) =
+            crate::services::encryption::encrypt_project_payload(
+                &project_key,
+                "Readable Fellowship",
+                &format!("questline/fellowship/name/v1/{route}"),
+            )
+            .unwrap();
+        let invitation = serde_json::json!({
+            "id": "valid-invite",
+            "project_id": route,
+            "project_name": "[encrypted]",
+            "inviter_identity": sender.public_key,
+            "inviter_username": "Sender",
+            "invitee_identity": recipient.public_key,
+            "role": "Companion",
+            "status": "Pending",
+            "created_at": Utc::now().to_rfc3339(),
+            "routing_id": route,
+            "inviter_encryption_key": sender_encryption_key,
+            "key_nonce": key_nonce,
+            "key_ciphertext": key_ciphertext,
+            "project_name_nonce": project_name_nonce,
+            "project_name_ciphertext": project_name_ciphertext,
+            "project_id_nonce": project_id_nonce,
+            "project_id_ciphertext": project_id_ciphertext,
+        });
+
+        App::store_validated_server_invitation(&db, &recipient, &invitation).unwrap();
+        let stored = db
+            .get_encrypted_invitation("valid-invite")
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.project_id, project_id);
+        assert_eq!(stored.project_name, "Readable Fellowship");
+
+        let mut corrupt = invitation;
+        corrupt["id"] = serde_json::Value::String("corrupt-invite".to_string());
+        corrupt["key_ciphertext"] = serde_json::Value::String("not-base64".to_string());
+        assert!(App::store_validated_server_invitation(&db, &recipient, &corrupt).is_err());
+        assert!(
+            db.get_encrypted_invitation("corrupt-invite")
+                .unwrap()
+                .is_none()
+        );
+
+        drop(db);
+        let _ = std::fs::remove_file(db_path);
+    }
 
     #[test]
     fn scroll_destinations_include_campaign_roots_and_codices() {
@@ -18051,6 +24858,115 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
     }
 
+    // Test fixture: an App parked on the editor screen with a body hit
+    // region wide enough to avoid wrapping, matching what draw() would have
+    // stashed on the last frame.
+    fn editor_app_for_mouse_tests(db_file: &Path, content: &str) -> App {
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let mut state =
+            crate::screens::editor::EditorState::new(Uuid::new_v4(), None, String::new(), content.to_string());
+        state.editing_title = false;
+        state.mode = crate::screens::editor::EditorMode::Normal;
+        app.editor_state = Some(state);
+        app.active_screen = ActiveScreen::Editor;
+        app.hit_regions.editor = Some(crate::screens::hit_test::EditorHitRegions {
+            body: ratatui::layout::Rect {
+                x: 0,
+                y: 0,
+                width: 40,
+                height: 5,
+            },
+            title: ratatui::layout::Rect::default(),
+            status: ratatui::layout::Rect::default(),
+            quick_note: false,
+        });
+        app
+    }
+
+    fn left_click(app: &mut App, col: u16, row: u16, modifiers: KeyModifiers) {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: col,
+            row,
+            modifiers,
+        })
+        .unwrap();
+        app.handle_mouse_event(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: col,
+            row,
+            modifiers,
+        })
+        .unwrap();
+    }
+
+    /// Two `left_click`s at the same cell in immediate succession — well
+    /// under `register_click_run`'s 400ms window since both calls run
+    /// synchronously — so the second one registers as a double-click.
+    fn double_click(app: &mut App, col: u16, row: u16, modifiers: KeyModifiers) {
+        left_click(app, col, row, modifiers);
+        left_click(app, col, row, modifiers);
+    }
+
+    #[test]
+    fn shift_tab_in_normal_mode_returns_to_the_scroll_title() {
+        // Existing scrolls open with the body in Normal mode (see
+        // EditorState::new), so Shift+Tab must work from Normal mode too —
+        // not just from Insert — or the title becomes unreachable.
+        let db_file = Path::new("test_questline_shift_tab_normal_mode.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+        assert_eq!(
+            app.editor_state.as_ref().unwrap().mode,
+            crate::screens::editor::EditorMode::Normal
+        );
+
+        app.handle_key_event(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert!(app.editor_state.as_ref().unwrap().editing_title);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn triple_click_in_editor_selects_the_whole_line() {
+        let db_file = Path::new("test_questline_mouse_triple_click.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+        left_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let state = app.editor_state.as_ref().unwrap();
+        assert!(matches!(
+            state.mode,
+            crate::screens::editor::EditorMode::Visual {
+                line_mode: true,
+                ..
+            }
+        ));
+        assert_eq!(state.get_visual_text(), "hello world");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn shift_click_extends_selection_from_the_current_cursor() {
+        let db_file = Path::new("test_questline_mouse_shift_click.db");
+        let mut app = editor_app_for_mouse_tests(db_file, "hello world");
+        app.editor_state.as_mut().unwrap().cursor_x = 1; // sitting on the 'e'
+
+        left_click(&mut app, 9, 0, KeyModifiers::SHIFT); // extend to the 'l' in "world"
+
+        let state = app.editor_state.as_ref().unwrap();
+        assert_eq!(state.visual_range(), Some((0, 1, 0, 9, false)));
+        assert_eq!(state.get_visual_text(), "ello worl");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
     #[test]
     fn test_streak_actions() {
         let db_file = Path::new("test_questline_streak.db");
@@ -18210,6 +25126,90 @@ mod app_tests {
     }
 
     #[test]
+    fn unresolved_blocker_prevents_workspace_quest_completion() {
+        let db_file = Path::new("test_questline_blocked_completion.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Blocked Campaign".to_string(),
+            description: None,
+            archived: false,
+            completed: false,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+
+        let make_task = |title: &str| Task {
+            id: Uuid::new_v4(),
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            priority: TaskPriority::Medium,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let dependent = make_task("A Dependent Quest");
+        let blocker = make_task("B Open the Gate");
+        app.db.insert_task(&dependent).unwrap();
+        app.db.insert_task(&blocker).unwrap();
+        app.db
+            .add_task_dependency(
+                &dependent.id.to_string(),
+                &blocker.id.to_string(),
+                &project_id.to_string(),
+                "owner",
+                "Owner",
+            )
+            .unwrap();
+
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.all_tasks = app.db.get_tasks().unwrap();
+        let visible = visible_workspace_tasks(
+            &app.all_tasks,
+            project_id,
+            None,
+            &app.task_filter,
+            &app.task_sort,
+            &app.search_query,
+            Some(&app.db),
+            &app.identity.public_key,
+        );
+        app.selected_task_idx = visible
+            .iter()
+            .position(|task| task.id == dependent.id)
+            .unwrap();
+        app.handle_workspace_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(!app.db.get_task_by_id(dependent.id).unwrap().completed);
+        assert!(app.notifications.iter().any(|notification| {
+            notification.kind == NotificationKind::Warning
+                && notification.message.contains("B Open the Gate")
+        }));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn test_completed_workspace_quest_builds_edit_modal() {
         let task = Task {
             id: Uuid::new_v4(),
@@ -18311,6 +25311,181 @@ mod app_tests {
     }
 
     #[test]
+    fn test_paste_into_quest_and_step_titles() {
+        let mut cursor = 0;
+        let mut editing = false;
+        let mut quest_modal = ModalType::NewTask {
+            title: "Quest: ".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        assert!(App::paste_into_task_title(
+            &mut quest_modal,
+            "first line\r\nsecond line",
+            &mut cursor,
+            &mut editing,
+        ));
+        match quest_modal {
+            ModalType::NewTask { title, .. } => {
+                assert_eq!(title, "Quest: first line second line");
+            }
+            _ => panic!("Expected a new quest modal"),
+        }
+
+        let mut step_modal = ModalType::EditTask {
+            id: Uuid::new_v4(),
+            title: "Step ".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            step_selected_idx: 0,
+            is_step: true,
+            recurrence: None,
+        };
+        cursor = 0;
+        editing = false;
+        assert!(App::paste_into_task_title(
+            &mut step_modal,
+            "pasted\tstep",
+            &mut cursor,
+            &mut editing,
+        ));
+        match step_modal {
+            ModalType::EditTask { title, .. } => assert_eq!(title, "Step pasted step"),
+            _ => panic!("Expected an edited step modal"),
+        }
+    }
+
+    #[test]
+    fn test_task_title_paste_respects_unicode_character_limit() {
+        let mut cursor = 0;
+        let mut editing = false;
+        let mut modal = ModalType::NewTask {
+            title: "é".repeat(TASK_TITLE_CHAR_LIMIT - 1),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: Some(Uuid::new_v4()),
+            recurrence: None,
+        };
+
+        assert!(App::paste_into_task_title(
+            &mut modal,
+            "界extra",
+            &mut cursor,
+            &mut editing,
+        ));
+        match modal {
+            ModalType::NewTask { title, .. } => {
+                assert_eq!(title.chars().count(), TASK_TITLE_CHAR_LIMIT);
+                assert!(title.ends_with('界'));
+            }
+            _ => panic!("Expected a new step modal"),
+        }
+    }
+
+    #[test]
+    fn test_quest_title_cursor_edits_in_the_middle() {
+        let db_file = Path::new("test_questline_quest_title_cursor.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        app.modal_state = ModalType::NewTask {
+            title: "Alpha beta".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        };
+
+        app.handle_workspace_modal_key(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::empty()),
+            project_id,
+        )
+        .unwrap();
+        app.handle_workspace_modal_key(
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::empty()),
+            project_id,
+        )
+        .unwrap();
+        app.handle_workspace_modal_key(
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::empty()),
+            project_id,
+        )
+        .unwrap();
+        app.handle_workspace_modal_key(
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::empty()),
+            project_id,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::NewTask { ref title, .. } if title == "Alpha beX"
+        ));
+        assert_eq!(app.task_title_cursor, "Alpha beX".len());
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn test_step_title_cursor_navigates_unicode_safely() {
+        let db_file = Path::new("test_questline_step_title_cursor.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        app.modal_state = ModalType::EditTask {
+            id: Uuid::new_v4(),
+            title: "A界B".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            step_selected_idx: 0,
+            is_step: true,
+            recurrence: None,
+        };
+
+        for code in [KeyCode::Left, KeyCode::Left, KeyCode::Delete] {
+            app.handle_workspace_modal_key(KeyEvent::new(code, KeyModifiers::empty()), project_id)
+                .unwrap();
+        }
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { ref title, .. } if title == "AB"
+        ));
+        assert_eq!(app.task_title_cursor, 1);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn test_extract_url_supports_bare_and_markdown_links() {
         assert_eq!(
             extract_url("Visit https://questlinecli.com/docs."),
@@ -18386,12 +25561,32 @@ mod app_tests {
             "All",
             "CreatedDate",
             "",
+            None,
+            "",
         );
 
         assert_eq!(visible.len(), 3);
         assert_eq!(visible[0].id, parent.id);
         assert_eq!(visible[1].id, open_step.id);
         assert_eq!(visible[2].id, done_step.id);
+    }
+
+    #[test]
+    fn quest_board_navigation_moves_spatially_and_skips_empty_columns() {
+        let statuses = [
+            QuestStatus::Backlog,
+            QuestStatus::Backlog,
+            QuestStatus::InProgress,
+            QuestStatus::InProgress,
+            QuestStatus::Done,
+        ];
+
+        assert_eq!(move_quest_board_selection(&statuses, 0, 0, 1), 1);
+        assert_eq!(move_quest_board_selection(&statuses, 1, 0, 1), 0);
+        assert_eq!(move_quest_board_selection(&statuses, 1, 1, 0), 3);
+        assert_eq!(move_quest_board_selection(&statuses, 3, 1, 0), 4);
+        assert_eq!(move_quest_board_selection(&statuses, 4, 1, 0), 0);
+        assert_eq!(move_quest_board_selection(&statuses, 0, -1, 0), 4);
     }
 
     #[test]
@@ -18915,6 +26110,167 @@ mod app_tests {
     }
 
     #[test]
+    fn campaign_template_picker_creates_quest_trees() {
+        let db_file = Path::new("test_questline_campaign_template.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Projects;
+        app.modal_state = ModalType::None;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::CampaignTemplateSelect { selected_idx: 0 }
+        ));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let project = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|project| project.name == "Content Sprint")
+            .expect("template Campaign was not created");
+        assert!(!project.is_shared);
+        let tasks = app.db.get_tasks_for_project(project.id).unwrap();
+        let parent_count = tasks
+            .iter()
+            .filter(|task| task.parent_task_id.is_none())
+            .count();
+        let step_count = tasks
+            .iter()
+            .filter(|task| task.parent_task_id.is_some())
+            .count();
+        assert_eq!(parent_count, 3);
+        assert_eq!(step_count, 9);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn new_campaign_escape_saves_and_new_profiles_start_without_ambient_particles() {
+        let db_file = Path::new("test_questline_new_campaign_escape.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        assert_eq!(app.active_ambient_effect, 0);
+
+        app.active_screen = ActiveScreen::Projects;
+        app.modal_state = ModalType::NewProject {
+            name: "Saved Campaign".to_string(),
+            name_cursor: 14,
+            desc: "Created with Escape".to_string(),
+            desc_cursor: 19,
+            focus_idx: 1,
+        };
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let projects = app.db.get_projects().unwrap();
+        assert!(projects.iter().any(|project| {
+            project.name == "Saved Campaign"
+                && project.description.as_deref() == Some("Created with Escape")
+        }));
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn completed_companion_lookup_autofills_the_open_invitation() {
+        let db_file = Path::new("test_questline_companion_lookup.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let companion_key = "ab".repeat(32);
+        app.modal_state = ModalType::InviteMember {
+            identity: companion_key.clone(),
+            username: String::new(),
+            role_idx: 2,
+            project_idx: 0,
+            focus_idx: 1,
+        };
+        app.companion_lookup_in_flight = Some(companion_key.clone());
+        *app.companion_lookup_result.lock().unwrap() = Some(CompanionLookupResult {
+            identity: companion_key.clone(),
+            username: Some("Gibranlp".to_string()),
+            encryption_key: Some("cd".repeat(32)),
+        });
+
+        app.tick_companion_lookup();
+
+        assert_eq!(app.companion_lookup_in_flight, None);
+        assert!(app.companion_lookup_cache.as_ref().is_some_and(|result| {
+            result.identity == companion_key && result.encryption_key.is_some()
+        }));
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember { ref username, .. } if username == "Gibranlp"
+        ));
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_invitation_defaults_to_companion_and_never_cycles_to_owner() {
+        let db_file = Path::new("test_questline_invitation_roles.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Role Ceremony".to_string(),
+            description: None,
+            archived: false,
+            completed: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.active_screen = ActiveScreen::Fellowship;
+        app.open_fellowship_sharing();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember { role_idx: 1, .. }
+        ));
+
+        if let ModalType::InviteMember {
+            identity,
+            username,
+            role_idx,
+            project_idx,
+            ..
+        } = app.modal_state.clone()
+        {
+            app.modal_state = ModalType::InviteMember {
+                identity,
+                username,
+                role_idx,
+                project_idx,
+                focus_idx: 3,
+            };
+        }
+        for _ in 0..6 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+                .unwrap();
+            assert!(matches!(
+                app.modal_state,
+                ModalType::InviteMember {
+                    role_idx: 0..=2,
+                    ..
+                }
+            ));
+        }
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn test_quick_note_shortcut_and_palette_action_save_a_scroll() {
         let db_file = Path::new("test_questline_quick_note.db");
         let _ = std::fs::remove_file(db_file);
@@ -19117,9 +26473,9 @@ mod app_tests {
         assert_eq!(app.modal_state, ModalType::None);
 
         // Test fuzzy matching
-        let actions = app.get_available_command_actions("proj");
+        let actions = app.get_available_command_actions("camp");
         assert!(!actions.is_empty());
-        assert_eq!(actions[0].name, "Open Projects");
+        assert_eq!(actions[0].name, "Open Campaigns");
 
         let actions = app.get_available_command_actions("sync");
         assert!(!actions.is_empty());
@@ -19128,6 +26484,26 @@ mod app_tests {
         let actions = app.get_available_command_actions("char");
         assert!(!actions.is_empty());
         assert_eq!(actions[0].name, "Open Character");
+
+        assert_eq!(
+            app.get_available_command_actions("my quests")
+                .first()
+                .map(|action| action.id),
+            Some("show_my_quests")
+        );
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(Uuid::new_v4());
+        assert_eq!(
+            app.get_available_command_actions("review queue")
+                .first()
+                .map(|action| action.id),
+            Some("show_review_queue")
+        );
+        app.execute_command_action("show_review_queue").unwrap();
+        assert_eq!(app.task_filter, "Review");
+        assert_eq!(app.workspace_tab_idx, 0);
+        app.active_screen = ActiveScreen::Dashboard;
+        app.active_project_id = None;
 
         // 7. Press ? to open About screen (since we are not in text entry)
         app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty()))
@@ -19153,6 +26529,98 @@ mod app_tests {
         app.active_screen = ActiveScreen::Workspace;
         app.execute_command_action("open_quest_codex").unwrap();
         assert!(app.workspace_help_open);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn teamwork_search_finds_local_encrypted_collaboration_content() {
+        let db_file = Path::new("test_questline_teamwork_search.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Search Fellowship".to_string(),
+                description: None,
+                archived: false,
+                completed: false,
+                created_at: now,
+                updated_at: now,
+                owner_identity: Some("owner-key".to_string()),
+                owner_username: Some("Owner".to_string()),
+                is_shared: true,
+            })
+            .unwrap();
+        app.db
+            .insert_task(&Task {
+                id: task_id,
+                project_id: Some(project_id),
+                title: "Launch Quest".to_string(),
+                description: None,
+                priority: TaskPriority::Medium,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                created_at: now,
+                updated_at: now,
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                "stable-ren-key",
+                "Ren",
+                "Companion",
+            )
+            .unwrap();
+        app.db
+            .add_task_comment(
+                &task_id.to_string(),
+                &project_id.to_string(),
+                "stable-ren-key",
+                "Ren",
+                "inspect the starlight manifold",
+                &[],
+            )
+            .unwrap();
+        app.db
+            .add_chronicle_message(
+                &project_id.to_string(),
+                "stable-ren-key",
+                "Ren",
+                "the moonbridge is ready",
+                "message",
+            )
+            .unwrap();
+        app.reload_data().unwrap();
+
+        assert!(
+            app.perform_unified_search("starlight manifold")
+                .iter()
+                .any(|result| { result.result_type == SearchResultType::QuestCouncilMessage })
+        );
+        assert!(
+            app.perform_unified_search("moonbridge")
+                .iter()
+                .any(|result| { result.result_type == SearchResultType::CampaignChronicleMessage })
+        );
+        let companion = app
+            .perform_unified_search("stable-ren-key")
+            .into_iter()
+            .find(|result| result.result_type == SearchResultType::Companion)
+            .unwrap();
+        app.navigate_to_search_result(&companion).unwrap();
+        assert_eq!(app.task_filter, "Assignee:stable-ren-key");
+        assert_eq!(app.active_project_id, Some(project_id));
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -19283,6 +26751,7 @@ mod app_tests {
         assert!(app.ambient_particles.is_empty());
 
         // Triggering sets ticks remaining
+        app.active_ambient_effect = 1;
         app.trigger_ambient_particles();
         assert_eq!(app.ambient_particles_ticks_remaining, 90);
         assert_eq!(app.ambient_burst_effect, app.active_ambient_effect);
@@ -19302,6 +26771,38 @@ mod app_tests {
         assert_eq!(app.ambient_burst_effect, 5);
         app.tick_particles();
         assert!(!app.ambient_particles.is_empty());
+
+        // A completion effect replaces existing ambient particles and uses whichever
+        // effect the user selected in Settings, rather than a hard-coded effect.
+        for selected_effect in 1..=7 {
+            app.ambient_particles.push(Particle {
+                x: 0,
+                y: 0.0,
+                speed: 0.1,
+                symbol: '@',
+                color: ratatui::style::Color::Rgb(168, 85, 247),
+            });
+            app.task_completion_ambient_effect = selected_effect;
+            app.trigger_task_completion_particles();
+            assert!(app.ambient_particles.is_empty());
+            assert_eq!(app.ambient_burst_effect, selected_effect);
+            assert!(app.ambient_burst_overrides_active);
+        }
+
+        // Matrix Rain is one selectable example and keeps its own green palette.
+        app.task_completion_ambient_effect = 6;
+        app.trigger_task_completion_particles();
+        app.tick_particles();
+        assert!(!app.ambient_particles.is_empty());
+        assert!(app.ambient_particles.iter().all(|particle| {
+            matches!(
+                particle.color,
+                ratatui::style::Color::Rgb(220, 255, 225)
+                    | ratatui::style::Color::Rgb(74, 222, 128)
+                    | ratatui::style::Color::Rgb(22, 163, 74)
+                    | ratatui::style::Color::Rgb(12, 83, 45)
+            )
+        }));
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -19351,6 +26852,15 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Fellowship);
         assert_eq!(app.active_tab_idx, 8);
 
+        // Fellowship preserves universal vim pane navigation.
+        app.fellowship_focus_left = true;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(!app.fellowship_focus_left);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.fellowship_focus_left);
+
         // Key '7' -> GreatChronicle
         app.handle_key_event(KeyEvent::new(KeyCode::Char('7'), KeyModifiers::empty()))
             .unwrap();
@@ -19379,16 +26889,25 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::Settings);
 
-        // Key 'S' -> should NOT switch screens globally anymore
+        // Key 'S' -> should NOT switch screens globally anymore (stays on Settings)
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::GreatChronicle);
+        assert_eq!(app.active_screen, ActiveScreen::Settings);
 
-        // Switch to SyncSettings using key '6' for the next test
-        app.handle_key_event(KeyEvent::new(KeyCode::Char('6'), KeyModifiers::empty()))
+        // Switch to SyncSettings using key '8' for the next test ('6' now opens Fellowship)
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::empty()))
             .unwrap();
         assert_eq!(app.active_screen, ActiveScreen::SyncSettings);
         assert_eq!(app.active_tab_idx, 12);
+
+        // Both advertised lowercase and shifted uppercase shortcuts toggle Cloud Sync.
+        let sync_was_enabled = app.config.sync_enabled;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.config.sync_enabled, !sync_was_enabled);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(app.config.sync_enabled, sync_was_enabled);
 
         // Key 'c' on SyncSettings -> should copy key and NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()))
@@ -19457,11 +26976,469 @@ mod app_tests {
         };
         app.projects = vec![test_proj];
         app.selected_project_idx = 0;
+        // Sharing requires an individual project selected, not the "all campaigns" view.
+        app.projects_all_selected = false;
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
         assert!(
             matches!(app.modal_state, ModalType::InviteMember { project_idx, .. } if project_idx == 0)
         );
+
+        app.modal_state = ModalType::None;
+        app.active_screen = ActiveScreen::Fellowship;
+        app.selected_fellowship_tab = 1;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.selected_fellowship_tab, 5);
+
+        app.selected_fellowship_tab = 1;
+        // j/J are navigation-only and never open Fellowship sharing.
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('J'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
+
+        // v/V are the dedicated Fellowship sharing shortcuts. Focus starts on the
+        // project selector so a companion is invited into the right campaign before
+        // anyone pastes a key.
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('V'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember {
+                project_idx: 0,
+                focus_idx: 0,
+                ..
+            }
+        ));
+
+        app.modal_state = ModalType::None;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember { focus_idx: 0, .. }
+        ));
+
+        app.modal_state = ModalType::InviteMember {
+            identity: String::new(),
+            username: String::new(),
+            role_idx: 2,
+            project_idx: 0,
+            focus_idx: 1,
+        };
+        app.config.sync_enabled = false;
+        let pasted_key = "ab".repeat(32);
+        let grouped_key = pasted_key
+            .to_uppercase()
+            .as_bytes()
+            .chunks(8)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+            .join("-");
+        app.handle_paste(&format!("  {}\n", grouped_key));
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember { ref identity, .. } if identity == &pasted_key
+        ));
+
+        app.handle_paste("not-a-companion-key");
+        assert!(matches!(
+            app.modal_state,
+            ModalType::InviteMember { ref identity, .. } if identity == &pasted_key
+        ));
+        assert!(
+            app.notifications
+                .last()
+                .is_some_and(|notice| notice.message.contains("invalid character"))
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Un swipe horizontal de dos dedos: crossterm lo entrega como ScrollLeft/ScrollRight desde los
+    // botones SGR 6/7 (Unix) o MOUSE_HWHEELED (Windows). Los de 3 y 4 dedos nunca llegan a la TTY
+    // porque macOS se los queda, así que no hay nada que probar de ellos.
+    fn swipe(kind: crossterm::event::MouseEventKind) -> crossterm::event::MouseEvent {
+        crossterm::event::MouseEvent {
+            kind,
+            column: 10,
+            row: 5,
+            modifiers: KeyModifiers::empty(),
+        }
+    }
+
+    // Un gesto completo: la ráfaga que manda el trackpad, no un evento suelto.
+    fn full_swipe(app: &mut App, kind: crossterm::event::MouseEventKind) {
+        for _ in 0..App::SWIPE_EVENTS_TO_FIRE {
+            app.handle_mouse_event(swipe(kind)).unwrap();
+        }
+    }
+
+    // Levantar los dedos y esperar: envejece el gesto más allá de la ventana de silencio.
+    fn let_gesture_settle(app: &mut App) {
+        if let Some(gesture) = app.pane_swipe.as_mut() {
+            gesture.last_event_at -= App::SWIPE_GESTURE_GAP + std::time::Duration::from_millis(50);
+        }
+    }
+
+    #[test]
+    fn two_finger_swipe_walks_the_nine_panes() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_walk.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        let order = [
+            ActiveScreen::Dashboard,
+            ActiveScreen::Projects,
+            ActiveScreen::Character,
+            ActiveScreen::Library,
+            ActiveScreen::Soundscapes,
+            ActiveScreen::Fellowship,
+            ActiveScreen::GreatChronicle,
+            ActiveScreen::SyncSettings,
+            ActiveScreen::Settings,
+        ];
+
+        for expected in &order[1..] {
+            full_swipe(&mut app, MouseEventKind::ScrollRight);
+            assert_eq!(app.active_screen, *expected, "swipe derecha");
+            let_gesture_settle(&mut app);
+        }
+
+        for expected in order[..order.len() - 1].iter().rev() {
+            full_swipe(&mut app, MouseEventKind::ScrollLeft);
+            assert_eq!(app.active_screen, *expected, "swipe izquierda");
+            let_gesture_settle(&mut app);
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Lo que de verdad importa: el trackpad manda una ráfaga por gesto, no un evento. Sin agrupar
+    // la ráfaga, un solo swipe cruzaría los 9 paneles.
+    #[test]
+    fn one_swipe_burst_advances_a_single_pane() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_burst.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        for _ in 0..40 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Projects,
+            "una ráfaga de 40 eventos es UN gesto y debe avanzar un solo panel"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La queja concreta de uso: se sentía acelerado. macOS sigue mandando eventos de inercia
+    // después de levantar los dedos, y con un cooldown fijo esa cola disparaba el panel siguiente
+    // sola. Mientras los eventos lleguen seguidos son el mismo gesto, dure lo que dure.
+    #[test]
+    fn momentum_tail_does_not_advance_a_second_pane() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_momentum.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        // Cola de inercia: mucho más larga que cualquier cooldown fijo cómodo, pero sin huecos.
+        for _ in 0..200 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Projects,
+            "la inercia del gesto anterior no debe seguir cambiando de panel"
+        );
+
+        // Un gesto nuevo de verdad (después de una pausa) sí cuenta.
+        let_gesture_settle(&mut app);
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Character);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La otra mitad de "hay que tener mucho cuidado": un scroll vertical de dos dedos que se va
+    // un poco de lado suelta uno o dos eventos horizontales, y eso no es un swipe.
+    #[test]
+    fn stray_horizontal_jitter_does_not_switch_panes() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_jitter.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+
+        // El 2 va a propósito en duro, no derivado de SWIPE_EVENTS_TO_FIRE: si se calculara a
+        // partir de la constante, bajarla a 1 dejaría el bucle en cero vueltas y el test pasaría
+        // sin probar nada. Con literales, bajar el umbral rompe el test, que es la idea.
+        assert!(
+            App::SWIPE_EVENTS_TO_FIRE > 2,
+            "el umbral debe exigir más de dos eventos para que la deriva no cuente como swipe"
+        );
+
+        // Deriva suelta: eventos horizontales sueltos entre scroll vertical, cada uno su gesto.
+        for _ in 0..2 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+            let_gesture_settle(&mut app);
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Dashboard,
+            "eventos horizontales sueltos no deben cambiar de panel"
+        );
+
+        // Y un roce corto y continuo de dos eventos tampoco llega a swipe.
+        app.pane_swipe = None;
+        for _ in 0..2 {
+            app.handle_mouse_event(swipe(MouseEventKind::ScrollRight))
+                .unwrap();
+        }
+        assert_eq!(
+            app.active_screen,
+            ActiveScreen::Dashboard,
+            "un roce lateral corto tampoco debe cambiar de panel"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn swipe_clamps_at_both_ends_and_skips_non_pane_screens() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_edges.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+
+        // Extremo izquierdo: no cicla hasta Settings.
+        app.active_screen = ActiveScreen::Dashboard;
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollLeft);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
+
+        // Extremo derecho: tampoco vuelve a Dashboard.
+        app.active_screen = ActiveScreen::Settings;
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Settings);
+
+        // Workspace queda fuera a propósito: ahí 1-4 son sub-tabs, igual que con el teclado.
+        app.active_screen = ActiveScreen::Workspace;
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+
+        // En el Editor se está escribiendo; un swipe no debe sacarte del texto.
+        app.active_screen = ActiveScreen::Editor;
+        app.pane_swipe = None;
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Con un modal abierto el swipe no debe mover el panel de atrás.
+    #[test]
+    fn swipe_does_not_change_panes_behind_a_modal() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_swipe_modal.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Dashboard;
+        app.modal_state = ModalType::ChapterComplete;
+        app.pane_swipe = None;
+
+        full_swipe(&mut app, MouseEventKind::ScrollRight);
+        assert_eq!(app.active_screen, ActiveScreen::Dashboard);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // El scroll vertical va invertido en un solo punto de entrada. Este test lo fija explícito:
+    // sin él, quitar la inversión sólo rompería los tests de cada pantalla y no quedaría claro
+    // que el cambio era a propósito.
+    #[test]
+    fn vertical_scroll_is_inverted_and_horizontal_is_left_alone() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+
+        let flip = |kind| App::with_natural_scroll(swipe(kind)).kind;
+
+        assert_eq!(flip(MouseEventKind::ScrollUp), MouseEventKind::ScrollDown);
+        assert_eq!(flip(MouseEventKind::ScrollDown), MouseEventKind::ScrollUp);
+
+        // El eje horizontal ya se lee bien: invertirlo también dejaría el swipe al revés.
+        assert_eq!(flip(MouseEventKind::ScrollLeft), MouseEventKind::ScrollLeft);
+        assert_eq!(flip(MouseEventKind::ScrollRight), MouseEventKind::ScrollRight);
+
+        // Clics y arrastres no tienen eje que invertir.
+        assert_eq!(
+            flip(MouseEventKind::Down(MouseButton::Left)),
+            MouseEventKind::Down(MouseButton::Left)
+        );
+
+        // Y la posición se conserva: los handlers hacen hit-test con ella.
+        let moved = App::with_natural_scroll(crossterm::event::MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 42,
+            row: 7,
+            modifiers: KeyModifiers::empty(),
+        });
+        assert_eq!((moved.column, moved.row), (42, 7));
+    }
+
+    // De punta a punta sobre una pantalla real: bajar los dedos empuja el contenido hacia abajo,
+    // o sea que el offset baja, como en cualquier app con scroll natural.
+    #[test]
+    fn scrolling_down_moves_content_down_not_the_viewport() {
+        let db_file = Path::new("test_questline_natural_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(200);
+        app.about_scroll = 10;
+
+        scroll_notch(&mut app, true); // un notch hacia abajo (evento crudo del terminal)
+        assert!(
+            app.about_scroll < 10,
+            "con scroll natural, bajar los dedos debe retroceder el contenido, no avanzarlo"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La ráfaga del trackpad se dosifica: sólo pasa uno de cada SCROLL_BURST_DIVISOR. Antes cada
+    // evento valía un paso entero y un flick recorría la lista de golpe.
+    #[test]
+    fn a_trackpad_burst_is_rationed_instead_of_flying() {
+        let db_file = Path::new("test_questline_scroll_burst.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        // 30 eventos pegados = un flick. El primero pasa siempre, y luego uno de cada N.
+        let events = 30u32;
+        for _ in 0..events {
+            scroll_mouse(&mut app, false); // rueda arriba -> avanza el contenido
+        }
+
+        let divisor = u32::from(App::SCROLL_BURST_DIVISOR);
+        let steps_allowed = 1 + (events - 1) / divisor;
+        let per_step = 2u32; // About avanza de dos en dos líneas por paso
+        assert_eq!(
+            u32::from(app.about_scroll),
+            steps_allowed * per_step,
+            "una ráfaga de {events} eventos debe dejar pasar {steps_allowed} pasos, no {events}"
+        );
+        assert!(
+            u32::from(app.about_scroll) < events * per_step,
+            "la ráfaga sin dosificar habría avanzado {} líneas",
+            events * per_step
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La otra mitad: una rueda física manda notches sueltos y espaciados, y esos no deben
+    // dosificarse — si no, el mouse se sentiría pesado en Linux/Windows.
+    #[test]
+    fn spaced_out_wheel_notches_are_never_rationed() {
+        let db_file = Path::new("test_questline_scroll_notches.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        // Cada notch llega después del hueco, como una rueda de verdad.
+        for _ in 0..5 {
+            scroll_mouse(&mut app, false);
+            if let Some(burst) = app.scroll_burst.as_mut() {
+                burst.last_event_at -= App::SCROLL_BURST_GAP + std::time::Duration::from_millis(20);
+            }
+        }
+        assert_eq!(
+            app.about_scroll, 10,
+            "cinco notches sueltos deben mover cinco pasos completos"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // Cambiar de sentido corta la racha: al devolverte, el primer evento debe responder ya.
+    #[test]
+    fn reversing_direction_responds_immediately() {
+        let db_file = Path::new("test_questline_scroll_reverse.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(2000);
+        app.about_scroll = 0;
+        app.scroll_burst = None;
+
+        for _ in 0..10 {
+            scroll_mouse(&mut app, false);
+        }
+        let after_burst = app.about_scroll;
+        assert!(after_burst > 0);
+
+        // Sin pausa, pero en sentido contrario: cuenta como gesto nuevo.
+        scroll_mouse(&mut app, true);
+        assert!(
+            app.about_scroll < after_burst,
+            "invertir el sentido debe responder al primer evento, no tragárselo"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // El splash de arranque avanza con cualquier tecla; un clic debe hacer lo mismo.
+    #[test]
+    fn click_on_the_intro_splash_continues_like_a_key() {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let db_file = Path::new("test_questline_intro_click.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Intro;
+
+        app.handle_mouse_event(swipe(MouseEventKind::Down(MouseButton::Left)))
+            .unwrap();
+        assert_ne!(
+            app.active_screen,
+            ActiveScreen::Intro,
+            "un clic debe sacar del splash igual que una tecla"
+        );
+
+        // Sin usuario el destino es el Gateway, el mismo que elige el brazo de teclado.
+        assert_eq!(app.active_screen, ActiveScreen::Gateway);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // La rueda no debe saltarse el splash: sólo el clic.
+    #[test]
+    fn scrolling_on_the_intro_splash_does_not_skip_it() {
+        use crossterm::event::MouseEventKind;
+        let db_file = Path::new("test_questline_intro_scroll.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Intro;
+
+        app.handle_mouse_event(swipe(MouseEventKind::ScrollDown))
+            .unwrap();
+        assert_eq!(app.active_screen, ActiveScreen::Intro);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -19495,11 +27472,1385 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
     }
 
+    /// Prepara una campaña compartida con la tesorería sembrada y la identidad activa
+    /// registrada con el rol pedido, ya dentro de la pestaña Treasury.
+    fn treasury_role_app(db_file: &Path, role: &str) -> (App, Uuid, Uuid) {
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Shared Ledger".to_string(),
+                description: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                completed: false,
+                owner_identity: Some("owner-key".to_string()),
+                owner_username: Some("Aria".to_string()),
+                is_shared: true,
+            })
+            .unwrap();
+        app.db
+            .conn
+            .execute(
+                "INSERT INTO project_members (project_id, user_identity, user_username, role)
+                 VALUES (?1, ?2, 'Ren', ?3)",
+                params![project_id.to_string(), app.identity.public_key, role],
+            )
+            .unwrap();
+        let service = crate::services::TreasuryService::new(&app.db);
+        service.ensure_campaign(project_id).unwrap();
+        let category = service.categories(project_id).unwrap().remove(0);
+        // Movimiento asentado por otra persona: nunca es "propio" para quien prueba.
+        let now = Utc::now();
+        let foreign = service
+            .create_entry(crate::models::LedgerEntry {
+                id: Uuid::new_v4(),
+                campaign_id: project_id,
+                title: "Someone else's expense".to_string(),
+                description: String::new(),
+                entry_type: crate::models::LedgerEntryType::Expense,
+                category_id: category.id,
+                amount_minor: 5_00,
+                currency_code: "USD".to_string(),
+                status: crate::models::LedgerStatus::Planned,
+                due_date: None,
+                payment_date: None,
+                vendor_source: None,
+                related_task_id: None,
+                notes: None,
+                attachment_ref: None,
+                recurrence: crate::models::LedgerRecurrence::None,
+                custom_recurrence: None,
+                version: 0,
+                created_at: now,
+                updated_at: now,
+                created_by_identity: Some("someone-else".to_string()),
+            })
+            .unwrap();
+        app.projects = app.db.get_projects().unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 4;
+        app.workspace_sidebar_focused = false;
+        app.selected_treasury_idx = 0;
+        (app, project_id, foreign.id)
+    }
+
+    fn last_warning(app: &App) -> String {
+        app.notifications
+            .last()
+            .map(|notice| notice.message.clone())
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn fellowship_t_opens_the_treasury_tab() {
+        let db_file = Path::new("test_questline_fellowship_treasury_tab.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Fellowship;
+        app.selected_fellowship_tab = 0;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.selected_fellowship_tab, 7);
+        // Sigue en Fellowship: 't' no debe abrir la plantilla de campaña ni otra pantalla.
+        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
+        assert_eq!(app.modal_state, ModalType::None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn companion_cannot_approve_settle_budget_or_switch_currency() {
+        let db_file = Path::new("test_questline_treasury_companion.db");
+        let (mut app, project_id, entry_id) = treasury_role_app(db_file, "Companion");
+        for (code, denied) in [
+            ('a', "approve"),
+            ('p', "settle"),
+            ('B', "budgets"),
+            ('c', "categories"),
+            ('$', "currency"),
+        ] {
+            app.notifications.clear();
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(code), KeyModifiers::empty()))
+                .unwrap();
+            assert!(
+                last_warning(&app).to_lowercase().contains(denied),
+                "key {code} should be refused for a Companion, got {:?}",
+                last_warning(&app)
+            );
+            assert_eq!(
+                app.modal_state,
+                ModalType::None,
+                "key {code} opened a modal"
+            );
+        }
+        // El movimiento ajeno sigue en Planned: no se aprobó ni se pagó.
+        {
+            let service = crate::services::TreasuryService::new(&app.db);
+            assert_eq!(
+                service.get_entry(entry_id).unwrap().unwrap().status,
+                crate::models::LedgerStatus::Planned
+            );
+            assert_eq!(
+                service
+                    .get_campaign(project_id)
+                    .unwrap()
+                    .unwrap()
+                    .overall_budget_minor,
+                0
+            );
+        }
+
+        // Sí puede abrir el registro de un movimiento nuevo.
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(app.modal_state, ModalType::TreasuryEntry { .. }));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn new_treasury_entry_defaults_to_today_and_an_empty_amount() {
+        let db_file = Path::new("test_questline_treasury_new_entry_defaults.db");
+        let (mut app, _, _) = treasury_role_app(db_file, "Companion");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        match app.modal_state {
+            ModalType::TreasuryEntry {
+                ref amount,
+                ref date_val,
+                ..
+            } => {
+                assert_eq!(
+                    amount, "",
+                    "the amount field must start empty so typing 321 yields 321.00, not 3210.00"
+                );
+                assert_eq!(
+                    date_val,
+                    &Local::now().date_naive().format("%Y-%m-%d").to_string(),
+                    "a brand-new entry's date field must default to today"
+                );
+            }
+            ref other => panic!("expected the entry modal to open, got {other:?}"),
+        }
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn typing_an_amount_into_a_new_entry_does_not_trail_a_leftover_zero() {
+        // Regresión: con "0.00" precargado y el cursor en el primer 0, teclear
+        // "321" dejaba "3210.00" ($3,210.00) en vez de $321.00.
+        let db_file = Path::new("test_questline_treasury_new_entry_typed_amount.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        for character in "Rope".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()))
+                .unwrap();
+        }
+        // Enter salta de Title a Amount; ahí se teclea el monto tal cual.
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        for character in "321".chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(character), KeyModifiers::empty()))
+                .unwrap();
+        }
+        match app.modal_state {
+            ModalType::TreasuryEntry { ref amount, .. } => assert_eq!(amount, "321"),
+            ref other => panic!("expected the entry modal to stay open, got {other:?}"),
+        }
+        // Los Enter restantes recorren Type/Status/Category/Date y guardan.
+        for _ in 0..5 {
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+                .unwrap();
+        }
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid new entry must save");
+        let entries = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter::default(),
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap();
+        let created = entries
+            .iter()
+            .find(|entry| entry.title == "Rope")
+            .expect("the new entry must have been recorded");
+        assert_eq!(created.amount_minor, 32_100, "321 must land as $321.00");
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn creating_an_entry_respects_the_arrow_stepped_date() {
+        // Even a Companion — who can never backdate an *existing* entry — may freely
+        // choose the date while creating a new one: there is no prior date being
+        // rewritten, so ChangeEntryDate doesn't apply here.
+        let db_file = Path::new("test_questline_treasury_new_entry_stepped_date.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        let category_idx = 0;
+
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: "Backdated supplies".to_string(),
+            title_cursor: 18,
+            amount: "9.50".to_string(),
+            amount_cursor: 4,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx,
+            date_val: Local::now().date_naive().format("%Y-%m-%d").to_string(),
+            focus_idx: 5,
+        };
+        // Dos días atrás.
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Left, KeyModifiers::empty()))
+            .unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid new entry must save");
+        let entries = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter::default(),
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap();
+        let created = entries
+            .iter()
+            .find(|entry| entry.title == "Backdated supplies")
+            .expect("the new entry must have been recorded");
+        assert_eq!(
+            created.created_at.with_timezone(&Local).date_naive(),
+            Local::now().date_naive() - chrono::Duration::days(2),
+            "the entry must be dated two days back, as stepped in the modal"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn companion_cannot_edit_or_delete_an_entry_recorded_by_someone_else() {
+        let db_file = Path::new("test_questline_treasury_foreign_entry.db");
+        let (mut app, _, entry_id) = treasury_role_app(db_file, "Companion");
+
+        for code in ['e', 'd'] {
+            app.notifications.clear();
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(code), KeyModifiers::empty()))
+                .unwrap();
+            assert!(
+                last_warning(&app).contains("only change the Treasury entries they recorded"),
+                "key {code} should be refused, got {:?}",
+                last_warning(&app)
+            );
+        }
+        assert!(
+            crate::services::TreasuryService::new(&app.db)
+                .get_entry(entry_id)
+                .unwrap()
+                .is_some(),
+            "another member's entry must survive a Companion's delete"
+        );
+        assert_eq!(app.modal_state, ModalType::None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn companion_cannot_use_the_status_field_to_self_approve() {
+        let db_file = Path::new("test_questline_treasury_self_approve.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: "My own expense".to_string(),
+            title_cursor: 15,
+            amount: "12.00".to_string(),
+            amount_cursor: 5,
+            entry_type_idx: 1,
+            status_idx: 2, // Paid
+            category_idx: 0,
+            date_val: String::new(),
+            focus_idx: 5, // Date is now the last field — Enter here attempts the save.
+        };
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(
+            last_warning(&app).contains("settle a payment"),
+            "self-settling must be refused, got {:?}",
+            last_warning(&app)
+        );
+        // El modal se queda abierto con el estado devuelto a Planned, sin guardar nada.
+        match app.modal_state {
+            ModalType::TreasuryEntry { status_idx, .. } => assert_eq!(status_idx, 0),
+            ref other => panic!("expected the entry modal to stay open, got {other:?}"),
+        }
+        let entries = crate::services::TreasuryService::new(&app.db)
+            .entries(
+                project_id,
+                &crate::models::LedgerFilter::default(),
+                crate::models::LedgerSort::Newest,
+            )
+            .unwrap();
+        assert!(
+            !entries.iter().any(|entry| entry.title == "My own expense"),
+            "the entry must not be stored while the status is refused"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn steward_runs_the_ledger_but_only_the_owner_switches_currency() {
+        let db_file = Path::new("test_questline_treasury_steward.db");
+        let (mut app, project_id, entry_id) = treasury_role_app(db_file, "Steward");
+
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            crate::services::TreasuryService::new(&app.db)
+                .get_entry(entry_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::LedgerStatus::Approved,
+            "a Steward must be able to approve"
+        );
+
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('$'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(
+            last_warning(&app).contains("Campaign Owner"),
+            "currency is Owner-only, got {:?}",
+            last_warning(&app)
+        );
+        assert_eq!(app.modal_state, ModalType::None);
+        assert_eq!(
+            crate::services::TreasuryService::new(&app.db)
+                .campaign_currency(project_id)
+                .unwrap(),
+            crate::models::Currency::Usd
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn steward_can_backdate_a_treasury_entry() {
+        let db_file = Path::new("test_questline_treasury_steward_reschedule.db");
+        let (mut app, _, entry_id) = treasury_role_app(db_file, "Steward");
+        let original = crate::services::TreasuryService::new(&app.db)
+            .get_entry(entry_id)
+            .unwrap()
+            .unwrap();
+
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(entry_id),
+            title_cursor: original.title.len(),
+            title: original.title.clone(),
+            amount_cursor: 0,
+            amount: crate::services::treasury::format_minor(original.amount_minor),
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2020-01-15".to_string(),
+            focus_idx: 5,
+        };
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.modal_state, ModalType::None, "a valid date must save");
+        let updated = crate::services::TreasuryService::new(&app.db)
+            .get_entry(entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            updated.created_at.with_timezone(&Local).date_naive(),
+            NaiveDate::from_ymd_opt(2020, 1, 15).unwrap(),
+            "a Steward must be able to move an entry's date"
+        );
+        assert_ne!(
+            updated.created_at.date_naive(),
+            original.created_at.date_naive(),
+            "the date must actually have moved"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn companion_cannot_change_an_entry_date_even_their_own() {
+        let db_file = Path::new("test_questline_treasury_companion_reschedule.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        let service = crate::services::TreasuryService::new(&app.db);
+        let category = service.categories(project_id).unwrap().remove(0);
+        let now = Utc::now();
+        let mine = service
+            .create_entry(crate::models::LedgerEntry {
+                id: Uuid::new_v4(),
+                campaign_id: project_id,
+                title: "My own planned expense".to_string(),
+                description: String::new(),
+                entry_type: crate::models::LedgerEntryType::Expense,
+                category_id: category.id,
+                amount_minor: 3_00,
+                currency_code: "USD".to_string(),
+                status: crate::models::LedgerStatus::Planned,
+                due_date: None,
+                payment_date: None,
+                vendor_source: None,
+                related_task_id: None,
+                notes: None,
+                attachment_ref: None,
+                recurrence: crate::models::LedgerRecurrence::None,
+                custom_recurrence: None,
+                version: 0,
+                created_at: now,
+                updated_at: now,
+                created_by_identity: Some(app.identity.public_key.clone()),
+            })
+            .unwrap();
+
+        // Un Companion sigue pudiendo editar su propio movimiento en Planned...
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: Some(mine.id),
+            title_cursor: mine.title.len(),
+            title: mine.title.clone(),
+            amount_cursor: 0,
+            amount: crate::services::treasury::format_minor(mine.amount_minor),
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2020-01-15".to_string(),
+            focus_idx: 5,
+        };
+        app.notifications.clear();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        // ...pero no puede tocar cuándo ocurrió.
+        assert!(
+            last_warning(&app).contains("Only the Owner or a Steward may change"),
+            "changing the date must be refused for a Companion, got {:?}",
+            last_warning(&app)
+        );
+        assert!(
+            matches!(app.modal_state, ModalType::TreasuryEntry { .. }),
+            "the modal must stay open so the rest of the edit isn't lost"
+        );
+        let unchanged = crate::services::TreasuryService::new(&app.db)
+            .get_entry(mine.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            unchanged.created_at.date_naive(),
+            now.date_naive(),
+            "the date must not have moved"
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn observer_cannot_touch_the_treasury_at_all() {
+        let db_file = Path::new("test_questline_treasury_observer.db");
+        let (mut app, _, entry_id) = treasury_role_app(db_file, "Observer");
+
+        for code in ['n', 'e', 'd', 'a', 'p', 'B', 'c', '$'] {
+            app.notifications.clear();
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(code), KeyModifiers::empty()))
+                .unwrap();
+            assert!(
+                last_warning(&app).contains("Observers may audit this Treasury"),
+                "key {code} should be refused for an Observer, got {:?}",
+                last_warning(&app)
+            );
+            assert_eq!(
+                app.modal_state,
+                ModalType::None,
+                "key {code} opened a modal"
+            );
+        }
+        let entry = crate::services::TreasuryService::new(&app.db)
+            .get_entry(entry_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.status, crate::models::LedgerStatus::Planned);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_uppercase_k_opens_selected_campaign_kanban() {
+        let db_file = Path::new("test_questline_fellowship_kanban.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let project = Project {
+            id: project_id,
+            name: "Shared Test Campaign".to_string(),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: true,
+        };
+        app.projects = vec![project];
+        app.active_screen = ActiveScreen::Fellowship;
+        app.selected_fellowship_project_idx = 0;
+        app.modal_state = ModalType::None;
+        app.fellowship_composing = false;
+        assert!(app.projects.iter().any(|project| project.is_shared));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+            .unwrap();
+
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+        assert_eq!(app.active_project_id, Some(project_id));
+        assert_eq!(app.workspace_tab_idx, 0);
+        assert!(app.quest_board_open);
+        assert!(!app.workspace_sidebar_focused);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn projects_entry_uses_kanban_for_shared_and_ledger_for_private_campaigns() {
+        let db_file = Path::new("test_questline_project_entry_view.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let make_project = |name: &str, is_shared: bool| Project {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            description: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared,
+        };
+
+        let shared = make_project("Shared", true);
+        let private = make_project("Private", false);
+        app.projects = vec![shared.clone()];
+        app.active_screen = ActiveScreen::Projects;
+        app.projects_all_selected = false;
+        app.selected_project_idx = 0;
+        app.task_filter = "MyQuests".to_string();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.quest_board_open);
+        assert_eq!(app.task_filter, "All");
+
+        app.projects = vec![private.clone()];
+        app.active_screen = ActiveScreen::Projects;
+        app.projects_all_selected = false;
+        app.selected_project_idx = 0;
+        app.quest_board_open = true;
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(!app.quest_board_open);
+
+        // A campaign remembers an explicit view toggle across exits/re-entry.
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.quest_board_open);
+        app.projects = vec![private.clone()];
+        app.active_screen = ActiveScreen::Projects;
+        app.projects_all_selected = false;
+        app.selected_project_idx = 0;
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+        assert!(app.quest_board_open);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('K'), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(!app.quest_board_open);
+        app.projects = vec![private, shared];
+        let ordered = ordered_active_projects(&app.projects);
+        assert!(!ordered[0].is_shared);
+        assert!(ordered[1].is_shared);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn private_campaign_quests_cannot_convene_a_council() {
+        let db_file = Path::new("test_questline_private_quest_council.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Private Campaign".to_string(),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: Some(app.identity.public_key.clone()),
+                owner_username: Some("Solo Hero".to_string()),
+                is_shared: false,
+            })
+            .unwrap();
+        app.db
+            .insert_task(&Task {
+                id: Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "Private Quest".to_string(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: TaskPriority::Medium,
+                created_at: now,
+                updated_at: now,
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            })
+            .unwrap();
+        app.reload_data().unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.modal_state = ModalType::None;
+
+        app.handle_workspace_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
+        assert!(
+            app.get_available_command_actions("")
+                .iter()
+                .all(|action| action.id != "convene_quest_council")
+        );
+
+        app.execute_command_action("convene_quest_council").unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn kanban_enter_opens_selected_quest_steps() {
+        let db_file = Path::new("test_questline_kanban_steps.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Shared Steps".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Owner",
+                "Owner",
+            )
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &"bb".repeat(32),
+                "Bram",
+                "Companion",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(Uuid::new_v4(), "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step.clone()];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert_eq!(app.viewing_step_for_task, Some(parent_id));
+        assert!(app.quest_board_open);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::AssignTask { task_id, .. } if task_id == step.id
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Up/Down in the Kanban board walk through a card's nested steps
+    /// (rendered inline since a recent change) before moving on to the
+    /// next/previous card, and back out again in reverse — without ever
+    /// drilling into the flat Ledger list view.
+    #[test]
+    fn kanban_up_down_navigate_a_cards_steps_before_moving_cards() {
+        let db_file = Path::new("test_questline_kanban_step_nav.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step_a = make_task(Uuid::new_v4(), "Lay the first stone", Some(parent_id));
+        let step_b = make_task(Uuid::new_v4(), "Lay the second stone", Some(parent_id));
+        app.db
+            .insert_task_tree(&parent, &[step_a.clone(), step_b.clone()])
+            .unwrap();
+        app.all_tasks = vec![parent, step_a, step_b];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+        app.kanban_step_idx = None;
+
+        // Down: header -> step 0 -> step 1 -> (no more cards, wraps back to
+        // the same single card's header).
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.selected_task_idx, 0);
+        assert_eq!(app.kanban_step_idx, Some(0));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(1));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            app.kanban_step_idx, None,
+            "walking past the last step lands back on a card header, not stuck past the end"
+        );
+
+        // Up should mirror it exactly: from the header, land on the last step.
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(1));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, Some(0));
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.kanban_step_idx, None);
+
+        // Never left the board while doing any of this.
+        assert!(app.quest_board_open);
+        assert_eq!(app.viewing_step_for_task, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Space toggles the completion of whichever step is focused
+    /// (`kanban_step_idx`) inline on a Kanban card, without drilling into
+    /// the Ledger list view the way Enter does.
+    #[test]
+    fn kanban_space_completes_the_focused_step_in_place() {
+        let db_file = Path::new("test_questline_kanban_step_complete.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        // Completing a task can grant XP / check achievement unlocks, both
+        // of which need a hero on record.
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Bridge Builder".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: now,
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+        app.kanban_step_idx = Some(0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::empty()))
+            .unwrap();
+
+        let reloaded_step = app
+            .all_tasks
+            .iter()
+            .find(|t| t.id == step_id)
+            .expect("step still exists after completing it");
+        assert!(reloaded_step.completed, "Space should complete the focused step");
+        let parent_task = app
+            .all_tasks
+            .iter()
+            .find(|t| t.id == parent_id)
+            .expect("parent still exists");
+        assert!(
+            !parent_task.completed,
+            "completing a step must not also complete its parent card"
+        );
+        // Stayed in the board the whole time — no drill, board still open.
+        assert!(app.quest_board_open);
+        assert_eq!(app.viewing_step_for_task, None);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Same fixture as `kanban_enter_opens_selected_quest_steps`, but driven
+    /// through a mouse double-click on the Kanban card instead of Enter.
+    #[test]
+    fn workspace_kanban_double_click_drills_into_a_parent_tasks_steps() {
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
+
+        let db_file = Path::new("test_questline_mouse_kanban_double_click_drill.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Shared Steps".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Owner",
+                "Owner",
+            )
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &"bb".repeat(32),
+                "Bram",
+                "Companion",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(Uuid::new_v4(), "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+
+        let empty_col = || WorkspaceKanbanColumn {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceKanbanColumn {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None })],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                ],
+            }),
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.viewing_step_for_task, Some(parent_id));
+        assert!(app.quest_board_open);
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Same fixture as `workspace_kanban_double_click_drills_into_a_parent_tasks_steps`,
+    /// but the click lands on the card's step row instead of its header —
+    /// a step has nothing to drill into, so this should open its edit modal
+    /// directly and leave the board exactly as it was (no drill, no scoping
+    /// into `viewing_step_for_task`).
+    #[test]
+    fn workspace_kanban_double_click_on_a_step_row_opens_its_edit_modal() {
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
+
+        let db_file = Path::new("test_questline_mouse_kanban_double_click_step.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = true;
+        app.selected_task_idx = 0;
+
+        let empty_col = || WorkspaceKanbanColumn {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceKanbanColumn {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None }),
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: Some(0) }),
+                        ],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                ],
+            }),
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty()); // the step row
+
+        assert_eq!(
+            app.viewing_step_for_task, None,
+            "a step can't be drilled into — no scoping should happen"
+        );
+        assert!(app.quest_board_open, "double-clicking a step must not leave the board");
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == step_id
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    /// Same fixture, but `quest_board_open` is false so the list view (not
+    /// Kanban) is active and both the parent and its step are visible rows —
+    /// double-clicking the step (index 1) must open its edit modal, never
+    /// drill (steps have no children to drill into).
+    #[test]
+    fn workspace_tasks_double_click_opens_edit_modal_for_a_leaf_task() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_tasks_double_click_leaf.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let parent_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Shared Steps".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Owner".to_string()),
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &app.identity.public_key,
+                "Owner",
+                "Owner",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        let make_task = |id, title: &str, parent_task_id| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let parent = make_task(parent_id, "Build the bridge", None);
+        let step = make_task(step_id, "Lay the first stone", Some(parent_id));
+        app.db.insert_task_tree(&parent, &[step.clone()]).unwrap();
+        app.all_tasks = vec![parent, step];
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.quest_board_open = false;
+        // The list view interleaves each parent with its open steps right
+        // after it — index 0 is the parent, index 1 is its step.
+        app.selected_task_idx = 1;
+
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(1)],
+            }),
+            kanban: None,
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == step_id
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn chronicles_use_n_while_j_remains_down_navigation() {
+        let db_file = Path::new("test_questline_chronicle_shortcut.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 2;
+        app.workspace_sidebar_focused = false;
+        app.modal_state = ModalType::None;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
+            .unwrap();
+        assert!(
+            matches!(app.modal_state, ModalType::NewJournalEntry { .. }),
+            "unexpected modal: {:?}",
+            app.modal_state
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quest_council_at_mention_filters_and_inserts_selected_companion() {
+        let db_file = Path::new("test_questline_council_mentions.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        app.db
+            .insert_project(&Project {
+                id: project_id,
+                name: "Council Test".to_string(),
+                description: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: true,
+            })
+            .unwrap();
+        app.db
+            .add_project_member(&project_id.to_string(), &"aa".repeat(32), "Aria", "Steward")
+            .unwrap();
+        app.db
+            .add_project_member(
+                &project_id.to_string(),
+                &"bb".repeat(32),
+                "Bram",
+                "Companion",
+            )
+            .unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_sidebar_focused = false;
+        app.modal_state = ModalType::QuestCouncil {
+            task_id: Uuid::new_v4(),
+            content: String::new(),
+            selected_comment_idx: 0,
+            selected_member_idx: 0,
+            editing_comment_id: None,
+        };
+
+        for key in ['@', 'b', 'r'] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(key), KeyModifiers::empty()))
+                .unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::QuestCouncil { ref content, .. } if content == "@Bram "
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
     #[test]
     fn test_quit_confirmation_modal() {
         let db_file = Path::new("test_questline_quit.db");
         let _ = std::fs::remove_file(db_file);
         let mut app = App::new(db_file).unwrap();
+
+        // With sync enabled, confirming quit defers to a sync-then-exit pass. Disable
+        // auto-sync so 'y' exercises the immediate-quit path this test asserts.
+        app.auto_sync = false;
 
         // 1. Pressing 'q' opens the confirmation modal with a non-empty quote
         assert_eq!(app.modal_state, ModalType::None);
@@ -19537,6 +28888,2912 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.modal_state, ModalType::None);
         assert!(app.should_quit);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 mouse: easy-batch list/menu screens ─────────────────────────
+
+    fn app_for_mouse_tests(db_file: &Path, screen: ActiveScreen) -> App {
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = screen;
+        app
+    }
+
+    fn scroll_mouse(app: &mut App, down: bool) {
+        scroll_mouse_at(app, 0, 0, down);
+    }
+
+    // El scroll vertical va invertido (natural scrolling), así que el evento crudo y el
+    // movimiento resultante no coinciden: una rueda ARRIBA avanza. Estos wrappers nombran el
+    // efecto para que los tests no tengan que llevar la inversión en la cabeza.
+    //
+    // Cada uno es UN notch suelto, no parte de una ráfaga: se corta la racha antes de mandarlo.
+    // Sin esto, un bucle de test dispara los eventos con microsegundos de diferencia y
+    // throttle_vertical_scroll los lee —con razón— como el flick de un trackpad y se los traga.
+    // Las ráfagas de verdad se prueban aparte, en los tests de throttle.
+    fn scroll_notch(app: &mut App, down: bool) {
+        app.scroll_burst = None;
+        scroll_mouse(app, down);
+    }
+
+    fn scroll_notch_at(app: &mut App, col: u16, row: u16, down: bool) {
+        app.scroll_burst = None;
+        scroll_mouse_at(app, col, row, down);
+    }
+
+    fn scroll_forward(app: &mut App) {
+        scroll_notch(app, false);
+    }
+
+    fn scroll_back(app: &mut App) {
+        scroll_notch(app, true);
+    }
+
+    fn scroll_forward_at(app: &mut App, col: u16, row: u16) {
+        scroll_notch_at(app, col, row, false);
+    }
+
+    fn scroll_back_at(app: &mut App, col: u16, row: u16) {
+        scroll_notch_at(app, col, row, true);
+    }
+
+    fn scroll_mouse_at(app: &mut App, col: u16, row: u16, down: bool) {
+        use crossterm::event::{MouseEvent, MouseEventKind};
+        app.handle_mouse_event(MouseEvent {
+            kind: if down {
+                MouseEventKind::ScrollDown
+            } else {
+                MouseEventKind::ScrollUp
+            },
+            column: col,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn archive_click_selects_the_clicked_row_but_ignores_clicks_past_item_count() {
+        let db_file = Path::new("test_questline_mouse_archive.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 3,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_archive_idx, 1);
+
+        // Row 4 is inside the rendered Rect but past the last real item —
+        // must not move the selection.
+        left_click(&mut app, 2, 4, KeyModifiers::empty());
+        assert_eq!(app.selected_archive_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn archive_double_click_restores_the_selected_campaign() {
+        let db_file = Path::new("test_questline_mouse_archive_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Old Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: true,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 1,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let restored = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .expect("project should still exist");
+        assert!(!restored.archived, "double-click should restore, same as 'r'");
+        assert!(!restored.completed);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn archive_scroll_wheel_wraps_the_selection() {
+        let db_file = Path::new("test_questline_mouse_archive_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Archive);
+        let now = Utc::now();
+        app.projects = (0..3)
+            .map(|i| Project {
+                id: Uuid::new_v4(),
+                name: format!("Old Campaign {i}"),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: true,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: false,
+            })
+            .collect();
+        app.hit_regions.archive = Some(crate::screens::hit_test::ArchiveHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            item_count: 3,
+        });
+
+        scroll_forward(&mut app);
+        assert_eq!(app.selected_archive_idx, 1);
+
+        scroll_back(&mut app); // back to 0
+        assert_eq!(app.selected_archive_idx, 0);
+
+        scroll_back(&mut app); // wraps to the last item
+        assert_eq!(app.selected_archive_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn gateway_click_selects_and_activates_that_option() {
+        let db_file = Path::new("test_questline_mouse_gateway.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Gateway);
+        app.hit_regions.gateway = Some(crate::screens::hit_test::GatewayHitRegions {
+            option0: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            option1: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 3 },
+        });
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // inside option1
+        assert_eq!(app.gateway_selected_idx, 1);
+        // A click activates immediately, same as Enter — navigates to Restore.
+        assert_eq!(app.active_screen, ActiveScreen::Restore);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn great_chronicle_click_moves_panel_focus_and_scroll_follows_it() {
+        let db_file = Path::new("test_questline_mouse_great_chronicle.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::GreatChronicle);
+        app.hit_regions.great_chronicle = Some(crate::screens::hit_test::GreatChronicleHitRegions {
+            feed: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 10 },
+            chapter_panel: ratatui::layout::Rect { x: 20, y: 0, width: 10, height: 10 },
+        });
+        assert!(!app.chapter_panel_focused);
+
+        scroll_forward(&mut app);
+        assert_eq!(app.great_chronicle_scroll, 3);
+        assert_eq!(app.chapter_panel_scroll, 0);
+
+        left_click(&mut app, 21, 1, KeyModifiers::empty()); // inside chapter_panel
+        assert!(app.chapter_panel_focused);
+
+        scroll_forward(&mut app);
+        assert_eq!(app.chapter_panel_scroll, 3);
+        assert_eq!(app.great_chronicle_scroll, 3); // unchanged now that focus moved
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn onboarding_click_selects_class_and_moves_focus_between_fields() {
+        let db_file = Path::new("test_questline_mouse_onboarding.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Onboarding);
+        let class_count = app.onboarding_classes.len();
+        assert!(class_count > 2, "fixture needs at least 3 classes");
+        app.hit_regions.onboarding = Some(crate::screens::hit_test::OnboardingHitRegions {
+            name_input: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            class_list: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 5 },
+            class_count,
+        });
+
+        left_click(&mut app, 2, 7, KeyModifiers::empty()); // class row index 2
+        assert_eq!(app.onboarding_class_idx, 2);
+        assert_eq!(app.onboarding_focus, OnboardingFocus::ClassSelect);
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // back to the name field
+        assert_eq!(app.onboarding_focus, OnboardingFocus::NameInput);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn onboarding_double_click_on_a_class_finishes_onboarding() {
+        let db_file = Path::new("test_questline_mouse_onboarding_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Onboarding);
+        let class_count = app.onboarding_classes.len();
+        assert!(class_count > 2, "fixture needs at least 3 classes");
+        app.onboarding_username = "Tester".to_string();
+        app.hit_regions.onboarding = Some(crate::screens::hit_test::OnboardingHitRegions {
+            name_input: ratatui::layout::Rect { x: 0, y: 0, width: 10, height: 3 },
+            class_list: ratatui::layout::Rect { x: 0, y: 5, width: 10, height: 5 },
+            class_count,
+        });
+        assert!(app.user.is_none());
+
+        double_click(&mut app, 2, 6, KeyModifiers::empty()); // class row index 1
+
+        assert_eq!(app.onboarding_class_idx, 1);
+        let user = app
+            .user
+            .as_ref()
+            .expect("double-click should finish onboarding, same as Enter");
+        assert_eq!(user.username, "Tester");
+        assert_eq!(user.class, app.onboarding_classes[1]);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn legends_click_selects_relic_but_ignores_clicks_past_item_count() {
+        let db_file = Path::new("test_questline_mouse_legends.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Legends);
+        app.hit_regions.legends = Some(crate::screens::hit_test::LegendsHitRegions {
+            relic_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 7 },
+            item_count: 5,
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_relic_idx, 3);
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // row 6 is past item_count 5
+        assert_eq!(app.selected_relic_idx, 3);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_click_selects_the_clicked_picker_card() {
+        let db_file = Path::new("test_questline_mouse_focus.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+
+        left_click(&mut app, 22, 1, KeyModifiers::empty()); // inside cards[2]
+        assert_eq!(app.selected_focus_field_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_double_click_starts_a_session_with_the_selected_duration() {
+        let db_file = Path::new("test_questline_mouse_focus_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+        assert!(app.active_focus_session.is_none());
+
+        // Default duration index 0 -> 15 minutes; no Campaign/Quest/Soundscape
+        // selected, so this starts an untethered 15-minute session.
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+
+        let session = app
+            .active_focus_session
+            .as_ref()
+            .expect("double-click should start a session, same as Enter");
+        assert_eq!(session.duration_mins, 15);
+        assert_eq!(app.active_screen, ActiveScreen::Focus);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn focus_scroll_wheel_cycles_the_currently_selected_fields_value() {
+        let db_file = Path::new("test_questline_mouse_focus_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Focus);
+        app.hit_regions.focus = Some(crate::screens::hit_test::FocusHitRegions {
+            cards: [
+                ratatui::layout::Rect { x: 0, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 10, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 20, y: 0, width: 5, height: 3 },
+                ratatui::layout::Rect { x: 30, y: 0, width: 5, height: 3 },
+            ],
+        });
+        assert_eq!(app.selected_focus_field_idx, 0); // duration card, by default
+        assert_eq!(app.selected_focus_duration_idx, 0);
+
+        scroll_forward(&mut app);
+        assert_eq!(app.selected_focus_duration_idx, 1);
+
+        scroll_back(&mut app); // back to 0
+        assert_eq!(app.selected_focus_duration_idx, 0);
+
+        scroll_back(&mut app); // wraps to the last duration choice
+        assert_eq!(app.selected_focus_duration_idx, 5);
+
+        // Switching cards changes which field the wheel cycles.
+        left_click(&mut app, 32, 1, KeyModifiers::empty()); // soundscape card
+        assert_eq!(app.selected_focus_field_idx, 3);
+        scroll_forward(&mut app);
+        assert_eq!(app.selected_focus_soundscape_idx, 1);
+        assert_eq!(app.selected_focus_duration_idx, 5); // untouched
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2b mouse: Projects/Dashboard — row_targets skip separators ────
+
+    #[test]
+    fn projects_click_maps_rows_through_the_all_entry_and_the_shared_separator() {
+        use crate::screens::hit_test::{ProjectsHitRegions, ProjectsRowTarget};
+
+        let db_file = Path::new("test_questline_mouse_projects.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        // Mirrors what projects::draw would build for: All, Project(0),
+        // a "Shared Campaigns" separator, then Project(1).
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![
+                Some(ProjectsRowTarget::All),
+                Some(ProjectsRowTarget::Project(0)),
+                None,
+                Some(ProjectsRowTarget::Project(1)),
+            ],
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Project(0) row
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // separator row — no-op
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // Project(1) row, past the separator
+        assert_eq!(app.selected_project_idx, 1);
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // back to the All row
+        assert!(app.projects_all_selected);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn projects_double_click_opens_the_selected_campaign_into_its_war_room() {
+        use crate::screens::hit_test::{ProjectsHitRegions, ProjectsRowTarget};
+
+        let db_file = Path::new("test_questline_mouse_projects_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![Some(ProjectsRowTarget::All), Some(ProjectsRowTarget::Project(0))],
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // single click — select only
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+        assert_eq!(app.active_screen, ActiveScreen::Projects);
+
+        double_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+        assert_eq!(app.active_project_id, Some(project_id));
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn projects_scroll_wheel_wraps_through_the_all_entry() {
+        use crate::screens::hit_test::ProjectsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_projects_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.projects_all_selected = true;
+        // The scroll arm doesn't hit-test position, but the handler still
+        // bails out entirely if no frame has ever rendered hit_regions yet.
+        app.hit_regions.projects = Some(ProjectsHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 10 },
+            row_targets: vec![],
+        });
+
+        scroll_forward(&mut app); // from "All" into the first project
+        assert!(!app.projects_all_selected);
+        assert_eq!(app.selected_project_idx, 0);
+
+        scroll_back(&mut app); // back to "All"
+        assert!(app.projects_all_selected);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn dashboard_click_maps_through_visible_start_and_skips_separators() {
+        use crate::screens::hit_test::{DashboardHitRegions, DefaultHitRegions};
+
+        let db_file = Path::new("test_questline_mouse_dashboard.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.dashboard_task_focus = false;
+        // Logical rows: Main(0), Next(1), 2 separator rows, QuickWin(2). The
+        // list has auto-scrolled 2 rows down (visible_start = 2), so on-screen
+        // row 0 is logical row 2 (a separator), not Main.
+        app.hit_regions.dashboard = Some(DashboardHitRegions::Default(DefaultHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            row_targets: vec![Some(0), Some(1), None, None, Some(2)],
+            visible_start: 2,
+        }));
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // logical row 2 — separator
+        assert!(!app.dashboard_task_focus);
+        assert_eq!(app.selected_dashboard_task_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // logical row 4 — QuickWin
+        assert!(app.dashboard_task_focus);
+        assert_eq!(app.selected_dashboard_task_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn dashboard_double_click_opens_the_selected_task_edit_modal() {
+        use crate::screens::hit_test::{DashboardHitRegions, DefaultHitRegions};
+
+        let db_file = Path::new("test_questline_mouse_dashboard_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Solo Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        // No due date and no open steps — the only parent task on the board,
+        // so it's guaranteed to land as the Main Quest (dashboard_command_targets()
+        // index 0), whatever the exact scoring rules do with it.
+        let task = Task {
+            id: task_id,
+            project_id: Some(project_id),
+            title: "Forge the sword".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        app.db.insert_task(&task).unwrap();
+        app.projects = vec![project];
+
+        app.hit_regions.dashboard = Some(DashboardHitRegions::Default(DefaultHitRegions {
+            list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            row_targets: vec![Some(0)],
+            visible_start: 0,
+        }));
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::EditTask { id, .. } if id == task_id
+        ));
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 tier 3 mouse: Soundscapes/Library/Settings ──────────────────
+
+    #[test]
+    fn soundscapes_click_selects_source_and_local_track_separately() {
+        use crate::screens::hit_test::{LocalTracksHitRegions, SoundscapesHitRegions};
+
+        let db_file = Path::new("test_questline_mouse_soundscapes.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Soundscapes);
+        app.hit_regions.soundscapes = Some(SoundscapesHitRegions {
+            source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
+            item_count: 4,
+            local_tracks: Some(LocalTracksHitRegions {
+                area: ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 },
+                row_start: 3,
+                track_count: 2,
+            }),
+        });
+
+        // Each source row is 4 lines tall — row 8 is source index 2.
+        left_click(&mut app, 2, 8, KeyModifiers::empty());
+        assert_eq!(app.selected_soundscape_idx, 2);
+
+        left_click(&mut app, 32, 3, KeyModifiers::empty()); // "Random shuffle" row
+        assert_eq!(app.selected_local_track_idx, 0);
+
+        left_click(&mut app, 32, 5, KeyModifiers::empty()); // second track row (row_start + 2)
+        assert_eq!(app.selected_local_track_idx, 2);
+
+        left_click(&mut app, 32, 6, KeyModifiers::empty()); // past track_count — no-op
+        assert_eq!(app.selected_local_track_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn soundscapes_double_click_plays_the_selected_source() {
+        use crate::screens::hit_test::SoundscapesHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_soundscapes_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Soundscapes);
+        app.hit_regions.soundscapes = Some(SoundscapesHitRegions {
+            source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
+            item_count: 4,
+            local_tracks: None,
+        });
+
+        // Each source row is 4 lines tall — row 4 is source index 1
+        // ("Music For Programming" — a plain source, not Media Player or
+        // Local Folder's special-cased entries).
+        double_click(&mut app, 2, 4, KeyModifiers::empty());
+
+        assert_eq!(app.selected_soundscape_idx, 1);
+        assert_eq!(
+            app.db.get_setting("last_music_source").unwrap(),
+            Some("Music For Programming".to_string())
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn library_click_moves_column_focus_and_maps_item_row_through_scroll_start() {
+        use crate::screens::hit_test::LibraryHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_library.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Library);
+        app.hit_regions.library = Some(LibraryHitRegions {
+            cat_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 6 },
+            cat_count: 6,
+            item_list: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 4 },
+            item_start_idx: 10,
+            item_count: 20,
+            detail_panel: ratatui::layout::Rect { x: 40, y: 0, width: 15, height: 10 },
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // category row 3
+        assert_eq!(app.library_active_col, 0);
+        assert_eq!(app.selected_library_cat_idx, 3);
+
+        left_click(&mut app, 22, 1, KeyModifiers::empty()); // item row 1 -> logical 10+1
+        assert_eq!(app.library_active_col, 1);
+        assert_eq!(app.selected_library_item_idx, 11);
+
+        left_click(&mut app, 42, 2, KeyModifiers::empty()); // detail panel — focus only
+        assert_eq!(app.library_active_col, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn library_double_click_starts_the_selected_available_class_quest() {
+        use crate::screens::hit_test::LibraryHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_library_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Library);
+        app.user = Some(User {
+            id: Uuid::new_v4(),
+            username: "Tester".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: Utc::now(),
+            specialization: None,
+        });
+        app.db
+            .conn
+            .execute(
+                "INSERT INTO class_quests (class_name, unlock_level, quest_name, description, status, progress, target, lore_reward) VALUES (?1, ?2, ?3, ?4, 'Available', 0, ?5, ?6)",
+                params!["Code Warlock", 1, "First Compile", "desc", 10, "Lore"],
+            )
+            .unwrap();
+        // Category 0 (Class Quests) is the only one handle_library_action
+        // acts on — everything else it silently no-ops for.
+        app.selected_library_cat_idx = 0;
+        app.hit_regions.library = Some(LibraryHitRegions {
+            cat_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 6 },
+            cat_count: 6,
+            item_list: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 4 },
+            item_start_idx: 0,
+            item_count: 1,
+            detail_panel: ratatui::layout::Rect { x: 40, y: 0, width: 15, height: 10 },
+        });
+
+        double_click(&mut app, 22, 0, KeyModifiers::empty());
+
+        let quests = app.db.get_class_quests("Code Warlock").unwrap();
+        assert_eq!(
+            quests[0].4, "Active",
+            "double-click should start the Available quest, same as Space"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_click_moves_focus_across_theme_alerts_and_oath_panels() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // theme row 3
+        assert_eq!(app.selected_settings_focus_idx, 0);
+        assert_eq!(app.selected_settings_theme_idx, 3);
+
+        left_click(&mut app, 22, 4, KeyModifiers::empty()); // last alerts row -> focus_idx 5
+        assert_eq!(app.selected_settings_focus_idx, 5);
+
+        left_click(&mut app, 2, 19, KeyModifiers::empty()); // oath row 9 -> focus_idx 15
+        assert_eq!(app.selected_settings_focus_idx, 15);
+
+        // A click on the trailing decorative lines (row 10, past oath_row_count) is a no-op.
+        left_click(&mut app, 2, 20, KeyModifiers::empty());
+        assert_eq!(app.selected_settings_focus_idx, 15);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_double_click_on_an_alerts_row_activates_its_toggle() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        let was_enabled = app.task_notifications_enabled;
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        // Alerts row 1 -> focus_idx 2 -> Task Notifications toggle.
+        double_click(&mut app, 22, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_settings_focus_idx, 2);
+        assert_eq!(
+            app.task_notifications_enabled, !was_enabled,
+            "double-click should toggle it, same as Enter"
+        );
+
+        // A single click at a different row resets the click-run tracker —
+        // still select-only, proving the double-click check is per-cell.
+        left_click(&mut app, 22, 0, KeyModifiers::empty()); // alerts row 0 -> focus_idx 1
+        assert_eq!(app.selected_settings_focus_idx, 1);
+        assert_eq!(app.task_notifications_enabled, !was_enabled); // unchanged by a single click
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn settings_scroll_wheel_cycles_theme_and_wraps_within_the_alerts_block() {
+        use crate::screens::hit_test::SettingsHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_settings_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Settings);
+        let theme_count = crate::theme::Theme::all_choices().len();
+        assert!(theme_count > 1, "fixture needs multiple themes");
+        // The scroll arm doesn't hit-test position, but the handler still
+        // bails out entirely if no frame has ever rendered hit_regions yet.
+        app.hit_regions.settings = Some(SettingsHitRegions {
+            theme_list: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 8 },
+            theme_count: 8,
+            alerts_panel: ratatui::layout::Rect { x: 20, y: 0, width: 30, height: 5 },
+            alerts_row_count: 5,
+            oath_panel: ratatui::layout::Rect { x: 0, y: 10, width: 30, height: 12 },
+            oath_row_count: 10,
+        });
+
+        scroll_forward(&mut app); // theme idx 0 -> 1
+        assert_eq!(app.selected_settings_theme_idx, 1);
+
+        scroll_back(&mut app); // back to 0
+        assert_eq!(app.selected_settings_theme_idx, 0);
+
+        // Up/Down only cycles within the current block — moving into the
+        // Alerts block itself is Tab's job, not the wheel's.
+        app.selected_settings_focus_idx = 5; // last row of the Alerts block
+        scroll_forward(&mut app); // wraps 5 -> 1
+        assert_eq!(app.selected_settings_focus_idx, 1);
+
+        scroll_back(&mut app); // back to 5
+        assert_eq!(app.selected_settings_focus_idx, 5);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Phase 2 hardest tier mouse: Character/Sync/Fellowship ───────────────
+
+    #[test]
+    fn character_click_maps_adventure_log_rows_and_moves_reflection_focus() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        // Mirrors 3 chronicle entries of heights 1, 2, 1 — entry 1 (screen
+        // rows 1 and 2) is the two-line one.
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![0, 1, 1, 2],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 3,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // second screen row of entry 1
+        assert_eq!(app.character_focus, 0);
+        assert_eq!(app.selected_chronicle_idx, 1);
+
+        left_click(&mut app, 52, 2, KeyModifiers::empty()); // reflections list row 2
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 2);
+
+        left_click(&mut app, 72, 1, KeyModifiers::empty()); // detail pane — focus only
+        assert_eq!(app.character_focus, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn character_double_click_on_reflection_jumps_focus_to_detail() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 3,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        double_click(&mut app, 52, 2, KeyModifiers::empty());
+        assert_eq!(app.character_focus, 2); // jumps straight to detail, same as an extra Tab
+        assert_eq!(app.selected_reflection_idx, 2);
+
+        // A single click at a different row resets the click-run tracker —
+        // still select-only, proving the double-click check is per-cell.
+        left_click(&mut app, 52, 1, KeyModifiers::empty());
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn character_scroll_wheel_targets_whichever_pane_the_cursor_is_over() {
+        use crate::screens::hit_test::CharacterHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_character_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Character);
+        app.db.add_chronicle_entry(1, "Entry one").unwrap();
+        app.db.add_chronicle_entry(2, "Entry two").unwrap();
+        app.db
+            .insert_reflection(&crate::models::DailyReflection {
+                created_date: chrono::Local::now().date_naive(),
+                what_went_well: "Shipped a feature".to_string(),
+                what_can_improve: "Sleep more".to_string(),
+            })
+            .unwrap();
+        app.db
+            .insert_reflection(&crate::models::DailyReflection {
+                created_date: chrono::Local::now().date_naive() - chrono::Duration::days(1),
+                what_went_well: "Fixed a bug".to_string(),
+                what_can_improve: "Write tests first".to_string(),
+            })
+            .unwrap();
+        app.hit_regions.character = Some(CharacterHitRegions {
+            adventure_log: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 6 },
+            adventure_log_rows: vec![0, 1],
+            reflections_list: Some(ratatui::layout::Rect { x: 50, y: 0, width: 15, height: 5 }),
+            reflections_count: 2,
+            reflection_detail: Some(ratatui::layout::Rect { x: 70, y: 0, width: 20, height: 10 }),
+        });
+
+        // Scrolling over the adventure log moves focus there and cycles it,
+        // regardless of which pane was previously focused.
+        app.character_focus = 1;
+        scroll_back_at(&mut app, 2, 2); // over the adventure log
+        assert_eq!(app.character_focus, 0);
+        assert_eq!(app.selected_chronicle_idx, 1);
+
+        // Scrolling over the reflections list moves focus there instead.
+        scroll_back_at(&mut app, 52, 2);
+        assert_eq!(app.character_focus, 1);
+        assert_eq!(app.selected_reflection_idx, 1);
+        assert_eq!(app.reflection_detail_scroll, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn sync_click_activates_the_same_as_its_keybinding() {
+        use crate::screens::hit_test::SyncHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_sync.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::SyncSettings);
+        let was_auto_sync = app.auto_sync;
+        let was_sync_enabled = app.config.sync_enabled;
+        app.hit_regions.sync = Some(SyncHitRegions {
+            sync_now: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 1 },
+            cloud_sync_toggle: ratatui::layout::Rect { x: 0, y: 5, width: 30, height: 1 },
+            auto_sync_toggle: ratatui::layout::Rect { x: 0, y: 6, width: 30, height: 1 },
+        });
+
+        left_click(&mut app, 2, 6, KeyModifiers::empty()); // auto sync row
+        assert_eq!(app.auto_sync, !was_auto_sync);
+
+        left_click(&mut app, 2, 5, KeyModifiers::empty()); // cloud sync row
+        assert_eq!(app.config.sync_enabled, !was_sync_enabled);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn sync_double_click_toggles_are_unchanged_from_single_click() {
+        use crate::screens::hit_test::SyncHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_sync_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::SyncSettings);
+        let was_sync_enabled = app.config.sync_enabled;
+        app.hit_regions.sync = Some(SyncHitRegions {
+            sync_now: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 1 },
+            cloud_sync_toggle: ratatui::layout::Rect { x: 0, y: 5, width: 30, height: 1 },
+            auto_sync_toggle: ratatui::layout::Rect { x: 0, y: 6, width: 30, height: 1 },
+        });
+
+        // Sync's rows activate immediately on every Down(Left), independent
+        // of any click-run tracking — unlike the other 4 screens, there's no
+        // "select, then open on the second click" here. This documents that
+        // double-clicking the Cloud Sync toggle flips it twice (on, then
+        // back off) rather than being treated specially — deliberate, per
+        // handle_sync_mouse's own comment on why immediate activation is
+        // fine for this screen.
+        left_click(&mut app, 2, 5, KeyModifiers::empty());
+        assert_eq!(app.config.sync_enabled, !was_sync_enabled);
+
+        left_click(&mut app, 2, 5, KeyModifiers::empty());
+        assert_eq!(app.config.sync_enabled, was_sync_enabled);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_click_switches_tabs_and_resets_that_tabs_own_state() {
+        use crate::screens::hit_test::FellowshipHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_fellowship.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_notification_idx = 7;
+        let tabs: [ratatui::layout::Rect; 8] = std::array::from_fn(|i| ratatui::layout::Rect {
+            x: (i as u16) * 10,
+            y: 0,
+            width: 9,
+            height: 1,
+        });
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs,
+            left_list: None,
+            sub_list: None,
+        });
+
+        left_click(&mut app, 65, 0, KeyModifiers::empty()); // tab 6 (Council)
+        assert_eq!(app.selected_fellowship_tab, 6);
+        assert_eq!(app.selected_notification_idx, 0); // reset, mirroring the 'b' key
+
+        left_click(&mut app, 25, 0, KeyModifiers::empty()); // tab 2 (Companions)
+        assert_eq!(app.selected_fellowship_tab, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_left_list_click_selects_campaign_and_focuses_left() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_left.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.fellowship_focus_left = false;
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: Some(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 1,
+                row_height: 3,
+                count: 3,
+            }),
+            sub_list: None,
+        });
+
+        left_click(&mut app, 2, 4, KeyModifiers::empty()); // row 1: offset(1)+1*3=4
+        assert!(app.fellowship_focus_left);
+        assert_eq!(app.selected_fellowship_project_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_left_list_scroll_wheel_is_tab_independent() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_left_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        let now = Utc::now();
+        app.projects = (0..2)
+            .map(|i| Project {
+                id: Uuid::new_v4(),
+                name: format!("Shared Campaign {i}"),
+                description: None,
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                completed: false,
+                owner_identity: None,
+                owner_username: None,
+                is_shared: true,
+            })
+            .collect();
+        app.selected_fellowship_tab = 1; // Invites — has its own sub-list
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: Some(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 2,
+            }),
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 12 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 0,
+            })),
+        });
+
+        scroll_back_at(&mut app, 2, 0); // over the left Campaign list
+
+        assert_eq!(
+            app.selected_fellowship_project_idx, 1,
+            "scroll over the left list should move the Campaign list, not Invites"
+        );
+        assert_eq!(app.selected_invitation_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_chat_scroll_wheel_enters_and_leaves_browsing() {
+        use crate::screens::hit_test::{FellowshipChatHitRegions, FellowshipHitRegions, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_chat_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        let now = Utc::now();
+        let project = Project {
+            id: Uuid::new_v4(),
+            name: "Shared Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: true,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.db
+            .add_chronicle_message(
+                &project.id.to_string(),
+                &app.identity.public_key,
+                "Me",
+                "Hello",
+                "text",
+            )
+            .unwrap();
+        app.db
+            .add_chronicle_message(
+                &project.id.to_string(),
+                &app.identity.public_key,
+                "Me",
+                "World",
+                "text",
+            )
+            .unwrap();
+        app.projects = vec![project];
+        app.selected_fellowship_tab = 0;
+        app.fellowship_selected_msg_idx = usize::MAX; // not browsing
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Chat(FellowshipChatHitRegions {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+                scroll: 0,
+                msg_start_lines: vec![0, 1],
+                message_count: 2,
+            })),
+        });
+
+        scroll_back_at(&mut app, 2, 2); // enters browsing at the last message
+        assert_eq!(app.fellowship_selected_msg_idx, 1);
+
+        scroll_forward_at(&mut app, 2, 2); // past the last message -> exits browsing
+        assert_eq!(app.fellowship_selected_msg_idx, usize::MAX);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_uniform_sub_list_click_selects_row_for_the_active_tab() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_sublist.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 2; // Companions
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 3,
+                row_height: 4,
+                count: 2,
+            })),
+        });
+
+        left_click(&mut app, 2, 8, KeyModifiers::empty()); // offset(3) + 1*4 = 7..10 -> idx 1
+        assert_eq!(app.selected_fellowship_member_idx, 1);
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // inside the header rows — no-op
+        assert_eq!(app.selected_fellowship_member_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_invites_double_click_on_a_non_pending_invitation_is_a_no_op() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_invite_non_pending.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.config.sync_enabled = true;
+        app.db
+            .create_invitation(
+                &Uuid::new_v4().to_string(),
+                "Some Campaign",
+                &"aa".repeat(32),
+                "Aria",
+                &app.identity.public_key,
+                "Companion",
+            )
+            .unwrap();
+        let invite_id = app.db.get_invitations().unwrap()[0].0.clone();
+        app.db
+            .conn
+            .execute(
+                "UPDATE invitations SET status = 'Accepted' WHERE id = ?1",
+                params![invite_id],
+            )
+            .unwrap();
+        app.selected_fellowship_tab = 1; // Invites
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 1,
+            })),
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.selected_invitation_idx, 0); // selection still happens
+        let status_after = app
+            .db
+            .get_invitations()
+            .unwrap()
+            .into_iter()
+            .find(|invite| invite.0 == invite_id)
+            .map(|invite| invite.7)
+            .unwrap();
+        assert_eq!(status_after, "Accepted"); // untouched — no accept, no network call
+        assert_eq!(app.modal_state, ModalType::None);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_invites_double_click_requires_cloud_sync_first() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_invite_no_sync.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.config.sync_enabled = false;
+        app.db
+            .create_invitation(
+                &Uuid::new_v4().to_string(),
+                "Some Campaign",
+                &"aa".repeat(32),
+                "Aria",
+                &app.identity.public_key,
+                "Companion",
+            )
+            .unwrap();
+        let invite_id = app.db.get_invitations().unwrap()[0].0.clone();
+        app.selected_fellowship_tab = 1; // Invites
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+                first_row_offset: 0,
+                row_height: 1,
+                count: 1,
+            })),
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        let status_after = app
+            .db
+            .get_invitations()
+            .unwrap()
+            .into_iter()
+            .find(|invite| invite.0 == invite_id)
+            .map(|invite| invite.7)
+            .unwrap();
+        assert_eq!(status_after, "Pending"); // never reached the network call
+        assert!(
+            last_warning(&app).contains("Enable Cloud Sync"),
+            "expected the Cloud Sync guard warning, got {:?}",
+            last_warning(&app)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_companions_double_click_is_a_no_op_beyond_select() {
+        use crate::screens::hit_test::{FellowshipHitRegions, FellowshipRowList, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_companions_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 2; // Companions — no keyboard "open" action exists
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Uniform(FellowshipRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 12 },
+                first_row_offset: 3,
+                row_height: 4,
+                count: 2,
+            })),
+        });
+
+        double_click(&mut app, 2, 8, KeyModifiers::empty()); // offset(3) + 1*4 = 7..10 -> idx 1
+
+        assert_eq!(app.selected_fellowship_member_idx, 1); // still just selected
+        assert_eq!(app.modal_state, ModalType::None);
+        assert_eq!(app.active_screen, ActiveScreen::Fellowship);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn fellowship_chat_click_maps_screen_line_to_message_index() {
+        use crate::screens::hit_test::{FellowshipChatHitRegions, FellowshipHitRegions, FellowshipSubList};
+
+        let db_file = Path::new("test_questline_mouse_fellowship_chat.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Fellowship);
+        app.selected_fellowship_tab = 0;
+        // 3 messages starting at lines 0, 2, 5 — scrolled down by 2, so
+        // on-screen row 0 is logical line 2 (message 1's first line).
+        app.hit_regions.fellowship = Some(FellowshipHitRegions {
+            tabs: [ratatui::layout::Rect::default(); 8],
+            left_list: None,
+            sub_list: Some(FellowshipSubList::Chat(FellowshipChatHitRegions {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 40, height: 10 },
+                scroll: 2,
+                msg_start_lines: vec![0, 2, 5],
+                message_count: 3,
+            })),
+        });
+
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // logical line 2 -> message 1
+        assert_eq!(app.fellowship_selected_msg_idx, 1);
+
+        left_click(&mut app, 2, 4, KeyModifiers::empty()); // logical line 6 -> message 2 (last)
+        assert_eq!(app.fellowship_selected_msg_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_sidebar_click_maps_display_row_to_the_real_tab_index() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_sidebar_focused = false;
+        // Display order is Overview/Tasks/Scrolls/Treasury/Chronicle, but
+        // those map to tab indices 3/0/1/4/2 respectively — not row order.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty()); // row 3 = "Treasury" = tab 4
+        assert_eq!(app.workspace_tab_idx, 4);
+        assert!(!app.workspace_sidebar_focused); // activate_workspace_tab focuses content
+
+        // The shortcut codex overlay swallows the click entirely, same as
+        // every key but Esc/'?' while it's open.
+        app.workspace_help_open = true;
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // row 1 = "Tasks" = tab 0
+        assert_eq!(app.workspace_tab_idx, 4); // unchanged
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_tasks_click_selects_a_row_and_unfocuses_the_sidebar() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_tasks.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = true;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(1), Some(2)],
+            }),
+            kanban: None,
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_task_idx, 1);
+        assert!(!app.workspace_sidebar_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_milestones_click_selects_across_variable_height_rows() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_milestones.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 3; // Overview
+        // Milestone 0 has 3 rows (header + 2 requirements), milestone 1 has 1.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(0), Some(0), Some(1)],
+            }),
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // milestone 0's 3rd row
+        assert_eq!(app.selected_milestone_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_milestone_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_treasury_click_selects_a_ledger_row_below_the_header() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_treasury.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 4;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            // Table header row lives one row above area.y — the header
+            // itself isn't part of this region at all.
+            treasury: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 1, width: 30, height: 5 },
+                row_targets: vec![Some(0), Some(1), Some(2)],
+            }),
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        app.selected_treasury_idx = 99; // sentinel — proves the next click is a genuine no-op
+        left_click(&mut app, 2, 0, KeyModifiers::empty()); // above the region — the header row
+        assert_eq!(app.selected_treasury_idx, 99);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // area row 1 -> ledger entry 1
+        assert_eq!(app.selected_treasury_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_treasury_double_click_opens_the_entry_modal() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_treasury_double_click.db");
+        // Owners govern the Treasury and may edit any entry, including one
+        // `treasury_role_app` seeded as recorded by someone else.
+        let (mut app, _project_id, entry_id) = treasury_role_app(db_file, "Owner");
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 5 },
+                row_targets: vec![Some(0)],
+            }),
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::TreasuryEntry { entry_id: Some(id), .. } if id == entry_id
+        ));
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_journal_click_selects_across_variable_height_entries() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_journal.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 2;
+        // Entry 0 is a 2-line entry (header + one content line + blank = 3
+        // rows), entry 1 follows right after.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: Some(WorkspaceRowList {
+                area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
+                row_targets: vec![Some(0), Some(0), Some(0), Some(1)],
+            }),
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty());
+        assert_eq!(app.selected_journal_idx, 0);
+
+        left_click(&mut app, 2, 3, KeyModifiers::empty());
+        assert_eq!(app.selected_journal_idx, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_click_selects_row_skips_dividers_and_focuses_preview() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.note_preview_focused = false;
+        // Row 1 is a non-selectable "── Unassigned ──" divider.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0), None, Some(1)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: Vec::new(),
+            }),
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // divider row — no-op
+        assert_eq!(app.selected_notes_flat_idx, 0);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty());
+        assert_eq!(app.selected_notes_flat_idx, 1);
+        assert!(!app.note_preview_focused);
+
+        left_click(&mut app, 32, 1, KeyModifiers::empty()); // preview pane — focus only
+        assert!(app.note_preview_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_clicking_a_preview_link_opens_it() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_preview_link.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: vec![(
+                    ratatui::layout::Rect { x: 32, y: 4, width: 8, height: 1 },
+                    "https://questlinecli.com".to_string(),
+                )],
+            }),
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        // Preview pane but off the link — focus only, no browser.
+        left_click(&mut app, 32, 1, KeyModifiers::empty());
+        assert!(app.note_preview_focused);
+        assert!(!app.notifications.iter().any(|n| n.message.contains("Opening")));
+
+        // On the link — one click activates it, unlike the rest of the pane.
+        left_click(&mut app, 35, 4, KeyModifiers::empty());
+        assert!(
+            app.notifications
+                .iter()
+                .any(|n| n.message == "Opening https://questlinecli.com"),
+            "clicking a rendered link should open it"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_double_click_opens_the_editor() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_double_click_open.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.workspace_tab_idx = 1;
+        app.active_project_id = Some(project_id);
+        app.codices = vec![];
+        app.all_notes = vec![Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "My Note".to_string(),
+            markdown_content: "some content".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "private".to_string(),
+            codex_id: None,
+            owner_identity: Some(app.identity.public_key.clone()),
+        }];
+        // build_notes_flat puts a lone codex-less note behind an "Unassigned"
+        // divider row (flat index 0) — the note itself lands at flat index 1.
+        app.selected_notes_flat_idx = 1;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(1)],
+                },
+                preview: None,
+                preview_links: Vec::new(),
+            }),
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.active_screen, ActiveScreen::Editor);
+        assert_eq!(
+            app.editor_state.as_ref().unwrap().note_id,
+            Some(note_id)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_double_click_on_a_sealed_note_shows_a_warning_instead() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_double_click_sealed.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        let note_id = Uuid::new_v4();
+        let now = Utc::now();
+        app.workspace_tab_idx = 1;
+        app.active_project_id = Some(project_id);
+        app.codices = vec![];
+        app.all_notes = vec![Note {
+            id: note_id,
+            project_id: Some(project_id),
+            title: "Someone Else's Note".to_string(),
+            markdown_content: "some content".to_string(),
+            created_at: now,
+            updated_at: now,
+            sharing_permission: "read_only".to_string(),
+            codex_id: None,
+            owner_identity: Some("someone-else".to_string()),
+        }];
+        app.selected_notes_flat_idx = 1; // same "Unassigned" layout as above
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(1)],
+                },
+                preview: None,
+                preview_links: Vec::new(),
+            }),
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        double_click(&mut app, 2, 0, KeyModifiers::empty());
+
+        assert_eq!(app.active_screen, ActiveScreen::Workspace); // never opened
+        assert!(
+            last_warning(&app).contains("sealed"),
+            "expected the sealed-note warning, got {:?}",
+            last_warning(&app)
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_kanban_click_selects_a_card_in_any_column() {
+        use crate::screens::hit_test::{
+            WorkspaceHitRegions, WorkspaceKanbanColumn, WorkspaceKanbanHitRegions,
+            WorkspaceKanbanRow,
+        };
+
+        let db_file = Path::new("test_questline_mouse_workspace_kanban.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        // Column 0 (Backlog) has task 0's header at row 0, one of its steps
+        // at row 1, and task 1's header at row 2; column 4 (Review) has task
+        // 2. Kanban and the list view are mutually exclusive, so `tasks`
+        // stays None here — this proves the handler doesn't fall through to
+        // it.
+        let empty_col = || WorkspaceKanbanColumn {
+            area: ratatui::layout::Rect { x: 40, y: 0, width: 10, height: 3 },
+            row_targets: vec![],
+        };
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: Some(WorkspaceKanbanHitRegions {
+                columns: [
+                    WorkspaceKanbanColumn {
+                        area: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+                        row_targets: vec![
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: None }),
+                            Some(WorkspaceKanbanRow { task_idx: 0, step_idx: Some(0) }),
+                            Some(WorkspaceKanbanRow { task_idx: 1, step_idx: None }),
+                        ],
+                    },
+                    empty_col(),
+                    empty_col(),
+                    empty_col(),
+                    WorkspaceKanbanColumn {
+                        area: ratatui::layout::Rect { x: 20, y: 0, width: 15, height: 5 },
+                        row_targets: vec![Some(WorkspaceKanbanRow { task_idx: 2, step_idx: None })],
+                    },
+                    empty_col(),
+                ],
+            }),
+            ledger: None,
+        });
+
+        left_click(&mut app, 2, 1, KeyModifiers::empty()); // Backlog column, task 0's step row
+        assert_eq!(app.selected_task_idx, 0);
+        assert_eq!(
+            app.kanban_step_idx,
+            Some(0),
+            "clicking a step row should focus that step, not just its card"
+        );
+        assert!(!app.workspace_sidebar_focused);
+
+        left_click(&mut app, 2, 2, KeyModifiers::empty()); // Backlog column, task 1's header
+        assert_eq!(app.selected_task_idx, 1);
+        assert_eq!(
+            app.kanban_step_idx, None,
+            "clicking a card's header should focus the card, not carry over a stale step"
+        );
+
+        left_click(&mut app, 22, 0, KeyModifiers::empty()); // Review column, row 0
+        assert_eq!(app.selected_task_idx, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_sidebar_scroll_wheel_cycles_tabs_via_the_permutation() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace_sidebar_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 3; // Milestones — first in the sidebar order
+        app.workspace_sidebar_focused = false;
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        scroll_forward_at(&mut app, 2, 0); // 3 -> 0
+        assert!(app.workspace_sidebar_focused);
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        scroll_forward_at(&mut app, 2, 0); // 0 -> 1
+        assert_eq!(app.workspace_tab_idx, 1);
+
+        scroll_back_at(&mut app, 2, 0); // 1 -> 0
+        assert_eq!(app.workspace_tab_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_scroll_wheel_cycles_the_selected_quest() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        let db_file = Path::new("test_questline_mouse_workspace_quest_ledger_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        let project_id = Uuid::new_v4();
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0; // Quests
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.all_tasks = vec![
+            Task {
+                id: Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "First Quest".to_string(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: crate::models::TaskPriority::Medium,
+                created_at: Utc::now() - chrono::Duration::hours(2),
+                updated_at: Utc::now(),
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            },
+            Task {
+                id: Uuid::new_v4(),
+                project_id: Some(project_id),
+                title: "Second Quest".to_string(),
+                description: None,
+                due_date: None,
+                set_date: None,
+                completed: false,
+                priority: crate::models::TaskPriority::Medium,
+                created_at: Utc::now() - chrono::Duration::hours(1),
+                updated_at: Utc::now(),
+                owner_identity: None,
+                owner_username: None,
+                parent_task_id: None,
+                xp_awarded: false,
+                recurrence: None,
+            },
+        ];
+        // No ledger region — mouse lands somewhere else on the tab (e.g. the
+        // status bar), so this exercises the generic "anywhere else" scroll
+        // fallback, which still cycles the selected quest.
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        scroll_forward_at(&mut app, 60, 5);
+        assert_eq!(app.selected_task_idx, 1);
+
+        scroll_back_at(&mut app, 60, 5);
+        assert_eq!(app.selected_task_idx, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_scroll_wheel_scrolls_the_details_pane_instead() {
+        use crate::screens::hit_test::WorkspaceHitRegions;
+
+        // Once the mouse is actually over the Quest Ledger pane, scrolling
+        // should scroll that pane's own content — not cycle the selected
+        // quest, which is what the generic fallback (tested above) would do.
+        let db_file = Path::new("test_questline_mouse_workspace_quest_ledger_pane_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.quest_ledger_max_scroll.set(2);
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: None,
+            tasks: None,
+            kanban: None,
+            ledger: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+        });
+
+        scroll_forward_at(&mut app, 32, 1);
+        assert!(app.quest_ledger_focused);
+        assert_eq!(app.quest_ledger_scroll, 1);
+        assert_eq!(app.selected_task_idx, 0); // unchanged — the ledger scrolled, not the list
+
+        scroll_forward_at(&mut app, 32, 1);
+        assert_eq!(app.quest_ledger_scroll, 2);
+        scroll_forward_at(&mut app, 32, 1); // past max — stays clamped at 2
+        assert_eq!(app.quest_ledger_scroll, 2);
+
+        scroll_back_at(&mut app, 32, 1);
+        assert_eq!(app.quest_ledger_scroll, 1);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_quest_ledger_arrow_keys_scroll_once_focused() {
+        // Once the ledger is focused (mirroring what a click or scroll there
+        // does), Up/Down should scroll its content — same wiring as the
+        // Notes preview — not move the quest selection.
+        let db_file = Path::new("test_questline_workspace_quest_ledger_arrow_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.selected_task_idx = 0;
+        app.quest_ledger_focused = true;
+        app.quest_ledger_max_scroll.set(5);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.quest_ledger_scroll, 1);
+        assert_eq!(app.selected_task_idx, 0);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(app.quest_ledger_scroll, 0);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn tab_cycles_through_quest_list_and_ledger_panes() {
+        // Quests' list view has three focusable panes now — sidebar, quest
+        // list, and the Quest Ledger — same shape as Scrolls' menu/list/preview.
+        let db_file = Path::new("test_questline_workspace_quest_pane_tab_cycle.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 0;
+        app.quest_board_open = false;
+        app.workspace_sidebar_focused = false;
+        app.quest_ledger_focused = false;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // list -> ledger
+        assert!(!app.workspace_sidebar_focused);
+        assert!(app.quest_ledger_focused);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // ledger -> sidebar
+        assert!(app.workspace_sidebar_focused);
+        assert!(!app.quest_ledger_focused);
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::empty()))
+            .unwrap(); // sidebar -> list
+        assert!(!app.workspace_sidebar_focused);
+        assert!(!app.quest_ledger_focused);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_notes_preview_scroll_wheel_is_clamped_both_ends() {
+        use crate::screens::hit_test::{WorkspaceHitRegions, WorkspaceNotesHitRegions, WorkspaceRowList};
+
+        let db_file = Path::new("test_questline_mouse_workspace_notes_preview_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.workspace_tab_idx = 1;
+        app.workspace_sidebar_focused = false;
+        app.note_preview_max_scroll.set(2);
+        app.hit_regions.workspace = Some(WorkspaceHitRegions {
+            sidebar: ratatui::layout::Rect::default(),
+            sidebar_tab_order: [3, 0, 1, 4, 2],
+            milestones: None,
+            treasury: None,
+            journal: None,
+            notes: Some(WorkspaceNotesHitRegions {
+                list: WorkspaceRowList {
+                    area: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 6 },
+                    row_targets: vec![Some(0)],
+                },
+                preview: Some(ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 }),
+                preview_links: Vec::new(),
+            }),
+            tasks: None,
+            kanban: None,
+            ledger: None,
+        });
+
+        scroll_back_at(&mut app, 32, 1); //  at scroll 0 — stays at 0
+        assert_eq!(app.note_preview_scroll, 0);
+        assert!(app.note_preview_focused);
+
+        scroll_forward_at(&mut app, 32, 1);
+        assert_eq!(app.note_preview_scroll, 1);
+        scroll_forward_at(&mut app, 32, 1);
+        assert_eq!(app.note_preview_scroll, 2);
+        scroll_forward_at(&mut app, 32, 1); //  past max — stays clamped at 2
+        assert_eq!(app.note_preview_scroll, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Modal mouse support ──────────────────────────────────────────────
+    //
+    // compute_modal_hit_regions() recomputes each modal's popup/list Rects
+    // fresh, rather than being stashed from a render pass — these tests
+    // call it directly to derive real click coordinates, so they exercise
+    // the actual layout math (percentage rounding included) instead of
+    // hand-guessing pixel positions.
+
+    #[test]
+    fn modal_click_outside_a_confirm_dialog_cancels_it() {
+        let db_file = Path::new("test_questline_modal_confirm_cancel.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::QuitConfirm {
+            quote: "Onward.".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        assert!(regions.popup_area.y > 0, "popup should be inset from the top edge");
+
+        // The very top-left corner is always outside a centered popup.
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        assert!(!app.should_quit, "cancel must not also quit");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_the_yes_button_confirms_a_confirm_dialog() {
+        let db_file = Path::new("test_questline_modal_confirm_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Doomed Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        // Persisted, not just set in memory — the archive flow's own
+        // grow_tree() call reloads self.user straight from the db, which
+        // would otherwise clobber an in-memory-only user back to None.
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "Tester".to_string(),
+            class: ClassType::CodeWarlock,
+            level: 1,
+            xp: 0,
+            created_at: now,
+            specialization: None,
+        };
+        app.db.insert_user(&user).unwrap();
+        app.user = Some(user);
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Doomed Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let buttons = regions.buttons.expect("ConfirmArchiveProject should expose real Yes/No buttons");
+        assert_eq!(buttons.len(), 2, "Yes and No");
+        let (yes_rect, yes_key) = buttons[0];
+        assert_eq!(yes_key, KeyCode::Char('y'));
+
+        left_click(&mut app, yes_rect.x, yes_rect.y, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let archived = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(archived.archived, "clicking the Yes button should confirm, same as 'y'");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_the_no_button_cancels_a_confirm_dialog_without_confirming() {
+        let db_file = Path::new("test_questline_modal_confirm_no_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Spared Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Spared Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let buttons = regions.buttons.unwrap();
+        let (no_rect, no_key) = buttons[1];
+        assert_eq!(no_key, KeyCode::Char('n'));
+
+        left_click(&mut app, no_rect.x, no_rect.y, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        let untouched = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(!untouched.archived, "clicking No must not archive the project");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_a_confirm_dialog_but_off_the_buttons_does_nothing() {
+        // With real distinct buttons, clicking the dialog's message text
+        // (rather than a button) is no longer a "click anywhere confirms"
+        // zone — it should be an inert no-op, not an accidental confirm.
+        let db_file = Path::new("test_questline_modal_confirm_off_button.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Untouched Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        app.modal_state = ModalType::ConfirmArchiveProject {
+            project_id,
+            project_name: "Untouched Campaign".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let popup_inner = ratatui::layout::Rect {
+            x: regions.popup_area.x + 1,
+            y: regions.popup_area.y + 1,
+            width: regions.popup_area.width.saturating_sub(2),
+            height: regions.popup_area.height.saturating_sub(2),
+        };
+        // Row 1 of the interior is the "Realm: {name}" message line, not
+        // the button row.
+        left_click(&mut app, popup_inner.x, popup_inner.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ConfirmArchiveProject { .. } => {}
+            other => panic!("expected the dialog to stay open, got {other:?}"),
+        }
+        let untouched = app
+            .db
+            .get_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.id == project_id)
+            .unwrap();
+        assert!(!untouched.archived);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_encryption_migration_prompt_exposes_its_three_choices_as_distinct_buttons() {
+        // Deliberately checks the geometry/key-mapping only, without
+        // actually clicking — every one of this dialog's 3 real key
+        // handlers (m/l/Esc) writes to the user's real on-disk config or
+        // spawns a background sync thread, neither of which a unit test
+        // should trigger for real.
+        let db_file = Path::new("test_questline_modal_encryption_migration.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::EncryptionMigrationPrompt;
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let buttons = regions.buttons.unwrap();
+        assert_eq!(buttons.len(), 3, "Migrate / Local-only / Decide later");
+        assert_eq!(buttons[0].1, KeyCode::Char('m'));
+        assert_eq!(buttons[1].1, KeyCode::Char('l'));
+        assert_eq!(buttons[2].1, KeyCode::Esc);
+        // Each choice occupies its own full-width row, top to bottom.
+        assert!(buttons[1].0.y > buttons[0].0.y);
+        assert!(buttons[2].0.y > buttons[1].0.y);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_outside_a_form_replicates_its_save_on_esc_side_effect() {
+        // NewProject's Esc arm doesn't just discard the draft — it saves
+        // it. Clicking outside must replicate that faithfully rather than
+        // silently dropping the in-progress Campaign name.
+        let db_file = Path::new("test_questline_modal_form_click_outside.db");
+        // NewProject/EditProject are only reachable via handle_project_modal_key,
+        // gated on active_screen == Projects — matches how this modal can
+        // only ever be opened from the Projects screen in the real app.
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "Half-written Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+        // save_project_modal only inserts into the db — app.projects itself
+        // isn't refreshed until the next reload_data(), same as pressing
+        // Esc for real, so check the persisted source of truth.
+        assert!(
+            app.db
+                .get_projects()
+                .unwrap()
+                .iter()
+                .any(|p| p.name == "Half-written Campaign"),
+            "click outside should save the draft, same as Esc"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_row_selects_it_in_a_simple_list_modal() {
+        let db_file = Path::new("test_questline_modal_list_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::ThemeSelect {
+            choices: vec!["Forest".to_string(), "Ocean".to_string(), "Mountain".to_string()],
+            selected_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let list_area = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows { area, .. } => area,
+            _ => panic!("ThemeSelect should be a Rows list"),
+        };
+
+        left_click(&mut app, list_area.x, list_area.y + 2, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ThemeSelect { selected_idx, .. } => assert_eq!(*selected_idx, 2),
+            other => panic!("expected ThemeSelect, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_tier_box_selects_it_in_milestone_tier_select() {
+        let db_file = Path::new("test_questline_modal_tier_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        app.modal_state = ModalType::MilestoneTierSelect {
+            project_id,
+            selected_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let items = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Items(items) => items,
+            _ => panic!("MilestoneTierSelect should be an Items list"),
+        };
+        assert_eq!(items.len(), 3);
+        let tier2 = items[2];
+
+        left_click(&mut app, tier2.x, tier2.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::MilestoneTierSelect { selected_idx, .. } => assert_eq!(*selected_idx, 2),
+            other => panic!("expected MilestoneTierSelect, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_span_selects_it_in_share_note() {
+        let db_file = Path::new("test_questline_modal_share_note_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let note_id = Uuid::new_v4();
+        app.modal_state = ModalType::ShareNote {
+            note_id,
+            permission_idx: 0,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let items = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Items(items) => items,
+            _ => panic!("ShareNote should be an Items list"),
+        };
+        assert_eq!(items.len(), 3);
+        let editable_span = items[1];
+
+        left_click(&mut app, editable_span.x, editable_span.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::ShareNote { permission_idx, .. } => assert_eq!(*permission_idx, 1),
+            other => panic!("expected ShareNote, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_a_running_progress_modal_does_nothing() {
+        let db_file = Path::new("test_questline_modal_progress_running.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::CloudBackupProgress {
+            step: 0,
+            message: "Exporting...".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        assert!(regions.confirm_key.is_none(), "still running — nothing should confirm it yet");
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        assert!(
+            matches!(app.modal_state, ModalType::CloudBackupProgress { .. }),
+            "a running progress modal must not be dismissible by clicking it"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_a_finished_progress_modal_dismisses_it() {
+        let db_file = Path::new("test_questline_modal_progress_finished.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::CloudBackupProgress {
+            step: 2,
+            message: "Done.".to_string(),
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let center = (
+            regions.popup_area.x + regions.popup_area.width / 2,
+            regions.popup_area.y + regions.popup_area.height / 2,
+        );
+
+        left_click(&mut app, center.0, center.1, KeyModifiers::empty());
+
+        assert_eq!(app.modal_state, ModalType::None);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_on_a_scrolled_refile_list_selects_the_right_row() {
+        // RefileTask uses ListState's auto-scroll — once the list no
+        // longer fits on screen, ratatui scrolls just enough to keep
+        // `selected_idx` as the last visible row. A click still needs to
+        // map to the correct target despite that scroll.
+        let db_file = Path::new("test_questline_modal_refile_overscrolled.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Big Campaign".to_string(),
+            description: None,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            completed: false,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects = vec![project];
+        let task_id = Uuid::new_v4();
+        let make_task = |id: Uuid, title: &str, parent: Option<Uuid>| Task {
+            id,
+            project_id: Some(project_id),
+            title: title.to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: parent,
+            xp_awarded: false,
+            recurrence: None,
+        };
+        let root = make_task(task_id, "Root Quest", None);
+        // Enough sibling top-level tasks that the refile-target list can't
+        // possibly fit in the terminal's 40 rows.
+        let mut all = vec![root];
+        for i in 0..60 {
+            all.push(make_task(Uuid::new_v4(), &format!("Sibling {i}"), None));
+        }
+        app.all_tasks = all;
+        app.modal_state = ModalType::RefileTask {
+            task_id,
+            selected_idx: 0,
+        };
+        let count = match app.compute_modal_hit_regions().unwrap().list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows { count, .. } => count,
+            _ => panic!("RefileTask should be a Rows list"),
+        };
+        assert!(
+            (count as u16) > app.terminal_height,
+            "fixture needs more targets than fit on screen"
+        );
+
+        // Select the last item — forces maximum scroll, so the visible
+        // window's first row is no longer item 0.
+        app.modal_state = ModalType::RefileTask {
+            task_id,
+            selected_idx: count - 1,
+        };
+        let regions = app.compute_modal_hit_regions().unwrap();
+        let (list_area, first_visible_index) = match regions.list.unwrap() {
+            crate::screens::hit_test::ModalListRegion::Rows {
+                area,
+                first_visible_index,
+                ..
+            } => (area, first_visible_index),
+            _ => panic!("RefileTask should be a Rows list"),
+        };
+        assert!(first_visible_index > 0, "selecting the last item should have scrolled the list");
+
+        // Click the first visible row — should land on first_visible_index,
+        // not on row 0 of the underlying (unscrolled) list.
+        left_click(&mut app, list_area.x, list_area.y, KeyModifiers::empty());
+        match &app.modal_state {
+            ModalType::RefileTask { selected_idx, .. } => {
+                assert_eq!(*selected_idx, first_visible_index)
+            }
+            other => panic!("expected RefileTask to remain open, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Task calendar mouse support ──────────────────────────────────────
+
+    #[test]
+    fn calendar_click_outside_cancels_it() {
+        let db_file = Path::new("test_questline_calendar_click_outside.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+
+        left_click(&mut app, 0, 0, KeyModifiers::empty());
+
+        assert!(app.task_calendar.is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn calendar_click_a_day_selects_it_without_closing() {
+        use chrono::Datelike;
+        let db_file = Path::new("test_questline_calendar_click_day.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+        let regions = app.compute_calendar_hit_regions().unwrap();
+        // Day 1 of the month — guaranteed to exist and differ from the 15th.
+        let (day1_rect, day1_date) = *regions.days.iter().find(|(_, d)| d.day() == 1).unwrap();
+
+        left_click(&mut app, day1_rect.x, day1_rect.y, KeyModifiers::empty());
+
+        assert_eq!(
+            app.task_calendar.map(|c| c.selected),
+            Some(day1_date),
+            "single click should move selection, same as an arrow key"
+        );
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn calendar_double_click_a_day_confirms_it_in_date_picker_mode() {
+        use chrono::Datelike;
+        let db_file = Path::new("test_questline_calendar_double_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 4,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        app.task_calendar = Some(TaskCalendarState {
+            selected: chrono::NaiveDate::from_ymd_opt(2026, 3, 15).unwrap(),
+            planner_mode: false,
+            show_all_projects: false,
+        });
+        let regions = app.compute_calendar_hit_regions().unwrap();
+        let (day1_rect, day1_date) = *regions.days.iter().find(|(_, d)| d.day() == 1).unwrap();
+
+        double_click(&mut app, day1_rect.x, day1_rect.y, KeyModifiers::empty());
+
+        assert!(app.task_calendar.is_none(), "confirming should close the calendar");
+        match &app.modal_state {
+            ModalType::NewTask {
+                due_date_type,
+                due_date_val,
+                ..
+            } => {
+                assert_eq!(*due_date_type, DueDateType::Specific);
+                assert_eq!(due_date_val, &day1_date.format("%Y-%m-%d").to_string());
+            }
+            other => panic!("expected NewTask to still be open with the date applied, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Prologue checkbox / About Report button ──────────────────────────
+
+    #[test]
+    fn prologue_click_the_checkbox_toggles_dont_show_again() {
+        use crate::screens::prologue::CHAPTER_ONE;
+        let db_file = Path::new("test_questline_prologue_checkbox_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = CHAPTER_ONE.len(); // page fully typed out
+        app.prologue_skip_checked = false;
+
+        let rect = app.compute_prologue_checkbox_rect().expect("checkbox should be on screen");
+        left_click(&mut app, rect.x, rect.y, KeyModifiers::empty());
+        assert!(app.prologue_skip_checked, "click should check the box");
+
+        left_click(&mut app, rect.x, rect.y, KeyModifiers::empty());
+        assert!(!app.prologue_skip_checked, "clicking again should uncheck it");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn prologue_click_elsewhere_does_not_toggle_the_checkbox() {
+        use crate::screens::prologue::CHAPTER_ONE;
+        let db_file = Path::new("test_questline_prologue_checkbox_miss.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = CHAPTER_ONE.len();
+        app.prologue_skip_checked = false;
+
+        // The footer hint row, well below the checkbox — never the checkbox itself.
+        let footer_row = app.terminal_height - 2;
+        left_click(&mut app, 5, footer_row, KeyModifiers::empty());
+        assert!(!app.prologue_skip_checked, "clicking outside the checkbox must not toggle it");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn prologue_checkbox_has_no_hit_region_while_still_typing() {
+        let db_file = Path::new("test_questline_prologue_checkbox_not_yet.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Prologue);
+        app.prologue_page = 1;
+        app.prologue_line_idx = 0; // still typing — page not done yet
+        assert!(app.compute_prologue_checkbox_rect().is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn about_click_the_report_button_opens_the_bug_report_modal() {
+        let db_file = Path::new("test_questline_about_report_click.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        assert!(app.bug_report_modal.is_none());
+
+        let regions = app.compute_about_hit_regions().unwrap();
+        left_click(&mut app, regions.report_button.x, regions.report_button.y, KeyModifiers::empty());
+
+        assert!(app.bug_report_modal.is_some(), "clicking [R] Send Report should open the Bug Report modal, same as 'r'");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn about_scroll_wheel_scrolls_both_panels() {
+        let db_file = Path::new("test_questline_about_scroll.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::About);
+        app.about_content_lines.set(200);
+        app.about_scroll = 10;
+
+        scroll_forward(&mut app);
+        assert!(app.about_scroll > 10, "scrolling down should increase the offset");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    // ── Modal text-field click-to-focus ──────────────────────────────────
+
+    #[test]
+    fn modal_click_a_field_focuses_it_in_a_layout_based_form() {
+        let db_file = Path::new("test_questline_modal_field_click_layout.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "New Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+        let fields = match app.compute_modal_hit_regions().unwrap().focus_fields {
+            Some(fields) => fields,
+            None => panic!("NewProject should expose focus_fields"),
+        };
+        assert_eq!(fields.len(), 2, "Name and Description");
+        let desc_field = fields[1];
+
+        left_click(&mut app, desc_field.x, desc_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewProject { focus_idx, .. } => assert_eq!(*focus_idx, 1),
+            other => panic!("expected NewProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_a_field_focuses_it_in_a_paragraph_line_based_form() {
+        let db_file = Path::new("test_questline_modal_field_click_lines.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: String::new(),
+            title_cursor: 0,
+            amount: "0.00".to_string(),
+            amount_cursor: 0,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2026-03-15".to_string(),
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        assert_eq!(fields.len(), 6, "Title/Amount/Type/Status/Category/Date");
+        let amount_field = fields[1]; // second focus stop
+
+        left_click(&mut app, amount_field.x, amount_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::TreasuryEntry { focus_idx, .. } => assert_eq!(*focus_idx, 1),
+            other => panic!("expected TreasuryEntry, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_the_due_value_field_in_new_task_focuses_it_not_priority_or_due_type() {
+        // Priority, Due Type, and Due Value all share one Layout row —
+        // proves the horizontal sub-split correctly disambiguates them by
+        // X position, not just row/Y.
+        let db_file = Path::new("test_questline_modal_field_click_task_row.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::Specific,
+            due_date_val: "2026-03-15".to_string(),
+            set_date_val: String::new(),
+            focus_idx: 0,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        // title(0), desc(1), priority(2), due_type(3), due_value(4) — a
+        // top-level NewTask always shows recurrence too, but that's field 5.
+        assert!(fields.len() >= 5, "expected at least 5 focus stops, got {}", fields.len());
+        let due_value_field = fields[4];
+        assert!(
+            due_value_field.x > fields[3].x,
+            "due_value should sit to the right of due_type on the same row"
+        );
+
+        left_click(&mut app, due_value_field.x, due_value_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewTask { focus_idx, .. } => assert_eq!(*focus_idx, 4),
+            other => panic!("expected NewTask, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_project_name_field_positions_the_cursor_mid_string() {
+        let db_file = Path::new("test_questline_modal_cursor_name.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::NewProject {
+            name: "New Campaign".to_string(),
+            name_cursor: 0,
+            desc: String::new(),
+            desc_cursor: 0,
+            focus_idx: 1, // starts away from the name field on purpose
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let name_field = fields[0];
+        // "New Campaign" — click right after "New " (4 chars in).
+        left_click(&mut app, name_field.x + 1 + 4, name_field.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewProject { focus_idx, name_cursor, .. } => {
+                assert_eq!(*focus_idx, 0);
+                assert_eq!(*name_cursor, 4);
+            }
+            other => panic!("expected NewProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_project_desc_field_positions_the_cursor_on_the_clicked_line() {
+        let db_file = Path::new("test_questline_modal_cursor_desc.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Projects);
+        app.modal_state = ModalType::EditProject {
+            id: Uuid::new_v4(),
+            name: "Existing Campaign".to_string(),
+            name_cursor: 0,
+            desc: "Hello\nWorld".to_string(),
+            desc_cursor: 0,
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let desc_field = fields[1];
+        // Second line ("World"), 2 chars in — lands between 'o' and 'r'.
+        left_click(&mut app, desc_field.x + 1 + 2, desc_field.y + 1 + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::EditProject { focus_idx, desc_cursor, .. } => {
+                assert_eq!(*focus_idx, 1);
+                assert_eq!(*desc_cursor, "Hello\n".len() + 2);
+            }
+            other => panic!("expected EditProject, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_new_task_title_field_positions_the_cursor_and_enables_editing() {
+        let db_file = Path::new("test_questline_modal_cursor_task_title.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        app.modal_state = ModalType::NewTask {
+            title: "Forge the sword".to_string(),
+            desc: String::new(),
+            desc_cursor: 0,
+            priority: TaskPriority::Medium,
+            due_date_type: DueDateType::None,
+            due_date_val: String::new(),
+            set_date_val: String::new(),
+            focus_idx: 1,
+            parent_task_id: None,
+            recurrence: None,
+        };
+        app.task_title_editing = false;
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let title_field = fields[0];
+        // "Forge the sword" — click right after "Forge " (6 chars in).
+        left_click(&mut app, title_field.x + 1 + 6, title_field.y + 1, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::NewTask { focus_idx, .. } => assert_eq!(*focus_idx, 0),
+            other => panic!("expected NewTask, got {other:?}"),
+        }
+        assert!(app.task_title_editing, "clicking the title should enable cursor editing on it");
+        assert_eq!(app.task_title_cursor, 6);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_click_inside_treasury_amount_field_positions_the_cursor_after_the_currency_symbol() {
+        let db_file = Path::new("test_questline_modal_cursor_treasury_amount.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Workspace);
+        // No active_project_id, so the currency prefix falls back to the
+        // default (USD, symbol "US$") — deliberately exercising that path.
+        app.modal_state = ModalType::TreasuryEntry {
+            entry_id: None,
+            title: String::new(),
+            title_cursor: 0,
+            amount: "123.45".to_string(),
+            amount_cursor: 0,
+            entry_type_idx: 1,
+            status_idx: 0,
+            category_idx: 0,
+            date_val: "2026-03-15".to_string(),
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        let amount_field = fields[1];
+        // "Amount (USD) " is 13 chars, "US$" is 3 more — value starts at
+        // column 16. Click 3 chars into "123.45", right after "123".
+        left_click(&mut app, amount_field.x + 16 + 3, amount_field.y, KeyModifiers::empty());
+
+        match &app.modal_state {
+            ModalType::TreasuryEntry { focus_idx, amount_cursor, .. } => {
+                assert_eq!(*focus_idx, 1);
+                assert_eq!(*amount_cursor, 3);
+            }
+            other => panic!("expected TreasuryEntry, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn modal_hydration_settings_exposes_only_the_five_real_fields() {
+        // Tab can reach focus_idx 5 on this modal, but nothing renders for
+        // it — a pre-existing dead Tab stop. Confirms click support doesn't
+        // invent a click target for it.
+        let db_file = Path::new("test_questline_modal_field_click_hydration.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.modal_state = ModalType::HydrationSettings {
+            interval_idx: 0,
+            from_hour: 8,
+            to_hour: 22,
+            target: 8,
+            pause_focus: false,
+            focus_idx: 0,
+        };
+        let fields = app.compute_modal_hit_regions().unwrap().focus_fields.unwrap();
+        assert_eq!(fields.len(), 5, "only the 5 bordered fields should be clickable");
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn hydration_reminder_does_not_interrupt_the_editor_screen() {
+        let db_file = Path::new("test_questline_hydration_editor_guard.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Editor);
+        app.hydration_enabled = true;
+        app.hydration_active_from = 0;
+        app.hydration_active_to = 0; // from == to means "always active" (see hydration_is_active_at_hour)
+        app.hydration_next_reminder_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        app.tick_hydration().unwrap();
+
+        assert_eq!(
+            app.modal_state,
+            ModalType::None,
+            "typing in the Editor must not get interrupted by the hydration reminder"
+        );
+        // The elapsed timer is cleared either way — it rearms for a fresh
+        // interval on the next tick rather than firing instantly the moment
+        // the user leaves the Editor.
+        assert!(app.hydration_next_reminder_at.is_none());
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn hydration_reminder_still_fires_on_a_screen_thats_not_text_entry() {
+        // Control for the test above: confirms the Editor guard is actually
+        // doing something, not just vacuously passing because the reminder
+        // never fires at all in tests.
+        let db_file = Path::new("test_questline_hydration_dashboard_fires.db");
+        let mut app = app_for_mouse_tests(db_file, ActiveScreen::Dashboard);
+        app.hydration_enabled = true;
+        app.hydration_active_from = 0;
+        app.hydration_active_to = 0;
+        app.hydration_next_reminder_at = Some(
+            std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(1))
+                .unwrap(),
+        );
+
+        app.tick_hydration().unwrap();
+
+        assert_eq!(app.modal_state, ModalType::HydrationReminder);
 
         let _ = std::fs::remove_file(db_file);
     }

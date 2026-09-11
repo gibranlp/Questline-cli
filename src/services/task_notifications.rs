@@ -6,6 +6,19 @@ use crate::database::Database;
 use crate::models::{Task, TaskPriority};
 use crate::services::notifications::NotificationIcon;
 
+/// True only if `task` belongs to a project that's shared with a Fellowship.
+/// Tasks with no project, or whose project is a private/solo campaign, don't
+/// belong in Fellowship-facing surfaces (Council Notices, Notification Center).
+fn belongs_to_shared_project(db: &Database, task: &Task) -> bool {
+    let Some(project_id) = task.project_id else {
+        return false;
+    };
+    db.get_projects()
+        .unwrap_or_default()
+        .iter()
+        .any(|p| p.id == project_id && p.is_shared)
+}
+
 const KEY_ENABLED: &str = "task_notifications_enabled";
 const KEY_DUE_ENABLED: &str = "task_due_notifications_enabled";
 const KEY_OVERDUE_ENABLED: &str = "task_overdue_notifications_enabled";
@@ -126,13 +139,14 @@ fn due_event(
     } else {
         &[("24h", 24), ("1h", 1)]
     };
+    let shared = belongs_to_shared_project(db, task);
 
     for (label, hours) in windows {
         let threshold = due - chrono::Duration::hours(*hours);
         if now >= threshold && now < due {
             let key = task_key("due_before", task.id, label);
             if mark_once(db, &key)? {
-                return Ok(Some(TaskNotificationEvent {
+                let event = TaskNotificationEvent {
                     title: "Quest approaching".to_string(),
                     message: format!("{} is due in {}.", task.title, label),
                     urgent: task.priority == TaskPriority::High,
@@ -141,7 +155,17 @@ fn due_event(
                     } else {
                         NotificationIcon::TaskDue
                     },
-                }));
+                };
+                if shared {
+                    db.create_notification_once(
+                        &format!("quest_due:{}:{}", task.id, label),
+                        "due_soon",
+                        &event.title,
+                        &event.message,
+                        Some(&task.id.to_string()),
+                    )?;
+                }
+                return Ok(Some(event));
             }
         }
     }
@@ -149,7 +173,7 @@ fn due_event(
     if now >= due && now < due + chrono::Duration::minutes(30) {
         let key = task_key("due_now", task.id, "once");
         if mark_once(db, &key)? {
-            return Ok(Some(TaskNotificationEvent {
+            let event = TaskNotificationEvent {
                 title: "Quest due".to_string(),
                 message: format!("{} is due now.", task.title),
                 urgent: task.priority == TaskPriority::High,
@@ -158,7 +182,17 @@ fn due_event(
                 } else {
                     NotificationIcon::TaskDue
                 },
-            }));
+            };
+            if shared {
+                db.create_notification_once(
+                    &format!("quest_due:{}:now", task.id),
+                    "due_soon",
+                    &event.title,
+                    &event.message,
+                    Some(&task.id.to_string()),
+                )?;
+            }
+            return Ok(Some(event));
         }
     }
 
@@ -175,6 +209,7 @@ fn overdue_event(
     if now < due + chrono::Duration::minutes(30) {
         return Ok(None);
     }
+    let shared = belongs_to_shared_project(db, task);
 
     let first_key = task_key("overdue_first", task.id, "once");
     if let Some(sent_at) = db.get_setting(&first_key)? {
@@ -186,12 +221,22 @@ fn overdue_event(
         }
     } else {
         db.set_setting(&first_key, &now.to_rfc3339())?;
-        return Ok(Some(TaskNotificationEvent {
+        let event = TaskNotificationEvent {
             title: "Quest overdue".to_string(),
             message: format!("{} is overdue.", task.title),
             urgent: task.priority == TaskPriority::High,
             icon: NotificationIcon::TaskOverdue,
-        }));
+        };
+        if shared {
+            db.create_notification_once(
+                &format!("quest_overdue:{}:first", task.id),
+                "overdue",
+                &event.title,
+                &event.message,
+                Some(&task.id.to_string()),
+            )?;
+        }
+        return Ok(Some(event));
     }
 
     let daily_key = task_key(
@@ -200,12 +245,22 @@ fn overdue_event(
         &today.format("%Y-%m-%d").to_string(),
     );
     if mark_once(db, &daily_key)? {
-        return Ok(Some(TaskNotificationEvent {
+        let event = TaskNotificationEvent {
             title: "Overdue quest".to_string(),
             message: format!("{} still needs your attention.", task.title),
             urgent: false,
             icon: NotificationIcon::TaskOverdue,
-        }));
+        };
+        if shared {
+            db.create_notification_once(
+                &format!("quest_overdue:{}:{}", task.id, today.format("%Y-%m-%d")),
+                "overdue",
+                &event.title,
+                &event.message,
+                Some(&task.id.to_string()),
+            )?;
+        }
+        return Ok(Some(event));
     }
 
     Ok(None)

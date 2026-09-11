@@ -2,6 +2,7 @@
 // screens/archive.rs — vista de proyectos archivados
 // ─────────────────────────────────────────────────────────────────────────────
 use crate::models::Project;
+use crate::screens::hit_test::ArchiveHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -12,7 +13,12 @@ use ratatui::{
 };
 
 // Renders the Archive Screen listing archived items from SQLite.
-pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Theme) {
+pub fn draw(
+    f: &mut Frame,
+    projects: &[Project],
+    selected_idx: usize,
+    theme: &Theme,
+) -> ArchiveHitRegions {
     let size = f.size();
     let accent_color = theme.primary;
 
@@ -56,13 +62,13 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
             .collect()
     };
 
-    let list_widget = List::new(list_items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.border))
-            .title(" Archived Campaigns"),
-    );
+    let list_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(" Archived Campaigns");
+    let list_inner = list_block.inner(body_chunks[0]);
+    let list_widget = List::new(list_items).block(list_block);
     f.render_widget(list_widget, body_chunks[0]);
 
     // 2. Archived Details Panel
@@ -164,4 +170,9 @@ pub fn draw(f: &mut Frame, projects: &[Project], selected_idx: usize, theme: &Th
             .border_style(Style::default().fg(theme.border)),
     );
     f.render_widget(footer, chunks[1]);
+
+    ArchiveHitRegions {
+        list: list_inner,
+        item_count: archived_projects.len(),
+    }
 }

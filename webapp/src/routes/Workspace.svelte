@@ -1,18 +1,36 @@
 <script>
   import { onMount } from 'svelte';
-  import { projects, tasks, notes, codices, journalEntries, milestones, focusSessions, currentProjectId, addToast } from '../lib/store.js';
+  import { projects, tasks, notes, codices, journalEntries, milestones, focusSessions, currentProjectId, identity, addToast } from '../lib/store.js';
   import { pushEvent } from '../lib/sync.js';
   import { navigate } from '../lib/router.js';
   import TaskItem from '../components/TaskItem.svelte';
   import Modal from '../components/Modal.svelte';
   import MarkdownEditor from '../components/MarkdownEditor.svelte';
   import CodexTree from '../components/CodexTree.svelte';
+  import { listRotationMembers } from '../lib/fellowship.js';
 
   export let projectId;
   export let api;
 
+  let projectMembers = [];
+  let membersProjectId = null;
+
   $: currentProjectId.set(projectId);
   $: project = $projects.get(projectId);
+  $: myMembership = projectMembers.find(m => String(m.identity || '').toLowerCase() === String($identity?.public_key || '').toLowerCase());
+  $: canAssign = ['Owner', 'Steward'].includes(myMembership?.role);
+  $: if (project?.is_shared && membersProjectId !== projectId && $identity) loadProjectMembers();
+
+  async function loadProjectMembers() {
+    membersProjectId = projectId;
+    try {
+      projectMembers = await listRotationMembers($identity, projectId);
+    } catch (err) {
+      projectMembers = [];
+      membersProjectId = null;
+      addToast('Could not load Fellowship members: ' + err.message, 'error');
+    }
+  }
 
   $: projectTasks = [...$tasks.values()]
     .filter(t => t.project_id === projectId && !t.parent_task_id)
@@ -252,7 +270,7 @@
           <button class="btn-add" on:click={() => showNewTask = true}>+ Add Quest</button>
         </div>
         {#each projectTasks as task (task.id)}
-          <TaskItem {task} {api} />
+          <TaskItem {task} {api} members={projectMembers} {canAssign} />
         {/each}
         {#if projectTasks.length === 0}
           <div class="empty">No quests yet. Add your first one.</div>

@@ -3,6 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 use crate::models::{Achievement, Statistics};
+use crate::screens::hit_test::LibraryHitRegions;
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -238,7 +239,7 @@ pub fn draw(
     user_class: &str,
     theme: &Theme,
     animation_ticks: usize,
-) {
+) -> LibraryHitRegions {
     detail_max_scroll.set(0);
     let size = f.size();
     let accent_color = theme.primary;
@@ -328,6 +329,7 @@ pub fn draw(
             theme.muted
         }))
         .title(" Categories ");
+    let cat_list_inner = cat_block.inner(col_chunks[0]);
     let cat_list = List::new(cat_items).block(cat_block);
     f.render_widget(cat_list, col_chunks[0]);
 
@@ -555,6 +557,7 @@ pub fn draw(
             theme.muted
         }))
         .title(items_title);
+    let item_list_inner = item_block.inner(col_chunks[1]);
     let item_list = List::new(item_items).block(item_block);
     f.render_widget(item_list, col_chunks[1]);
     if items_lines.len() > visible_item_rows {
@@ -1097,4 +1100,13 @@ pub fn draw(
     )
     .alignment(Alignment::Center);
     f.render_widget(footer_p, main_chunks[2]);
+
+    LibraryHitRegions {
+        cat_list: cat_list_inner,
+        cat_count: categories.len(),
+        item_list: item_list_inner,
+        item_start_idx: start_idx,
+        item_count: items_lines.len(),
+        detail_panel: col_chunks[2],
+    }
 }

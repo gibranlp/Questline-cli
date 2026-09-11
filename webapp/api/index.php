@@ -11,6 +11,7 @@ header("Access-Control-Allow-Methods: GET, POST, OPTIONS");
 header("X-Content-Type-Options: nosniff");
 header("X-Frame-Options: DENY");
 header("Referrer-Policy: no-referrer");
+header("Cache-Control: no-store, no-cache, must-revalidate");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') { exit(0); }
 
@@ -66,6 +67,11 @@ $db_pass = getenv('WEBAPP_DB_PASS');
 
 // ── Debug status — reports env + DB health without leaking credentials ────────
 if ($route === 'debug-status') {
+    if (!$isLocal) {
+        http_response_code(404);
+        echo json_encode(["error" => "Not found"]);
+        exit;
+    }
     $report = [
         'env_file'     => file_exists(__DIR__ . '/.env') ? 'found' : 'MISSING',
         'db_name_set'  => !empty($db_name),
@@ -163,6 +169,10 @@ if ($route === 'webhook/ingest') {
             echo json_encode(["error" => "Invalid webhook signature"]);
             exit;
         }
+    } else {
+        http_response_code(401);
+        echo json_encode(["error" => "Webhook is not configured"]);
+        exit;
     }
 
     // Upsert user so foreign keys work
@@ -242,7 +252,7 @@ try {
 } catch (PDOException $e) {
     error_log("[WebApp API] Auth DB error (nonce): " . $e->getMessage());
     http_response_code(500);
-    echo json_encode(["error" => "Auth service error: " . $e->getMessage()]);
+    echo json_encode(["error" => "Auth service unavailable"]);
     exit;
 }
 
@@ -284,7 +294,7 @@ try {
 } catch (PDOException $e) {
     error_log("[WebApp API] Auth DB error (user/device): " . $e->getMessage());
     http_response_code(500);
-    echo json_encode(["error" => "Auth service error: " . $e->getMessage()]);
+    echo json_encode(["error" => "Auth service unavailable"]);
     exit;
 }
 
@@ -330,26 +340,37 @@ try {
                 echo json_encode(["error" => "Expected array of events"]);
                 break;
             }
+            if (count($events) > 10000) {
+                http_response_code(413);
+                echo json_encode(["error" => "Encrypted import is too large"]);
+                break;
+            }
+            foreach ($events as $event) {
+                if (is_array($event) && ($event['key_id'] ?? '') === 'project-v1') continue;
+                $validationError = validate_account_v2_event($event);
+                if ($validationError !== null) {
+                    http_response_code(400);
+                    echo json_encode(["error" => $validationError]);
+                    break 2;
+                }
+                if (($event['author_public_key'] ?? '') !== $identity || !verify_sync_v2_event_signature($event)) {
+                    http_response_code(400); echo json_encode(["error" => "Invalid durable sync event signature"]); break 2;
+                }
+            }
 
             $pdo->beginTransaction();
-            $stmt = $pdo->prepare(
-                "INSERT IGNORE INTO sync_events (id, user_id, entity_type, entity_id, operation, payload, created_at, device_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+            $v2 = $pdo->prepare(
+                "INSERT IGNORE INTO sync_v2_events (id, user_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, device_id, author_public_key, event_signature)
+                 VALUES (?, ?, 2, ?, ?, ?, ?, 'account-v1', ?, ?, ?, ?, ?)"
             );
             $inserted = 0;
             foreach ($events as $e) {
-                if (empty($e['id'])) continue;
-                $stmt->execute([
-                    $e['id'],
-                    $userId,
-                    $e['entity_type'],
-                    $e['entity_id'],
-                    $e['operation'],
-                    $e['content']  ?? '',
-                    $e['timestamp'] ?? date(DATE_RFC3339),
-                    $e['device_id'] ?? '',
-                ]);
-                $inserted += $stmt->rowCount();
+                // The browser does not hold Fellowship project keys yet. Keep its
+                // private account mirror E2EE-only and ignore project-v1 envelopes.
+                if (($e['key_id'] ?? '') === 'project-v1') continue;
+                $v2->execute([$e['id'], $userId, $e['entity_type'], $e['entity_id'], $e['operation'],
+                    $e['timestamp'] ?? date(DATE_RFC3339), $e['nonce'] ?? '', $e['ciphertext'] ?? '', $e['device_id'] ?? '', $e['author_public_key'], $e['event_signature']]);
+                $inserted += $v2->rowCount();
             }
             $pdo->commit();
 
@@ -357,6 +378,55 @@ try {
             $pdo->prepare("UPDATE users SET supporter = 1 WHERE id = ?")->execute([$userId]);
 
             echo json_encode(["status" => "ok", "inserted" => $inserted]);
+            break;
+
+        case 'sync/v2/push':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); break; }
+            $entries = json_decode($body, true);
+            if (!is_array($entries)) { http_response_code(400); echo json_encode(["error" => "Expected encrypted events"]); break; }
+            if (count($entries) > 1000) { http_response_code(413); echo json_encode(["error" => "Encrypted push is too large"]); break; }
+            foreach ($entries as $event) {
+                $validationError = validate_account_v2_event($event);
+                if ($validationError !== null) {
+                    http_response_code(400);
+                    echo json_encode(["error" => $validationError]);
+                    break 2;
+                }
+                if (($event['author_public_key'] ?? '') !== $identity || !verify_sync_v2_event_signature($event)) {
+                    http_response_code(400); echo json_encode(["error" => "Invalid durable sync event signature"]); break 2;
+                }
+            }
+            $stmt = $pdo->prepare("INSERT IGNORE INTO sync_v2_events
+                (id, user_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, device_id, author_public_key, event_signature)
+                VALUES (?, ?, 2, ?, ?, ?, ?, 'account-v1', ?, ?, ?, ?, ?)");
+            $inserted = 0;
+            foreach ($entries as $e) {
+                $stmt->execute([$e['id'], $userId, $e['entity_type'], $e['entity_id'], $e['operation'],
+                    $e['timestamp'], $e['nonce'], $e['ciphertext'], $e['device_id'] ?? $deviceId, $e['author_public_key'], $e['event_signature']]);
+                $inserted += $stmt->rowCount();
+            }
+            echo json_encode(["status" => "success", "pushed" => $inserted]);
+            break;
+
+        case 'sync/v2/pull':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') { http_response_code(405); break; }
+            $sinceSeq = max(0, (int)($_GET['since_seq'] ?? 0));
+            $limit = max(1, min(500, (int)($_GET['limit'] ?? 500)));
+            $stmt = $pdo->prepare("SELECT id, version, entity_type, entity_id, operation,
+                event_timestamp AS timestamp, key_id, nonce, ciphertext, 'account' AS scope,
+                '' AS routing_id, device_id, author_public_key, event_signature, seq FROM sync_v2_events
+                WHERE user_id = ? AND device_id != ? AND seq > ? ORDER BY seq ASC LIMIT {$limit}");
+            $stmt->execute([$userId, $deviceId, $sinceSeq]);
+            $events = $stmt->fetchAll();
+            $nextSeq = $sinceSeq;
+            foreach ($events as $event) $nextSeq = max($nextSeq, (int)$event['seq']);
+            $head = $pdo->prepare("SELECT COALESCE(MAX(seq), 0) FROM sync_v2_events WHERE user_id = ? AND device_id != ?");
+            $head->execute([$userId, $deviceId]);
+            $headSeq = (int)$head->fetchColumn();
+            $unsigned = $pdo->prepare("SELECT COUNT(*) FROM sync_v2_events WHERE user_id = ? AND (author_public_key IS NULL OR event_signature IS NULL)");
+            $unsigned->execute([$userId]);
+            echo json_encode(["events" => $events, "head_seq" => $headSeq, "next_seq" => $nextSeq,
+                "has_more" => $nextSeq < $headSeq, "signatures_required" => ((int)$unsigned->fetchColumn() === 0)]);
             break;
 
         // ── Sync push — store events in gibranlp_webappquest ─────────────────────
@@ -440,6 +510,58 @@ try {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
+function validate_account_v2_event($event) {
+    if (!is_array($event)) return "Encrypted event must be an object";
+    $limits = [
+        'id' => 128, 'entity_type' => 50, 'entity_id' => 255,
+        'operation' => 20, 'timestamp' => 50, 'nonce' => 32,
+    ];
+    foreach ($limits as $field => $limit) {
+        if (!isset($event[$field]) || !is_string($event[$field])
+            || $event[$field] === '' || strlen($event[$field]) > $limit) {
+            return "Invalid encrypted event field: $field";
+        }
+    }
+    if (($event['version'] ?? null) !== 2 || ($event['key_id'] ?? '') !== 'account-v1'
+        || (array_key_exists('content', $event) && $event['content'] !== null)
+        || (($event['scope'] ?? 'account') !== 'account')
+        || !empty($event['routing_id'])
+        || !isset($event['ciphertext']) || !is_string($event['ciphertext'])
+        || $event['ciphertext'] === '' || strlen($event['ciphertext']) > 8 * 1024 * 1024) {
+        return "Unsupported or malformed account-v1 envelope";
+    }
+    if (!isset($event['author_public_key'], $event['event_signature'])
+        || !is_string($event['author_public_key']) || !is_string($event['event_signature'])
+        || strlen($event['author_public_key']) !== 64 || !ctype_xdigit($event['author_public_key'])
+        || strlen($event['event_signature']) !== 128 || !ctype_xdigit($event['event_signature'])) {
+        return "Invalid durable sync event signature fields";
+    }
+    $nonce = base64_decode($event['nonce'], true);
+    $ciphertext = base64_decode($event['ciphertext'], true);
+    if ($nonce === false || strlen($nonce) !== 12
+        || $ciphertext === false || strlen($ciphertext) < 16) {
+        return "Invalid encrypted event encoding";
+    }
+    return null;
+}
+
+function sync_v2_signature_message($event) {
+    $fields = [(string)($event['version'] ?? ''), (string)($event['id'] ?? ''),
+        (string)($event['entity_type'] ?? ''), (string)($event['entity_id'] ?? ''),
+        (string)($event['operation'] ?? ''), (string)($event['timestamp'] ?? ''),
+        (string)($event['key_id'] ?? ''), (string)($event['nonce'] ?? ''),
+        (string)($event['ciphertext'] ?? ''), (string)($event['scope'] ?? 'account'),
+        (string)($event['routing_id'] ?? ''), (string)($event['device_id'] ?? ''),
+        (string)($event['author_public_key'] ?? '')];
+    $message = "questline-sync-event-v1\n";
+    foreach ($fields as $field) $message .= strlen($field) . ':' . $field;
+    return $message;
+}
+
+function verify_sync_v2_event_signature($event) {
+    return verify_ed25519($event['author_public_key'], $event['event_signature'], sync_v2_signature_message($event));
+}
+
 function verify_ed25519($publicKeyHex, $signatureHex, $message) {
     try {
         if (!extension_loaded('sodium')) return false;
@@ -504,7 +626,7 @@ function setup_tables($pdo) {
         id          VARCHAR(36)  PRIMARY KEY,
         user_id     VARCHAR(36)  NOT NULL,
         entity_type VARCHAR(50)  NOT NULL,
-        entity_id   VARCHAR(36)  NOT NULL,
+        entity_id   VARCHAR(255) NOT NULL,
         operation   VARCHAR(20)  NOT NULL,
         payload     LONGTEXT     NOT NULL DEFAULT '',
         created_at  VARCHAR(50)  NOT NULL DEFAULT '',
@@ -513,6 +635,35 @@ function setup_tables($pdo) {
         KEY idx_seq (seq),
         INDEX idx_user_seq (user_id, seq)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    $pdo->exec("CREATE TABLE IF NOT EXISTS sync_v2_events (
+        seq             BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        id              VARCHAR(128) NOT NULL,
+        user_id         VARCHAR(36) NOT NULL,
+        version         TINYINT UNSIGNED NOT NULL,
+        entity_type     VARCHAR(50) NOT NULL,
+        entity_id       VARCHAR(255) NOT NULL,
+        operation       VARCHAR(20) NOT NULL,
+        event_timestamp VARCHAR(50) NOT NULL,
+        key_id          VARCHAR(64) NOT NULL,
+        nonce           VARCHAR(32) NOT NULL,
+        ciphertext      LONGTEXT NOT NULL,
+        device_id       VARCHAR(64) NOT NULL DEFAULT '',
+        author_public_key VARCHAR(64) NULL,
+        event_signature VARCHAR(128) NULL,
+        UNIQUE KEY uq_web_v2_event (user_id, id),
+        INDEX idx_web_v2_pull (user_id, seq)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    foreach (['sync_events', 'sync_v2_events'] as $table) {
+        $entityIdColumn = $pdo->query("SHOW COLUMNS FROM $table LIKE 'entity_id'")->fetch();
+        if ($entityIdColumn && strtolower($entityIdColumn['Type'] ?? '') !== 'varchar(255)') {
+            $pdo->exec("ALTER TABLE $table MODIFY COLUMN entity_id VARCHAR(255) NOT NULL");
+        }
+    }
+    foreach ([['author_public_key', 'VARCHAR(64) NULL'], ['event_signature', 'VARCHAR(128) NULL']] as [$column, $definition]) {
+        $check = $pdo->query("SHOW COLUMNS FROM sync_v2_events LIKE " . $pdo->quote($column));
+        if (!$check->fetch()) $pdo->exec("ALTER TABLE sync_v2_events ADD COLUMN $column $definition");
+    }
 
     $pdo->exec("CREATE TABLE IF NOT EXISTS nonces (
         user_id    VARCHAR(36)  NOT NULL,

@@ -132,14 +132,16 @@ export async function loginWebapp(username, password) {
   return data; // { user_id, public_key, encrypted_key_blob }
 }
 
-// Pull ALL sync events from questlinecli.com (seq=0) for the initial import.
+// Pull ALL encrypted sync-v2 events from questlinecli.com (seq=0).
 // Yields batches so the caller can show progress.
 export async function* pullAllFromQuestline(identity) {
   const client = new ApiClient(identity, QUESTLINE_API_BASE);
   let seq = 0;
   while (true) {
-    const events = await client.request('POST', 'sync/pull', null, { since_seq: seq });
+    const page = await client.request('POST', 'sync/v2/pull', null, { since_seq: seq, limit: 500, include_meta: 1 });
+    const events = page.events;
     if (!Array.isArray(events) || events.length === 0) break;
+    events.signatures_required = Boolean(page.signatures_required);
     yield events;
     for (const e of events) { if (e.seq > seq) seq = e.seq; }
     if (events.length < 500) break;

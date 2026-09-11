@@ -6,6 +6,7 @@
   import { ApiClient } from './lib/api.js';
   import { identity as identityStore, apiClient as apiStore, dataKey as dataKeyStore, addToast, userStats } from './lib/store.js';
   import { startBackgroundSync, loadLocalCache } from './lib/sync.js';
+  import { ensureEncryptionKeyRegistered } from './lib/fellowship.js';
   import { clearLocalDatabase } from './lib/db.js';
 
   import Nav from './components/Nav.svelte';
@@ -45,6 +46,12 @@
   }
 
   async function startSession(client) {
+    const cacheOwnerKey = 'questline_cache_identity';
+    const previousCacheOwner = localStorage.getItem(cacheOwnerKey);
+    if (previousCacheOwner && previousCacheOwner !== client.identity.public_key) {
+      await clearLocalDatabase().catch(() => {});
+    }
+    localStorage.setItem(cacheOwnerKey, client.identity.public_key);
     try {
       const status = await client.get('webapp/supporter-status');
       if (!status.supporter) {
@@ -56,6 +63,10 @@
       }
       // Redirect to settings/import if no data has been imported yet
       if (status.needs_import) {
+        // Import-gated accounts must still be discoverable for encrypted
+        // Fellowship invitations. Registration publishes only the X25519
+        // public key; it does not enable sync or expose private content.
+        await ensureEncryptionKeyRegistered(client.identity);
         navigate('/settings');
         if (stopSync) stopSync();
         stopSync = startBackgroundSync(client);
@@ -71,6 +82,9 @@
 
     // Load local cache for fresh logins (page-reload already did this in onMount)
     await loadLocalCache();
+
+    // Publish our X25519 key so companions can invite us to encrypted Fellowships.
+    await ensureEncryptionKeyRegistered(client.identity);
 
     if (stopSync) stopSync();
     stopSync = startBackgroundSync(client);
