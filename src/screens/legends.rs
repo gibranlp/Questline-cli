@@ -416,7 +416,7 @@ pub fn draw(
 
     let relic_list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.border))
         .title(" Cosmetical Relics Inventory ");
     let relic_list_inner = relic_list_block.inner(relics_layout[0]);

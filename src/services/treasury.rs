@@ -76,7 +76,13 @@ impl<'a> TreasuryService<'a> {
                 |row| row.get(0),
             )?;
             let default_account_count: i64 = self.db.conn.query_row(
-                "SELECT COUNT(*) FROM treasury_accounts WHERE campaign_id = ?1 AND is_default = 1",
+                "SELECT COUNT(*) FROM (
+                    SELECT id FROM treasury_accounts WHERE campaign_id=?1 AND is_default=1
+                    UNION
+                    SELECT entity_id FROM treasury_history WHERE campaign_id=?1
+                    AND entity_type='treasury_account' AND action IN ('deleted', 'remote_delete')
+                    AND json_extract(snapshot, '$.is_default')=1
+                 )",
                 params![campaign_id.to_string()],
                 |row| row.get(0),
             )?;
@@ -130,6 +136,12 @@ impl<'a> TreasuryService<'a> {
         }
         for (name, kind) in DEFAULT_ACCOUNTS {
             let id = deterministic_account_id(campaign_id, name);
+            let deleted: bool = self.db.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM treasury_history WHERE entity_type='treasury_account'
+                 AND entity_id=?1 AND action IN ('deleted', 'remote_delete'))",
+                params![id.to_string()], |row| row.get(0),
+            )?;
+            if deleted { continue; }
             let inserted = self.db.conn.execute(
                 "INSERT OR IGNORE INTO treasury_accounts
                  (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
@@ -147,12 +159,6 @@ impl<'a> TreasuryService<'a> {
                     .log_change("treasury_account", &id.to_string(), "create")?;
             }
         }
-        let spending_id = deterministic_account_id(campaign_id, "Spending");
-        self.db.conn.execute(
-            "UPDATE ledger_entries SET account_id=?1
-             WHERE campaign_id=?2 AND account_id IS NULL",
-            params![spending_id.to_string(), campaign_id.to_string()],
-        )?;
         self.get_campaign(campaign_id)?
             .ok_or_else(|| anyhow!("Treasury initialization did not persist"))
     }
@@ -363,6 +369,8 @@ impl<'a> TreasuryService<'a> {
         if name.is_empty() {
             bail!("Account name cannot be empty");
         }
+        self.validate_account_name(campaign_id, name, None)?;
+        let transaction = self.db.conn.unchecked_transaction()?;
         let id = Uuid::new_v4();
         let now = Utc::now();
         self.db.conn.execute(
@@ -379,7 +387,82 @@ impl<'a> TreasuryService<'a> {
         )?;
         self.db
             .log_change("treasury_account", &id.to_string(), "create")?;
+        self.record_history(campaign_id, "treasury_account", id, "created", 1)?;
+        transaction.commit()?;
         self.get_account(id)?.context("Account was not persisted")
+    }
+
+    fn validate_account_name(&self, campaign_id: Uuid, name: &str, excluding: Option<Uuid>) -> Result<()> {
+        if name.trim().is_empty() {
+            bail!("Account name cannot be empty");
+        }
+        let duplicate: bool = self.db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM treasury_accounts WHERE campaign_id=?1 AND name=?2 COLLATE NOCASE AND (?3 IS NULL OR id != ?3))",
+            params![campaign_id.to_string(), name.trim(), excluding.map(|id| id.to_string())],
+            |row| row.get(0),
+        )?;
+        if duplicate {
+            bail!("An account with that name already exists in this campaign");
+        }
+        Ok(())
+    }
+
+    /// Rename or reclassify an account without changing its identity or ledger links.
+    pub fn update_account(&self, mut account: TreasuryAccount) -> Result<TreasuryAccount> {
+        let transaction = self.db.conn.unchecked_transaction()?;
+        let previous = self.get_account(account.id)?.context("Treasury account not found")?;
+        if previous.campaign_id != account.campaign_id {
+            bail!("An account cannot move between campaigns");
+        }
+        account.name = account.name.trim().to_string();
+        self.validate_account_name(account.campaign_id, &account.name, Some(account.id))?;
+        account.is_default = previous.is_default;
+        account.created_at = previous.created_at;
+        let expected_version = account.version;
+        account.version += 1;
+        account.updated_at = Utc::now();
+        let changed = self.db.conn.execute(
+            "UPDATE treasury_accounts SET name=?1, kind=?2, version=?3, updated_at=?4 WHERE id=?5 AND version=?6",
+            params![account.name, account.kind.as_str(), account.version, account.updated_at.to_rfc3339(), account.id.to_string(), expected_version],
+        )?;
+        if changed == 0 {
+            bail!("Treasury account changed on another device; reload before editing");
+        }
+        self.record_history(account.campaign_id, "treasury_account", account.id, "updated", account.version)?;
+        self.db.log_change("treasury_account", &account.id.to_string(), "update")?;
+        transaction.commit()?;
+        Ok(account)
+    }
+
+    /// Only unused accounts may be removed, including unused seeded accounts.
+    pub fn delete_account(&self, id: Uuid) -> Result<()> {
+        let transaction = self.db.conn.unchecked_transaction()?;
+        let account = self.validate_account_deletion(id)?;
+        self.db.create_revision("treasury_account", &id.to_string(), &serde_json::to_string(&account)?)?;
+        self.record_history(account.campaign_id, "treasury_account", id, "deleted", account.version + 1)?;
+        self.db.conn.execute("DELETE FROM treasury_accounts WHERE id=?1", params![id.to_string()])?;
+        self.db.log_change("treasury_account", &id.to_string(), "delete")?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_account_deletion(&self, id: Uuid) -> Result<TreasuryAccount> {
+        let account = self.get_account(id)?.context("Treasury account not found")?;
+        let implicit_source = deterministic_account_id(account.campaign_id, "Spending");
+        let has_transactions: bool = self.db.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM ledger_entries WHERE campaign_id=?1
+                AND (COALESCE(account_id, ?3)=?2 OR transfer_account_id=?2))
+             OR EXISTS(SELECT 1 FROM treasury_history WHERE campaign_id=?1
+                AND entity_type='ledger_entry'
+                AND (COALESCE(json_extract(snapshot, '$.account_id'), ?3)=?2
+                     OR json_extract(snapshot, '$.transfer_account_id')=?2))",
+            params![account.campaign_id.to_string(), id.to_string(), implicit_source.to_string()],
+            |row| row.get(0),
+        )?;
+        if has_transactions {
+            bail!("Only empty accounts with no transaction history can be deleted");
+        }
+        Ok(account)
     }
 
     pub fn get_account(&self, id: Uuid) -> Result<Option<TreasuryAccount>> {
@@ -919,6 +1002,7 @@ impl<'a> TreasuryService<'a> {
             monthly_spending,
             accounts,
             outstanding_payments,
+            entries: self.entries(campaign_id, &LedgerFilter::default(), LedgerSort::Newest)?,
         })
     }
 
@@ -1018,10 +1102,14 @@ impl<'a> TreasuryService<'a> {
         if category.entry_type != entry.entry_type {
             bail!("Category does not match the transaction type");
         }
-        if let Some(account_id) = entry.account_id {
+        let source_account = entry.account_id.or_else(|| {
+            matches!(entry.entry_type, LedgerEntryType::Income | LedgerEntryType::Expense | LedgerEntryType::Transfer)
+                .then(|| deterministic_account_id(entry.campaign_id, "Spending"))
+        });
+        if let Some(account_id) = source_account {
             let account = self
                 .get_account(account_id)?
-                .context("Treasury account not found")?;
+                .context("Select an existing Treasury account before recording this entry")?;
             if account.campaign_id != entry.campaign_id {
                 bail!("Account does not belong to this campaign");
             }
@@ -1034,7 +1122,7 @@ impl<'a> TreasuryService<'a> {
                 if destination.campaign_id != entry.campaign_id {
                     bail!("Transfer destination does not belong to this campaign");
                 }
-                if entry.account_id == Some(destination_id) {
+                if entry.account_id.unwrap_or_else(|| deterministic_account_id(entry.campaign_id, "Spending")) == destination_id {
                     bail!("Transfer source and destination must be different accounts");
                 }
             }
@@ -1099,6 +1187,9 @@ impl<'a> TreasuryService<'a> {
         let snapshot = match entity_type {
             "ledger_entry" => self
                 .get_entry(entity_id)?
+                .and_then(|value| serde_json::to_string(&value).ok()),
+            "treasury_account" => self
+                .get_account(entity_id)?
                 .and_then(|value| serde_json::to_string(&value).ok()),
             "ledger_category" => self
                 .get_category(entity_id)?
@@ -1830,6 +1921,113 @@ mod tests {
             ))
             .unwrap_err();
         assert!(error.to_string().contains("does not match"));
+    }
+
+    #[test]
+    fn accounts_can_be_renamed_reclassified_and_paid_entries_reassigned() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let bank1 = service.create_account(campaign_id, "bank1", TreasuryAccountKind::Spending).unwrap();
+        let mut bank2 = service.create_account(campaign_id, "bank2", TreasuryAccountKind::Savings).unwrap();
+        let mut paid = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Expense), LedgerEntryType::Expense, LedgerStatus::Paid, 2500);
+        paid.account_id = Some(bank1.id);
+        let paid = service.create_entry(paid).unwrap();
+        let original_totals = service.calculate_campaign_totals(campaign_id).unwrap();
+        let stale = bank2.clone();
+        bank2.name = "Emergency fund".into();
+        bank2.kind = TreasuryAccountKind::Other;
+        bank2 = service.update_account(bank2).unwrap();
+        assert_eq!(bank2.version, 2);
+        assert!(service.update_account(stale).unwrap_err().to_string().contains("another device"));
+        assert!(service.create_account(campaign_id, " BANK1 ", TreasuryAccountKind::Savings).is_err());
+        let mut duplicate = bank2.clone();
+        duplicate.name = "bank1".into();
+        assert!(service.update_account(duplicate).is_err());
+        let mut blank = bank2.clone();
+        blank.name = " ".into();
+        assert!(service.update_account(blank).is_err());
+        let mut moved = paid.clone();
+        moved.account_id = Some(bank2.id);
+        let moved = service.update_entry(moved).unwrap();
+        assert_eq!(moved.payment_date, paid.payment_date);
+        assert_eq!(moved.created_by_identity, paid.created_by_identity);
+        assert_eq!(service.calculate_campaign_totals(campaign_id).unwrap(), original_totals);
+        let balances = service.account_balances(campaign_id).unwrap();
+        assert_eq!(balances.iter().find(|b| b.account.id == bank1.id).unwrap().balance_minor, 0);
+        assert_eq!(balances.iter().find(|b| b.account.id == bank2.id).unwrap().balance_minor, -2500);
+        let mut default = service.accounts(campaign_id).unwrap().into_iter().find(|a| a.is_default).unwrap();
+        let default_id = default.id;
+        default.name = "My main bank".into();
+        service.update_account(default).unwrap();
+        service.ensure_campaign(campaign_id).unwrap();
+        assert_eq!(service.get_account(default_id).unwrap().unwrap().name, "My main bank");
+        assert_eq!(service.accounts(campaign_id).unwrap().len(), DEFAULT_ACCOUNTS.len() + 2);
+        let snapshot: String = db.conn.query_row("SELECT snapshot FROM treasury_history WHERE entity_type='treasury_account' AND entity_id=?1 AND action='updated'", params![bank2.id.to_string()], |row| row.get(0)).unwrap();
+        assert!(snapshot.contains("Emergency fund"));
+        let report: serde_json::Value = serde_json::from_str(&service.export_json(campaign_id).unwrap()).unwrap();
+        assert_eq!(report["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(report["entries"][0]["account_id"], bank2.id.to_string());
+        assert_eq!(report["accounts"].as_array().unwrap().len(), DEFAULT_ACCOUNTS.len() + 2);
+    }
+
+    #[test]
+    fn account_deletion_rejects_transactions_even_when_balance_is_zero() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let account = service.create_account(campaign_id, "MLSavings", TreasuryAccountKind::Savings).unwrap();
+        let mut planned = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Expense), LedgerEntryType::Expense, LedgerStatus::Planned, 100);
+        planned.account_id = Some(account.id);
+        let planned = service.create_entry(planned).unwrap();
+        assert_eq!(service.account_balances(campaign_id).unwrap().iter().find(|b| b.account.id == account.id).unwrap().balance_minor, 0);
+        assert!(service.delete_account(account.id).unwrap_err().to_string().contains("transaction history"));
+        service.delete_entry(planned.id).unwrap();
+        assert!(service.delete_account(account.id).is_err());
+        assert!(service.get_account(account.id).unwrap().is_some());
+
+        let destination = service.create_account(campaign_id, "Transfer destination", TreasuryAccountKind::Other).unwrap();
+        let mut transfer = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Transfer), LedgerEntryType::Transfer, LedgerStatus::Cancelled, 100);
+        transfer.account_id = Some(account.id);
+        transfer.transfer_account_id = Some(destination.id);
+        service.create_entry(transfer).unwrap();
+        assert!(service.delete_account(destination.id).is_err());
+        assert!(service.delete_account(account.id).is_err());
+    }
+
+    #[test]
+    fn unused_defaults_can_be_deleted_without_reappearing() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let savings = deterministic_account_id(campaign_id, "Savings");
+        service.ensure_campaign(campaign_id).unwrap();
+        service.delete_account(savings).unwrap();
+        service.ensure_campaign(campaign_id).unwrap();
+        assert!(service.get_account(savings).unwrap().is_none());
+        // Force the full seeding path as well as the render-loop fast path.
+        db.conn.execute("DELETE FROM ledger_categories WHERE campaign_id=?1", params![campaign_id.to_string()]).unwrap();
+        service.ensure_campaign(campaign_id).unwrap();
+        assert!(service.get_account(savings).unwrap().is_none());
+        let custom = service.create_account(campaign_id, "Savings", TreasuryAccountKind::Savings).unwrap();
+        service.delete_account(custom.id).unwrap();
+        let spending = deterministic_account_id(campaign_id, "Spending");
+        service.delete_account(spending).unwrap();
+        let missing_source = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Income), LedgerEntryType::Income, LedgerStatus::Paid, 100);
+        assert!(service.create_entry(missing_source).unwrap_err().to_string().contains("existing Treasury account"));
+        // An explicit account still works after the default source was removed.
+        let cash = deterministic_account_id(campaign_id, "Cash");
+        let mut legacy = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Income), LedgerEntryType::Income, LedgerStatus::Paid, 100);
+        legacy.account_id = Some(cash);
+        service.create_entry(legacy).unwrap();
+        assert!(service.delete_account(cash).is_err());
+    }
+
+    #[test]
+    fn legacy_transfer_cannot_send_to_its_implicit_source() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let mut transfer = entry(campaign_id, category_id(&service, campaign_id, LedgerEntryType::Transfer), LedgerEntryType::Transfer, LedgerStatus::Paid, 100);
+        transfer.account_id = None;
+        transfer.transfer_account_id = Some(deterministic_account_id(campaign_id, "Spending"));
+        assert!(service.create_entry(transfer).unwrap_err().to_string().contains("different accounts"));
     }
 
     #[test]

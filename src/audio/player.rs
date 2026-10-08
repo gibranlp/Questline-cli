@@ -51,8 +51,7 @@ impl Default for AudioPlayer {
 }
 
 impl AudioPlayer {
-    #[cfg(test)]
-    pub fn new() -> Self {
+    pub fn silent() -> Self {
         Self {
             _stream: None,
             handle: None,
@@ -62,6 +61,11 @@ impl AudioPlayer {
             spectrum: crate::audio::spectrum::new_spectrum_data(),
             playing_effects: Arc::new(Mutex::new(HashSet::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub fn new() -> Self {
+        Self::silent()
     }
 
     // inicializa el sistema de audio — si falla, el app sigue en modo silencioso, no truena

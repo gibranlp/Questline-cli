@@ -143,7 +143,7 @@ pub fn draw(f: &mut Frame, input: &str, error: Option<&str>, ticks: usize, theme
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(border_color))
                     .title(Span::styled(
                         " Transfer Code — Paste it here ",

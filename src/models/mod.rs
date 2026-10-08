@@ -2,6 +2,7 @@
 // models/mod.rs — re-exporta todos los modelos de datos para usarlos fácil
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod chapter;
+pub mod atlas;
 pub mod codex;
 pub mod global_chronicle;
 pub mod journal_entry;
@@ -14,6 +15,7 @@ pub mod user;
 pub mod xp_event;
 
 pub use codex::Codex;
+pub use atlas::{AtlasChart, AtlasNode};
 pub use global_chronicle::GlobalChronicleEntry;
 pub use journal_entry::JournalEntry;
 pub use note::Note;

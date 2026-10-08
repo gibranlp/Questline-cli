@@ -436,6 +436,8 @@ pub struct TreasuryReport {
     #[serde(default)]
     pub accounts: Vec<TreasuryAccountBalance>,
     pub outstanding_payments: Vec<LedgerEntry>,
+    #[serde(default)]
+    pub entries: Vec<LedgerEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

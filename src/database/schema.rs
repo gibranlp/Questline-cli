@@ -72,6 +72,38 @@ CREATE TABLE IF NOT EXISTS notes (
     FOREIGN KEY(codex_id) REFERENCES codices(id) ON DELETE SET NULL
 );
 
+CREATE TABLE IF NOT EXISTS atlas_charts (
+    id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
+    owner_identity TEXT,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS atlas_nodes (
+    id TEXT PRIMARY KEY,
+    chart_id TEXT NOT NULL,
+    project_id TEXT NOT NULL,
+    parent_id TEXT,
+    title TEXT NOT NULL,
+    position INTEGER NOT NULL DEFAULT 0,
+    collapsed INTEGER NOT NULL DEFAULT 0,
+    marked INTEGER NOT NULL DEFAULT 0,
+    hidden INTEGER NOT NULL DEFAULT 0,
+    color INTEGER,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
+    owner_identity TEXT,
+    FOREIGN KEY(chart_id) REFERENCES atlas_charts(id) ON DELETE CASCADE,
+    FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+    FOREIGN KEY(parent_id) REFERENCES atlas_nodes(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_atlas_charts_project ON atlas_charts(project_id);
+CREATE INDEX IF NOT EXISTS idx_atlas_nodes_chart_parent ON atlas_nodes(chart_id, parent_id, position);
+
 CREATE TABLE IF NOT EXISTS xp_events (
     id TEXT PRIMARY KEY,
     event_type TEXT NOT NULL,

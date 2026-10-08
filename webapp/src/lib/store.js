@@ -13,6 +13,8 @@ export const projects = writable(new Map());
 export const tasks = writable(new Map());
 export const notes = writable(new Map());
 export const codices = writable(new Map());
+export const atlasCharts = writable(new Map());
+export const atlasNodes = writable(new Map());
 export const journalEntries = writable(new Map());
 export const milestones = writable(new Map());
 export const achievements = writable(new Map());
@@ -95,6 +97,8 @@ export function applySyncEvent(event) {
     task: tasks,
     note: notes,
     codex: codices,
+    atlas_chart: atlasCharts,
+    atlas_node: atlasNodes,
     journal_entry: journalEntries,
     milestone: milestones,
     achievement: achievements,

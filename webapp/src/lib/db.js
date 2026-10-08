@@ -1,7 +1,7 @@
 // IndexedDB local cache — decrypted entity state, populated by the sync engine
 
 const DB_NAME = 'questline_local_v1';
-const DB_VERSION = 5;
+const DB_VERSION = 6;
 
 // Encrypted Fellowship project keys — keyed by opaque routing_id.
 // Records: { routing_id, project_id, key_hex, retired }. Durable at rest, like the
@@ -16,6 +16,7 @@ const ENTITY_STORES = [
   'rituals', 'focus_sessions', 'lore_unlocks',
   'chronicle_messages',
   'task_assignments', 'notifications',
+  'atlas_charts', 'atlas_nodes',
 ];
 // Singleton stores — keyed by the fixed string 'singleton'
 const SINGLETON_STORES = ['user_stats', 'zen_tree', 'streaks'];

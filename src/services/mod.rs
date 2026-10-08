@@ -2,6 +2,7 @@
 // services/mod.rs — re-exports de los servicios
 // ─────────────────────────────────────────────────────────────────────────────
 pub mod api_client;
+pub mod atlas;
 pub mod bonsai;
 pub mod config;
 pub mod credential_vault;
@@ -24,5 +25,6 @@ pub use config::Config;
 pub use identity::Identity;
 pub use logger::{init_panic_hook, log_structured};
 pub use theme::ThemeService;
+pub use atlas::AtlasService;
 pub use treasury::TreasuryService;
 pub use xp::XPService;

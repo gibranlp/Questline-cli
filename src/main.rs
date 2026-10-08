@@ -420,7 +420,16 @@ fn parse_cli_options(args: impl IntoIterator<Item = String>) -> Result<CliOption
                     "calendar-import requires <Campaign name-or-id> <file> and optional --confirm or --reconcile"
                 ));
             }
-            "campaign-export" | "campaign-import" | "calendar-import" => {}
+            "shell-action" if command_args.len() != 1 => {
+                return Err(anyhow!("shell-action requires one JSON request"));
+            }
+            "shell-hero" if command_args.len() != 1 => {
+                return Err(anyhow!("shell-hero requires one JSON request"));
+            }
+            "shell-tree" if command_args.len() != 1 => {
+                return Err(anyhow!("shell-tree requires one JSON request"));
+            }
+            "campaign-export" | "campaign-import" | "calendar-import" | "shell-action" | "shell-tree" | "shell-hero" => {}
             _ if !command_args.is_empty() => {
                 return Err(anyhow!("{command} does not accept additional arguments"));
             }
@@ -453,6 +462,9 @@ fn print_cli_help() {
     println!("                                 Preview, then import a Campaign template");
     println!("  calendar-import <name|id> <file> [--confirm|--reconcile]");
     println!("                                 Preview local iCalendar events as Quests");
+    println!("  shell-action <json>           Run a local SpectrumShell action (including sidequests)");
+    println!("  shell-tree <json>             Render the current procedural Evergrowth tree");
+    println!("  shell-hero <json>             Describe hero class progression for SpectrumShell");
     println!("  --version, --help");
 }
 
@@ -489,6 +501,25 @@ async fn main() -> Result<()> {
     // Checa si corrieron el binario con un subcomando (export / import / backup / --version)
     if let Some(cmd) = options.command.as_deref() {
         match cmd {
+            "shell-hero" => {
+                let request: serde_json::Value = serde_json::from_str(&options.command_args[0])?;
+                let result = questline::shell_api::hero_metadata(&request)?;
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
+            "shell-tree" => {
+                let request: serde_json::Value = serde_json::from_str(&options.command_args[0])?;
+                let result = questline::shell_api::render_tree(&request)?;
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
+            "shell-action" => {
+                let request: serde_json::Value = serde_json::from_str(&options.command_args[0])?;
+                let db_path = storage::get_storage_dir()?.join("questline.db");
+                let result = questline::shell_api::run(&db_path, &request)?;
+                println!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
             "archive" => {
                 let db_path = storage::get_storage_dir()?.join("questline.db");
                 if !db_path.exists() {
@@ -1327,15 +1358,14 @@ async fn main() -> Result<()> {
                         }
                         tab_spans.push(Span::styled(" ", Style::default()));
                     }
-                    // Tab de About — activa con [?]About
                     if app.active_screen == ActiveScreen::About {
-                        tab_spans.push(Span::styled(
-                            "[?]About",
-                            theme.primary_selected_style(),
-                        ));
+                        tab_spans.push(Span::styled("[?]About", theme.primary_selected_style()));
                     } else {
-                        tab_spans.push(Span::styled("?", Style::default().fg(muted)));
+                        tab_spans.push(Span::styled("?", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+                        tab_spans.push(Span::styled(" About", Style::default().fg(muted)));
                     }
+                    tab_spans.push(Span::styled("  F1", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
+                    tab_spans.push(Span::styled(" shortcuts", Style::default().fg(muted)));
                     tab_spans.push(Span::styled(" ", Style::default()));
                     tab_spans.push(Span::styled("| ", Style::default().fg(muted)));
                     tab_spans.push(Span::styled("Ctrl+P", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)));
@@ -1406,7 +1436,7 @@ async fn main() -> Result<()> {
                 .retain(|notification| notification.is_visible_at(notification_now));
 
             // Suena el efecto y dispara OS alert para notificaciones nuevas
-            if let Some(notif) = app.notifications.last() {
+            if let Some(notif) = app.foreground_notification() {
                 use questline::app::NotificationKind;
                 use questline::services::notifications::NotificationIcon;
                 let is_new = last_notification_time.map_or(true, |t| notif.unlocked_at > t);
@@ -1449,7 +1479,7 @@ async fn main() -> Result<()> {
                 && app.active_screen != ActiveScreen::Prologue
                 && app.active_screen != ActiveScreen::Onboarding
             {
-                if let Some(notif) = app.notifications.last() {
+                if let Some(notif) = app.foreground_notification() {
                     use questline::app::NotificationKind;
                     use ratatui::layout::Alignment;
                     use ratatui::widgets::Wrap;
@@ -1500,7 +1530,7 @@ async fn main() -> Result<()> {
                     let title_text = format!("  {}  ", notif.title);
                     let block = Block::default()
                         .borders(Borders::ALL)
-                        .border_type(BorderType::Double)
+                        .border_type(BorderType::Thick)
                         .border_style(Style::default().fg(border_color).add_modifier(Modifier::BOLD))
                         .title(Span::styled(
                             title_text,
@@ -1539,7 +1569,7 @@ async fn main() -> Result<()> {
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), area);
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow))
                     .title(Span::styled(
                         " Set Local Music Folder Path ",
@@ -1569,6 +1599,7 @@ async fn main() -> Result<()> {
                 let input_p = Paragraph::new(format!("  {}_", input)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Thick)
                         .border_style(Style::default().fg(input_theme.primary))
                         .title(" Folder Path "),
                 );
@@ -1590,11 +1621,11 @@ async fn main() -> Result<()> {
                             .title(Span::styled(" Suggestions  [Tab/↓↑] navigate ", Style::default().fg(Color::Rgb(140, 140, 140)))),
                     );
                     f.render_widget(list, inner[2]);
-                    let help_p = Paragraph::new("  [Tab/↓] next  [↑] prev  [Enter] save  [Esc] cancel")
+                    let help_p = Paragraph::new("  [Ctrl+U] clear  [Tab/↓] next  [↑] prev  [Enter] save  [Esc] cancel")
                         .style(Style::default().fg(Color::Rgb(140, 140, 140)));
                     f.render_widget(help_p, inner[3]);
                 } else {
-                    let help_p = Paragraph::new("  [Enter] save  |  [Esc] cancel")
+                    let help_p = Paragraph::new("  [Ctrl+U] clear  |  [Enter] save  |  [Esc] cancel")
                         .style(Style::default().fg(Color::Rgb(140, 140, 140)));
                     f.render_widget(help_p, inner[2]);
                 }
@@ -1619,7 +1650,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(rarity_color).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " MEMORY FRAGMENT DISCOVERED ",
@@ -1689,7 +1720,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Choose Legendary Theme ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -1721,7 +1752,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Mention User ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -1753,7 +1784,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" CELEBRATION MOMENT ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -1790,7 +1821,7 @@ async fn main() -> Result<()> {
                 let gold = Color::Rgb(218, 165, 32);
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(gold))
                     .title(Span::styled(
                         " Support the Realm ",
@@ -1949,7 +1980,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Search Everywhere ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -2021,7 +2052,10 @@ async fn main() -> Result<()> {
 
                 let results_list = List::new(list_items)
                     .block(Block::default().borders(Borders::ALL).title(" Results ").border_style(Style::default().fg(Color::DarkGray)));
-                f.render_widget(results_list, inner_layout[1]);
+                let mut results_state = ratatui::widgets::ListState::default().with_selected(
+                    (!results.is_empty()).then_some(selected_idx.min(results.len().saturating_sub(1)))
+                );
+                f.render_stateful_widget(results_list, inner_layout[1], &mut results_state);
                 f.render_widget(block, overlay_area);
             }
 
@@ -2033,7 +2067,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Command Palette ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -2124,10 +2158,15 @@ async fn main() -> Result<()> {
                 f.render_widget(Clear, overlay_area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
-                let title = if action_id == "create_task" { " Select Project — New Task " } else { " Select Project — New Note " };
+                let title = match action_id {
+                    "create_task" => " Select Campaign — New Quest ",
+                    "open_atlas" => " Select Campaign — Atlas ",
+                    "open_treasury" => " Select Campaign — Treasury ",
+                    _ => " Select Campaign — New Note ",
+                };
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(title, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -2206,7 +2245,7 @@ async fn main() -> Result<()> {
                 ];
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary))
                     .title(Span::styled(
                         " End-to-End Encryption Migration ",
@@ -2230,7 +2269,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(" Campfire Rest ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
 
@@ -2339,7 +2378,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " [!] Archive Realm ",
@@ -2385,7 +2424,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Project Sharing Configuration ",
@@ -2450,7 +2489,7 @@ async fn main() -> Result<()> {
                 let roles = ["Steward", "Companion", "Observer"];
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.warning))
                     .title(Span::styled(
                         " Invite Companion to Fellowship Project ",
@@ -2616,7 +2655,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Slay Realm Permanently ",
@@ -2664,7 +2703,7 @@ async fn main() -> Result<()> {
                 );
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Red))
                     .title(" Remove Fellowship Companion ");
                 let lines = vec![
@@ -2693,7 +2732,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Rgb(56, 189, 248)).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Conquer Campaign ",
@@ -2736,7 +2775,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Delete Codex ",
@@ -2775,7 +2814,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Prune Old Completed Tasks ",
@@ -2822,7 +2861,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Clean Local History ",
@@ -2870,7 +2909,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " * Update Available ",
@@ -2905,117 +2944,283 @@ async fn main() -> Result<()> {
                 f.render_widget(p, overlay_area);
             }
 
-            // Ayuda de teclado contextual — los shortcuts cambian según la pantalla activa
+            // One paged shortcut reference for the whole application. The first page
+            // separates global bindings from local ones; the remaining pages inventory
+            // every screen so a local key is never mistaken for an app-wide command.
             if let questline::app::ModalType::KeyboardHelp = app.modal_state {
-                let overlay_area = questline::screens::intro::centered_rect(75, 35, size);
+                use questline::app::SHORTCUT_HELP_PAGE_COUNT;
+                let overlay_area = questline::screens::intro::centered_rect(88, 82, size);
                 f.render_widget(Clear, overlay_area);
                 f.render_widget(Block::default().style(Style::default().bg(theme.background)), overlay_area);
 
+                let page = app.shortcut_help_page.min(SHORTCUT_HELP_PAGE_COUNT - 1);
+                let (page_title, entries): (&str, Vec<(&str, &str)>) = match page {
+                    0 => ("Global conventions", vec![
+                        ("GLOBAL · AVAILABLE OUTSIDE TEXT FIELDS", ""),
+                        ("F1", "Open or close this shortcut reference"),
+                        ("?", "Open the About tab"),
+                        ("Ctrl+P / Ctrl+K / :", "Open the command palette"),
+                        ("/", "Search everywhere"),
+                        ("Ctrl+N", "Create a quick Scroll"),
+                        ("Ctrl+T", "Create a Quest"),
+                        ("Ctrl+Y", "Sync now"),
+                        ("1–9", "Open a main section (outside Campaign Workspace)"),
+                        ("q / Q", "Quit safely and sync before exit"),
+                        ("", ""),
+                        ("CONSISTENT LOCAL CONVENTIONS", ""),
+                        ("↑ ↓ / j k", "Move through lists"),
+                        ("← → / h l", "Move between panes or choices"),
+                        ("Enter", "Open, edit, or confirm the selected item"),
+                        ("Space", "Toggle the selected item"),
+                        ("Tab / Shift+Tab", "Next / previous pane or form field"),
+                        ("n / e / Delete", "New / edit / remove in the active screen"),
+                        ("Esc", "Close, cancel, or return to the parent view"),
+                        ("", "Plain letters are local; media controls only work in Soundscapes."),
+                    ]),
+                    1 => ("Home & Campaigns", vec![
+                        ("DASHBOARD", ""),
+                        ("↑ ↓ / j k", "Select a Quest or Sidequest"),
+                        ("Enter", "Open the selected Quest"),
+                        ("Space", "Complete / reopen the selection"),
+                        ("n", "Create a Sidequest"),
+                        ("r", "Write the daily reflection"),
+                        ("w", "Water The Evergrowth"),
+                        ("h", "Open hydration settings"),
+                        ("o", "Open the planned Main Quest"),
+                        ("e", "Cycle the ambient effect"),
+                        ("m", "Cycle Dashboard layout"),
+                        ("z / Z", "Defer selected Quest one day / one week"),
+                        ("Delete", "Remove selected Sidequest"),
+                        ("", ""),
+                        ("CAMPAIGNS", ""),
+                        ("↑ ↓ / j k", "Select All Campaigns or a Campaign"),
+                        ("Enter", "Open the selected Campaign"),
+                        ("n / e", "Create / edit a Campaign"),
+                        ("d", "Archive the selected Campaign"),
+                        ("A", "Open archived Campaigns"),
+                        ("f", "Start Focus for the selected Campaign"),
+                        ("t", "Create a Campaign from a template"),
+                        ("C", "Open the Campaign calendar"),
+                        ("s / S", "Share the selected Campaign"),
+                        ("Delete", "Delete an archived Campaign"),
+                    ]),
+                    2 => ("Campaign · Overview & Quests", vec![
+                        ("CAMPAIGN NAVIGATION", ""),
+                        ("1–6", "Overview, Quests, Scrolls, Treasury, Atlas, Chronicles"),
+                        ("Tab / Shift+Tab", "Cycle sidebar and content panes"),
+                        ("↑ ↓ / j k", "Select an item"),
+                        ("C", "Open Quest calendar"),
+                        ("B", "Open Council Briefing (shared Campaign)"),
+                        ("/", "Search within the Campaign"),
+                        ("Esc", "Step back, then leave the Campaign"),
+                        ("", ""),
+                        ("OVERVIEW / MILESTONES", ""),
+                        ("m", "Create a Milestone"),
+                        ("Space", "Complete / reopen a Milestone"),
+                        ("Delete", "Remove a Milestone"),
+                        ("c", "Conquer the Campaign"),
+                        ("", ""),
+                        ("QUESTS / STEPS", ""),
+                        ("n / e / Delete", "Create / edit / remove"),
+                        ("Enter", "Edit in Ledger; open steps in Kanban"),
+                        ("Space", "Complete / reopen"),
+                        ("→ / ←", "Open steps / return to Quests"),
+                        ("+", "Add a step"),
+                        ("m", "Move to top level or into another Quest"),
+                        ("f / s", "Cycle filter / sort"),
+                        ("g / Shift+G", "Advance / reverse Quest stance"),
+                        ("K / L", "Toggle Kanban / link blockers"),
+                        ("a / c", "Assign / open Quest Council when shared"),
+                    ]),
+                    3 => ("Campaign · Scrolls, Treasury & Atlas", vec![
+                        ("SCROLLS / CODEX", ""),
+                        ("n / Enter", "New Scroll / open selected Scroll or Codex"),
+                        ("e / Delete", "Edit or rename / remove"),
+                        ("d", "Create a Codex"),
+                        ("r", "Move a Scroll or Codex"),
+                        ("← →", "Parent / child Codex"),
+                        ("s", "Share selected Scroll"),
+                        ("", ""),
+                        ("CHRONICLES", ""),
+                        ("n / e / Delete", "Create / edit / remove an entry"),
+                        ("v", "Change entry visibility"),
+                        ("", ""),
+                        ("TREASURY", ""),
+                        ("n / e / d", "Record / edit / delete an entry"),
+                        ("a / p", "Approve / settle an entry"),
+                        ("B / c / A", "Budgets / categories / add account"),
+                        ("E", "View all accounts and edit name / type"),
+                        ("$", "Switch currency"),
+                        ("f / F / g / s", "Filter type / status / account; sort"),
+                        ("x", "Export ledger"),
+                        ("", ""),
+                        ("ATLAS / CARTOGRAPHER", ""),
+                        ("n / a", "New sibling (or Chart) / child branch"),
+                        ("Enter / Space", "Fold / mark a branch"),
+                        ("e / Delete", "Rename / remove"),
+                        ("J / K", "Move among siblings"),
+                        ("y / x", "Copy / export the active Chart"),
+                        ("t / # / Alt+↑ ↓", "Cycle mark / number siblings / adjust stars"),
+                        ("H / Ctrl+H / B", "Hide branch / show hidden / color subtree"),
+                        ("Ctrl+arrows / c / C", "Pan view / center / lock active at center"),
+                        ("m or ~ / g / G", "Root / first / last branch"),
+                        ("w W / z Z / |", "Node width / line spacing / aligned levels"),
+                    ]),
+                    4 => ("Character, Library & Focus", vec![
+                        ("CHARACTER", ""),
+                        ("Tab / Shift+Tab", "Cycle character panes"),
+                        ("↑ ↓ / j k", "Navigate the focused pane"),
+                        ("← → / h l", "Change the active choice"),
+                        ("s", "Choose specialization when available"),
+                        ("t", "Change title when available"),
+                        ("", ""),
+                        ("LIBRARY", ""),
+                        ("Tab / Shift+Tab", "Cycle Library columns"),
+                        ("↑ ↓ / j k", "Select an entry"),
+                        ("Enter / Space", "Start or inspect the selection"),
+                        ("g", "Open Legendary Relics"),
+                        ("", ""),
+                        ("LEGENDS", ""),
+                        ("↑ ↓ / j k", "Browse Legendary Relics"),
+                        ("", ""),
+                        ("ARCHIVE", ""),
+                        ("↑ ↓ / j k", "Select an archived Campaign"),
+                        ("r", "Restore selected Campaign"),
+                        ("Delete", "Permanently delete selected Campaign"),
+                        ("", ""),
+                        ("FOCUS", ""),
+                        ("← → / h l", "Choose duration, Campaign, Quest, or sound"),
+                        ("↑ ↓ / j k", "Change the selected option"),
+                        ("Enter", "Start the session"),
+                        ("p", "Pause / resume an active session"),
+                        ("Esc", "Cancel or leave Focus"),
+                    ]),
+                    5 => ("Fellowship & Great Chronicle", vec![
+                        ("FELLOWSHIP", ""),
+                        ("c / i / p / a / s", "Chat / invites / companions / activity / search"),
+                        ("t / y / b", "Treasury / My Quests / notices"),
+                        ("← → / Tab", "Move between Campaigns and content"),
+                        ("↑ ↓ / j k", "Select a Campaign, message, or member"),
+                        ("Enter", "Compose, open, or activate the selection"),
+                        ("v", "Share a Campaign"),
+                        ("K", "Open the selected Campaign in Kanban"),
+                        ("r", "React to chat or refresh companions"),
+                        ("x", "Remove selected companion (owner)"),
+                        ("f / u / A", "Filter notices / toggle unread / mark all read"),
+                        ("", ""),
+                        ("GREAT CHRONICLE", ""),
+                        ("Tab / ← →", "Switch Realm feed and chapter panel"),
+                        ("↑ ↓ / j k", "Scroll the focused panel"),
+                        ("r / R", "Refresh Realm activity"),
+                        ("p / P", "Cycle Chronicle privacy"),
+                        ("x / X", "Replay Story So Far and Chapter One"),
+                    ]),
+                    6 => ("Soundscapes, Settings & About", vec![
+                        ("SOUNDSCAPES · MEDIA KEYS ARE LOCAL HERE", ""),
+                        ("← → / ↑ ↓", "Select a soundscape"),
+                        ("Enter", "Play selected soundscape"),
+                        ("p / s", "Pause / stop"),
+                        ("b / n", "Previous / next media or local track"),
+                        ("j / k", "Select local tracks"),
+                        ("r", "Random local-folder playback"),
+                        ("f", "Choose local music folder"),
+                        ("+ / - / *", "Volume up / down / reset to 50%"),
+                        ("", ""),
+                        ("SETTINGS", ""),
+                        ("Tab / Shift+Tab", "Cycle settings groups"),
+                        ("↑ ↓ / j k", "Select a setting"),
+                        ("← → / Enter / Space", "Change or toggle a setting"),
+                        ("+ / -", "Increase / decrease the selected value"),
+                        ("n", "Cycle the selected notification option"),
+                        ("", ""),
+                        ("SYNC", ""),
+                        ("Enter", "Sync now"),
+                        ("s / a", "Toggle cloud sync / automatic sync"),
+                        ("n / t / T", "OS alerts / task alerts / test alert"),
+                        ("c / u", "Copy Companion Key / edit server URL"),
+                        ("b / r / R", "Cloud backup / restore / reset"),
+                        ("e / i", "Export / import profile"),
+                        ("p / C", "Prune old Quests / clean local sync history"),
+                        ("", "ABOUT: use r to send a bug or feedback report."),
+                    ]),
+                    7 => ("Scroll Editor", vec![
+                        ("INSERT MODE", ""),
+                        ("Type / Enter / Backspace", "Edit text normally"),
+                        ("Ctrl+S", "Save"),
+                        ("Ctrl+Z / Ctrl+R", "Undo / redo"),
+                        ("Ctrl+C / Ctrl+X / Ctrl+V", "Copy / cut / paste"),
+                        ("Esc", "Return to Normal mode"),
+                        ("", ""),
+                        ("NORMAL MODE · VIM-STYLE", ""),
+                        ("h j k l / arrows", "Move cursor"),
+                        ("i / a / I / A", "Enter Insert mode"),
+                        ("o / O", "Open a line below / above"),
+                        ("w / b / e", "Move by word"),
+                        ("0 / $ / gg / G", "Move to line/file edges"),
+                        ("x / X / dd / dw / d$", "Delete"),
+                        ("cc / cw / c$ / ciw", "Change"),
+                        ("yy / Y", "Yank line"),
+                        ("p / P", "Paste after / before"),
+                        ("u / Ctrl+R", "Undo / redo"),
+                        ("v / V", "Character / line Visual mode"),
+                        ("?", "Open the editor-specific help"),
+                        ("Esc", "Close a clean editor from Normal mode"),
+                    ]),
+                    _ => ("Welcome, forms & mini-games", vec![
+                        ("WELCOME / RESTORE / ONBOARDING", ""),
+                        ("Tab / Shift+Tab", "Move between fields"),
+                        ("↑ ↓ / ← →", "Move through choices"),
+                        ("Enter / Space", "Select or continue"),
+                        ("Esc", "Return to the previous step"),
+                        ("q", "Quit from the Gateway"),
+                        ("", ""),
+                        ("DIALOGS & FORMS", ""),
+                        ("Tab / Shift+Tab", "Next / previous field"),
+                        ("↑ ↓ / ← →", "Select or adjust a value"),
+                        ("Enter", "Confirm, advance, or save"),
+                        ("Esc", "Cancel or close"),
+                        ("Ctrl+Backspace", "Delete the previous word in text fields"),
+                        ("y / n", "Confirm / decline yes-no dialogs"),
+                        ("", ""),
+                        ("THE GREAT BACKLOG / ARCHIVE GAME", ""),
+                        ("?", "Open the game-specific command help"),
+                        ("Type commands + Enter", "Act in The Great Backlog"),
+                        ("arrows / h j k l", "Move in the Archive game"),
+                        ("p", "Use class power in the Archive game"),
+                        ("q / Esc", "Leave a mini-game"),
+                    ]),
+                };
+
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
-                    .title(Span::styled(" Keyboard Shortcuts (Esc/Enter/Space to close) ", Style::default().fg(Color::White).add_modifier(Modifier::BOLD)));
+                    .title(Span::styled(
+                        format!(" Shortcuts · {} · {}/{} ", page_title, page + 1, SHORTCUT_HELP_PAGE_COUNT),
+                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ));
 
-                let mut lines = vec![
-                    Line::from(Span::styled("Global Shortcuts:", Style::default().fg(theme.primary).add_modifier(Modifier::UNDERLINED | Modifier::BOLD))),
-                    Line::from("  Ctrl+P / : / Ctrl+K / F1  Command Palette (Fuzzy Navigation & Commands)"),
-                    Line::from("  Ctrl+N       Quick Note (title, campaign, then scroll editor)"),
-                    Line::from("  ?            Show Keyboard Shortcuts Help (Context-Sensitive)"),
-                    Line::from("  1-9          Switch sections directly"),
-                    Line::from("  Swipe ← / →  Two-finger swipe: previous/next section"),
-                    Line::from("  Tab          Cycle input focus/fields"),
-                    Line::from("  Shift+Tab    Cycle fields backwards"),
-                    Line::from("  q / Q        Quit (seals Chronicle + syncs before exit)"),
-                    Line::from(""),
-                ];
-
-                // Los shortcuts de contexto cambian según qué pantalla y hasta qué tab está activo
-                lines.push(Line::from(Span::styled(
-                    format!("Context Shortcuts (Active Screen: {:?}):", app.active_screen),
-                    Style::default().fg(theme.secondary).add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
-                )));
-
-                match app.active_screen {
-                    ActiveScreen::Dashboard => {
-                        lines.push(Line::from("  Ctrl+N       Write a Quick Note"));
-                        lines.push(Line::from("  w            Water The Evergrowth (Growth & XP)"));
-                        lines.push(Line::from("  f            Quick start Focus Session"));
-                        lines.push(Line::from("  m            Cycle Dashboard Layout"));
-                    }
-                    ActiveScreen::Projects => {
-                        lines.push(Line::from("  n            Create a New Project"));
-                        lines.push(Line::from("  e            Edit selected Project"));
-                        lines.push(Line::from("  a            Archive selected Project"));
-                        lines.push(Line::from("  c            Mark selected Project as Complete"));
-                    }
-                    ActiveScreen::Workspace => {
-                        lines.push(Line::from("  Workspace Tabs: Tasks (0) | Notes (1) | Journal (2) | Milestones (3)"));
-                        match app.workspace_tab_idx {
-                            0 => {
-                                lines.push(Line::from("  n            Create New Task"));
-                                lines.push(Line::from("  e            Edit selected Task"));
-                                lines.push(Line::from("  d            Delete selected Task"));
-                                lines.push(Line::from("  c            Toggle Task completed status (Earn XP!)"));
-                                lines.push(Line::from("  s            Cycle Task sorting method (DueDate -> Priority -> CreatedDate)"));
-                                lines.push(Line::from("  f            Toggle Tasks filter (All -> Incomplete -> Completed)"));
-                            }
-                            1 => {
-                                lines.push(Line::from("  n            Create New Note (in current codex if one is selected)"));
-                                lines.push(Line::from("  Enter        Open selected Note in Editor / Drill into Codex"));
-                                lines.push(Line::from("  e            Rename selected Codex"));
-                                lines.push(Line::from("  r            Move Scroll to a campaign/codex, or move a Codex"));
-                                lines.push(Line::from("  d            Create new Codex (sub-codex if inside one)"));
-                                lines.push(Line::from("  →            Drill into selected Codex"));
-                                lines.push(Line::from("  ←  / Esc    Go back up one Codex level"));
-                                lines.push(Line::from("  Del          Remove selected Note or Codex"));
-                                lines.push(Line::from("  s            Open Note Sharing modal (Multi-device Sync)"));
-                            }
-                            2 => {
-                                lines.push(Line::from("  n            Create New Journal Entry (Reflections)"));
-                                lines.push(Line::from("  v            Toggle Journal Visibility (Public / Personal)"));
-                            }
-                            3 => {
-                                lines.push(Line::from("  m            Create New Milestone for this project"));
-                                lines.push(Line::from("  c            Toggle Milestone completed status"));
-                            }
-                            _ => {}
-                        }
-                    }
-                    ActiveScreen::Fellowship => {
-                        lines.push(Line::from("  p            Switch to Fellowship Companions Presence list"));
-                        lines.push(Line::from("  m            Switch to Project Chronicle Chat Messages"));
-                        lines.push(Line::from("  i            Switch to Fellowship Invitations tab"));
-                        lines.push(Line::from("  a            Switch to Activity Log tab"));
-                        lines.push(Line::from("  n            Write/Post a new chat message to the Chronicle"));
-                    }
-                    ActiveScreen::Soundscapes => {
-                        lines.push(Line::from("  p            Pause current ambient soundscape"));
-                        lines.push(Line::from("  s            Stop playing soundscape"));
-                        lines.push(Line::from(
-                            "  Left/Right   Cycle through available Soundscapes",
-                        ));
-                        lines.push(Line::from("  Up/Down      Cycle through available Soundscapes"));
-                        lines.push(Line::from("  j / k        Select local tracks"));
-                        lines.push(Line::from("  r            Random local folder playback"));
-                        lines.push(Line::from("  b / n        Previous / next media or local track"));
-                        lines.push(Line::from("  + / *        Increase audio volume"));
-                        lines.push(Line::from("  -            Decrease audio volume"));
-                    }
-
-                    ActiveScreen::Legends => {
-                        lines.push(Line::from("  j / k / Up/Down  Scroll and inspect your collection of Legendary Relics"));
-                    }
-                    ActiveScreen::GreatChronicle => {
-                        lines.push(Line::from("  ↑ / ↓        Scroll the realm achievement feed"));
-                        lines.push(Line::from("  R            Refresh — pull latest entries from the server"));
-                        lines.push(Line::from("  P            Cycle privacy level (off / everything)"));
-                        lines.push(Line::from("  X            Replay the Story So Far & Chapter One prologue"));
-                    }
-                    _ => {
-                        lines.push(Line::from("  Esc          Return to parent view"));
+                let mut lines = Vec::new();
+                for (key, description) in entries {
+                    if description.is_empty() && !key.is_empty() {
+                        lines.push(Line::from(Span::styled(
+                            key,
+                            Style::default().fg(theme.secondary).add_modifier(Modifier::BOLD),
+                        )));
+                    } else if key.is_empty() {
+                        lines.push(Line::from(Span::styled(description, Style::default().fg(Color::Rgb(130, 130, 130)))));
+                    } else {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("  {:<22}", key), Style::default().fg(theme.primary).add_modifier(Modifier::BOLD)),
+                            Span::styled(description, Style::default().fg(Color::White)),
+                        ]));
                     }
                 }
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "←/→ or Tab: change page   Home: global   F1/Esc/Enter: close",
+                    Style::default().fg(Color::Rgb(140, 140, 140)),
+                )));
 
                 let p = Paragraph::new(lines)
                     .block(block)
@@ -3034,7 +3239,7 @@ async fn main() -> Result<()> {
 
                 let block = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Double)
+                    .border_type(BorderType::Thick)
                     .border_style(Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))
                     .title(Span::styled(
                         " Send Report to Questline ",

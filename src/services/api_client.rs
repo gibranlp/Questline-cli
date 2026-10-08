@@ -106,6 +106,7 @@ impl ApiClient {
         };
 
         let result = req
+            .timeout(std::time::Duration::from_secs(30))
             .set("X-User-Id", &self.identity.user_uuid.to_string())
             .set("X-Identity", &self.identity.public_key)
             .set("X-Device-Id", &self.device_id)

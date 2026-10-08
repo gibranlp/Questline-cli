@@ -2527,6 +2527,8 @@ function is_project_scoped_sync_type($entityType) {
         'milestone',
         'focus_session',
         'codex',
+        'atlas_chart',
+        'atlas_node',
         'task_assignment',
         'task_status',
         'task_comment',

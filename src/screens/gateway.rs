@@ -108,7 +108,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) -> 
     let (border0, btype0, title0) = if sel0 {
         (
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            BorderType::Double,
+            BorderType::Thick,
             " ▸  NEW ADVENTURER  ◂ ",
         )
     } else {
@@ -156,7 +156,7 @@ pub fn draw(f: &mut Frame, selected_idx: usize, ticks: usize, theme: &Theme) -> 
     let (border1, btype1, title1) = if sel1 {
         (
             Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            BorderType::Double,
+            BorderType::Thick,
             " ▸  CONTINUE THE ADVENTURE  ◂ ",
         )
     } else {

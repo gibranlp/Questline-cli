@@ -453,7 +453,7 @@ pub fn draw(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!app.chapter_panel_focused))
                 .border_style(left_border_style)
                 .title(Span::styled(
                     " Realm Activity ",
@@ -471,7 +471,7 @@ pub fn draw(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(app.chapter_panel_focused))
                     .border_style(right_border_style)
                     .title(Span::styled(
                         " Chapter History ",
@@ -501,7 +501,7 @@ pub fn draw(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(app.chapter_panel_focused))
                     .border_style(right_border_style)
                     .title(Span::styled(
                         chapter_title_str,
@@ -524,7 +524,7 @@ pub fn draw(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(app.chapter_panel_focused))
                     .border_style(right_border_style)
                     .title(Span::styled(
                         " Progress ",
@@ -545,7 +545,7 @@ pub fn draw(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(app.chapter_panel_focused))
                     .border_style(right_border_style)
                     .title(Span::styled(
                         " Objectives ",
@@ -567,7 +567,7 @@ pub fn draw(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(app.chapter_panel_focused))
                 .border_style(right_border_style)
                 .title(Span::styled(
                     " No Active Chapter ",

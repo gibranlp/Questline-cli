@@ -366,7 +366,7 @@ pub fn draw(
     };
     let log_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(character_focus == 0))
         .border_style(log_border_style)
         .title(" Adventure Log Book (Up/Down to scroll) ");
 
@@ -505,7 +505,7 @@ pub fn draw(
         };
         let list_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(character_focus == 1))
             .border_style(list_border_style)
             .title(" Entries ");
         let ref_list_inner = list_block.inner(ref_sub_chunks[0]);
@@ -517,7 +517,7 @@ pub fn draw(
         };
         let detail_block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(character_focus == 2))
             .border_style(detail_border_style)
             .title(" Reflection Detail ");
 

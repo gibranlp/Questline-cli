@@ -4,6 +4,7 @@
 
 use crate::app::{App, ModalType, extract_url};
 use crate::screens::hit_test::FellowshipHitRegions;
+use crate::screens::editor::{mode_style, render_body_line};
 use crate::theme::Theme;
 use ratatui::{
     Frame,
@@ -136,7 +137,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
     };
     let left_border = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(left_focused))
         .border_style(Style::default().fg(left_border_color))
         .title(Span::styled(
             " Shared Fellowship Campaigns",
@@ -178,7 +179,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
         " [i] Invites ",
         " [p] Companions ",
         " [a] Activity ",
-        " [/] Search ",
+        " [s] Search ",
         " [y] My Quests ",
         " [b] Council ",
         " [t] Treasury ",
@@ -324,7 +325,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
 
                 let notif_border = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left))
                     .border_style(Style::default().fg(accent_color))
                     .title(Span::styled(
                         " Fellowship Notification Center ",
@@ -363,7 +364,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                 // Split right panel: messages on top, input bar on bottom
                 let chat_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([Constraint::Min(3), Constraint::Length(3)])
+                    .constraints([Constraint::Min(3), Constraint::Length(if app.fellowship_composing { 8 } else { 3 })])
                     .split(right_chunks[1]);
 
                 // Construimos las líneas del chat — también guardamos en qué línea empieza cada msg
@@ -461,7 +462,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
 
                             // Detección de URLs — si hay link, se pinta en cyan con underline
                             let content = &msg.4;
-                            let has_url = extract_url(content).is_some();
+                            for content_line in content.split('\n') {
+                            let has_url = extract_url(content_line).is_some();
                             let mut content_spans = vec![Span::styled(
                                 if is_selected { "▌ " } else { "  " },
                                 Style::default()
@@ -474,7 +476,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                             )];
                             if has_url {
                                 // Partimos el contenido palabra por palabra para colorear solo las URLs
-                                for word in content.split(' ') {
+                                for word in content_line.split(' ') {
                                     let is_url =
                                         word.starts_with("http://") || word.starts_with("https://");
                                     if is_url {
@@ -509,7 +511,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                                 }
                             } else {
                                 content_spans.push(Span::styled(
-                                    content.as_str(),
+                                    content_line,
                                     Style::default()
                                         .fg(if is_selected {
                                             selected_fg
@@ -520,6 +522,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                                 ));
                             }
                             chat_lines.push(Line::from(content_spans));
+                            }
 
                             // Reactions line (only if there are reactions or it's selected)
                             if !reactions.is_empty() {
@@ -595,7 +598,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                 let chat_title = format!(" Chronicle: {}  {}", current_proj.name, online_badge);
                 let chat_border = Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left && !app.fellowship_composing))
                     .border_style(Style::default().fg(chat_border_color))
                     .title(vec![
                         Span::styled(
@@ -646,21 +649,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                         " Browse ",
                     )
                 } else if app.fellowship_composing {
-                    // Cursor parpadeante — alterna cada 500ms usando el timestamp del sistema
-                    let cursor = if (std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis()
-                        / 500)
-                        % 2
-                        == 0
-                    {
-                        "█"
-                    } else {
-                        " "
-                    };
                     (
-                        format!("  > {}{}", app.fellowship_chat_input, cursor),
+                        app.fellowship_chat_input.clone(),
                         accent_color,
                         " Compose ",
                     )
@@ -672,10 +662,33 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                     )
                 };
 
+                if let Some(editor) = app.fellowship_editor.as_ref().filter(|_| app.fellowship_composing) {
+                    let width = chat_chunks[1].width.saturating_sub(2) as usize;
+                    let height = chat_chunks[1].height.saturating_sub(2) as usize;
+                    let mut rows = Vec::new();
+                    let mut cursor_row = 0;
+                    for (index, line) in editor.lines.iter().enumerate() {
+                        if index == editor.cursor_y {
+                            cursor_row = rows.len() + crate::screens::text_wrap::wrap_with_cursor(line, editor.cursor_x, width).cursor_row;
+                        }
+                        let styled = render_body_line(line, index, editor, theme);
+                        rows.extend(crate::screens::text_wrap::split_styled_line(&styled, width));
+                    }
+                    let scroll = cursor_row.saturating_sub(height.saturating_sub(1));
+                    let lines = rows.into_iter().skip(scroll).take(height).collect::<Vec<_>>();
+                    let mode = &editor.mode;
+                    let input_p = Paragraph::new(lines).block(
+                        Block::default().borders(Borders::ALL).border_type(crate::ui::focus_border_type(!app.fellowship_focus_left && app.fellowship_composing))
+                            .border_style(Style::default().fg(input_border_color))
+                            .title(Span::styled(format!(" {} ", mode.label()), mode_style(mode, theme)))
+                            .title(Span::styled("  Chronicle message · Ctrl+S / Normal Enter send ", Style::default().fg(theme.muted))),
+                    );
+                    f.render_widget(input_p, chat_chunks[1]);
+                } else {
                 let input_p = Paragraph::new(input_text).block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
+                        .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left && app.fellowship_composing))
                         .border_style(Style::default().fg(input_border_color))
                         .title(Span::styled(
                             input_title,
@@ -683,6 +696,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
                         )),
                 );
                 f.render_widget(input_p, chat_chunks[1]);
+                }
             }
         }
         1 => {
@@ -737,7 +751,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
 
             let invite_border = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left))
                 .border_style(Style::default().fg(accent_color))
                 .title(Span::styled(
                     " Shared Fellowship Invitations ",
@@ -867,7 +881,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
             let comp_title = format!(" {} — Members ", proj_name);
             let comp_border = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left))
                 .border_style(Style::default().fg(accent_color))
                 .title(Span::styled(
                     comp_title,
@@ -1094,7 +1108,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
             };
             let quests_border = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left))
                 .border_style(Style::default().fg(accent_color))
                 .title(Span::styled(
                     format!(" My Quests — {} assigned ", assigned_tasks.len()),
@@ -1172,7 +1186,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
             }
             let notices_border = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!app.fellowship_focus_left))
                 .border_style(Style::default().fg(accent_color))
                 .title(format!(
                     " Council Notices — {} unread · Filter: {} ",
@@ -1221,7 +1235,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
             } else if app.fellowship_focus_left {
                 " [↑↓/jk] campaign  |  [Enter/→/l] chat  |  [K] Kanban  |  [v/V] share  |  [Esc] back"
             } else if app.fellowship_composing {
-                " Type your message  |  [Enter] send  |  [Esc] cancel compose"
+                " Vim: i/a edit · v select · y copy · p paste  |  Ctrl+S / Normal Enter send  |  Esc normal/cancel"
             } else {
                 " [Enter] compose  |  [↑↓/jk] messages  |  [K] Kanban  |  [←/h] campaigns  |  [c/i/p/a] tabs"
             }
@@ -1229,7 +1243,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> FellowshipHi
         1 => " [Enter] accept invitation  |  [d] decline invitation  |  [Esc] back",
         2 => " [↑↓] select companion  |  [x] remove + rotate key  |  [r] refresh  |  [Esc] back",
         3 => " [Esc] back",
-        4 => " [/] new search  |  [Esc] back",
+        4 => " [s] new search  |  [Esc] back",
         5 => " [↑↓] select assigned quest  |  [Enter] open campaign  |  [Esc] back",
         6 => " [↑↓] choose · [Enter] open · [f] filter · [u] unread · [A] all read ",
         7 => " [↑↓/jk] campaign  |  [K] open workspace to edit  |  [Esc] back",

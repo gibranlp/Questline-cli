@@ -254,7 +254,7 @@ pub fn draw(
     };
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(list_border_style)
         .title(" Active Campaigns");
     let list_inner = list_block.inner(body_chunks[0]);
@@ -733,7 +733,7 @@ fn draw_project_modal(
 
     let main_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             title,
@@ -779,7 +779,7 @@ fn draw_project_modal(
     let name_p = Paragraph::new(Line::from(name_spans)).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(focus_idx == 0))
             .border_style(name_border_style)
             .title(" Quest Name "),
     );
@@ -803,7 +803,7 @@ fn draw_project_modal(
     let desc_p = Paragraph::new(desc_lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(focus_idx == 1))
             .border_style(desc_border_style)
             .title(" Description "),
     );

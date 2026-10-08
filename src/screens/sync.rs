@@ -410,7 +410,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
 
     let left_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Questline Sync Node Settings ",
@@ -888,7 +888,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Double)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(theme.warning))
             .title(Span::styled(
                 " Edit Sync Server URL ",
@@ -937,7 +937,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Double)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(accent_color))
             .title(Span::styled(
                 " Export Profile — Transfer Code ",
@@ -1087,7 +1087,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Double)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(theme.warning))
             .title(Span::styled(
                 " Restore Identity — Paste Transfer Code ",
@@ -1218,7 +1218,7 @@ fn draw_cloud_progress_modal(
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(border_color))
         .title(Span::styled(
             title,

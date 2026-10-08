@@ -80,7 +80,7 @@ pub fn draw(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(focus == OnboardingFocus::NameInput))
                 .border_style(name_border_style)
                 .title(" Declare Your Name "),
         )
@@ -136,7 +136,7 @@ pub fn draw(
 
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(focus == OnboardingFocus::ClassSelect))
         .border_style(list_border_style)
         .title(" Select RPG Class ");
     let list_inner = list_block.inner(body_chunks[0]);

@@ -520,6 +520,14 @@ impl Theme {
         let selection = role("accent")?;
         let success = role("success")?;
         let accent_alt = role("accent_alt")?;
+        let muted = role("muted")?;
+        let text = role("foreground")?;
+        let backgrounds = [role("background")?, role("surface")?, role("surface_alt")?];
+        let border = if backgrounds.iter().all(|background| color_contrast(muted, *background) >= 3.0) {
+            muted
+        } else {
+            text
+        };
 
         Some(Self {
             primary: selection,
@@ -527,11 +535,11 @@ impl Theme {
             background: role("background")?,
             surface: role("surface")?,
             panel: role("surface_alt")?,
-            border: role("surface_alt")?,
+            border,
             selection,
             selection_text: readable_text_on(selection),
-            text: role("foreground")?,
-            muted: role("muted")?,
+            text,
+            muted,
             success,
             warning: role("warning")?,
             danger: role("error")?,
@@ -696,9 +704,9 @@ fn hex_color(input: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
-fn readable_text_on(color: Color) -> Color {
+fn color_luminance(color: Color) -> Option<f64> {
     let Color::Rgb(r, g, b) = color else {
-        return Color::Black;
+        return match color { Color::Black => Some(0.0), Color::White => Some(1.0), _ => None };
     };
     let channel = |value: u8| {
         let value = value as f64 / 255.0;
@@ -708,7 +716,18 @@ fn readable_text_on(color: Color) -> Color {
             ((value + 0.055) / 1.055).powf(2.4)
         }
     };
-    let luminance = 0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b);
+    Some(0.2126 * channel(r) + 0.7152 * channel(g) + 0.0722 * channel(b))
+}
+
+fn color_contrast(first: Color, second: Color) -> f64 {
+    let (Some(first), Some(second)) = (color_luminance(first), color_luminance(second)) else {
+        return 1.0;
+    };
+    (first.max(second) + 0.05) / (first.min(second) + 0.05)
+}
+
+fn readable_text_on(color: Color) -> Color {
+    let Some(luminance) = color_luminance(color) else { return Color::Black; };
     let black_contrast = (luminance + 0.05) / 0.05;
     let white_contrast = 1.05 / (luminance + 0.05);
     if black_contrast >= white_contrast {
@@ -754,6 +773,30 @@ mod tests {
         assert_eq!(theme.warning, Color::Rgb(122, 82, 0));
         assert_eq!(theme.danger, Color::Rgb(163, 41, 61));
         assert_eq!(theme.selected_fg(), Color::White);
+    }
+
+    #[test]
+    fn spectrum_borders_are_visible_on_every_panel() {
+        let dark = LIGHT_SPECTRUM
+            .replace("#f7f8fb", "#261b01")
+            .replace("#eef1f6", "#30300a")
+            .replace("#e1e6ee", "#503a10")
+            .replace("#1c2430", "#edeed3")
+            .replace("#566273", "#bca888");
+        for palette in [LIGHT_SPECTRUM, dark.as_str()] {
+            let theme = Theme::from_spectrum_json(palette).unwrap();
+            for background in [theme.background, theme.surface, theme.panel] {
+                assert!(color_contrast(theme.border, background) >= 3.0);
+            }
+        }
+    }
+
+    #[test]
+    fn spectrum_border_uses_text_when_muted_is_too_faint() {
+        let palette = LIGHT_SPECTRUM.replace("#566273", "#e1e6ee");
+        let theme = Theme::from_spectrum_json(&palette).unwrap();
+        assert_eq!(theme.border, theme.text);
+        assert!(color_contrast(theme.border, theme.panel) >= 3.0);
     }
 
     #[test]

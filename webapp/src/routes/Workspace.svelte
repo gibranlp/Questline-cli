@@ -7,6 +7,7 @@
   import Modal from '../components/Modal.svelte';
   import MarkdownEditor from '../components/MarkdownEditor.svelte';
   import CodexTree from '../components/CodexTree.svelte';
+  import Atlas from '../components/Atlas.svelte';
   import { listRotationMembers } from '../lib/fellowship.js';
 
   export let projectId;
@@ -101,7 +102,7 @@
     return events;
   })();
 
-  let tab = 'tasks'; // tasks | notes | journal | overview | chronicle
+  let tab = 'tasks'; // tasks | notes | journal | atlas | overview | chronicle
   let showNewTask = false;
   let showNewNote = false;
   let showNewJournal = false;
@@ -259,6 +260,7 @@
       <button class="tab" class:active={tab === 'tasks'} on:click={() => tab = 'tasks'}>Quests</button>
       <button class="tab" class:active={tab === 'notes'} on:click={() => tab = 'notes'}>Scrolls</button>
       <button class="tab" class:active={tab === 'journal'} on:click={() => tab = 'journal'}>Journal</button>
+      <button class="tab" class:active={tab === 'atlas'} on:click={() => tab = 'atlas'}>Atlas</button>
       <button class="tab" class:active={tab === 'overview'} on:click={() => tab = 'overview'}>Overview</button>
       <button class="tab" class:active={tab === 'chronicle'} on:click={() => tab = 'chronicle'}>Chronicle</button>
     </div>
@@ -330,6 +332,9 @@
           {/if}
         </div>
       </div>
+    {:else if tab === 'atlas'}
+      <Atlas {projectId} {api} readOnly={project.is_shared && (!myMembership || myMembership.role === 'Observer')} />
+
     {:else if tab === 'journal'}
       <div class="journal-section">
         <div class="section-header">

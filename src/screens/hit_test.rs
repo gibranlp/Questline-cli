@@ -319,6 +319,7 @@ pub struct SoundscapesHitRegions {
     pub source_list: Rect,
     pub item_count: usize,
     pub local_tracks: Option<LocalTracksHitRegions>,
+    pub folder_picker: Option<Rect>,
 }
 
 /// `screens::library::draw` — three columns (Categories / Items / Details).
@@ -477,8 +478,7 @@ pub enum FellowshipSubList {
     Chat(FellowshipChatHitRegions),
 }
 
-/// `screens::project_workspace::draw` — the 5-item sidebar (Overview /
-/// Tasks / Scrolls / Treasury / Chronicle) plus whichever of the 5 tabs'
+/// `screens::project_workspace::draw` — the workspace sidebar plus its tabs'
 /// own content lists is active. The sidebar is a plain `List`,
 /// single-line rows, no scroll — same shape as Archive/Gateway — except
 /// its *display* order isn't `workspace_tab_idx` order, so
@@ -487,7 +487,7 @@ pub enum FellowshipSubList {
 pub struct WorkspaceHitRegions {
     /// Inner sidebar list area — borders already excluded.
     pub sidebar: Rect,
-    pub sidebar_tab_order: [usize; 5],
+    pub sidebar_tab_order: [usize; 6],
     /// Overview tab's milestone list — one field per workspace tab, `None`
     /// unless that tab is the one currently rendered (and, for each, unless
     /// its list is non-empty — an empty-state placeholder row isn't real).

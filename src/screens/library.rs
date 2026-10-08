@@ -322,7 +322,7 @@ pub fn draw(
 
     let cat_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(active_col == 0))
         .border_style(Style::default().fg(if active_col == 0 {
             accent_color
         } else {
@@ -550,7 +550,7 @@ pub fn draw(
 
     let item_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(active_col == 1))
         .border_style(Style::default().fg(if active_col == 1 {
             accent_color
         } else {
@@ -584,8 +584,12 @@ pub fn draw(
     // Render Column 2: panel de detalles — bifurca entre quests y lore general
     let details_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(theme.border))
+        .border_type(crate::ui::focus_border_type(active_col == 2))
+        .border_style(Style::default().fg(if active_col == 2 {
+            accent_color
+        } else {
+            theme.border
+        }))
         .title(" Chronicle Details ");
 
     if items_lines.is_empty()

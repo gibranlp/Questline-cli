@@ -64,7 +64,7 @@ pub fn draw(
 
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.border))
         .title(" Archived Campaigns");
     let list_inner = list_block.inner(body_chunks[0]);

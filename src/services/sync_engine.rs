@@ -233,6 +233,48 @@ fn project_id_from_sync_content(
         })
 }
 
+fn apply_atlas_sync_event(
+    db: &Database,
+    entity_type: &str,
+    operation: &str,
+    entity_id: &str,
+    content: Option<&str>,
+) -> bool {
+    if operation == "delete" {
+        let table = if entity_type == "atlas_chart" { "atlas_charts" } else { "atlas_nodes" };
+        return db.conn.execute(&format!("DELETE FROM {table} WHERE id=?1"), params![entity_id]).is_ok();
+    }
+    match entity_type {
+        "atlas_chart" => serde_json::from_str::<crate::models::AtlasChart>(content.unwrap_or(""))
+            .ok()
+            .and_then(|chart| db.conn.execute(
+                "INSERT INTO atlas_charts (id,project_id,name,created_at,updated_at,owner_identity)
+                 VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET
+                 project_id=excluded.project_id,name=excluded.name,updated_at=excluded.updated_at,
+                 owner_identity=excluded.owner_identity",
+                params![chart.id.to_string(), chart.project_id.to_string(), chart.name,
+                    chart.created_at.to_rfc3339(), chart.updated_at.to_rfc3339(), chart.owner_identity],
+            ).ok())
+            .is_some(),
+        "atlas_node" => serde_json::from_str::<crate::models::AtlasNode>(content.unwrap_or(""))
+            .ok()
+            .and_then(|node| db.conn.execute(
+                "INSERT INTO atlas_nodes (id,chart_id,project_id,parent_id,title,position,collapsed,marked,created_at,updated_at,owner_identity,hidden,color)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET
+                 chart_id=excluded.chart_id,project_id=excluded.project_id,parent_id=excluded.parent_id,
+                 title=excluded.title,position=excluded.position,collapsed=excluded.collapsed,
+                 marked=excluded.marked,updated_at=excluded.updated_at,owner_identity=excluded.owner_identity,
+                 hidden=excluded.hidden,color=excluded.color",
+                params![node.id.to_string(), node.chart_id.to_string(), node.project_id.to_string(),
+                    node.parent_id.map(|id| id.to_string()), node.title, node.position,
+                    node.collapsed as i32, node.marked as i32, node.created_at.to_rfc3339(),
+                    node.updated_at.to_rfc3339(), node.owner_identity, node.hidden as i32, node.color],
+            ).ok())
+            .is_some(),
+        _ => false,
+    }
+}
+
 pub struct HttpCloudProvider {
     pub client: ApiClient,
 }
@@ -733,6 +775,16 @@ impl<'a> SyncEngine<'a> {
                     .get_note_by_id(uuid)
                     .ok()
                     .and_then(|n| serde_json::to_string(&n).ok()),
+                "atlas_chart" => crate::services::AtlasService::new(self.db)
+                    .chart(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|chart| serde_json::to_string(&chart).ok()),
+                "atlas_node" => crate::services::AtlasService::new(self.db)
+                    .node(uuid)
+                    .ok()
+                    .flatten()
+                    .and_then(|node| serde_json::to_string(&node).ok()),
                 "project" => {
                     let mut stmt = self.db.conn.prepare("SELECT id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared FROM projects WHERE id = ?1")?;
                     stmt.query_row(params![entity_id], |row| {
@@ -1777,6 +1829,8 @@ impl<'a> SyncEngine<'a> {
                 "ritual_history" => true,
                 "setting" => crate::database::is_synced_setting_key(&log.entity_id),
                 "codex" => self.incoming_entity_is_newer("codices", &log),
+                "atlas_chart" => self.incoming_entity_is_newer("atlas_charts", &log),
+                "atlas_node" => self.incoming_entity_is_newer("atlas_nodes", &log),
                 // Las sesiones de focus son inmutables una vez completadas — nunca se actualizan
                 "focus_session" => {
                     self.db
@@ -1928,6 +1982,17 @@ impl<'a> SyncEngine<'a> {
                                 .execute("DELETE FROM notes WHERE id = ?1", params![log.entity_id]);
                             pulled_count += 1;
                         }
+                        "atlas_chart" | "atlas_node" => {
+                            if apply_atlas_sync_event(
+                                self.db,
+                                &log.entity_type,
+                                "delete",
+                                &log.entity_id,
+                                None,
+                            ) {
+                                pulled_count += 1;
+                            }
+                        }
                         "project" => {
                             self.save_local_revision_before_delete("project", &log.entity_id);
                             let _ = self.db.conn.execute(
@@ -1961,10 +2026,41 @@ impl<'a> SyncEngine<'a> {
                             pulled_count += 1;
                         }
                         "treasury_account" => {
-                            let _ = self.db.conn.execute(
+                            let service = crate::services::TreasuryService::new(self.db);
+                            if let Ok(id) = Uuid::parse_str(&log.entity_id) {
+                                if service.get_account(id)?.is_some() {
+                                    if let Err(error) = service.validate_account_deletion(id) {
+                                        conflicts.push(format!("Account deletion could not be applied: {error}"));
+                                        if log.seq > 0 {
+                                            retry_from_seq = Some(retry_from_seq.map_or(log.seq, |seq| seq.min(log.seq)));
+                                        }
+                                        continue;
+                                    }
+                                }
+                            }
+                            let transaction = self.db.conn.unchecked_transaction()?;
+                            let tombstone = log.content.as_deref().and_then(|content|
+                                serde_json::from_str::<crate::models::TreasuryAccount>(content).ok());
+                            let stored = self.db.conn.execute(
                                 "DELETE FROM treasury_accounts WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            ).and_then(|count| {
+                                if let Some(account) = &tombstone {
+                                    self.db.conn.execute(
+                                        "INSERT INTO treasury_history
+                                         (id,campaign_id,entity_type,entity_id,action,snapshot,version,created_at)
+                                         VALUES (?1,?2,'treasury_account',?3,'remote_delete',?4,?5,?6)",
+                                        params![Uuid::new_v4().to_string(), account.campaign_id.to_string(),
+                                            log.entity_id, log.content.as_deref().unwrap_or("null"),
+                                            account.version + 1, log.timestamp],
+                                    )?;
+                                }
+                                Ok(count)
+                            });
+                            if Self::defer_treasury_event(&log, stored, &mut conflicts, &mut retry_from_seq) {
+                                continue;
+                            }
+                            transaction.commit()?;
                             pulled_count += 1;
                         }
                         "task_assignment" => {
@@ -2338,6 +2434,17 @@ impl<'a> SyncEngine<'a> {
                                         n.owner_identity,
                                     ],
                                 );
+                                pulled_count += 1;
+                            }
+                        }
+                        "atlas_chart" | "atlas_node" => {
+                            if apply_atlas_sync_event(
+                                self.db,
+                                &log.entity_type,
+                                &log.operation,
+                                &log.entity_id,
+                                Some(content),
+                            ) {
                                 pulled_count += 1;
                             }
                         }
@@ -4896,6 +5003,73 @@ mod tests {
         );
     }
 
+    #[test]
+    fn atlas_round_trips_through_account_encrypted_sync() {
+        let identity = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let (path_a, db_a) = treasury_test_db("atlas_sync_account_device_a");
+        let (path_b, db_b) = treasury_test_db("atlas_sync_account_device_b");
+        db_a.insert_project(&shared_campaign_project(campaign_id, &identity, false)).unwrap();
+        let atlas = crate::services::AtlasService::new(&db_a);
+        let chart = atlas.create_chart(campaign_id, "Release Paths", Some(&identity.public_key)).unwrap();
+        let root = atlas.nodes(chart.id).unwrap()[0].clone();
+        let mut child = atlas.add_node(chart.id, Some(root.id), "Ship the beta", Some(&identity.public_key)).unwrap();
+        atlas.color_branch(root.id, Some(15)).unwrap();
+        child.hidden = true;
+        child.color = Some(15);
+        child.updated_at = Utc::now();
+        atlas.update_node(&child).unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine { db: &db_a, identity: &identity, device_id: "atlas-a", provider: Box::new(RecordingProvider { events: server.clone(), serve: false, project_scope_only: false, withhold: None }) }.sync().unwrap();
+        SyncEngine { db: &db_b, identity: &identity, device_id: "atlas-b", provider: Box::new(RecordingProvider { events: server.clone(), serve: true, project_scope_only: false, withhold: None }) }.sync().unwrap();
+
+        let received = crate::services::AtlasService::new(&db_b);
+        let charts = received.charts(campaign_id).unwrap();
+        assert_eq!(charts.len(), 1);
+        assert_eq!(charts[0].name, "Release Paths");
+        assert!(received.nodes(charts[0].id).unwrap().iter().any(|node| node.title == "Ship the beta"));
+        assert!(received.nodes(charts[0].id).unwrap().iter().all(|node| node.color == Some(15)));
+        assert!(received.node(child.id).unwrap().unwrap().hidden);
+        let wire = serde_json::to_string(&server.0.lock().unwrap().clone()).unwrap();
+        assert!(!wire.contains("Ship the beta"));
+        drop(db_a); drop(db_b);
+        let _ = std::fs::remove_file(path_a); let _ = std::fs::remove_file(path_b);
+    }
+
+    #[test]
+    fn atlas_round_trips_through_fellowship_encryption() {
+        let owner = test_identity();
+        let companion = test_identity();
+        let campaign_id = Uuid::new_v4();
+        let routing_id = Uuid::new_v4().to_string();
+        let project_key = [29u8; 32];
+        let (path_a, db_a) = treasury_test_db("atlas_sync_fellowship_owner");
+        let (path_b, db_b) = treasury_test_db("atlas_sync_fellowship_companion");
+        for db in [&db_a, &db_b] {
+            db.insert_project(&shared_campaign_project(campaign_id, &owner, true)).unwrap();
+            db.save_project_encryption_key_from_sync(&campaign_id.to_string(), &routing_id, &project_key).unwrap();
+        }
+        let atlas = crate::services::AtlasService::new(&db_a);
+        let chart = atlas.create_chart(campaign_id, "Shared Strategy", Some(&owner.public_key)).unwrap();
+        let root = atlas.nodes(chart.id).unwrap()[0].clone();
+        atlas.add_node(chart.id, Some(root.id), "Companion path", Some(&owner.public_key)).unwrap();
+
+        let server = SharedEventLog::default();
+        SyncEngine { db: &db_a, identity: &owner, device_id: "atlas-owner", provider: Box::new(RecordingProvider { events: server.clone(), serve: false, project_scope_only: true, withhold: None }) }.sync().unwrap();
+        let raw = server.0.lock().unwrap().clone();
+        let events = raw.iter().filter(|event| matches!(event.entity_type.as_str(), "atlas_chart" | "atlas_node")).collect::<Vec<_>>();
+        assert!(!events.is_empty());
+        assert!(events.iter().all(|event| event.scope == "project" && event.key_id == "project-v1" && event.routing_id == routing_id && event.content.is_none()));
+        assert!(!serde_json::to_string(&raw).unwrap().contains("Companion path"));
+
+        SyncEngine { db: &db_b, identity: &companion, device_id: "atlas-companion", provider: Box::new(RecordingProvider { events: server.clone(), serve: true, project_scope_only: true, withhold: None }) }.sync().unwrap();
+        let received = crate::services::AtlasService::new(&db_b);
+        assert!(received.nodes(chart.id).unwrap().iter().any(|node| node.title == "Companion path"));
+        drop(db_a); drop(db_b);
+        let _ = std::fs::remove_file(path_a); let _ = std::fs::remove_file(path_b);
+    }
+
     /// Campaña personal: la tesorería viaja cifrada con la llave de cuenta y llega
     /// completa al segundo dispositivo de la misma identidad.
     #[test]
@@ -4985,6 +5159,89 @@ mod tests {
         drop(db_b);
         let _ = std::fs::remove_file(&path_a);
         let _ = std::fs::remove_file(&path_b);
+    }
+
+    #[test]
+    fn treasury_account_edits_and_paid_reassignment_sync_privately_and_in_fellowships() {
+        for shared in [false, true] {
+            let owner = test_identity();
+            let companion = test_identity();
+            let receiver = if shared { &companion } else { &owner };
+            let campaign_id = Uuid::new_v4();
+            let task_id = Uuid::new_v4();
+            let (path_a, db_a) = treasury_test_db(&format!("treasury_account_edit_a_{shared}"));
+            let (path_b, db_b) = treasury_test_db(&format!("treasury_account_edit_b_{shared}"));
+            db_a.insert_project(&shared_campaign_project(campaign_id, &owner, shared)).unwrap();
+            db_a.insert_task(&campaign_task(task_id, campaign_id, &owner)).unwrap();
+            if shared {
+                db_b.insert_project(&shared_campaign_project(campaign_id, &owner, true)).unwrap();
+                let routing_id = Uuid::new_v4().to_string();
+                for db in [&db_a, &db_b] {
+                    db.save_project_encryption_key_from_sync(&campaign_id.to_string(), &routing_id, &[39u8; 32]).unwrap();
+                }
+            }
+            let (_, entry_id) = seed_treasury(&db_a, campaign_id, task_id, &owner.public_key);
+            let server = SharedEventLog::default();
+            let sync = |db: &Database, identity: &Identity, device: &str, serve: bool| {
+                let result = SyncEngine { db, identity, device_id: device, provider: Box::new(RecordingProvider {
+                    events: server.clone(), serve, project_scope_only: shared, withhold: None,
+                }) }.sync().unwrap();
+                assert!(result.2.is_empty(), "sync conflicts: {:?}", result.2);
+            };
+            sync(&db_a, &owner, "account-edit-a", false);
+            sync(&db_b, receiver, "account-edit-b", true);
+            let service = crate::services::TreasuryService::new(&db_a);
+            let bank1 = service.create_account(campaign_id, "bank1", crate::models::TreasuryAccountKind::Spending).unwrap();
+            let bank2 = service.create_account(campaign_id, "bank2", crate::models::TreasuryAccountKind::Savings).unwrap();
+            sync(&db_a, &owner, "account-edit-a", false);
+            sync(&db_b, receiver, "account-edit-b", true);
+            let mut edited = bank1.clone();
+            edited.name = "Daily bank".into();
+            edited.kind = crate::models::TreasuryAccountKind::Other;
+            let edited = service.update_account(edited).unwrap();
+            let mut moved = service.get_entry(entry_id).unwrap().unwrap();
+            let old_payment_date = moved.payment_date;
+            moved.account_id = Some(bank2.id);
+            let moved = service.update_entry(moved).unwrap();
+            sync(&db_a, &owner, "account-edit-a", false);
+            sync(&db_b, receiver, "account-edit-b", true);
+            let received = crate::services::TreasuryService::new(&db_b);
+            assert_eq!(received.get_account(bank1.id).unwrap().unwrap(), edited);
+            assert_eq!(serde_json::to_value(received.get_entry(entry_id).unwrap().unwrap()).unwrap(), serde_json::to_value(&moved).unwrap());
+            assert_eq!(moved.payment_date, old_payment_date);
+            assert_eq!(received.account_balances(campaign_id).unwrap(), service.account_balances(campaign_id).unwrap());
+            assert_eq!(received.account_balances(campaign_id).unwrap().iter().find(|b| b.account.id == bank2.id).unwrap().balance_minor, -742_55);
+            let wire = serde_json::to_string(&server.0.lock().unwrap().clone()).unwrap();
+            assert!(!wire.contains("Daily bank"));
+            sync(&db_b, receiver, "account-edit-b", true);
+            assert_eq!(received.get_account(bank1.id).unwrap().unwrap().version, 2);
+            assert_eq!(received.get_entry(entry_id).unwrap().unwrap().version, 2);
+            let unused_default = service.accounts(campaign_id).unwrap().into_iter().find(|a| a.name == "Cash").unwrap();
+            service.delete_account(unused_default.id).unwrap();
+            sync(&db_a, &owner, "account-edit-a", false);
+            sync(&db_b, receiver, "account-edit-b", true);
+            received.ensure_campaign(campaign_id).unwrap();
+            assert!(received.get_account(unused_default.id).unwrap().is_none());
+            assert!(received.get_account(bank2.id).unwrap().is_some());
+            // A transaction recorded on the other device before it receives deletion
+            // must protect that account and report the conflict.
+            let mut concurrent_entry = received.get_entry(entry_id).unwrap().unwrap();
+            concurrent_entry.id = Uuid::new_v4();
+            concurrent_entry.account_id = Some(bank1.id);
+            concurrent_entry.status = crate::models::LedgerStatus::Planned;
+            concurrent_entry.payment_date = None;
+            concurrent_entry.created_by_identity = Some(receiver.public_key.clone());
+            received.create_entry(concurrent_entry).unwrap();
+            service.delete_account(bank1.id).unwrap();
+            sync(&db_a, &owner, "account-edit-a", false);
+            let result = SyncEngine { db: &db_b, identity: receiver, device_id: "account-edit-b",
+                provider: Box::new(RecordingProvider { events: server.clone(), serve: true,
+                    project_scope_only: shared, withhold: None }) }.sync().unwrap();
+            assert!(result.2.iter().any(|message| message.contains("Account deletion could not be applied")));
+            assert!(received.get_account(bank1.id).unwrap().is_some());
+            drop(db_a); drop(db_b);
+            let _ = std::fs::remove_file(path_a); let _ = std::fs::remove_file(path_b);
+        }
     }
 
     /// Un cambio de divisa aislado —sin ningún otro movimiento después— tiene que

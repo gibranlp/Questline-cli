@@ -77,6 +77,8 @@ All platforms are supported through native installers, AppImage, and Cargo.
 ![Soundscapes](screenshots/11-music.png)
 *Ambient audio for focus — Lo-Fi, rain, forest, ocean, white noise, or your own local folder.*
 
+For local music, click **Choose folder** or **Change folder** in Local Library, or press `f` on Soundscapes. The picker starts with the saved path; `Ctrl+U` clears it, Enter saves an existing folder, and Escape cancels. Changing folders resets the track selection and replaces the library, including when the new folder has no supported audio files.
+
 **Sync**
 ![Sync](screenshots/12-sync.png)
 *Identity, server connection, device mesh, and your full productivity progression at a glance.*
@@ -159,6 +161,15 @@ Press `o` from the Dashboard to open the current Main Quest directly in its work
 ### Scrolls and Codices
 Notes are scrolls organized into codices — thematic collections tied to your projects. Write in Markdown, search across your full knowledge base, and share scrolls with your fellowship.
 
+### Campaign Atlas
+Every Campaign has an **Atlas** for mapping ideas, decisions, and possible paths. Create multiple Charts and open one in **The Cartographer**, a keyboard-first tree editor. Branches can be nested, folded, marked, renamed, reordered, and shared through the same encrypted device and Fellowship sync as the rest of the Campaign.
+
+In the native app, open section `5` in a Campaign. Use `n` for a new Chart or sibling branch, `a` for a child branch, `e` to rename, `Space` to mark, `Enter` to fold, `J`/`K` to reorder, `y` to copy the indented Chart, and `x` to export Markdown, text, self-contained HTML, and PDF files.
+
+Atlas marks and colors: `t` cycles ✓, ✗, and no mark; `#` toggles sibling numbering; `Alt+↑`/`Alt+↓` add or remove stars. `H` hides a branch and `Ctrl+H` shows or hides hidden branches. `B` opens a 16-color picker (`0` clears the color); a color choice applies to the selected branch and all descendants, including their connectors. New children inherit their parent's color.
+
+Atlas view controls: `Ctrl+arrows` pan, `c` centers the active branch, `C` locks or unlocks the center, `m` or `~` selects the root, and `g`/`G` select the first or last visible branch. `w`/`W` adjust node width, `z`/`Z` adjust line spacing, and `|` toggles aligned levels. Search Everywhere (`/`) also finds Atlas charts and branches, Treasury entries, accounts, categories, and Codex folders.
+
 ### Zen Tree
 Every completed task waters a Zen Tree that lives in your dashboard. It grows through stages across hundreds of levels. It is the most honest measure of your consistency.
 
@@ -189,6 +200,8 @@ Every Campaign has a Treasury — a full ledger for the money behind the work. P
 
 The Treasury summarizes Budget, Income, Paid, Committed, Saved, and Available at a glance, warns at 80%, 90%, and 100% of any budget, tracks upcoming and overdue payments, and exports the whole ledger to CSV and JSON with `x`. Transfers move money between accounts without changing Campaign income or spending totals.
 
+You can create any number of Spending, Savings, Cash, or Other accounts (for example, bank1 for Spending and bank2 for Savings). Press `E` to browse every account and its balance; select one and press Enter to rename it or change its type. Defaults can be edited too. To reassign an existing transaction, select it, press `e`, change the Account field (and Destination for transfers), then save. Paid transactions keep their amount, payment date, and history; account balances recalculate immediately. This corrects where a transaction was recorded. Use a Transfer entry when money actually moves between accounts.
+
 Choose the currency your Campaign works in — **USD** or **MXN**:
 
 - Press `$` in the Treasury to switch. Amounts display with the currency symbol and thousands separators (`MX$1,234,567.89`).
@@ -197,7 +210,10 @@ Choose the currency your Campaign works in — **USD** or **MXN**:
 
 Currency is per Campaign, so different Campaigns can be kept in different currencies.
 
-Treasury keys: `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter by transaction type, `F` filter by status, `g` filter by account, `s` sort, `A` add an account, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
+Treasury keys: `r` show all transactions from every month (clear filters), `Home`/`End` first/last transaction, `n` record, `e` edit, `d` delete, `a` approve, `p` settle payment, `f` filter by transaction type, `F` filter by status, `g` filter by account, `s` sort, `A` add an account, `E` view all accounts and edit their name/type, `B` budgets, `c` categories, `$` currency, `x` export. Press `$` on a Quest in the Ledger to set its costs.
+
+Press `E` to manage accounts: select one with ↑/↓, press Enter to rename it or change its type, `A` to add one, or Delete to remove an unused account. Deletion requires a zero balance and no transaction history, including planned, cancelled, transferred, or deleted entries. Unused default accounts such as Savings can also be removed and stay removed after syncing. Workspace footers show primary actions and keep `F1` visible for the full contextual shortcut reference, even on narrow terminals.
+
 
 ### Encrypted Sync and Fellowship
 
@@ -818,7 +834,7 @@ If Questline helps you on your adventures, consider starring the repository and 
 - **Quest Kanban:** Press `k` in a Campaign's Quest workspace to toggle between the detailed Ledger and a six-column stance board. The board uses the same offline Quest Stances and permissions as the Ledger.
 - **Quest dependencies:** Press `l` on a Quest to link or unlink blockers. Unresolved blockers appear in the Ledger and are marked with `⛓` on Kanban cards; dependency cycles are rejected locally and during encrypted sync.
 - **Council Briefing:** Press `B` in a shared Campaign for an offline team summary of blocked, review, overdue, due-soon, and unassigned Quests, Companion workload and presence, and recent activity. Enter opens the selected queue or Companion workload in the Quest Ledger.
-- **Teamwork search and commands:** Global Search includes active Quest Council messages, Campaign Chronicle messages, and Companions from the local encrypted cache. The command palette can open My Quests, Kanban, Council Briefing, blocked/review queues, and the selected Quest Council.
+- **Teamwork search and commands:** Global Search includes active Quest Council messages, Campaign Chronicle messages, Companions, Atlas charts and nodes, and Treasury records from the local encrypted cache. The command palette can open Atlas and Treasury, create an Atlas chart, add or color a selected branch, center a node, toggle hidden nodes, and open My Quests, Kanban, Council Briefing, blocked/review queues, and the selected Quest Council.
 - **Workload and review visibility:** Council Briefing labels Companion workload as available, balanced, or overloaded and shows open/high/blocked/overdue counts. Its Awaiting Judgment panel names assignees, flags unassigned reviews, and identifies Owner/Steward review responsibility.
 
 ---

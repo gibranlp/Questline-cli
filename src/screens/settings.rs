@@ -6,7 +6,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitRegions {
@@ -51,7 +51,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitR
 
     let theme_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(app.selected_settings_focus_idx == 0))
         .border_style(
             Style::default().fg(if app.selected_settings_focus_idx == 0 {
                 theme.primary
@@ -154,7 +154,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitR
     let alerts_row_count = alerts.len();
     let alerts_border = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(
+            (1..=5).contains(&app.selected_settings_focus_idx),
+        ))
         .border_style(Style::default().fg(
             if (1..=5).contains(&app.selected_settings_focus_idx) {
                 theme.primary
@@ -285,7 +287,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SettingsHitR
 
     let oath_border = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(
+            (6..=15).contains(&app.selected_settings_focus_idx),
+        ))
         .border_style(Style::default().fg(
             if (6..=15).contains(&app.selected_settings_focus_idx) {
                 theme.primary

@@ -26,6 +26,66 @@ use crate::theme::ThemeChoice;
 pub const JOURNAL_ENTRY_CHAR_LIMIT: usize = 255;
 const TASK_TITLE_CHAR_LIMIT: usize = 100;
 
+#[derive(Debug, Clone)]
+pub enum AtlasInputKind {
+    NewChart,
+    NewNode { chart_id: Uuid, parent_id: Option<Uuid> },
+    RenameChart { chart_id: Uuid },
+    RenameNode { node_id: Uuid },
+    Color { node_id: Uuid },
+}
+
+#[derive(Debug, Clone)]
+pub struct AtlasInput {
+    pub kind: AtlasInputKind,
+    pub value: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AtlasView {
+    pub offset_x: i32,
+    pub offset_y: i32,
+    pub center_lock: bool,
+    pub node_width: usize,
+    pub line_spacing: usize,
+    pub align_levels: bool,
+    pub show_hidden: bool,
+    pub anchor: Option<Uuid>,
+    pub expanded: std::collections::HashSet<Uuid>,
+}
+
+impl Default for AtlasView {
+    fn default() -> Self {
+        Self { offset_x: 0, offset_y: 0, center_lock: false, node_width: 24,
+            line_spacing: 2, align_levels: false, show_hidden: false, anchor: None,
+            expanded: std::collections::HashSet::new() }
+    }
+}
+
+fn atlas_title_parts(title: &str) -> (usize, Option<char>, Option<usize>, &str) {
+    let mut rest = title;
+    let mut stars = 0;
+    while let Some(next) = rest.strip_prefix("★ ") { stars += 1; rest = next; }
+    let mark = if let Some(next) = rest.strip_prefix("✓ ") { rest = next; Some('✓') }
+        else if let Some(next) = rest.strip_prefix("✗ ") { rest = next; Some('✗') }
+        else { None };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let number = if digits > 0 && rest[digits..].starts_with(". ") {
+        let parsed = rest[..digits].parse().ok();
+        rest = &rest[digits + 2..];
+        parsed
+    } else { None };
+    (stars, mark, number, rest)
+}
+
+fn atlas_title(stars: usize, mark: Option<char>, number: Option<usize>, text: &str) -> String {
+    let mut title = "★ ".repeat(stars);
+    if let Some(symbol) = mark { title.push(symbol); title.push(' '); }
+    if let Some(number) = number { title.push_str(&format!("{number}. ")); }
+    title.push_str(text);
+    title
+}
+
 // Presets del Oath Calendar para "Show quests up to" — cuántos días adelante puede
 // competir una quest por Main Quest / Next Quest / Quick Win / Upcoming Threats.
 // None = All (sin límite).
@@ -338,6 +398,13 @@ pub enum SearchResultType {
     Companion,
     Milestone,
     Ritual,
+    AtlasChart,
+    AtlasNode,
+    TreasuryEntry,
+    TreasuryCategory,
+    TreasuryAccount,
+    Codex,
+    Reflection,
 }
 
 impl SearchResultType {
@@ -356,6 +423,13 @@ impl SearchResultType {
             SearchResultType::Companion => "Companion",
             SearchResultType::Milestone => "Milestone",
             SearchResultType::Ritual => "Sidequest",
+            SearchResultType::AtlasChart => "Chart",
+            SearchResultType::AtlasNode => "Atlas Branch",
+            SearchResultType::TreasuryEntry => "Treasury Entry",
+            SearchResultType::TreasuryCategory => "Treasury Category",
+            SearchResultType::TreasuryAccount => "Treasury Account",
+            SearchResultType::Codex => "Codex",
+            SearchResultType::Reflection => "Reflection",
         }
     }
 }
@@ -500,7 +574,12 @@ pub enum ModalType {
         entry_type_idx: usize,
         focus_idx: usize,
     },
+    TreasuryAccounts {
+        selected_idx: usize,
+    },
     TreasuryAccount {
+        account_id: Option<Uuid>,
+        version: i64,
         name: String,
         kind_idx: usize,
         focus_idx: usize,
@@ -704,6 +783,8 @@ pub enum ModalType {
         focus_idx: usize,
     },
 }
+
+pub const SHORTCUT_HELP_PAGE_COUNT: usize = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotificationKind {
@@ -1068,6 +1149,7 @@ pub struct App {
     pub projects: Vec<Project>,
     pub should_quit: bool,
     pub quitting_after_sync: bool,
+    pub quit_needs_final_sync: bool,
     pub quit_completed_sync: bool,
 
     pub selected_project_idx: usize,
@@ -1076,6 +1158,7 @@ pub struct App {
     pub workspace_tab_idx: usize,
     pub workspace_sidebar_focused: bool,
     pub workspace_help_open: bool,
+    pub shortcut_help_page: usize,
     pub quest_board_open: bool,
     /// Which step of the card at `selected_task_idx` is focused in the Kanban
     /// board — `None` means the card's header itself is focused. Only
@@ -1096,6 +1179,8 @@ pub struct App {
     pub overlay_modal: ModalType,
     pub editor_state: Option<EditorState>,
     pub task_desc_editor: Option<EditorState>,
+    pub journal_editor: Option<EditorState>,
+    pub fellowship_editor: Option<EditorState>,
     pub task_title_cursor: usize,
     pub task_title_editing: bool,
     pub task_calendar: Option<TaskCalendarState>,
@@ -1133,6 +1218,11 @@ pub struct App {
     pub selected_ritual_idx: usize,
     pub selected_milestone_idx: usize,
     pub selected_treasury_idx: usize,
+    pub selected_atlas_chart_idx: usize,
+    pub active_atlas_chart_id: Option<Uuid>,
+    pub selected_atlas_node_idx: usize,
+    pub atlas_input: Option<AtlasInput>,
+    pub atlas_view: AtlasView,
     pub treasury_filter: crate::models::LedgerFilter,
     pub treasury_sort: crate::models::LedgerSort,
     pub treasury_account_idx: usize,
@@ -1294,6 +1384,7 @@ pub struct App {
     pub chapter_progress_refreshed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 
     pub sprite_notifications_shown_this_session: u32,
+    pub sprite_eligible_checks: u8,
     pub last_sprite_notification_time: Option<std::time::Instant>,
     pub last_sprite_check_time: Option<std::time::Instant>,
     pub last_task_notification_tick: Option<std::time::Instant>,
@@ -1791,8 +1882,7 @@ impl App {
             .count_focus_sessions_with_soundscape(&["Rain Sounds"])
             .unwrap_or(0);
         self.stats_cache.unique_soundscapes = self.db.count_unique_soundscapes_used().unwrap_or(0);
-        self.stats_cache.focus_sessions_total =
-            self.db.get_focus_sessions().map(|s| s.len()).unwrap_or(0) as i64;
+        self.stats_cache.focus_sessions_total = self.stats_cache.statistics.sessions_completed as i64;
         self.stats_cache.daily_adventures_completed =
             self.db.get_daily_adventures_completed_count().unwrap_or(0);
         // todays_* de verdad: la tabla conserva historial, así que hay que filtrar por fecha.
@@ -1814,13 +1904,11 @@ impl App {
             .iter()
             .filter(|p| !p.archived && !p.completed)
             .flat_map(|p| {
+                let milestones = self.db.get_milestones_for_project(p.id)
+                    .unwrap_or_default().into_iter().filter(|m| !m.completed).collect::<Vec<_>>();
+                if milestones.is_empty() { return Vec::new(); }
                 let stats = build_project_stats(p.id, p.created_at, &self.db);
-                self.db
-                    .get_milestones_for_project(p.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .filter(|m| !m.completed)
-                    .map(|m| {
+                milestones.into_iter().map(|m| {
                         let progress = if let Some(tmpl) =
                             milestone_templates::get_template_by_id(&m.template_id)
                         {
@@ -2331,6 +2419,14 @@ impl App {
     // Initializer.
     // Inicializa toda la app: DB, identidad, config, quote, audio, sync — pues aquí empieza todo
     pub fn new(db_path: &Path) -> Result<Self> {
+        Self::new_with_mode(db_path, false)
+    }
+
+    pub fn new_headless(db_path: &Path) -> Result<Self> {
+        Self::new_with_mode(db_path, true)
+    }
+
+    fn new_with_mode(db_path: &Path, headless: bool) -> Result<Self> {
         let db = Database::new(db_path)?;
 
         // Carga el lore desde questlinecli.com (o del caché local si es reciente).
@@ -2432,14 +2528,18 @@ impl App {
 
         // La URL/config base viven en config.toml, pero el toggle visible de Auto Sync
         // debe persistir desde la DB porque el usuario lo cambia dentro del TUI con [a].
-        let config = crate::services::config::Config::load().unwrap_or_default();
+        let mut config = crate::services::config::Config::load().unwrap_or_default();
+        if headless {
+            config.sync_enabled = false;
+            config.auto_sync = false;
+        }
         let server_url = if config.sync_enabled {
             config.server_url.clone()
         } else {
             db.get_setting("server_url")?
                 .unwrap_or_else(|| "http://localhost:8080".to_string())
         };
-        let mut auto_sync = db
+        let mut auto_sync = !headless && db
             .get_setting("auto_sync")?
             .map(|s| s == "true")
             .unwrap_or(config.auto_sync);
@@ -2565,6 +2665,7 @@ impl App {
             projects: Vec::new(),
             should_quit: false,
             quitting_after_sync: false,
+            quit_needs_final_sync: false,
             quit_completed_sync: false,
 
             selected_project_idx: 0,
@@ -2573,6 +2674,7 @@ impl App {
             workspace_tab_idx: 0,
             workspace_sidebar_focused: true,
             workspace_help_open: false,
+            shortcut_help_page: 0,
             quest_board_open: false,
             kanban_step_idx: None,
             selected_task_idx: 0,
@@ -2586,6 +2688,8 @@ impl App {
             overlay_modal: ModalType::None,
             editor_state: None,
             task_desc_editor: None,
+            journal_editor: None,
+            fellowship_editor: None,
             task_title_cursor: 0,
             task_title_editing: false,
             task_calendar: None,
@@ -2612,13 +2716,18 @@ impl App {
             selected_ritual_idx: 0,
             selected_milestone_idx: 0,
             selected_treasury_idx: 0,
+            selected_atlas_chart_idx: 0,
+            active_atlas_chart_id: None,
+            selected_atlas_node_idx: 0,
+            atlas_input: None,
+            atlas_view: AtlasView::default(),
             treasury_filter: crate::models::LedgerFilter::default(),
             treasury_sort: crate::models::LedgerSort::Newest,
             treasury_account_idx: 0,
             treasury_transfer_account_idx: 1,
             pending_financial_completion_bypass: None,
 
-            audio_player: crate::audio::AudioPlayer::new(),
+            audio_player: if headless { crate::audio::AudioPlayer::silent() } else { crate::audio::AudioPlayer::new() },
             selected_soundscape_idx: 3,
             selected_local_track_idx: 0,
             local_music_tracks_cache: Vec::new(),
@@ -2739,6 +2848,7 @@ impl App {
                 false,
             )),
             sprite_notifications_shown_this_session: 0,
+            sprite_eligible_checks: 0,
             last_sprite_notification_time: None,
             last_sprite_check_time: None,
             last_task_notification_tick: None,
@@ -2784,7 +2894,7 @@ impl App {
         // Existing users remain on plaintext protocol 1 until they explicitly choose
         // which local device is authoritative and publish a complete encrypted snapshot.
         #[cfg(not(test))]
-        if app.config.sync_enabled {
+        if !headless && app.config.sync_enabled {
             let client = crate::services::api_client::ApiClient::new(
                 &app.server_url,
                 app.identity.clone(),
@@ -2810,7 +2920,7 @@ impl App {
         }
 
         // Checa la versión en un hilo aparte para no bloquear el arranque — el resultado llega después
-        {
+        if !headless {
             let channel = app.update_check.clone();
             let _ = std::thread::spawn(move || {
                 fn is_newer(current: &str, latest: &str) -> bool {
@@ -2861,7 +2971,7 @@ impl App {
             .set_sound_effects_enabled(app.sound_effects_enabled);
         app.audio_player
             .set_sound_effects_volume(app.sound_effects_volume);
-        if let Ok(Some(last_source)) = app.db.get_setting("last_music_source") {
+        if !headless && let Ok(Some(last_source)) = app.db.get_setting("last_music_source") {
             if !last_source.is_empty() && last_source != "Silent" && last_source != "None" {
                 if let Some(idx) = crate::audio::SOUNDSCAPES
                     .iter()
@@ -3251,7 +3361,7 @@ impl App {
                 )
             }
             ModalType::SupportRealm => confirm(fixed_h(58, 14, term), KeyCode::Enter),
-            ModalType::KeyboardHelp => confirm(pct(75, 35, term), KeyCode::Enter),
+            ModalType::KeyboardHelp => confirm(pct(88, 82, term), KeyCode::Enter),
             // EncryptionMigrationPrompt is a 3-way choice already laid out
             // as 3 separate, full-width Lines (not one string to split) —
             // one Rect per choice, centered like the render code.
@@ -3565,6 +3675,12 @@ impl App {
                         },
                     ],
                 )
+            }
+            ModalType::TreasuryAccounts { selected_idx } => {
+                let popup = pct(76, 75, term);
+                let count = self.active_project_id.and_then(|id| crate::services::TreasuryService::new(&self.db).accounts(id).ok()).map_or(0, |accounts| accounts.len());
+                let visible = inner(popup).height.saturating_sub(1) as usize;
+                rows(popup, 1, count, selected_idx.saturating_add(1).saturating_sub(visible))
             }
             ModalType::TreasuryAccount { .. } => {
                 let popup = pct(56, 30, term);
@@ -3944,6 +4060,7 @@ impl App {
             | ModalType::TaskExpenseCompletion { selected_idx, .. }
             | ModalType::SelectProjectForAction { selected_idx, .. }
             | ModalType::MilestoneTierSelect { selected_idx, .. }
+            | ModalType::TreasuryAccounts { selected_idx }
             | ModalType::MilestoneTemplateSelect { selected_idx, .. } => {
                 *selected_idx = idx;
             }
@@ -5148,6 +5265,11 @@ impl App {
             self.selected_note_idx = 0;
             self.selected_notes_flat_idx = 0;
             self.selected_journal_idx = 0;
+            self.active_atlas_chart_id = None;
+            self.selected_atlas_chart_idx = 0;
+            self.selected_atlas_node_idx = 0;
+            self.atlas_input = None;
+            self.atlas_view = AtlasView::default();
             self.reload_data()?;
             if proj_is_shared {
                 self.start_background_sync();
@@ -5290,6 +5412,13 @@ impl App {
         }
     }
 
+    fn open_local_music_folder(&mut self) {
+        let input = self.db.get_setting("local_music_folder")
+            .unwrap_or_default().unwrap_or_default();
+        let suggestions = Self::path_suggestions(&input);
+        self.modal_state = ModalType::LocalMusicFolder { input, suggestions, selected: 0 };
+    }
+
     /// Plays the selected Soundscape (or toggles the OS media player, or
     /// opens the Local Folder picker/track browser for that special entry).
     /// Mirrors the KeyCode::Enter arm's Soundscapes branch in
@@ -5334,6 +5463,12 @@ impl App {
 
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(button) = regions.folder_picker
+                    && HitRegions::contains(button, mouse.column, mouse.row)
+                {
+                    self.open_local_music_folder();
+                    return;
+                }
                 if let Some(tracks) = regions.local_tracks
                     && HitRegions::contains(tracks.area, mouse.column, mouse.row)
                 {
@@ -5793,6 +5928,8 @@ impl App {
                         .and_then(|target| Uuid::parse_str(target).ok())
                     {
                         self.active_project_id = Some(project_id);
+                        self.refresh_stats_cache();
+                        self.reload_data()?;
                         self.active_screen = ActiveScreen::Workspace;
                         self.workspace_tab_idx = 0;
                         self.workspace_sidebar_focused = false;
@@ -6131,6 +6268,7 @@ impl App {
             self.fellowship_selected_msg_idx = usize::MAX;
             self.fellowship_chat_input.clear();
             self.fellowship_composing = false;
+            self.fellowship_editor = None;
         }
         self.selected_fellowship_project_idx = new_idx;
     }
@@ -6493,6 +6631,12 @@ impl App {
             entry_id: Some(entry.id),
             content: entry.content.clone(),
         };
+        self.journal_editor = Some(Self::task_desc_editor_from_text(
+            p_id,
+            entry.content.clone(),
+            0,
+            false,
+        ));
         Ok(())
     }
 
@@ -6773,7 +6917,12 @@ impl App {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
-        let key = normalize_ctrl_backspace(key);
+        let key = if self.active_screen == ActiveScreen::Workspace
+            && self.workspace_tab_idx == 5
+            && self.active_atlas_chart_id.is_some()
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace)
+        { key } else { normalize_ctrl_backspace(key) };
 
         if self.task_calendar.is_some() {
             self.handle_task_calendar_key(key);
@@ -6852,7 +7001,6 @@ impl App {
 
         if (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p'))
             || (key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('k'))
-            || key.code == KeyCode::F(1)
             || (key.code == KeyCode::Char(':') && !in_text_entry)
         {
             let actions = self.get_available_command_actions("");
@@ -6927,15 +7075,22 @@ impl App {
             }
         }
 
-        if key.code == KeyCode::Char('?') {
-            if !in_text_entry && self.active_screen != ActiveScreen::Workspace {
+        if !in_text_entry && key.code == KeyCode::F(1) {
+            self.shortcut_help_page = self.contextual_shortcut_help_page();
+            self.modal_state = ModalType::KeyboardHelp;
+            return Ok(());
+        }
+
+        if !in_text_entry && key.code == KeyCode::Char('?') {
+            if self.active_screen == ActiveScreen::Workspace && self.workspace_tab_idx == 5 {
+                self.shortcut_help_page = self.contextual_shortcut_help_page();
+                self.modal_state = ModalType::KeyboardHelp;
+            } else {
                 self.active_screen = ActiveScreen::About;
                 self.active_tab_idx = 13;
                 self.about_scroll = 0;
-                use rand::Rng;
-                self.about_fact_seed = rand::thread_rng().r#gen();
-                return Ok(());
             }
+            return Ok(());
         }
 
         if self.active_focus_session.is_some() {
@@ -7012,19 +7167,8 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('m') => {
-                    // 'm' en el Dashboard cicla el layout en vez de cambiar de pantalla —
-                    // mismo patrón que 'p' unas líneas más abajo.
                     if self.active_screen == ActiveScreen::Dashboard {
                         self.cycle_dashboard_layout();
-                        return Ok(());
-                    }
-                    // 'm' en Workspace quests/milestones y Fellowship ya está tomado — no cambiar pantalla
-                    if !(self.active_screen == ActiveScreen::Workspace
-                        && (self.workspace_tab_idx == 0 || self.workspace_tab_idx == 3))
-                        && self.active_screen != ActiveScreen::Fellowship
-                    {
-                        self.active_screen = ActiveScreen::Soundscapes;
-                        self.active_tab_idx = 7;
                         return Ok(());
                     }
                 }
@@ -7034,16 +7178,9 @@ impl App {
                         self.notifications
                             .push(Notification::info("Opening Ko-fi in your browser..."));
                         return Ok(());
-                    } else if self.active_screen != ActiveScreen::Fellowship
-                        && self.active_screen != ActiveScreen::SyncSettings
-                        // 'p' en la Treasury ya está tomado para saldar un pago
-                        && !(self.active_screen == ActiveScreen::Workspace
-                            && self.workspace_tab_idx == 4)
-                    {
+                    } else if self.active_screen == ActiveScreen::Soundscapes {
                         use crate::audio::SOUNDSCAPES;
-                        if self.active_screen == ActiveScreen::Soundscapes
-                            && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
-                        {
+                        if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
                             crate::audio::mpris_player::play_pause();
                         } else {
                             self.audio_player.pause();
@@ -7052,43 +7189,24 @@ impl App {
                     }
                 }
                 KeyCode::Char('s') => {
-                    // 's' en Character y en Workspace tareas/tesorería ya está tomado — no detener audio
-                    let is_character_spec = self.active_screen == ActiveScreen::Character;
-                    let is_task_sort = self.active_screen == ActiveScreen::Workspace
-                        && matches!(self.workspace_tab_idx, 0 | 4);
-                    if !is_character_spec
-                        && !is_task_sort
-                        && self.active_screen != ActiveScreen::Settings
-                        && self.active_screen != ActiveScreen::SyncSettings
-                    {
+                    if self.active_screen == ActiveScreen::Soundscapes {
                         self.audio_player.stop();
                         let _ = self.db.set_setting("last_music_source", "Silent");
                         return Ok(());
                     }
                 }
                 KeyCode::Char('n') => {
-                    use crate::audio::SOUNDSCAPES;
-                    if self.active_screen == ActiveScreen::Soundscapes
-                        && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player"
-                    {
-                        crate::audio::mpris_player::next_track();
-                        return Ok(());
-                    }
-                    if self.active_screen == ActiveScreen::Soundscapes
-                        && self.local_folder_selected()
-                    {
-                        self.select_next_local_track();
-                        self.play_selected_local_choice();
-                        return Ok(());
-                    }
-                    // 'n' en Dashboard/Projects/Workspace/Fellowship/SyncSettings ya está tomado para otras acciones
-                    if self.active_screen != ActiveScreen::Dashboard
-                        && self.active_screen != ActiveScreen::Projects
-                        && self.active_screen != ActiveScreen::Workspace
-                        && self.active_screen != ActiveScreen::Fellowship
-                        && self.active_screen != ActiveScreen::SyncSettings
-                        && self.active_screen != ActiveScreen::Settings
-                    {
+                    if self.active_screen == ActiveScreen::Soundscapes {
+                        use crate::audio::SOUNDSCAPES;
+                        if SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player" {
+                            crate::audio::mpris_player::next_track();
+                            return Ok(());
+                        }
+                        if self.local_folder_selected() {
+                            self.select_next_local_track();
+                            self.play_selected_local_choice();
+                            return Ok(());
+                        }
                         let current = self.audio_player.get_state().current_soundscape;
                         let idx = SOUNDSCAPES
                             .iter()
@@ -7110,7 +7228,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('+') => {
-                    if self.active_screen != ActiveScreen::Settings {
+                    if self.active_screen == ActiveScreen::Soundscapes {
                         self.audio_player.volume_up();
                         let vol = self.audio_player.get_state().volume;
                         let _ = self.db.set_setting("last_music_volume", &vol.to_string());
@@ -7118,14 +7236,14 @@ impl App {
                     }
                 }
                 KeyCode::Char('*') => {
-                    if self.active_screen != ActiveScreen::Settings {
+                    if self.active_screen == ActiveScreen::Soundscapes {
                         self.audio_player.set_volume(0.5);
                         let _ = self.db.set_setting("last_music_volume", "0.5");
                         return Ok(());
                     }
                 }
                 KeyCode::Char('-') => {
-                    if self.active_screen != ActiveScreen::Settings {
+                    if self.active_screen == ActiveScreen::Soundscapes {
                         self.audio_player.volume_down();
                         let vol = self.audio_player.get_state().volume;
                         let _ = self.db.set_setting("last_music_volume", &vol.to_string());
@@ -7136,17 +7254,7 @@ impl App {
                     if self.active_screen == ActiveScreen::Soundscapes
                         && self.modal_state == ModalType::None
                     {
-                        let current_val = self
-                            .db
-                            .get_setting("local_music_folder")
-                            .unwrap_or_default()
-                            .unwrap_or_default();
-                        let sugs = App::path_suggestions(&current_val);
-                        self.modal_state = ModalType::LocalMusicFolder {
-                            input: current_val,
-                            suggestions: sugs,
-                            selected: 0,
-                        };
+                        self.open_local_music_folder();
                         return Ok(());
                     }
                 }
@@ -7524,6 +7632,7 @@ impl App {
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         if self.quitting_after_sync {
                             self.quitting_after_sync = false;
+                            self.quit_needs_final_sync = false;
                             self.run_installer_on_exit = false;
                             self.sync_status_msg =
                                 "Exit canceled; the current sync will finish in the background."
@@ -8127,6 +8236,11 @@ impl App {
                     KeyCode::Esc => {
                         self.modal_state = ModalType::None;
                     }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.modal_state = ModalType::LocalMusicFolder {
+                            input: String::new(), suggestions: vec![], selected: 0,
+                        };
+                    }
                     KeyCode::Char(c) => {
                         val.push(c);
                         sugs = App::path_suggestions(&val);
@@ -8178,8 +8292,15 @@ impl App {
                         }
                     }
                     KeyCode::Enter => {
-                        let _ = self.db.set_setting("local_music_folder", &val);
-                        self.audio_player.set_local_music_folder(&val);
+                        let val = val.trim();
+                        if !std::path::Path::new(&Self::expand_home(val)).is_dir() {
+                            self.notifications.push(Notification::warning("Choose an existing music folder."));
+                            return Ok(true);
+                        }
+                        self.db.set_setting("local_music_folder", val)?;
+                        self.audio_player.set_local_music_folder(val);
+                        self.selected_local_track_idx = 0;
+                        self.local_music_tracks_cache.clear();
                         self.refresh_local_music_tracks_cache();
                         self.modal_state = ModalType::None;
                         let current_sc = self.audio_player.get_state().current_soundscape;
@@ -9556,8 +9677,13 @@ impl App {
                     }
                     KeyCode::Enter => {
                         let selected_username = &usernames[sel];
-                        self.fellowship_chat_input
-                            .push_str(&format!("@{}", selected_username));
+                        let mention = format!("@{}", selected_username);
+                        if let Some(editor) = self.fellowship_editor.as_mut() {
+                            editor.insert_text(&mention);
+                            self.fellowship_chat_input = editor.get_content();
+                        } else {
+                            self.fellowship_chat_input.push_str(&mention);
+                        }
                         self.modal_state = ModalType::None;
                     }
                     _ => {}
@@ -9779,6 +9905,9 @@ impl App {
                                         recurrence: None,
                                     }
                                 };
+                        } else if action_id == "open_atlas" || action_id == "open_treasury" {
+                            self.modal_state = ModalType::None;
+                            self.activate_workspace_tab(if action_id == "open_atlas" { 5 } else { 4 });
                         } else {
                             self.workspace_tab_idx = 1;
                             let mut state =
@@ -9806,9 +9935,25 @@ impl App {
             }
             ModalType::KeyboardHelp => {
                 match key.code {
-                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char(' ') => {
+                    KeyCode::Esc
+                    | KeyCode::Enter
+                    | KeyCode::Char(' ')
+                    | KeyCode::F(1) => {
                         self.modal_state = ModalType::None;
                     }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab | KeyCode::PageDown => {
+                        self.shortcut_help_page =
+                            (self.shortcut_help_page + 1) % SHORTCUT_HELP_PAGE_COUNT;
+                    }
+                    KeyCode::Left | KeyCode::Up | KeyCode::BackTab | KeyCode::PageUp => {
+                        self.shortcut_help_page = if self.shortcut_help_page == 0 {
+                            SHORTCUT_HELP_PAGE_COUNT - 1
+                        } else {
+                            self.shortcut_help_page - 1
+                        };
+                    }
+                    KeyCode::Home => self.shortcut_help_page = 0,
+                    KeyCode::End => self.shortcut_help_page = SHORTCUT_HELP_PAGE_COUNT - 1,
                     _ => {}
                 }
                 Ok(true)
@@ -10356,7 +10501,10 @@ impl App {
     }
 
     fn send_fellowship_message(&mut self) -> Result<()> {
-        let content = self.fellowship_chat_input.trim().to_string();
+        let content = self.fellowship_editor.as_ref()
+            .map(|editor| editor.get_content())
+            .unwrap_or_else(|| self.fellowship_chat_input.clone())
+            .trim().to_string();
         if content.is_empty() {
             return Ok(());
         }
@@ -10383,6 +10531,7 @@ impl App {
         // The local outbox sends this as a project-v1 encrypted sync event.
 
         self.fellowship_chat_input.clear();
+        self.fellowship_editor = None;
         self.fellowship_selected_msg_idx = usize::MAX;
         self.fellowship_composing = false;
         self.reload_data()?;
@@ -10391,6 +10540,59 @@ impl App {
 
     fn handle_fellowship_chat_key(&mut self, key: crossterm::event::KeyEvent) -> Result<bool> {
         use crossterm::event::{KeyCode, KeyModifiers};
+        use crate::screens::editor::EditorMode;
+
+        if self.fellowship_composing {
+            let project_id = self.projects.iter().filter(|p| p.is_shared)
+                .nth(self.selected_fellowship_project_idx).map(|p| p.id)
+                .unwrap_or_else(Uuid::nil);
+            if self.fellowship_editor.is_none() {
+                self.fellowship_editor = Some(Self::task_desc_editor_from_text(
+                    project_id, self.fellowship_chat_input.clone(),
+                    self.fellowship_chat_input.len(), true,
+                ));
+            }
+            let mode = self.fellowship_editor.as_ref().unwrap().mode.clone();
+            if key.code == KeyCode::Esc && mode == EditorMode::Normal {
+                self.fellowship_editor = None;
+                self.fellowship_chat_input.clear();
+                self.fellowship_composing = false;
+                return Ok(true);
+            }
+            if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
+                || key.code == KeyCode::Enter && mode == EditorMode::Normal
+            {
+                self.send_fellowship_message()?;
+                return Ok(true);
+            }
+            if key.code == KeyCode::Char('@') && mode == EditorMode::Insert {
+                let mut usernames = Vec::new();
+                if let Some(project) = self.projects.iter().filter(|p| p.is_shared)
+                    .nth(self.selected_fellowship_project_idx)
+                {
+                    usernames.extend(self.db.get_project_members(&project.id.to_string())
+                        .unwrap_or_default().into_iter().map(|member| member.1));
+                }
+                usernames.extend(self.db.get_presence_list().unwrap_or_default()
+                    .into_iter().map(|companion| companion.1));
+                usernames.sort();
+                usernames.dedup();
+                if let Some(user) = &self.user {
+                    usernames.retain(|name| name != &user.username);
+                }
+                if !usernames.is_empty() {
+                    self.modal_state = ModalType::MentionSelect { selected_idx: 0, usernames };
+                    return Ok(true);
+                }
+            }
+            let whole_text = if matches!(key.code, KeyCode::Home | KeyCode::End) {
+                self.consume_home_end_double_press(key.code)
+            } else { false };
+            let editor = self.fellowship_editor.as_mut().unwrap();
+            Self::handle_task_desc_editor_key(editor, key, whole_text);
+            self.fellowship_chat_input = editor.get_content();
+            return Ok(true);
+        }
 
         // Vim navigation is universal while browsing. Compose mode below keeps
         // h/j/k/l as text input, as expected.
@@ -10460,82 +10662,16 @@ impl App {
             _ => {}
         }
 
-        // Compose mode: all keys go to input
-        if self.fellowship_composing {
-            match key.code {
-                KeyCode::Enter => {
-                    if !self.fellowship_chat_input.is_empty() {
-                        self.send_fellowship_message()?;
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Esc => {
-                    self.fellowship_chat_input.clear();
-                    self.fellowship_composing = false;
-                    return Ok(true);
-                }
-                KeyCode::Backspace => {
-                    if is_ctrl_backspace(key) {
-                        delete_last_word(&mut self.fellowship_chat_input);
-                    } else {
-                        self.fellowship_chat_input.pop();
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Left => {
-                    // Allow leaving compose mode if input is empty
-                    if self.fellowship_chat_input.is_empty() {
-                        self.fellowship_composing = false;
-                        self.fellowship_focus_left = true;
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Char('@') => {
-                    let mut usernames = Vec::new();
-                    let shared_projects: Vec<_> =
-                        self.projects.iter().filter(|p| p.is_shared).collect();
-                    if !shared_projects.is_empty()
-                        && self.selected_fellowship_project_idx < shared_projects.len()
-                    {
-                        let proj = &shared_projects[self.selected_fellowship_project_idx];
-                        let members = self
-                            .db
-                            .get_project_members(&proj.id.to_string())
-                            .unwrap_or_default();
-                        for m in members {
-                            usernames.push(m.1);
-                        }
-                    }
-                    let companions = self.db.get_presence_list().unwrap_or_default();
-                    for c in companions {
-                        usernames.push(c.1);
-                    }
-                    usernames.sort();
-                    usernames.dedup();
-                    if let Some(ref u) = self.user {
-                        usernames.retain(|name| name != &u.username);
-                    }
-                    if !usernames.is_empty() {
-                        self.modal_state = ModalType::MentionSelect {
-                            selected_idx: 0,
-                            usernames,
-                        };
-                    } else {
-                        self.fellowship_chat_input.push('@');
-                    }
-                    return Ok(true);
-                }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.fellowship_chat_input.push(c);
-                    return Ok(true);
-                }
-                _ => return Ok(true), // swallow unhandled keys in compose mode
-            }
-        }
-
         // Command mode (not composing, not browsing): Enter starts composing, other keys fall through
         if let KeyCode::Enter = key.code {
             self.fellowship_composing = true;
+            self.fellowship_selected_msg_idx = usize::MAX;
+            let project_id = self.projects.iter().filter(|p| p.is_shared)
+                .nth(self.selected_fellowship_project_idx).map(|p| p.id)
+                .unwrap_or_else(Uuid::nil);
+            self.fellowship_editor = Some(Self::task_desc_editor_from_text(
+                project_id, String::new(), 0, true,
+            ));
             return Ok(true);
         }
         if let KeyCode::Left = key.code {
@@ -11066,6 +11202,29 @@ impl App {
             project_id,
             text,
         ) {
+            return;
+        }
+
+        if matches!(self.modal_state, ModalType::NewJournalEntry { .. }) {
+            if let Some(editor) = self.journal_editor.as_mut() {
+                let remaining = JOURNAL_ENTRY_CHAR_LIMIT.saturating_sub(editor.get_content().chars().count());
+                let clipped: String = text.chars().take(remaining).collect();
+                editor.insert_text(&clipped);
+                if let ModalType::NewJournalEntry { content, .. } = &mut self.modal_state {
+                    *content = editor.get_content();
+                }
+            }
+            return;
+        }
+
+        if self.active_screen == ActiveScreen::Fellowship
+            && self.fellowship_composing
+            && self.modal_state == ModalType::None
+        {
+            if let Some(editor) = self.fellowship_editor.as_mut() {
+                editor.insert_text(text);
+                self.fellowship_chat_input = editor.get_content();
+            }
             return;
         }
 
@@ -12680,6 +12839,11 @@ impl App {
             KeyCode::Char('s') | KeyCode::Char('S') => {
                 if self.active_screen == ActiveScreen::Settings {
                     self.toggle_sound_effects()?;
+                } else if self.active_screen == ActiveScreen::Fellowship {
+                    self.selected_fellowship_tab = 4;
+                    self.modal_state = ModalType::SearchMessages {
+                        query: String::new(),
+                    };
                 } else if self.active_screen == ActiveScreen::Character {
                     if let Some(ref u) = self.user {
                         if u.level >= 10 && u.specialization.is_none() {
@@ -13102,7 +13266,7 @@ impl App {
                     }
                 }
             }
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') | KeyCode::Char('R') => {
                 if self.active_screen == ActiveScreen::Fellowship
                     && self.selected_fellowship_tab == 2
                     && self.config.sync_enabled
@@ -13257,14 +13421,7 @@ impl App {
                     self.reload_data()?;
                 }
             }
-            KeyCode::Char('/') => {
-                if self.active_screen == ActiveScreen::Fellowship {
-                    self.selected_fellowship_tab = 4;
-                    self.modal_state = ModalType::SearchMessages {
-                        query: String::new(),
-                    };
-                }
-            }
+            KeyCode::Char('/') => {}
             // 'm' on Dashboard is handled earlier, in the global preamble's
             // KeyCode::Char('m') arm (next to 'p') — it returns before
             // reaching here, so this arm is unreachable for Dashboard and
@@ -13318,6 +13475,30 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    fn contextual_shortcut_help_page(&self) -> usize {
+        match self.active_screen {
+            ActiveScreen::Dashboard | ActiveScreen::Projects => 1,
+            ActiveScreen::Workspace if matches!(self.workspace_tab_idx, 0 | 3) => 2,
+            ActiveScreen::Workspace => 3,
+            ActiveScreen::Character
+            | ActiveScreen::Library
+            | ActiveScreen::Legends
+            | ActiveScreen::Archive
+            | ActiveScreen::Focus => 4,
+            ActiveScreen::Fellowship | ActiveScreen::GreatChronicle => 5,
+            ActiveScreen::Soundscapes
+            | ActiveScreen::Settings
+            | ActiveScreen::SyncSettings
+            | ActiveScreen::About => 6,
+            ActiveScreen::Editor => 7,
+            ActiveScreen::Intro
+            | ActiveScreen::Gateway
+            | ActiveScreen::Restore
+            | ActiveScreen::Prologue
+            | ActiveScreen::Onboarding => 8,
+        }
     }
 
     fn navigation_key_code(key: KeyEvent) -> KeyCode {
@@ -14000,7 +14181,7 @@ impl App {
                 }
             }
             // Quests-in-Kanban and Overview have two focusable panes: workspace menu and content.
-            0 | 3 | 4 => {
+            0 | 3 | 4 | 5 => {
                 self.note_preview_focused = false;
                 self.workspace_sidebar_focused = !self.workspace_sidebar_focused;
             }
@@ -14045,7 +14226,8 @@ impl App {
                     3 => 0,
                     0 => 1,
                     1 => 4,
-                    4 => 2,
+                    4 => 5,
+                    5 => 2,
                     _ => 3,
                 }
             } else {
@@ -14054,7 +14236,8 @@ impl App {
                     0 => 3,
                     1 => 0,
                     4 => 1,
-                    _ => 4,
+                    5 => 4,
+                    _ => 5,
                 }
             };
             self.note_preview_focused = false;
@@ -14305,6 +14488,28 @@ impl App {
                     };
                 }
             }
+            5 => {
+                let service = crate::services::AtlasService::new(&self.db);
+                if let Some(chart_id) = self.active_atlas_chart_id {
+                    let count = service.visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded).map(|v| v.len()).unwrap_or(0);
+                    if count > 0 {
+                        self.selected_atlas_node_idx = if forward {
+                            (self.selected_atlas_node_idx + 1) % count
+                        } else if self.selected_atlas_node_idx > 0 {
+                            self.selected_atlas_node_idx - 1
+                        } else { count - 1 };
+                    }
+                } else {
+                    let count = service.charts(p_id).map(|v| v.len()).unwrap_or(0);
+                    if count > 0 {
+                        self.selected_atlas_chart_idx = if forward {
+                            (self.selected_atlas_chart_idx + 1) % count
+                        } else if self.selected_atlas_chart_idx > 0 {
+                            self.selected_atlas_chart_idx - 1
+                        } else { count - 1 };
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -14519,6 +14724,157 @@ impl App {
             .collect()
     }
 
+    fn atlas_write_allowed(&mut self, project_id: Uuid) -> Result<bool> {
+        if self.project_is_shared(project_id)
+            && self.db.get_member_role(&project_id.to_string(), &self.identity.public_key)?.as_deref() == Some("Observer")
+        {
+            self.notifications.push(Notification::warning(
+                "Observers may study the Atlas, but cannot redraw it.".to_string(),
+            ));
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn handle_atlas_input_key(&mut self, key: KeyEvent, project_id: Uuid) -> Result<()> {
+        let Some(mut input) = self.atlas_input.take() else { return Ok(()); };
+        match key.code {
+            KeyCode::Esc => return Ok(()),
+            KeyCode::Backspace => { input.value.pop(); }
+            KeyCode::Char(c) if input.value.chars().count() < 120 => input.value.push(c),
+            KeyCode::Enter => {
+                if input.value.trim().is_empty() { self.atlas_input = Some(input); return Ok(()); }
+                let service = crate::services::AtlasService::new(&self.db);
+                match input.kind {
+                    AtlasInputKind::NewChart => {
+                        let chart = service.create_chart(project_id, &input.value, Some(&self.identity.public_key))?;
+                        self.active_atlas_chart_id = Some(chart.id);
+                        self.selected_atlas_node_idx = 0;
+                    }
+                    AtlasInputKind::NewNode { chart_id, parent_id } => {
+                        let node = service.add_node(chart_id, parent_id, &input.value, Some(&self.identity.public_key))?;
+                        self.selected_atlas_node_idx = service.visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.iter().position(|(n, _)| n.id == node.id).unwrap_or(0);
+                    }
+                    AtlasInputKind::RenameChart { chart_id } => service.rename_chart(chart_id, &input.value)?,
+                    AtlasInputKind::RenameNode { node_id } => {
+                        if let Some(mut node) = service.node(node_id)? {
+                            node.title = input.value.trim().to_string();
+                            node.updated_at = Utc::now();
+                            service.update_node(&node)?;
+                        }
+                    }
+                    AtlasInputKind::Color { node_id } => {
+                        let selection = input.value.trim().parse::<u8>().ok();
+                        if !matches!(selection, Some(0..=16)) {
+                            self.atlas_input = Some(input);
+                            return Ok(());
+                        }
+                        service.color_branch(node_id, selection.filter(|number| *number > 0).map(|number| number - 1))?;
+                    }
+                }
+                self.mark_dirty();
+                return Ok(());
+            }
+            _ => {}
+        }
+        self.atlas_input = Some(input);
+        Ok(())
+    }
+
+    fn handle_atlas_command(&mut self, key: KeyEvent, project_id: Uuid) -> Result<bool> {
+        let Some(chart_id) = self.active_atlas_chart_id else { return Ok(false) };
+        let visible = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?;
+        let selected = visible.get(self.selected_atlas_node_idx).map(|(node, _)| node.clone());
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        if ctrl {
+            match key.code {
+                KeyCode::Up => self.atlas_view.offset_y -= 2,
+                KeyCode::Down => self.atlas_view.offset_y += 2,
+                KeyCode::Left => self.atlas_view.offset_x -= 4,
+                KeyCode::Right => self.atlas_view.offset_x += 4,
+                KeyCode::Char('h') | KeyCode::Backspace => self.atlas_view.show_hidden = !self.atlas_view.show_hidden,
+                _ => return Ok(false),
+            }
+            return Ok(true);
+        }
+        if alt && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+            if let Some(mut node) = selected && self.atlas_write_allowed(project_id)? {
+                let (stars, mark, number, text) = atlas_title_parts(&node.title);
+                let stars = if key.code == KeyCode::Up { stars.saturating_add(1).min(9) } else { stars.saturating_sub(1) };
+                node.title = atlas_title(stars, mark, number, text);
+                node.updated_at = Utc::now();
+                crate::services::AtlasService::new(&self.db).update_node(&node)?;
+                self.mark_dirty();
+            }
+            return Ok(true);
+        }
+        if alt { return Ok(false); }
+        match key.code {
+            KeyCode::Char('c') => {
+                self.atlas_view.anchor = selected.as_ref().map(|node| node.id);
+                self.atlas_view.offset_x = 0; self.atlas_view.offset_y = 0;
+            }
+            KeyCode::Char('C') => {
+                self.atlas_view.center_lock = !self.atlas_view.center_lock;
+                self.atlas_view.anchor = selected.as_ref().map(|node| node.id);
+                self.atlas_view.offset_x = 0; self.atlas_view.offset_y = 0;
+            }
+            KeyCode::Char('m') | KeyCode::Char('~') => {
+                if let Some(node) = selected {
+                    let all = crate::services::AtlasService::new(&self.db).nodes(chart_id)?;
+                    let mut id = node.id;
+                    while let Some(parent) = all.iter().find(|candidate| candidate.id == id).and_then(|node| node.parent_id) { id = parent; }
+                    if let Some(index) = visible.iter().position(|(node, _)| node.id == id) { self.selected_atlas_node_idx = index; }
+                }
+            }
+            KeyCode::Char('g') => self.selected_atlas_node_idx = 0,
+            KeyCode::Char('G') => self.selected_atlas_node_idx = visible.len().saturating_sub(1),
+            KeyCode::Char('w') => self.atlas_view.node_width = (self.atlas_view.node_width + 4).min(80),
+            KeyCode::Char('W') => self.atlas_view.node_width = self.atlas_view.node_width.saturating_sub(4).max(8),
+            KeyCode::Char('z') => self.atlas_view.line_spacing = self.atlas_view.line_spacing.saturating_sub(1),
+            KeyCode::Char('Z') => self.atlas_view.line_spacing = (self.atlas_view.line_spacing + 1).min(8),
+            KeyCode::Char('|') => self.atlas_view.align_levels = !self.atlas_view.align_levels,
+            KeyCode::Char('B') => {
+                if let Some(node) = selected && self.atlas_write_allowed(project_id)? {
+                    self.atlas_input = Some(AtlasInput { kind: AtlasInputKind::Color { node_id: node.id }, value: String::new() });
+                }
+            }
+            KeyCode::Char('t') | KeyCode::Char('H') => {
+                if let Some(mut node) = selected && self.atlas_write_allowed(project_id)? {
+                    if key.code == KeyCode::Char('H') {
+                        node.hidden = !node.hidden;
+                    } else {
+                        let (stars, mark, number, text) = atlas_title_parts(&node.title);
+                        node.title = atlas_title(stars, match mark { None => Some('✓'), Some('✓') => Some('✗'), _ => None }, number, text);
+                    }
+                    node.updated_at = Utc::now();
+                    crate::services::AtlasService::new(&self.db).update_node(&node)?;
+                    if node.hidden && !self.atlas_view.show_hidden { self.selected_atlas_node_idx = self.selected_atlas_node_idx.saturating_sub(1); }
+                    self.mark_dirty();
+                }
+            }
+            KeyCode::Char('#') => {
+                if let Some(node) = selected && self.atlas_write_allowed(project_id)? {
+                    let service = crate::services::AtlasService::new(&self.db);
+                    let mut siblings = service.nodes(chart_id)?.into_iter().filter(|candidate| candidate.parent_id == node.parent_id).collect::<Vec<_>>();
+                    siblings.sort_by_key(|candidate| (candidate.position, candidate.created_at, candidate.id));
+                    let numbered = siblings.iter().all(|candidate| atlas_title_parts(&candidate.title).2.is_some());
+                    for (index, mut sibling) in siblings.into_iter().enumerate() {
+                        let (stars, mark, _, text) = atlas_title_parts(&sibling.title);
+                        sibling.title = atlas_title(stars, mark, (!numbered).then_some(index + 1), text);
+                        sibling.updated_at = Utc::now();
+                        service.update_node(&sibling)?;
+                    }
+                    self.mark_dirty();
+                }
+            }
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
     fn handle_workspace_key(&mut self, key: KeyEvent) -> Result<()> {
         let p_id = if let Some(id) = self.active_project_id {
             id
@@ -14533,6 +14889,11 @@ impl App {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('?')) {
                 self.workspace_help_open = false;
             }
+            return Ok(());
+        }
+
+        if self.atlas_input.is_some() {
+            self.handle_atlas_input_key(key, p_id)?;
             return Ok(());
         }
 
@@ -14628,11 +14989,17 @@ impl App {
             .cloned()
             .collect();
 
+        if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some()
+            && self.handle_atlas_command(key, p_id)? { return Ok(()); }
+
         let nav_code = Self::navigation_key_code(key);
 
         match nav_code {
             KeyCode::Esc => {
-                if self.note_preview_focused {
+                if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() {
+                    self.active_atlas_chart_id = None;
+                    self.selected_atlas_node_idx = 0;
+                } else if self.note_preview_focused {
                     self.note_preview_focused = false;
                 } else if self.quest_ledger_focused {
                     self.quest_ledger_focused = false;
@@ -14766,7 +15133,108 @@ impl App {
             KeyCode::Char('2') => self.activate_workspace_tab(0),
             KeyCode::Char('3') => self.activate_workspace_tab(1),
             KeyCode::Char('4') => self.activate_workspace_tab(4),
-            KeyCode::Char('5') => self.activate_workspace_tab(2),
+            KeyCode::Char('5') => self.activate_workspace_tab(5),
+            KeyCode::Char('6') => self.activate_workspace_tab(2),
+            KeyCode::Enter if self.workspace_tab_idx == 5 => {
+                let service = crate::services::AtlasService::new(&self.db);
+                if let Some(chart_id) = self.active_atlas_chart_id {
+                    if let Some((mut node, _)) = service.visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.get(self.selected_atlas_node_idx).cloned() {
+                        node.collapsed = !node.collapsed;
+                        node.updated_at = Utc::now();
+                        self.atlas_view.expanded.remove(&node.id);
+                        if self.atlas_write_allowed(p_id)? { crate::services::AtlasService::new(&self.db).update_node(&node)?; self.mark_dirty(); }
+                    }
+                } else if let Some(chart) = service.charts(p_id)?.get(self.selected_atlas_chart_idx) {
+                    self.active_atlas_chart_id = Some(chart.id);
+                    self.selected_atlas_node_idx = 0;
+                }
+            }
+            KeyCode::Char('n') if self.workspace_tab_idx == 5 => {
+                if self.atlas_write_allowed(p_id)? {
+                    let kind = if let Some(chart_id) = self.active_atlas_chart_id {
+                        let parent_id = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?
+                            .get(self.selected_atlas_node_idx).and_then(|(node, _)| node.parent_id);
+                        AtlasInputKind::NewNode { chart_id, parent_id }
+                    } else { AtlasInputKind::NewChart };
+                    self.atlas_input = Some(AtlasInput { kind, value: String::new() });
+                }
+            }
+            KeyCode::Char('a') if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() => {
+                if self.atlas_write_allowed(p_id)? {
+                    let chart_id = self.active_atlas_chart_id.unwrap();
+                    let parent_id = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?
+                        .get(self.selected_atlas_node_idx).map(|(node, _)| node.id);
+                    self.atlas_input = Some(AtlasInput { kind: AtlasInputKind::NewNode { chart_id, parent_id }, value: String::new() });
+                }
+            }
+            KeyCode::Char('e') if self.workspace_tab_idx == 5 => {
+                if self.atlas_write_allowed(p_id)? {
+                    let service = crate::services::AtlasService::new(&self.db);
+                    if let Some(chart_id) = self.active_atlas_chart_id {
+                        if let Some((node, _)) = service.visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.get(self.selected_atlas_node_idx) {
+                            self.atlas_input = Some(AtlasInput { kind: AtlasInputKind::RenameNode { node_id: node.id }, value: node.title.clone() });
+                        }
+                    } else if let Some(chart) = service.charts(p_id)?.get(self.selected_atlas_chart_idx) {
+                        self.atlas_input = Some(AtlasInput { kind: AtlasInputKind::RenameChart { chart_id: chart.id }, value: chart.name.clone() });
+                    }
+                }
+            }
+            KeyCode::Delete if self.workspace_tab_idx == 5 => {
+                if self.atlas_write_allowed(p_id)? {
+                    let service = crate::services::AtlasService::new(&self.db);
+                    if let Some(chart_id) = self.active_atlas_chart_id {
+                        if let Some((node, _)) = service.visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.get(self.selected_atlas_node_idx) {
+                            service.delete_node(node.id)?;
+                            self.selected_atlas_node_idx = self.selected_atlas_node_idx.saturating_sub(1);
+                        }
+                    } else if let Some(chart) = service.charts(p_id)?.get(self.selected_atlas_chart_idx) {
+                        service.delete_chart(chart.id)?;
+                        self.selected_atlas_chart_idx = self.selected_atlas_chart_idx.saturating_sub(1);
+                    }
+                    self.mark_dirty();
+                    self.audio_player.play_delete();
+                }
+            }
+            KeyCode::Char(' ') if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() => {
+                if self.atlas_write_allowed(p_id)? {
+                    let chart_id = self.active_atlas_chart_id.unwrap();
+                    if let Some((mut node, _)) = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.get(self.selected_atlas_node_idx).cloned() {
+                        node.marked = !node.marked; node.updated_at = Utc::now();
+                        crate::services::AtlasService::new(&self.db).update_node(&node)?; self.mark_dirty();
+                    }
+                }
+            }
+            KeyCode::Char('J') | KeyCode::Char('K') if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() => {
+                if self.atlas_write_allowed(p_id)? {
+                    let chart_id = self.active_atlas_chart_id.unwrap();
+                    if let Some((node, _)) = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?.get(self.selected_atlas_node_idx) {
+                        crate::services::AtlasService::new(&self.db).move_node(node.id, if key.code == KeyCode::Char('K') { -1 } else { 1 })?;
+                        self.mark_dirty();
+                    }
+                }
+            }
+            KeyCode::Char('y') if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() => {
+                let text = crate::services::AtlasService::new(&self.db).export_text(self.active_atlas_chart_id.unwrap())?;
+                match crate::services::identity::copy_to_clipboard(&text) {
+                    Ok(()) => self.notifications.push(Notification::info("Chart copied to the realm clipboard.".to_string())),
+                    Err(error) => self.notifications.push(Notification::warning(format!("Could not reach the clipboard: {error}"))),
+                }
+            }
+            KeyCode::Char('x') if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() => {
+                let directory = crate::storage::get_storage_dir()?.join("exports").join("atlas");
+                let outputs = crate::services::AtlasService::new(&self.db).export_all(self.active_atlas_chart_id.unwrap(), &directory)?;
+                self.notifications.push(Notification::info(format!("Chart exported as Markdown, text, HTML, and PDF to {} ({} files).", directory.display(), outputs.len())));
+            }
+            KeyCode::Left if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() && !self.workspace_sidebar_focused => {
+                let visible = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(self.active_atlas_chart_id.unwrap(), self.atlas_view.show_hidden, &self.atlas_view.expanded)?;
+                if let Some(parent) = visible.get(self.selected_atlas_node_idx).and_then(|(node, _)| node.parent_id)
+                    && let Some(index) = visible.iter().position(|(node, _)| node.id == parent) { self.selected_atlas_node_idx = index; }
+            }
+            KeyCode::Right if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() && !self.workspace_sidebar_focused => {
+                let visible = crate::services::AtlasService::new(&self.db).visible_nodes_for_view(self.active_atlas_chart_id.unwrap(), self.atlas_view.show_hidden, &self.atlas_view.expanded)?;
+                if let Some(current) = visible.get(self.selected_atlas_node_idx).map(|(node, _)| node.id)
+                    && let Some(index) = visible.iter().position(|(node, _)| node.parent_id == Some(current)) { self.selected_atlas_node_idx = index; }
+            }
             KeyCode::Tab => {
                 self.cycle_workspace_pane_focus(false);
             }
@@ -15245,6 +15713,22 @@ impl App {
                     focus_idx: 0,
                 };
             }
+            KeyCode::Char('r') if self.workspace_tab_idx == 4 => {
+                self.treasury_filter = crate::models::LedgerFilter::default();
+                self.treasury_sort = crate::models::LedgerSort::Newest;
+                self.search_query.clear();
+                self.searching = false;
+                self.selected_treasury_idx = 0;
+                self.notifications.push(Notification::info("Showing all transactions from every month. Use ↑↓ to browse and e to edit.".to_string()));
+            }
+            KeyCode::Home | KeyCode::End if self.workspace_tab_idx == 4 => {
+                let count = crate::services::TreasuryService::new(&self.db)
+                    .entries(p_id, &self.treasury_filter, self.treasury_sort)?.len();
+                self.selected_treasury_idx = if key.code == KeyCode::Home { 0 } else { count.saturating_sub(1) };
+            }
+            KeyCode::Char('E') if self.workspace_tab_idx == 4 => {
+                self.modal_state = ModalType::TreasuryAccounts { selected_idx: 0 };
+            }
             KeyCode::Char('A') if self.workspace_tab_idx == 4 => {
                 if !self.treasury_allows(
                     p_id,
@@ -15253,6 +15737,8 @@ impl App {
                     return Ok(());
                 }
                 self.modal_state = ModalType::TreasuryAccount {
+                    account_id: None,
+                    version: 1,
                     name: String::new(),
                     kind_idx: 0,
                     focus_idx: 0,
@@ -15381,6 +15867,12 @@ impl App {
                         entry_id: None,
                         content: String::new(),
                     };
+                    self.journal_editor = Some(Self::task_desc_editor_from_text(
+                        p_id,
+                        String::new(),
+                        0,
+                        true,
+                    ));
                 } else if self.workspace_tab_idx == 3 {
                     self.modal_state = ModalType::MilestoneTierSelect {
                         project_id: p_id,
@@ -16307,7 +16799,54 @@ impl App {
                     };
                 }
             }
+            ModalType::TreasuryAccounts { selected_idx } => {
+                let accounts = crate::services::TreasuryService::new(&self.db).accounts(project_id)?;
+                let mut selected_idx = selected_idx.min(accounts.len().saturating_sub(1));
+                match key.code {
+                    KeyCode::Esc => { self.modal_state = ModalType::None; return Ok(()); }
+                    KeyCode::Up if !accounts.is_empty() => selected_idx = (selected_idx + accounts.len() - 1) % accounts.len(),
+                    KeyCode::Down | KeyCode::Tab if !accounts.is_empty() => selected_idx = (selected_idx + 1) % accounts.len(),
+                    KeyCode::Enter | KeyCode::Char('e') => {
+                        if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
+                        if let Some(account) = accounts.get(selected_idx) {
+                            self.modal_state = ModalType::TreasuryAccount {
+                                account_id: Some(account.id), version: account.version,
+                                name: account.name.clone(),
+                                kind_idx: crate::models::TreasuryAccountKind::ALL.iter().position(|kind| *kind == account.kind).unwrap_or(0),
+                                focus_idx: 0,
+                            };
+                            return Ok(());
+                        }
+                    }
+                    KeyCode::Delete | KeyCode::Char('d') => {
+                        if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
+                        if let Some(account) = accounts.get(selected_idx) {
+                            match crate::services::TreasuryService::new(&self.db).delete_account(account.id) {
+                                Ok(()) => {
+                                    if self.treasury_filter.account_id == Some(account.id) {
+                                        self.treasury_filter.account_id = None;
+                                        self.selected_treasury_idx = 0;
+                                    }
+                                    selected_idx = selected_idx.min(accounts.len().saturating_sub(2));
+                                    self.mark_dirty();
+                                    self.notifications.push(Notification::info(format!("Account '{}' deleted.", account.name)));
+                                }
+                                Err(error) => self.notifications.push(Notification::warning(error.to_string())),
+                            }
+                        }
+                    }
+                    KeyCode::Char('A') => {
+                        if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
+                        self.modal_state = ModalType::TreasuryAccount { account_id: None, version: 1, name: String::new(), kind_idx: 0, focus_idx: 0 };
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+                self.modal_state = ModalType::TreasuryAccounts { selected_idx };
+            }
             ModalType::TreasuryAccount {
+                account_id,
+                version,
                 ref name,
                 kind_idx,
                 focus_idx,
@@ -16337,21 +16876,33 @@ impl App {
                     }
                     KeyCode::Enter if focus_idx == 0 => focus_idx = 1,
                     KeyCode::Enter if !name.trim().is_empty() => {
-                        crate::services::TreasuryService::new(&self.db).create_account(
-                            project_id,
-                            &name,
-                            crate::models::TreasuryAccountKind::ALL[kind_idx],
-                        )?;
+                        if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
+                        let service = crate::services::TreasuryService::new(&self.db);
+                        let result = if let Some(id) = account_id {
+                            let mut account = service.get_account(id)?.context("Treasury account no longer exists")?;
+                            account.version = version;
+                            account.name = name.clone();
+                            account.kind = crate::models::TreasuryAccountKind::ALL[kind_idx];
+                            service.update_account(account)
+                        } else {
+                            service.create_account(project_id, &name, crate::models::TreasuryAccountKind::ALL[kind_idx])
+                        };
+                        if let Err(error) = result {
+                            self.notifications.push(Notification::warning(error.to_string()));
+                            return Ok(());
+                        }
                         self.mark_dirty();
                         self.modal_state = ModalType::None;
                         self.notifications
-                            .push(Notification::info("Treasury account created.".to_string()));
+                            .push(Notification::info("Treasury account saved.".to_string()));
                         return Ok(());
                     }
                     _ => {}
                 }
                 if self.modal_state != ModalType::None {
                     self.modal_state = ModalType::TreasuryAccount {
+                        account_id,
+                        version,
                         name,
                         kind_idx,
                         focus_idx,
@@ -17618,26 +18169,39 @@ impl App {
         key: KeyEvent,
         project_id: Uuid,
         entry_id: Option<Uuid>,
-        mut content: String,
+        content: String,
     ) -> Result<()> {
+        use crate::screens::editor::EditorMode;
+
+        self.ensure_journal_editor(project_id, &content, entry_id.is_none());
+        let mode = self.journal_editor.as_ref().map(|editor| editor.mode.clone());
+        if key.code == KeyCode::Esc && mode == Some(EditorMode::Normal) {
+            self.journal_editor = None;
+            self.modal_state = ModalType::None;
+            return Ok(());
+        }
+        let save = key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL)
+            || key.code == KeyCode::Enter && mode == Some(EditorMode::Normal);
+        if !save {
+            let whole_text = if matches!(key.code, KeyCode::Home | KeyCode::End) {
+                self.consume_home_end_double_press(key.code)
+            } else {
+                false
+            };
+            let editor = self.journal_editor.as_mut().unwrap();
+            let before = editor.clone();
+            Self::handle_task_desc_editor_key(editor, key, whole_text);
+            if editor.get_content().chars().count() > JOURNAL_ENTRY_CHAR_LIMIT {
+                *editor = before;
+            }
+            self.modal_state = ModalType::NewJournalEntry {
+                entry_id,
+                content: editor.get_content(),
+            };
+            return Ok(());
+        }
+        let content = self.journal_editor.as_ref().unwrap().get_content();
         match key.code {
-            KeyCode::Esc => {
-                self.modal_state = ModalType::None;
-            }
-            KeyCode::Char(c) => {
-                if content.chars().count() < JOURNAL_ENTRY_CHAR_LIMIT {
-                    content.push(c);
-                }
-                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
-            }
-            KeyCode::Backspace => {
-                if is_ctrl_backspace(key) {
-                    delete_last_word(&mut content);
-                } else {
-                    content.pop();
-                }
-                self.modal_state = ModalType::NewJournalEntry { entry_id, content };
-            }
             // Editing an existing entry only rewrites its content — no XP/
             // achievement/daily-adventure credit a second time for the same
             // entry, unlike the brand-new-entry branch below.
@@ -17647,6 +18211,7 @@ impl App {
                 self.mark_dirty();
                 self.reload_data()?;
                 self.modal_state = ModalType::None;
+                self.journal_editor = None;
             }
             KeyCode::Enter if !content.trim().is_empty() => {
                 let author = self
@@ -17676,10 +18241,22 @@ impl App {
 
                 self.reload_data()?;
                 self.modal_state = ModalType::None;
+                self.journal_editor = None;
             }
             _ => {}
         }
         Ok(())
+    }
+
+    fn ensure_journal_editor(&mut self, project_id: Uuid, content: &str, insert_if_new: bool) {
+        if self.journal_editor.is_none() {
+            self.journal_editor = Some(Self::task_desc_editor_from_text(
+                project_id,
+                content.to_string(),
+                0,
+                insert_if_new,
+            ));
+        }
     }
 
     fn handle_treasury_entry_modal_key(
@@ -18365,32 +18942,15 @@ impl App {
         now_local: chrono::DateTime<chrono::Local>,
     ) -> Result<Result<(), String>> {
         let tree = self.db.get_zen_tree()?;
-        if tree.water_today >= 2 {
-            return Ok(Err(
-                "Your tree is already fully watered for today!".to_string()
-            ));
-        }
-
         let today = now_local.date_naive();
-        let current_hour = now_local.hour();
-        let is_morning = current_hour < 12;
-
-        if tree.water_today > 0 {
-            if let Some(last_utc) = tree.last_watered {
-                let last_local = last_utc.with_timezone(&chrono::Local);
-                if last_local.date_naive() == today {
-                    let last_hour = last_local.hour();
-                    let last_was_morning = last_hour < 12;
-
-                    if is_morning && last_was_morning {
-                        return Ok(Err("You have already watered the tree this morning. Please wait until afternoon!".to_string()));
-                    }
-
-                    if !is_morning && !last_was_morning {
-                        return Ok(Err("You have already watered the tree this afternoon. Please wait until tomorrow morning!".to_string()));
-                    }
-                }
-            }
+        if tree.water_today > 0
+            || tree
+                .last_watered
+                .is_some_and(|last| last.with_timezone(&chrono::Local).date_naive() == today)
+        {
+            return Ok(Err(
+                "You have already watered the tree today. Please wait until tomorrow!".to_string(),
+            ));
         }
         Ok(Ok(()))
     }
@@ -18433,7 +18993,7 @@ impl App {
         };
 
         self.notifications.push(Notification::info(format!(
-            "Tree Watered! Growth +{}{} (Today: {}/2)",
+            "Tree Watered! Growth +{}{} (Today: {}/1)",
             amount, hp_note, tree.water_today
         )));
 
@@ -18599,7 +19159,7 @@ impl App {
         Ok(())
     }
 
-    fn complete_dashboard_task(&mut self, task: Task) -> Result<()> {
+    pub fn complete_dashboard_task(&mut self, task: Task) -> Result<()> {
         if self.warn_if_quest_has_unresolved_blockers(task.id)? {
             return Ok(());
         }
@@ -18786,10 +19346,12 @@ impl App {
         let today = chrono::Local::now().date_naive();
         let mut advs = self.db.get_daily_adventures_for(today)?;
         let mut completed_any = false;
+        let mut changed_any = false;
         let was_all_completed = advs.iter().all(|a| a.completed);
 
         for adv in &mut advs {
             if adv.quest_type == quest_type && !adv.completed {
+                changed_any = true;
                 adv.current_count = (adv.current_count + amount).min(adv.target_count);
                 if adv.current_count >= adv.target_count {
                     adv.completed = true;
@@ -18828,6 +19390,8 @@ impl App {
                 self.db.update_daily_adventure(adv)?;
             }
         }
+
+        if !changed_any { return Ok(()); }
 
         if completed_any {
             self.trigger_task_completion_particles();
@@ -19638,6 +20202,7 @@ impl App {
             }
         }
 
+
         // 3. Notas / Scrolls
         if let Ok(notes) = self.db.get_notes() {
             for n in &notes {
@@ -19713,6 +20278,20 @@ impl App {
                             },
                         ));
                     }
+                }
+            }
+        }
+
+        // 6. Logros / Achievements
+        if let Ok(reflections) = self.db.get_reflections() {
+            for reflection in reflections {
+                let content = format!("{} {}", reflection.what_went_well, reflection.what_can_improve);
+                if let Some(score) = score_match(&reflection.created_date.to_string(), Some(&content)) {
+                    scored.push((score, SearchResult {
+                        result_type: SearchResultType::Reflection,
+                        title: format!("Reflection · {}", reflection.created_date), details: match_snippet(&content),
+                        project_id: None, item_id: reflection.created_date.to_string(),
+                    }));
                 }
             }
         }
@@ -19804,6 +20383,75 @@ impl App {
             }
         }
 
+        // Atlas, Scroll folders, and Treasury live outside the cached task/note lists.
+        let atlas = crate::services::AtlasService::new(&self.db);
+        let treasury = crate::services::TreasuryService::new(&self.db);
+        for project in &projects {
+            if let Ok(charts) = atlas.charts(project.id) {
+                for chart in charts {
+                    if let Some(score) = score_match(&chart.name, None) {
+                        scored.push((score, SearchResult {
+                            result_type: SearchResultType::AtlasChart, title: chart.name.clone(),
+                            details: project.name.clone(), project_id: Some(project.id), item_id: chart.id.to_string(),
+                        }));
+                    }
+                    if let Ok(nodes) = atlas.nodes(chart.id) {
+                        for node in nodes {
+                            if let Some(score) = score_match(&node.title, None) {
+                                scored.push((score, SearchResult {
+                                    result_type: SearchResultType::AtlasNode, title: node.title,
+                                    details: format!("{} · {}", project.name, chart.name),
+                                    project_id: Some(project.id), item_id: node.id.to_string(),
+                                }));
+                            }
+                        }
+                    }
+                }
+            }
+            if let Ok(codices) = self.db.get_codices_for_project(project.id) {
+                for codex in codices {
+                    if let Some(score) = score_match(&codex.name, None) {
+                        scored.push((score, SearchResult {
+                            result_type: SearchResultType::Codex, title: codex.name,
+                            details: project.name.clone(), project_id: Some(project.id), item_id: codex.id.to_string(),
+                        }));
+                    }
+                }
+            }
+            if let Ok(entries) = treasury.entries(project.id, &crate::models::LedgerFilter::default(), crate::models::LedgerSort::Newest) {
+                for entry in entries {
+                    let content = format!("{} {} {} {} {}", entry.description, entry.notes.as_deref().unwrap_or(""), entry.vendor_source.as_deref().unwrap_or(""), entry.currency_code, entry.amount_minor);
+                    if let Some(score) = score_match(&entry.title, Some(&content)) {
+                        scored.push((score, SearchResult {
+                            result_type: SearchResultType::TreasuryEntry, title: entry.title,
+                            details: format!("{} · {}", project.name, match_snippet(&content)),
+                            project_id: Some(project.id), item_id: entry.id.to_string(),
+                        }));
+                    }
+                }
+            }
+            if let Ok(categories) = treasury.categories(project.id) {
+                for category in categories {
+                    if let Some(score) = score_match(&category.name, None) {
+                        scored.push((score, SearchResult {
+                            result_type: SearchResultType::TreasuryCategory, title: category.name,
+                            details: project.name.clone(), project_id: Some(project.id), item_id: category.id.to_string(),
+                        }));
+                    }
+                }
+            }
+            if let Ok(accounts) = treasury.accounts(project.id) {
+                for account in accounts {
+                    if let Some(score) = score_match(&account.name, None) {
+                        scored.push((score, SearchResult {
+                            result_type: SearchResultType::TreasuryAccount, title: account.name,
+                            details: project.name.clone(), project_id: Some(project.id), item_id: account.id.to_string(),
+                        }));
+                    }
+                }
+            }
+        }
+
         // Ordena por puntaje y limita a 40 resultados
         for project in projects.iter().filter(|project| project.is_shared) {
             if let Ok(members) = self.db.get_project_members(&project.id.to_string()) {
@@ -19870,9 +20518,9 @@ impl App {
             }
         }
 
-        // Ordena por puntaje y limita a 40 resultados
+        // Keep the best matches first while allowing the larger index to scroll.
         scored.sort_by(|a, b| b.0.cmp(&a.0));
-        scored.into_iter().map(|(_, r)| r).take(40).collect()
+        scored.into_iter().map(|(_, r)| r).take(100).collect()
     }
 
     pub fn navigate_to_search_result(&mut self, result: &SearchResult) -> Result<()> {
@@ -19885,6 +20533,84 @@ impl App {
                     self.active_screen = ActiveScreen::Workspace;
                     self.workspace_tab_idx = 0;
                     self.audio_player.play_open_tasks();
+                }
+            }
+            SearchResultType::AtlasChart | SearchResultType::AtlasNode => {
+                if let Some(project_id) = result.project_id
+                    && let Ok(id) = Uuid::parse_str(&result.item_id) {
+                    let service = crate::services::AtlasService::new(&self.db);
+                    let chart_id = if result.result_type == SearchResultType::AtlasChart { Some(id) }
+                        else { service.node(id)?.map(|node| node.chart_id) };
+                    if let Some(chart_id) = chart_id {
+                        if result.result_type == SearchResultType::AtlasNode {
+                            self.atlas_view.show_hidden = true;
+                            let all = service.nodes(chart_id)?;
+                            let mut parent = all.iter().find(|node| node.id == id).and_then(|node| node.parent_id);
+                            while let Some(parent_id) = parent {
+                                if let Some(branch) = all.iter().find(|node| node.id == parent_id) {
+                                    parent = branch.parent_id;
+                                    if branch.collapsed { self.atlas_view.expanded.insert(parent_id); }
+                                } else { break; }
+                            }
+                        }
+                        let selected_idx = if result.result_type == SearchResultType::AtlasNode {
+                            service.visible_nodes_for_view(chart_id, true, &self.atlas_view.expanded)?.iter().position(|(node, _)| node.id == id).unwrap_or(0)
+                        } else { 0 };
+                        self.active_project_id = Some(project_id);
+                        self.refresh_stats_cache();
+                        self.reload_data()?;
+                        self.active_screen = ActiveScreen::Workspace;
+                        self.workspace_tab_idx = 5;
+                        self.workspace_sidebar_focused = false;
+                        self.active_atlas_chart_id = Some(chart_id);
+                        self.selected_atlas_node_idx = selected_idx;
+                        self.atlas_view.anchor = None;
+                    }
+                }
+            }
+            SearchResultType::TreasuryEntry | SearchResultType::TreasuryCategory | SearchResultType::TreasuryAccount => {
+                if let Some(project_id) = result.project_id {
+                    self.active_project_id = Some(project_id);
+                    self.refresh_stats_cache();
+                    self.reload_data()?;
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 4;
+                    self.workspace_sidebar_focused = false;
+                    self.treasury_filter = crate::models::LedgerFilter::default();
+                    self.treasury_sort = crate::models::LedgerSort::Newest;
+                    if let Ok(id) = Uuid::parse_str(&result.item_id) {
+                        match result.result_type {
+                            SearchResultType::TreasuryEntry => {
+                                let entries = crate::services::TreasuryService::new(&self.db).entries(project_id, &self.treasury_filter, self.treasury_sort)?;
+                                self.selected_treasury_idx = entries.iter().position(|entry| entry.id == id).unwrap_or(0);
+                            }
+                            SearchResultType::TreasuryCategory => { self.treasury_filter.category_id = Some(id); self.selected_treasury_idx = 0; }
+                            SearchResultType::TreasuryAccount => { self.treasury_filter.account_id = Some(id); self.selected_treasury_idx = 0; }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            SearchResultType::Codex => {
+                if let Some(project_id) = result.project_id && let Ok(id) = Uuid::parse_str(&result.item_id) {
+                    self.active_project_id = Some(project_id);
+                    self.refresh_stats_cache();
+                    self.reload_data()?;
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.workspace_tab_idx = 1;
+                    self.workspace_sidebar_focused = false;
+                    let folders = self.db.get_codices_for_project(project_id)?;
+                    let mut parent = folders.iter().find(|folder| folder.id == id).and_then(|folder| folder.parent_codex_id);
+                    while let Some(parent_id) = parent {
+                        if let Some(folder) = folders.iter().find(|folder| folder.id == parent_id) {
+                            if folder.collapsed { self.db.set_codex_collapsed(parent_id, false)?; }
+                            parent = folder.parent_codex_id;
+                        } else { break; }
+                    }
+                    let notes = self.db.get_notes()?;
+                    let codices = self.db.get_codices_for_project(project_id)?;
+                    let flat = Self::build_notes_flat(&notes, &codices, project_id);
+                    self.selected_notes_flat_idx = flat.iter().position(|(codex_id, _)| *codex_id == Some(id)).unwrap_or(0);
                 }
             }
             SearchResultType::Task => {
@@ -20109,6 +20835,14 @@ impl App {
             SearchResultType::Achievement => {
                 self.active_screen = ActiveScreen::Character;
                 self.active_tab_idx = 2;
+            }
+            SearchResultType::Reflection => {
+                self.active_screen = ActiveScreen::Character;
+                self.active_tab_idx = 2;
+                self.character_focus = 2;
+                self.reflection_detail_scroll = 0;
+                self.selected_reflection_idx = self.db.get_reflections()?.iter()
+                    .position(|reflection| reflection.created_date.to_string() == result.item_id).unwrap_or(0);
             }
             SearchResultType::Lore => {
                 self.active_screen = ActiveScreen::Library;
@@ -20343,6 +21077,12 @@ impl App {
                 id: "open_settings",
             },
             CommandAction {
+                name: "Open About",
+                description: "Version information, credits, and feedback",
+                shortcut: "Command Palette",
+                id: "open_about",
+            },
+            CommandAction {
                 name: "Open Focus",
                 description: "Navigate to Focus screen",
                 shortcut: "F (from Campaigns)",
@@ -20362,14 +21102,26 @@ impl App {
             },
             CommandAction {
                 name: "Search Everywhere",
-                description: "Search across quests, notes, and achievements",
+                description: "Search quests, notes, Atlas, Treasury, and more",
                 shortcut: "/",
                 id: "search_integration",
             },
             CommandAction {
-                name: "Open Quest Codex",
-                description: "View Workspace keybindings and commands",
-                shortcut: "? (Workspace)",
+                name: "Open Atlas",
+                description: "Open a Campaign's mind map Charts",
+                shortcut: "5 (in Campaign)",
+                id: "open_atlas",
+            },
+            CommandAction {
+                name: "Open Treasury",
+                description: "Open a Campaign's accounts and ledger",
+                shortcut: "4 (in Campaign)",
+                id: "open_treasury",
+            },
+            CommandAction {
+                name: "Open Shortcut Codex",
+                description: "View global and local keybindings for every screen",
+                shortcut: "F1",
                 id: "open_quest_codex",
             },
             CommandAction {
@@ -20434,6 +21186,12 @@ impl App {
                 .is_some_and(|project_id| self.project_is_shared(project_id));
             all_actions.extend([
                 CommandAction {
+                    name: "Create Atlas Chart",
+                    description: "Start a mind map in this Campaign",
+                    shortcut: "n (Atlas)",
+                    id: "create_atlas_chart",
+                },
+                CommandAction {
                     name: "Open Quest Kanban",
                     description: "Open this Campaign's stance board",
                     shortcut: "k",
@@ -20452,6 +21210,34 @@ impl App {
                     id: "show_review_queue",
                 },
             ]);
+            if self.workspace_tab_idx == 5 && self.active_atlas_chart_id.is_some() {
+                all_actions.extend([
+                    CommandAction {
+                        name: "Add Atlas Child",
+                        description: "Add a child to the selected mind map node",
+                        shortcut: "a",
+                        id: "add_atlas_child",
+                    },
+                    CommandAction {
+                        name: "Color Atlas Branch",
+                        description: "Choose a color for the selected node and descendants",
+                        shortcut: "B",
+                        id: "color_atlas_branch",
+                    },
+                    CommandAction {
+                        name: "Center Atlas Node",
+                        description: "Center the selected mind map node in view",
+                        shortcut: "c",
+                        id: "center_atlas_node",
+                    },
+                    CommandAction {
+                        name: "Toggle Hidden Atlas Nodes",
+                        description: "Show or hide hidden mind map nodes",
+                        shortcut: "Ctrl+H",
+                        id: "toggle_hidden_atlas_nodes",
+                    },
+                ]);
+            }
             if is_shared {
                 all_actions.extend([
                     CommandAction {
@@ -20526,6 +21312,64 @@ impl App {
     pub fn execute_command_action(&mut self, action_id: &str) -> Result<()> {
         self.modal_state = ModalType::None;
         match action_id {
+            "open_atlas" | "open_treasury" => {
+                if self.active_project_id.is_some() {
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.activate_workspace_tab(if action_id == "open_atlas" { 5 } else { 4 });
+                } else {
+                    self.modal_state = ModalType::SelectProjectForAction {
+                        action_id: if action_id == "open_atlas" { "open_atlas" } else { "open_treasury" },
+                        selected_idx: 0,
+                    };
+                }
+            }
+            "create_atlas_chart" => {
+                if let Some(project_id) = self.active_project_id
+                    && self.atlas_write_allowed(project_id)?
+                {
+                    self.active_screen = ActiveScreen::Workspace;
+                    self.activate_workspace_tab(5);
+                    self.active_atlas_chart_id = None;
+                    self.atlas_input = Some(AtlasInput { kind: AtlasInputKind::NewChart, value: String::new() });
+                }
+            }
+            "add_atlas_child" | "color_atlas_branch" | "center_atlas_node" | "toggle_hidden_atlas_nodes" => {
+                if self.active_screen == ActiveScreen::Workspace
+                    && self.workspace_tab_idx == 5
+                    && let Some(chart_id) = self.active_atlas_chart_id
+                {
+                    if action_id == "toggle_hidden_atlas_nodes" {
+                        self.atlas_view.show_hidden = !self.atlas_view.show_hidden;
+                    } else {
+                        let selected = crate::services::AtlasService::new(&self.db)
+                            .visible_nodes_for_view(chart_id, self.atlas_view.show_hidden, &self.atlas_view.expanded)?
+                            .get(self.selected_atlas_node_idx)
+                            .map(|(node, _)| node.id);
+                        if let Some(node_id) = selected {
+                            match action_id {
+                                "center_atlas_node" => {
+                                    self.atlas_view.anchor = Some(node_id);
+                                    self.atlas_view.offset_x = 0;
+                                    self.atlas_view.offset_y = 0;
+                                }
+                                "add_atlas_child" | "color_atlas_branch" => {
+                                    if let Some(project_id) = self.active_project_id
+                                        && self.atlas_write_allowed(project_id)?
+                                    {
+                                        let kind = if action_id == "add_atlas_child" {
+                                            AtlasInputKind::NewNode { chart_id, parent_id: Some(node_id) }
+                                        } else {
+                                            AtlasInputKind::Color { node_id }
+                                        };
+                                        self.atlas_input = Some(AtlasInput { kind, value: String::new() });
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
             "open_dashboard" => {
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
@@ -20551,6 +21395,11 @@ impl App {
             "open_settings" => {
                 self.active_screen = ActiveScreen::Settings;
                 self.active_tab_idx = 15;
+            }
+            "open_about" => {
+                self.active_screen = ActiveScreen::About;
+                self.active_tab_idx = 13;
+                self.about_scroll = 0;
             }
             "open_stats" => {
                 self.active_screen = ActiveScreen::Legends;
@@ -20672,13 +21521,8 @@ impl App {
                 };
             }
             "open_quest_codex" => {
-                if self.active_screen == ActiveScreen::Workspace {
-                    self.workspace_help_open = true;
-                } else {
-                    self.notifications.push(Notification::info(
-                        "Open a campaign Workspace to view the Quest Codex.",
-                    ));
-                }
+                self.shortcut_help_page = self.contextual_shortcut_help_page();
+                self.modal_state = ModalType::KeyboardHelp;
             }
             "create_task" => {
                 self.pending_calendar_due_date = None;
@@ -21551,9 +22395,10 @@ impl App {
                             };
                         }
                         self.last_sync_status_time = Some(std::time::Instant::now());
-                        let _ = self.reload_data();
+                        if !self.quitting_after_sync { let _ = self.reload_data(); }
                         if self.quitting_after_sync {
                             self.quitting_after_sync = false;
+                            self.quit_needs_final_sync = false;
                             self.run_installer_on_exit = false;
                             self.modal_state = ModalType::None;
                             self.notifications.push(Notification::warning(
@@ -21589,13 +22434,24 @@ impl App {
                             };
                         }
                         self.last_sync_status_time = Some(std::time::Instant::now());
-                        self.apply_class_passive("sync_complete", 0)?;
-                        self.reload_data()?;
-                        self.last_task_notification_tick = None;
-                        self.load_chapter_progress_from_cache();
-                        self.great_chronicle_entries =
-                            self.db.get_global_chronicle_entries().unwrap_or_default();
+                        if !self.quitting_after_sync {
+                            self.apply_class_passive("sync_complete", 0)?;
+                        }
+                        if !self.quitting_after_sync {
+                            self.reload_data()?;
+                            self.last_task_notification_tick = None;
+                            self.load_chapter_progress_from_cache();
+                            self.great_chronicle_entries = self.db.get_global_chronicle_entries().unwrap_or_default();
+                        }
                         if self.quitting_after_sync {
+                            let needs_final_pass = self.quit_needs_final_sync
+                                && (self.final_sync_needs_full_state() || !self.db.get_pending_sync_logs()?.is_empty());
+                            self.quit_needs_final_sync = false;
+                            if needs_final_pass {
+                                self.sync_status_msg = "Running final cloud sync before exit…".to_string();
+                                self.do_background_sync(self.final_sync_needs_full_state());
+                                return Ok(());
+                            }
                             match self.db.flush_for_shutdown() {
                                 Ok(()) => {
                                     self.quitting_after_sync = false;
@@ -21875,10 +22731,7 @@ impl App {
     }
 
     pub fn refresh_local_music_tracks_cache(&mut self) {
-        let tracks = self.scan_local_audio_files();
-        if !tracks.is_empty() {
-            self.local_music_tracks_cache = tracks;
-        }
+        self.local_music_tracks_cache = self.scan_local_audio_files();
     }
 
     fn play_selected_local_choice(&mut self) {
@@ -22206,11 +23059,22 @@ impl App {
         self.do_background_sync(false);
     }
 
-    /// Save all local state and, when automatic cloud sync is enabled, wait
+    fn should_sync_on_quit(&self) -> bool {
+        self.config.sync_enabled
+    }
+
+    fn final_sync_needs_full_state(&self) -> bool {
+        self.db.get_setting("sync_restore_hold").ok().flatten().as_deref() == Some("1")
+    }
+
+    /// Save all local state and, when cloud sync is enabled, wait
     /// for a final sync result before allowing the event loop to terminate.
     /// A sync or checkpoint failure deliberately leaves the app open so the
     /// user can see the error and retry instead of losing that feedback.
     fn begin_graceful_quit(&mut self) {
+        if self.quitting_after_sync {
+            return;
+        }
         let editor_is_dirty = self
             .editor_state
             .as_ref()
@@ -22232,9 +23096,11 @@ impl App {
         // An already-running sync owns a second SQLite connection. Do not
         // contend with it for a checkpoint; wait for its result and perform
         // the final checkpoint after that connection has been dropped.
-        if self.auto_sync && self.config.sync_enabled && self.sync_in_progress {
+        let sync_on_quit = self.should_sync_on_quit();
+        if self.sync_in_progress {
             self.should_quit = false;
             self.quitting_after_sync = true;
+            self.quit_needs_final_sync = sync_on_quit;
             self.sync_status_msg = "Finishing cloud sync before exit…".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             if !matches!(self.modal_state, ModalType::QuitConfirm { .. }) {
@@ -22256,9 +23122,10 @@ impl App {
             return;
         }
 
-        if self.auto_sync && self.config.sync_enabled {
+        if sync_on_quit {
             self.should_quit = false;
             self.quitting_after_sync = true;
+            self.quit_needs_final_sync = false;
             self.sync_status_msg = "Saving locally and syncing before exit…".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             if !matches!(self.modal_state, ModalType::QuitConfirm { .. }) {
@@ -22266,9 +23133,10 @@ impl App {
                     quote: "The Chronicle is sealing every page before departure.".to_string(),
                 };
             }
-            self.start_background_sync();
+            self.do_background_sync(self.final_sync_needs_full_state());
         } else {
             self.quit_completed_sync = false;
+            self.quit_needs_final_sync = false;
             self.should_quit = true;
             self.modal_state = ModalType::None;
         }
@@ -22505,7 +23373,6 @@ impl App {
             step: 0,
             message: "Preparing full synchronization...".to_string(),
         };
-        let _ = self.db.set_setting("sync_restore_hold", "0");
         self.do_background_sync(true);
     }
 
@@ -22517,15 +23384,20 @@ impl App {
         self.sync_status_msg = "S󰓦".to_string();
         let _ = self.db.conn.execute_batch("PRAGMA busy_timeout = 50;");
 
+        let quitting = self.quitting_after_sync;
         let result_slot = std::sync::Arc::clone(&self.sync_result);
         let identity = self.identity.clone();
         let device_id = self.device_id.clone();
         let server_url = self.server_url.clone();
+        let db_path = self.db.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'",
+            [],
+            |row| row.get::<_, String>(0),
+        ).ok().filter(|path| !path.is_empty()).map(std::path::PathBuf::from);
 
         let _ = std::thread::spawn(move || {
             let outcome: Result<(usize, usize, Vec<String>)> = (|| {
-                let storage_dir = crate::storage::get_storage_dir()?;
-                let db_path = storage_dir.join("questline.db");
+                let db_path = db_path.ok_or_else(|| anyhow::anyhow!("Could not resolve the active Questline database"))?;
                 let db = crate::database::Database::new(&db_path)?;
                 // WAL mode ya permite concurrencia — pero damos 5s por si acaso hay contención
                 let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
@@ -22537,7 +23409,7 @@ impl App {
                     Some(server_url.as_str()),
                 )?;
                 if include_contributions {
-                    let _ = db.set_setting("sync_restore_hold", "0");
+                    Self::local_db_is_safe_for_cloud_reset(&db)?;
                     db.queue_full_state_sync()
                         .map_err(|e| anyhow::anyhow!("Full-state queue failed: {}", e))?;
                 }
@@ -22553,159 +23425,165 @@ impl App {
 
                 let now_str = chrono::Utc::now().to_rfc3339();
                 let _ = db.set_setting("last_sync", &now_str);
-
-                let client = crate::services::api_client::ApiClient::new(
-                    &server_url,
-                    identity.clone(),
-                    &device_id,
-                );
-
-                // Pull pending invitations
-                if let Ok(resp) = client.send_request("GET", "pending", "") {
-                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if let Some(list) = arr.as_array() {
-                            for inv in list {
-                                if let Err(error) =
-                                    App::store_validated_server_invitation(&db, &identity, inv)
-                                {
-                                    let invite_id = inv["id"].as_str().unwrap_or("unknown");
-                                    let warning_key =
-                                        format!("invalid_invitation_warning_{invite_id}");
-                                    if db.get_setting(&warning_key).ok().flatten().is_none() {
-                                        let _ = db.create_notification(
-                                            "fellowship_invitation_error",
-                                            "Invalid Fellowship invitation",
-                                            &format!(
-                                                "An invitation was left pending because its encrypted envelope could not be verified: {error}"
-                                            ),
-                                            Some(invite_id),
-                                        );
-                                        let _ = db.set_setting(&warning_key, "1");
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Fellowship messages arrive as encrypted project-v1 sync events.
-
-                // Refresh companion presence
-                if let Ok(resp) = client.send_request("GET", "project/companions", "") {
-                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if let Some(companions) = arr.as_array() {
-                            for comp in companions {
-                                let identity_key =
-                                    comp["user_identity"].as_str().unwrap_or_default();
-                                let username = comp["user_username"].as_str().unwrap_or_default();
-                                if identity_key.is_empty() || username.is_empty() {
-                                    continue;
-                                }
-                                let last_seen_raw = comp["last_seen"].as_str().unwrap_or_default();
-                                let (is_online, last_seen_display) =
-                                    App::parse_companion_last_seen(last_seen_raw);
-                                let _ = db.update_presence(
-                                    identity_key,
-                                    username,
-                                    is_online,
-                                    &last_seen_display,
-                                    None,
-                                    if is_online { "Visible" } else { "Offline" },
-                                );
-                                let _ = db.conn.execute(
-                                    "UPDATE project_members SET user_username = ?1 WHERE user_identity = ?2 AND user_username = 'Accepted Companion'",
-                                    rusqlite::params![username, identity_key],
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // Pull Realm Activity (global chronicle) entries from server into local DB
-                if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
-                    if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
-                        if let Some(entries) = arr.as_array() {
-                            let _ = db.cleanup_global_chronicle_entries(1);
-                            for e in entries {
-                                let id = e["id"].as_str().unwrap_or_default();
-                                let hero = e["hero_name"].as_str().unwrap_or_default();
-                                let etype = e["event_type"].as_str().unwrap_or_default();
-                                let desc = e["description"].as_str().unwrap_or_default();
-                                let ts = e["timestamp"].as_str().unwrap_or_default();
-                                let hero_class = e["hero_class"].as_str().filter(|s| !s.is_empty());
-                                if !id.is_empty() {
-                                    let _ = db.conn.execute(
-                                        "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                                        rusqlite::params![id, hero, etype, desc, ts, hero_class],
-                                    );
-                                    if hero_class.is_some() {
-                                        let _ = db.conn.execute(
-                                            "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
-                                            rusqlite::params![hero_class, id],
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Submit chapter contribution increments (only on forced/manual sync)
                 if include_contributions {
-                    if let Some(chapter) = crate::models::chapter::get_active_chapter() {
-                        // Only count tasks owned by this user — prevents shared-project
-                        // pulls (other users' completed tasks) from inflating the delta.
-                        if let Ok(snapshot) = db.get_contribution_snapshot(&identity.public_key) {
-                            if let Ok(confirmed) = client.fetch_my_chapter_contributions(chapter.id)
-                            {
-                                let local_baseline = db
+                    db.set_setting("sync_restore_hold", "0")?;
+                }
+
+                if !quitting {
+                    let client = crate::services::api_client::ApiClient::new(
+                        &server_url,
+                        identity.clone(),
+                        &device_id,
+                    );
+
+                    // Pull pending invitations
+                    if let Ok(resp) = client.send_request("GET", "pending", "") {
+                        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
+                            if let Some(list) = arr.as_array() {
+                                for inv in list {
+                                    if let Err(error) =
+                                        App::store_validated_server_invitation(&db, &identity, inv)
+                                    {
+                                        let invite_id = inv["id"].as_str().unwrap_or("unknown");
+                                        let warning_key =
+                                            format!("invalid_invitation_warning_{invite_id}");
+                                        if db.get_setting(&warning_key).ok().flatten().is_none() {
+                                            let _ = db.create_notification(
+                                                "fellowship_invitation_error",
+                                                "Invalid Fellowship invitation",
+                                                &format!(
+                                                    "An invitation was left pending because its encrypted envelope could not be verified: {error}"
+                                                ),
+                                                Some(invite_id),
+                                            );
+                                            let _ = db.set_setting(&warning_key, "1");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fellowship messages arrive as encrypted project-v1 sync events.
+
+                    // Refresh companion presence
+                    if let Ok(resp) = client.send_request("GET", "project/companions", "") {
+                        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
+                            if let Some(companions) = arr.as_array() {
+                                for comp in companions {
+                                    let identity_key =
+                                        comp["user_identity"].as_str().unwrap_or_default();
+                                    let username = comp["user_username"].as_str().unwrap_or_default();
+                                    if identity_key.is_empty() || username.is_empty() {
+                                        continue;
+                                    }
+                                    let last_seen_raw = comp["last_seen"].as_str().unwrap_or_default();
+                                    let (is_online, last_seen_display) =
+                                        App::parse_companion_last_seen(last_seen_raw);
+                                    let _ = db.update_presence(
+                                        identity_key,
+                                        username,
+                                        is_online,
+                                        &last_seen_display,
+                                        None,
+                                        if is_online { "Visible" } else { "Offline" },
+                                    );
+                                    let _ = db.conn.execute(
+                                        "UPDATE project_members SET user_username = ?1 WHERE user_identity = ?2 AND user_username = 'Accepted Companion'",
+                                        rusqlite::params![username, identity_key],
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Pull Realm Activity (global chronicle) entries from server into local DB
+                    if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
+                        if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
+                            if let Some(entries) = arr.as_array() {
+                                let _ = db.cleanup_global_chronicle_entries(1);
+                                for e in entries {
+                                    let id = e["id"].as_str().unwrap_or_default();
+                                    let hero = e["hero_name"].as_str().unwrap_or_default();
+                                    let etype = e["event_type"].as_str().unwrap_or_default();
+                                    let desc = e["description"].as_str().unwrap_or_default();
+                                    let ts = e["timestamp"].as_str().unwrap_or_default();
+                                    let hero_class = e["hero_class"].as_str().filter(|s| !s.is_empty());
+                                    if !id.is_empty() {
+                                        let _ = db.conn.execute(
+                                            "INSERT OR IGNORE INTO global_chronicle (id, hero_name, event_type, description, timestamp, hero_class) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                                            rusqlite::params![id, hero, etype, desc, ts, hero_class],
+                                        );
+                                        if hero_class.is_some() {
+                                            let _ = db.conn.execute(
+                                                "UPDATE global_chronicle SET hero_class = ?1 WHERE id = ?2 AND hero_class IS NULL",
+                                                rusqlite::params![hero_class, id],
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Submit chapter contribution increments (only on forced/manual sync)
+                    if include_contributions {
+                        if let Some(chapter) = crate::models::chapter::get_active_chapter() {
+                            // Only count tasks owned by this user — prevents shared-project
+                            // pulls (other users' completed tasks) from inflating the delta.
+                            if let Ok(snapshot) = db.get_contribution_snapshot(&identity.public_key) {
+                                if let Ok(confirmed) = client.fetch_my_chapter_contributions(chapter.id)
+                                {
+                                    let local_baseline = db
+                                        .get_last_sent_contributions(chapter.id)
+                                        .unwrap_or_default();
+                                    let all_objectives = [
+                                        "tasks_completed",
+                                        "subtasks_completed",
+                                        "focus_sessions",
+                                        "tree_waterings",
+                                        "rituals_completed",
+                                        "reflections_written",
+                                        "scrolls_created",
+                                    ];
+                                    let mut corrected: std::collections::HashMap<String, u64> =
+                                        std::collections::HashMap::new();
+                                    for &obj in &all_objectives {
+                                        let server_val = confirmed.get(obj).copied();
+                                        let local_val = local_baseline.get(obj).copied().unwrap_or(0);
+                                        corrected
+                                            .insert(obj.to_string(), server_val.unwrap_or(local_val));
+                                    }
+                                    let _ = db.save_sent_contributions(chapter.id, &corrected);
+                                }
+
+                                let last_sent = db
                                     .get_last_sent_contributions(chapter.id)
                                     .unwrap_or_default();
-                                let all_objectives = [
-                                    "tasks_completed",
-                                    "subtasks_completed",
-                                    "focus_sessions",
-                                    "tree_waterings",
-                                    "rituals_completed",
-                                    "reflections_written",
-                                    "scrolls_created",
-                                ];
-                                let mut corrected: std::collections::HashMap<String, u64> =
-                                    std::collections::HashMap::new();
-                                for &obj in &all_objectives {
-                                    let server_val = confirmed.get(obj).copied();
-                                    let local_val = local_baseline.get(obj).copied().unwrap_or(0);
-                                    corrected
-                                        .insert(obj.to_string(), server_val.unwrap_or(local_val));
+                                let mut increments = std::collections::HashMap::new();
+                                for (key, &current) in &snapshot {
+                                    let prev = last_sent.get(key).copied().unwrap_or(0);
+                                    if current > prev {
+                                        increments.insert(key.clone(), current - prev);
+                                    }
                                 }
-                                let _ = db.save_sent_contributions(chapter.id, &corrected);
-                            }
-
-                            let last_sent = db
-                                .get_last_sent_contributions(chapter.id)
-                                .unwrap_or_default();
-                            let mut increments = std::collections::HashMap::new();
-                            for (key, &current) in &snapshot {
-                                let prev = last_sent.get(key).copied().unwrap_or(0);
-                                if current > prev {
-                                    increments.insert(key.clone(), current - prev);
+                                if !increments.is_empty() {
+                                    if client
+                                        .submit_chapter_contribution(chapter.id, &increments)
+                                        .is_ok()
+                                    {
+                                        let _ = db.save_sent_contributions(chapter.id, &snapshot);
+                                    }
                                 }
                             }
-                            if !increments.is_empty() {
-                                if client
-                                    .submit_chapter_contribution(chapter.id, &increments)
-                                    .is_ok()
-                                {
-                                    let _ = db.save_sent_contributions(chapter.id, &snapshot);
-                                }
+                            // Cache fresh chapter progress for the UI to pick up after sync
+                            if let Ok(val) = client.fetch_chapter_progress(chapter.id) {
+                                let json = serde_json::to_string(&val).unwrap_or_default();
+                                let _ = db.set_setting("chapter_progress_cache", &json);
                             }
-                        }
-                        // Cache fresh chapter progress for the UI to pick up after sync
-                        if let Ok(val) = client.fetch_chapter_progress(chapter.id) {
-                            let json = serde_json::to_string(&val).unwrap_or_default();
-                            let _ = db.set_setting("chapter_progress_cache", &json);
                         }
                     }
+
                 }
 
                 // Update sync and conflict counters
@@ -23094,6 +23972,12 @@ impl App {
         true
     }
 
+    pub fn foreground_notification(&self) -> Option<&Notification> {
+        self.notifications.iter().rev()
+            .find(|notification| matches!(notification.kind, NotificationKind::Swarm))
+            .or_else(|| self.notifications.last())
+    }
+
     fn notify_task_completed(&self, task: &Task, is_step: bool) {
         if !is_step {
             for dependent_id in self
@@ -23183,18 +24067,18 @@ impl App {
         self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
+        self.sprite_eligible_checks = 0;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
     }
 
-    /// Background idle-spawn tick — checked once per minute, very low probability.
+    /// Background idle-spawn tick. Eligible checks happen once per minute;
+    /// five unsuccessful checks guarantee a visible response.
     pub fn tick_sprite_notifications(&mut self) {
         if let Some(t) = self.last_sprite_check_time {
             if t.elapsed().as_secs() < 60 {
                 return;
             }
         }
-        self.last_sprite_check_time = Some(std::time::Instant::now());
-
         if !self.can_spawn_sprite_notification() {
             return;
         }
@@ -23225,6 +24109,9 @@ impl App {
             }
         }
 
+        self.last_sprite_check_time = Some(std::time::Instant::now());
+        self.sprite_eligible_checks = self.sprite_eligible_checks.saturating_add(1);
+
         // Per-minute spawn probability (decreases as chapter progresses)
         let spawn_chance: f64 = if progress >= 0.90 {
             0.015
@@ -23238,7 +24125,7 @@ impl App {
             0.20
         };
         use rand::Rng;
-        if rand::thread_rng().r#gen::<f64>() > spawn_chance {
+        if self.sprite_eligible_checks < 5 && rand::thread_rng().r#gen::<f64>() > spawn_chance {
             return;
         }
 
@@ -23246,6 +24133,7 @@ impl App {
         self.audio_player.play_notification_swarm();
         self.notifications.push(Notification::swarm(msg, title));
         self.sprite_notifications_shown_this_session += 1;
+        self.sprite_eligible_checks = 0;
         self.last_sprite_notification_time = Some(std::time::Instant::now());
     }
 
@@ -23911,14 +24799,14 @@ impl App {
                         tree.last_watered = Some(Utc::now());
                         self.db.update_zen_tree(&tree)?;
                         self.notifications.push(Notification::info(format!(
-                            "Rain Sounds Auto-Watered! Growth +1 (Today: {}/2)",
+                            "Rain Sounds Auto-Watered! Growth +1 (Today: {}/1)",
                             tree.water_today
                         )));
                         self.update_daily_adventure_progress("water_tree", 1)?;
                         self.check_tree_evolution(&mut tree)?;
                     } else {
                         self.notifications.push(Notification::warning(
-                            "Rain Sounds: Tree is already watered for this time period.",
+                            "Rain Sounds: Tree is already watered today.",
                         ));
                     }
                 }
@@ -24616,13 +25504,15 @@ impl App {
     }
 
     /// True while the user is actively typing somewhere outside a modal —
-    /// searching, the Editor screen (writing/editing a Scroll/Note), or one
-    /// of the pre-gameplay text-entry screens. `handle_key_event` uses this
-    /// to gate a few global shortcuts that would otherwise steal keystrokes
+    /// searching, an Atlas naming prompt, the Editor screen (writing/editing
+    /// a Scroll/Note), or one of the pre-gameplay text-entry screens.
+    /// `handle_key_event` uses this to gate a few global shortcuts that would
+    /// otherwise steal keystrokes
     /// meant as literal text; `tick_hydration` below uses the same check so
     /// the reminder can't pop up (and then swallow keystrokes) mid-typing.
     fn is_in_text_entry(&self) -> bool {
         self.searching
+            || self.atlas_input.is_some()
             || self.modal_state != ModalType::None
             || self.active_screen == ActiveScreen::Editor
             || self.active_screen == ActiveScreen::Onboarding
@@ -24778,9 +25668,18 @@ fn build_project_stats(
     project_created_at: DateTime<Utc>,
     db: &Database,
 ) -> ProjectStats {
-    let all_tasks = db.get_tasks().unwrap_or_default();
-    let all_notes = db.get_notes().unwrap_or_default();
-    let all_journals = db.get_journal_entries().unwrap_or_default();
+    // Milestones need counts, not a fresh copy of every campaign's full records.
+    let (completed, notes, journals, total_completed, focus_sessions) = db.conn.query_row(
+        "SELECT
+            (SELECT COUNT(*) FROM tasks WHERE project_id=?1 AND completed=1 AND parent_task_id IS NULL),
+            (SELECT COUNT(*) FROM notes WHERE project_id=?1),
+            (SELECT COUNT(*) FROM journal_entries WHERE project_id=?1),
+            (SELECT COUNT(*) FROM tasks WHERE completed=1 AND parent_task_id IS NULL),
+            (SELECT COUNT(*) FROM focus_sessions)",
+        params![p_id.to_string()],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?,
+                  row.get::<_, i64>(3)?, row.get::<_, i64>(4)?)),
+    ).unwrap_or_default();
     let streak = db.get_streak().unwrap_or(crate::models::Streak {
         id: String::new(),
         current_streak: 0,
@@ -24790,23 +25689,13 @@ fn build_project_stats(
 
     ProjectStats {
         project_age_days: (Utc::now() - project_created_at).num_days(),
-        completed_tasks_in_project: all_tasks
-            .iter()
-            .filter(|t| t.project_id == Some(p_id) && t.completed && t.parent_task_id.is_none())
-            .count() as i64,
-        notes_in_project: all_notes
-            .iter()
-            .filter(|n| n.project_id == Some(p_id))
-            .count() as i64,
-        journal_entries_in_project: all_journals.iter().filter(|j| j.project_id == p_id).count()
-            as i64,
+        completed_tasks_in_project: completed,
+        notes_in_project: notes,
+        journal_entries_in_project: journals,
         active_days_in_project: db.get_active_days_for_project(p_id).unwrap_or(0),
-        total_completed_tasks: all_tasks
-            .iter()
-            .filter(|t| t.completed && t.parent_task_id.is_none())
-            .count() as i64,
+        total_completed_tasks: total_completed,
         current_streak: streak.current_streak as i64,
-        focus_sessions_total: db.get_focus_sessions().unwrap_or_default().len() as i64,
+        focus_sessions_total: focus_sessions,
         daily_adventures_completed: db.get_daily_adventures_completed_count().unwrap_or(0),
     }
 }
@@ -24817,6 +25706,91 @@ mod app_tests {
     use crate::models::{Codex, Season};
     use crate::services::identity::Identity;
     use std::path::Path;
+
+    #[test]
+    fn milestone_stats_count_completed_parent_quests_in_the_correct_campaign() {
+        let path = std::env::temp_dir().join(format!("questline-milestone-counts-{}.db", Uuid::new_v4()));
+        let db = Database::new(&path).unwrap();
+        let now = Utc::now();
+        let campaign_id = Uuid::new_v4();
+        let other_id = Uuid::new_v4();
+        for id in [campaign_id, other_id] {
+            db.insert_project(&Project { id, name: "Counts".into(), description: None,
+                archived: false, completed: false, created_at: now, updated_at: now,
+                owner_identity: None, owner_username: None, is_shared: false }).unwrap();
+        }
+        let parent_id = Uuid::new_v4();
+        for (id, project_id, parent_task_id, completed) in [
+            (parent_id, campaign_id, None, true),
+            (Uuid::new_v4(), campaign_id, Some(parent_id), true),
+            (Uuid::new_v4(), campaign_id, None, false),
+            (Uuid::new_v4(), other_id, None, true),
+        ] {
+            db.insert_task(&Task { id, project_id: Some(project_id), title: "Count me".into(),
+                description: None, due_date: None, set_date: None, completed,
+                priority: TaskPriority::Medium, created_at: now, updated_at: now,
+                owner_identity: None, owner_username: None, parent_task_id,
+                xp_awarded: completed, recurrence: None }).unwrap();
+        }
+        let stats = build_project_stats(campaign_id, now, &db);
+        assert_eq!(stats.completed_tasks_in_project, 1);
+        assert_eq!(stats.total_completed_tasks, 2);
+        assert_eq!(stats.active_days_in_project, 1);
+        assert_eq!(stats.notes_in_project, 0);
+        assert_eq!(stats.focus_sessions_total, 0);
+        drop(db); let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    #[ignore = "manual local performance review with a synthetic database"]
+    fn profile_task_actions_with_many_campaigns() {
+        let path = std::env::temp_dir().join(format!("questline-action-profile-{}.db", Uuid::new_v4()));
+        let mut app = App::new(&path).unwrap();
+        app.config.sync_enabled = false;
+        app.auto_sync = false;
+        app.external_notifications = false;
+        let now = Utc::now();
+        app.db.insert_user(&User { id: Uuid::new_v4(), username: "Profile".into(),
+            class: ClassType::MindSage, level: 20, xp: 0, created_at: now, specialization: None }).unwrap();
+        {
+            for project_index in 0..20 {
+                let id = Uuid::new_v4();
+                app.db.insert_project(&Project { id, name: format!("Campaign {project_index}"),
+                    description: None, archived: false, completed: false, created_at: now,
+                    updated_at: now, owner_identity: None, owner_username: None, is_shared: false }).unwrap();
+                for index in 0..100 {
+                    app.db.insert_task(&Task { id: Uuid::new_v4(), project_id: Some(id),
+                        title: format!("Quest {index}"), description: None, due_date: None,
+                        set_date: None, completed: false, priority: TaskPriority::Medium,
+                        created_at: now, updated_at: now, owner_identity: None, owner_username: None,
+                        parent_task_id: None, xp_awarded: false, recurrence: None }).unwrap();
+                }
+                app.active_project_id = Some(id);
+            }
+        }
+        let start = std::time::Instant::now();
+        app.reload_data().unwrap();
+        eprintln!("20 campaigns / 2,000 tasks: reload {:?}", start.elapsed());
+        app.active_screen = ActiveScreen::Workspace;
+        app.workspace_tab_idx = 0;
+        app.modal_state = ModalType::NewTask { title: "Profile creation".into(), desc: String::new(),
+            desc_cursor: 0, priority: TaskPriority::Medium, due_date_type: DueDateType::None,
+            due_date_val: String::new(), set_date_val: String::new(), focus_idx: 0,
+            parent_task_id: None, recurrence: None };
+        let start = std::time::Instant::now();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        eprintln!("create task {:?}", start.elapsed());
+        let task = app.all_tasks.iter().find(|task| task.title == "Profile creation").unwrap().clone();
+        let start = std::time::Instant::now();
+        app.complete_dashboard_task(task.clone()).unwrap();
+        eprintln!("complete task {:?}", start.elapsed());
+        assert!(app.all_tasks.iter().find(|candidate| candidate.id == task.id).unwrap().completed);
+        let start = std::time::Instant::now();
+        app.begin_graceful_quit();
+        eprintln!("local quit {:?}", start.elapsed());
+        assert!(app.should_quit);
+        drop(app); let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn encrypted_invitation_is_decrypted_before_it_is_stored() {
@@ -25193,6 +26167,52 @@ mod app_tests {
     }
 
     #[test]
+    fn swarm_notifications_reach_tasks_treasury_and_atlas() {
+        let db_file = Path::new("test_questline_swarm_workspace_tabs.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(Uuid::new_v4());
+        for tab in [0, 4, 5] {
+            app.workspace_tab_idx = tab;
+            app.last_sprite_notification_time = None;
+            app.last_sprite_check_time = Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+            app.sprite_eligible_checks = 4;
+            let before = app.sprite_notifications_shown_this_session;
+            app.tick_sprite_notifications();
+            assert_eq!(app.sprite_notifications_shown_this_session, before + 1, "tab {tab}");
+            assert!(matches!(app.foreground_notification().map(|notification| notification.kind), Some(NotificationKind::Swarm)));
+        }
+        app.notifications.push(Notification::info("Routine update"));
+        assert!(matches!(app.foreground_notification().map(|notification| notification.kind), Some(NotificationKind::Swarm)));
+        app.notifications.retain(|notification| !matches!(notification.kind, NotificationKind::Swarm));
+        assert!(matches!(app.foreground_notification().map(|notification| notification.kind), Some(NotificationKind::Info)));
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn blocked_swarm_tick_does_not_consume_eligible_check() {
+        let db_file = Path::new("test_questline_swarm_blocked_tick.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.workspace_tab_idx = 5;
+        let previous = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        app.last_sprite_check_time = Some(previous);
+        app.sprite_eligible_checks = 4;
+        app.modal_state = ModalType::KeyboardHelp;
+        app.tick_sprite_notifications();
+        assert_eq!(app.sprite_eligible_checks, 4);
+        assert_eq!(app.last_sprite_check_time, Some(previous));
+        app.modal_state = ModalType::None;
+        app.tick_sprite_notifications();
+        assert_eq!(app.sprite_notifications_shown_this_session, 1);
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn test_parse_due_date_input() {
         let db_file = Path::new("test_questline_date.db");
         let _ = std::fs::remove_file(db_file);
@@ -25240,7 +26260,6 @@ mod app_tests {
         assert_eq!(tree.stage, 1);
         assert_eq!(tree.water_today, 0);
 
-        // Water tree once (morning)
         let morning_time = chrono::Local::now()
             .with_time(chrono::NaiveTime::from_hms_opt(9, 0, 0).unwrap())
             .unwrap();
@@ -25249,26 +26268,23 @@ mod app_tests {
         assert_eq!(tree.water_today, 1);
         assert_eq!(tree.growth, 1);
 
-        // Water tree twice (afternoon)
         let afternoon_time = chrono::Local::now()
             .with_time(chrono::NaiveTime::from_hms_opt(14, 0, 0).unwrap())
             .unwrap();
         app.water_tree_at(afternoon_time).unwrap();
         let tree = app.db.get_zen_tree().unwrap();
-        assert_eq!(tree.water_today, 2);
-        assert_eq!(tree.growth, 2);
+        assert_eq!(tree.water_today, 1);
+        assert_eq!(tree.growth, 1);
 
-        // Water tree thrice (afternoon again, should fail/block)
         let afternoon_time_2 = chrono::Local::now()
             .with_time(chrono::NaiveTime::from_hms_opt(16, 0, 0).unwrap())
             .unwrap();
         app.water_tree_at(afternoon_time_2).unwrap();
         let tree = app.db.get_zen_tree().unwrap();
-        assert_eq!(tree.water_today, 2);
-        assert_eq!(tree.growth, 2);
+        assert_eq!(tree.water_today, 1);
+        assert_eq!(tree.growth, 1);
 
-        // Grow tree manually to test evolution
-        app.grow_tree(8).unwrap(); // total 10 growth
+        app.grow_tree(9).unwrap();
         let tree = app.db.get_zen_tree().unwrap();
         assert_eq!(tree.growth, 10);
         assert_eq!(tree.stage, 2); // evolved to sprout
@@ -26877,13 +27893,17 @@ mod app_tests {
             .unwrap();
         assert_eq!(app.modal_state, ModalType::None);
 
-        // 5. Press F1 to open CommandPalette
+        // 5. F1 is the conventional global help key.
         app.handle_key_event(KeyEvent::new(KeyCode::F(1), KeyModifiers::empty()))
             .unwrap();
-        match app.modal_state {
-            ModalType::CommandPalette { .. } => {}
-            _ => panic!("Expected ModalType::CommandPalette"),
-        }
+        assert_eq!(app.modal_state, ModalType::KeyboardHelp);
+        let first_page = app.shortcut_help_page;
+        app.handle_key_event(KeyEvent::new(KeyCode::Right, KeyModifiers::empty()))
+            .unwrap();
+        assert_eq!(
+            app.shortcut_help_page,
+            (first_page + 1) % SHORTCUT_HELP_PAGE_COUNT
+        );
 
         // 6. Escape to close
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
@@ -26923,9 +27943,10 @@ mod app_tests {
         app.active_screen = ActiveScreen::Dashboard;
         app.active_project_id = None;
 
-        // 7. Press ? to open About screen (since we are not in text entry)
+        // 7. ? retains its original Dashboard behavior: open About.
         app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty()))
             .unwrap();
+        assert_eq!(app.modal_state, ModalType::None);
         assert_eq!(app.active_screen, ActiveScreen::About);
         assert_eq!(app.active_tab_idx, 13);
 
@@ -26946,7 +27967,77 @@ mod app_tests {
 
         app.active_screen = ActiveScreen::Workspace;
         app.execute_command_action("open_quest_codex").unwrap();
-        assert!(app.workspace_help_open);
+        assert_eq!(app.modal_state, ModalType::KeyboardHelp);
+        assert_eq!(app.shortcut_help_page, 2);
+
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn command_palette_opens_campaign_atlas_and_treasury() {
+        let db_file = Path::new("test_questline_atlas_palette.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+
+        assert_eq!(
+            app.get_available_command_actions("atlas")
+                .first()
+                .map(|action| action.id),
+            Some("open_atlas")
+        );
+        assert_eq!(
+            app.get_available_command_actions("treasury")
+                .first()
+                .map(|action| action.id),
+            Some("open_treasury")
+        );
+        app.execute_command_action("open_atlas").unwrap();
+        assert!(matches!(
+            app.modal_state,
+            ModalType::SelectProjectForAction { action_id: "open_atlas", .. }
+        ));
+
+        let project_id = Uuid::new_v4();
+        let now = Utc::now();
+        let project = Project {
+            id: project_id,
+            name: "Map Campaign".to_string(),
+            description: None,
+            archived: false,
+            completed: false,
+            created_at: now,
+            updated_at: now,
+            owner_identity: None,
+            owner_username: None,
+            is_shared: false,
+        };
+        app.db.insert_project(&project).unwrap();
+        app.projects.push(project);
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert_eq!(app.active_project_id, Some(project_id));
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+        assert_eq!(app.workspace_tab_idx, 5);
+
+        assert!(app.get_available_command_actions("create atlas chart")
+            .iter().any(|action| action.id == "create_atlas_chart"));
+        app.execute_command_action("create_atlas_chart").unwrap();
+        assert!(matches!(app.atlas_input, Some(AtlasInput { kind: AtlasInputKind::NewChart, .. })));
+        app.atlas_input = None;
+        let chart = crate::services::AtlasService::new(&app.db)
+            .create_chart(project_id, "Directions", None).unwrap();
+        app.active_atlas_chart_id = Some(chart.id);
+        assert!(app.get_available_command_actions("color atlas branch")
+            .iter().any(|action| action.id == "color_atlas_branch"));
+        app.execute_command_action("add_atlas_child").unwrap();
+        assert!(matches!(app.atlas_input, Some(AtlasInput { kind: AtlasInputKind::NewNode { .. }, .. })));
+        app.execute_command_action("color_atlas_branch").unwrap();
+        assert!(matches!(app.atlas_input, Some(AtlasInput { kind: AtlasInputKind::Color { .. }, .. })));
+        app.execute_command_action("toggle_hidden_atlas_nodes").unwrap();
+        assert!(app.atlas_view.show_hidden);
+
+        app.execute_command_action("open_treasury").unwrap();
+        assert_eq!(app.workspace_tab_idx, 4);
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
 
         let _ = std::fs::remove_file(db_file);
     }
@@ -28045,6 +29136,41 @@ mod app_tests {
     }
 
     #[test]
+    fn treasury_show_all_restores_old_transactions_for_editing() {
+        let db_file = Path::new("test_questline_treasury_show_all.db");
+        let (mut app, campaign_id, entry_id) = treasury_role_app(db_file, "Owner");
+        let service = crate::services::TreasuryService::new(&app.db);
+        let mut older = service.get_entry(entry_id).unwrap().unwrap();
+        older.id = Uuid::new_v4();
+        older.title = "Older account correction".into();
+        older.created_at = Utc::now() - chrono::Duration::days(180);
+        let older = service.create_entry(older).unwrap();
+        app.treasury_filter = crate::models::LedgerFilter {
+            date_from: Some(Utc::now() - chrono::Duration::days(30)),
+            account_id: Some(Uuid::new_v4()),
+            status: Some(crate::models::LedgerStatus::Cancelled),
+            text: Some("hidden".into()),
+            ..Default::default()
+        };
+        app.search_query = "hidden".into();
+        app.selected_treasury_idx = 99;
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::empty())).unwrap();
+        assert!(app.search_query.is_empty());
+        assert_eq!(app.selected_treasury_idx, 0);
+        let entries = crate::services::TreasuryService::new(&app.db).entries(campaign_id, &app.treasury_filter, app.treasury_sort).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries.last().unwrap().id, older.id);
+        app.handle_key_event(KeyEvent::new(KeyCode::End, KeyModifiers::empty())).unwrap();
+        assert_eq!(app.selected_treasury_idx, 1);
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty())).unwrap();
+        assert!(matches!(app.modal_state, ModalType::TreasuryEntry { entry_id: Some(id), .. } if id == older.id));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Home, KeyModifiers::empty())).unwrap();
+        assert_eq!(app.selected_treasury_idx, 0);
+        drop(app); let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn treasury_can_create_savings_accounts_and_record_account_transfers() {
         let db_file = Path::new("test_questline_treasury_accounts.db");
         let (mut app, project_id, _) = treasury_role_app(db_file, "Owner");
@@ -28107,6 +29233,65 @@ mod app_tests {
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_account_manager_edits_defaults_and_moves_paid_entries() {
+        let db_file = Path::new("test_questline_treasury_account_manager.db");
+        let (mut app, project_id, entry_id) = treasury_role_app(db_file, "Owner");
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('E'), KeyModifiers::SHIFT)).unwrap();
+        assert!(matches!(app.modal_state, ModalType::TreasuryAccounts { .. }));
+        let original = crate::services::TreasuryService::new(&app.db).accounts(project_id).unwrap()[0].clone();
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert!(matches!(app.modal_state, ModalType::TreasuryAccount { account_id: Some(id), .. } if id == original.id));
+        app.modal_state = ModalType::TreasuryAccount { account_id: Some(original.id), version: original.version, name: "bank1".into(), kind_idx: 1, focus_idx: 1 };
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        let updated = crate::services::TreasuryService::new(&app.db).get_account(original.id).unwrap().unwrap();
+        assert_eq!(updated.name, "bank1");
+        assert_eq!(updated.kind, crate::models::TreasuryAccountKind::Savings);
+        let service = crate::services::TreasuryService::new(&app.db);
+        let mut paid = service.get_entry(entry_id).unwrap().unwrap();
+        paid.status = crate::models::LedgerStatus::Paid;
+        paid.payment_date = Some(Utc::now());
+        let paid = service.update_entry(paid).unwrap();
+        let destination = service.create_account(project_id, "bank2", crate::models::TreasuryAccountKind::Spending).unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::empty())).unwrap();
+        assert!(matches!(app.modal_state, ModalType::TreasuryEntry { entry_id: Some(id), .. } if id == entry_id));
+        let accounts = crate::services::TreasuryService::new(&app.db).accounts(project_id).unwrap();
+        app.treasury_account_idx = accounts.iter().position(|a| a.id == destination.id).unwrap();
+        if let ModalType::TreasuryEntry { ref mut focus_idx, .. } = app.modal_state { *focus_idx = 7; }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        let moved = crate::services::TreasuryService::new(&app.db).get_entry(entry_id).unwrap().unwrap();
+        assert_eq!(moved.account_id, Some(destination.id));
+        assert_eq!(moved.payment_date, paid.payment_date);
+        assert_eq!(moved.amount_minor, paid.amount_minor);
+        drop(app); let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_account_manager_deletes_only_unused_accounts_and_clears_filter() {
+        for role in ["Owner", "Observer"] {
+            let path = format!("test_questline_account_delete_{role}.db");
+            let db_file = Path::new(&path);
+            let (mut app, campaign_id, _) = treasury_role_app(db_file, role);
+            let accounts = crate::services::TreasuryService::new(&app.db).accounts(campaign_id).unwrap();
+            let index = accounts.iter().position(|a| a.name == "Savings").unwrap();
+            let id = accounts[index].id;
+            app.treasury_filter.account_id = Some(id);
+            app.modal_state = ModalType::TreasuryAccounts { selected_idx: index };
+            app.handle_key_event(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty())).unwrap();
+            let exists = crate::services::TreasuryService::new(&app.db).get_account(id).unwrap().is_some();
+            assert_eq!(exists, role == "Observer");
+            assert_eq!(app.treasury_filter.account_id, if role == "Observer" { Some(id) } else { None });
+            if role == "Owner" {
+                let accounts = crate::services::TreasuryService::new(&app.db).accounts(campaign_id).unwrap();
+                let index = accounts.iter().position(|a| a.name == "Spending").unwrap();
+                app.modal_state = ModalType::TreasuryAccounts { selected_idx: index };
+                app.handle_key_event(KeyEvent::new(KeyCode::Delete, KeyModifiers::empty())).unwrap();
+                assert!(last_warning(&app).contains("transaction history"));
+            }
+            drop(app); let _ = std::fs::remove_file(db_file);
+        }
     }
 
     #[test]
@@ -28629,6 +29814,43 @@ mod app_tests {
     }
 
     #[test]
+    fn fellowship_chronicle_composer_uses_vim_editor_and_multiline_paste() {
+        let db_file = Path::new("test_questline_fellowship_chronicle_editor.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.projects = vec![Project {
+            id: Uuid::new_v4(), name: "Shared Campaign".to_string(), description: None,
+            created_at: Utc::now(), updated_at: Utc::now(), archived: false,
+            completed: false, owner_identity: None, owner_username: None, is_shared: true,
+        }];
+        app.active_screen = ActiveScreen::Fellowship;
+        app.selected_fellowship_tab = 0;
+        app.fellowship_focus_left = false;
+        let press = |app: &mut App, code| {
+            app.handle_key_event(KeyEvent::new(code, KeyModifiers::empty())).unwrap();
+        };
+
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.fellowship_editor.as_ref().unwrap().mode, crate::screens::editor::EditorMode::Insert);
+        app.handle_paste("First line\nSecond line");
+        assert_eq!(app.fellowship_chat_input, "First line\nSecond line");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.fellowship_chat_input, "First line\nFirst line\nSecond line");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.fellowship_chat_input, "First line\nSecond line");
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.fellowship_composing);
+        assert!(app.fellowship_editor.is_none());
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
     fn projects_entry_uses_kanban_for_shared_and_ledger_for_private_campaigns() {
         let db_file = Path::new("test_questline_project_entry_view.db");
         let _ = std::fs::remove_file(db_file);
@@ -29107,7 +30329,7 @@ mod app_tests {
         };
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -29205,7 +30427,7 @@ mod app_tests {
         };
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -29315,7 +30537,7 @@ mod app_tests {
 
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -29333,6 +30555,181 @@ mod app_tests {
         assert!(matches!(
             app.modal_state,
             ModalType::EditTask { id, .. } if id == step_id
+        ));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn atlas_chart_name_accepts_letters_reserved_by_global_shortcuts() {
+        let db_file = Path::new("test_questline_atlas_chart_name_shortcuts.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 5;
+        app.atlas_input = Some(AtlasInput {
+            kind: AtlasInputKind::NewChart,
+            value: String::new(),
+        });
+
+        for character in "spnSPN".chars() {
+            app.handle_key_event(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::empty(),
+            ))
+            .unwrap();
+        }
+
+        assert_eq!(
+            app.atlas_input.as_ref().map(|input| input.value.as_str()),
+            Some("spnSPN")
+        );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn atlas_question_mark_opens_context_help_without_leaving_workspace() {
+        let db_file = Path::new("test_questline_atlas_help.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(Uuid::new_v4());
+        app.workspace_tab_idx = 5;
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::empty())).unwrap();
+
+        assert_eq!(app.active_screen, ActiveScreen::Workspace);
+        assert_eq!(app.workspace_tab_idx, 5);
+        assert_eq!(app.modal_state, ModalType::KeyboardHelp);
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn atlas_marks_view_controls_and_global_search_round_trip() {
+        let db_file = Path::new("test_questline_atlas_controls_search.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let now = Utc::now();
+        let project = Project { id: Uuid::new_v4(), name: "Map campaign".into(), description: None,
+            created_at: now, updated_at: now, archived: false, completed: false,
+            owner_identity: None, owner_username: None, is_shared: false };
+        app.db.insert_project(&project).unwrap();
+        app.projects.push(project.clone());
+        let atlas = crate::services::AtlasService::new(&app.db);
+        let chart = atlas.create_chart(project.id, "Strategy", None).unwrap();
+        let root = atlas.nodes(chart.id).unwrap()[0].clone();
+        let child = atlas.add_node(chart.id, Some(root.id), "Prototype", None).unwrap();
+        let sibling = atlas.add_node(chart.id, Some(root.id), "Review", None).unwrap();
+        let treasury = crate::services::TreasuryService::new(&app.db);
+        let category = treasury.create_category(project.id, "Travel fuel").unwrap();
+        let account = treasury.create_account(project.id, "Road wallet", crate::models::TreasuryAccountKind::Cash).unwrap();
+        let entry = treasury.create_entry(crate::models::LedgerEntry {
+            id: Uuid::new_v4(), campaign_id: project.id, title: "Road supplies".into(), description: "Camp lantern oil".into(),
+            entry_type: crate::models::LedgerEntryType::Expense, category_id: category.id, amount_minor: 1250,
+            currency_code: "USD".into(), status: crate::models::LedgerStatus::Planned,
+            due_date: None, payment_date: None, vendor_source: None, related_task_id: None,
+            notes: None, attachment_ref: None, recurrence: crate::models::LedgerRecurrence::None,
+            custom_recurrence: None, version: 1, created_at: now, updated_at: now,
+            created_by_identity: None, account_id: Some(account.id), transfer_account_id: None,
+        }).unwrap();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project.id);
+        app.workspace_tab_idx = 5;
+        app.active_atlas_chart_id = Some(chart.id);
+        app.selected_atlas_node_idx = 1;
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+
+        for (expected, _) in [("✓ Prototype", 0), ("✗ Prototype", 1), ("Prototype", 2)] {
+            app.handle_atlas_command(key(KeyCode::Char('t'), KeyModifiers::empty()), project.id).unwrap();
+            assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().title, expected);
+        }
+        app.handle_atlas_command(key(KeyCode::Char('#'), KeyModifiers::empty()), project.id).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().title, "1. Prototype");
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(sibling.id).unwrap().unwrap().title, "2. Review");
+        app.handle_atlas_command(key(KeyCode::Up, KeyModifiers::ALT), project.id).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().title, "★ 1. Prototype");
+        app.handle_atlas_command(key(KeyCode::Char('#'), KeyModifiers::empty()), project.id).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().title, "★ Prototype");
+        app.handle_atlas_command(key(KeyCode::Char('#'), KeyModifiers::empty()), project.id).unwrap();
+        app.handle_atlas_command(key(KeyCode::Char('H'), KeyModifiers::empty()), project.id).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).visible_nodes(chart.id).unwrap().len(), 2);
+        app.handle_atlas_command(key(KeyCode::Char('h'), KeyModifiers::CONTROL), project.id).unwrap();
+        assert!(app.atlas_view.show_hidden);
+        app.handle_atlas_command(key(KeyCode::Char('C'), KeyModifiers::empty()), project.id).unwrap();
+        assert!(app.atlas_view.center_lock);
+        app.selected_atlas_node_idx = 1;
+        app.handle_key_event(key(KeyCode::Char('B'), KeyModifiers::empty())).unwrap();
+        assert!(matches!(app.atlas_input.as_ref().map(|input| &input.kind), Some(AtlasInputKind::Color { .. })));
+        for character in "16".chars() { app.handle_key_event(key(KeyCode::Char(character), KeyModifiers::empty())).unwrap(); }
+        app.handle_key_event(key(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().color, Some(15));
+        app.handle_key_event(key(KeyCode::Char('t'), KeyModifiers::empty())).unwrap();
+        assert_eq!(crate::services::AtlasService::new(&app.db).node(child.id).unwrap().unwrap().title, "★ ✓ 1. Prototype");
+        let mut collapsed_root = crate::services::AtlasService::new(&app.db).node(root.id).unwrap().unwrap();
+        collapsed_root.collapsed = true;
+        crate::services::AtlasService::new(&app.db).update_node(&collapsed_root).unwrap();
+
+        let found = app.perform_unified_search("Prototype");
+        let result = found.iter().find(|result| result.result_type == SearchResultType::AtlasNode).unwrap().clone();
+        app.navigate_to_search_result(&result).unwrap();
+        assert_eq!(app.active_atlas_chart_id, Some(chart.id));
+        assert_eq!(app.selected_atlas_node_idx, 1);
+        assert!(crate::services::AtlasService::new(&app.db).node(root.id).unwrap().unwrap().collapsed);
+        assert!(app.atlas_view.expanded.contains(&root.id));
+        assert!(app.perform_unified_search("Travel fuel").iter().any(|result| result.result_type == SearchResultType::TreasuryCategory));
+        assert!(app.perform_unified_search("Road wallet").iter().any(|result| result.result_type == SearchResultType::TreasuryAccount));
+        let entry_result = app.perform_unified_search("lantern oil").into_iter().find(|result| result.result_type == SearchResultType::TreasuryEntry).unwrap();
+        assert_eq!(entry_result.item_id, entry.id.to_string());
+        app.navigate_to_search_result(&entry_result).unwrap();
+        assert_eq!(app.workspace_tab_idx, 4);
+        assert_eq!(app.selected_treasury_idx, 0);
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn workspace_plus_opens_a_step_instead_of_changing_global_audio() {
+        let db_file = Path::new("test_questline_workspace_plus_is_local.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        let quest_id = Uuid::new_v4();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 0;
+        app.workspace_sidebar_focused = false;
+        app.all_tasks = vec![Task {
+            id: quest_id,
+            project_id: Some(project_id),
+            title: "Map the shortcut system".to_string(),
+            description: None,
+            due_date: None,
+            set_date: None,
+            completed: false,
+            priority: TaskPriority::Medium,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            owner_identity: None,
+            owner_username: None,
+            parent_task_id: None,
+            xp_awarded: false,
+            recurrence: None,
+        }];
+
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::empty()))
+            .unwrap();
+
+        assert!(matches!(
+            app.modal_state,
+            ModalType::NewTask {
+                parent_task_id: Some(id),
+                ..
+            } if id == quest_id
         ));
 
         drop(app);
@@ -29361,6 +30758,41 @@ mod app_tests {
             "unexpected modal: {:?}",
             app.modal_state
         );
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn chronicle_editor_supports_multiline_paste_and_vim_commands() {
+        let db_file = Path::new("test_questline_chronicle_editor.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        let project_id = Uuid::new_v4();
+        app.active_screen = ActiveScreen::Workspace;
+        app.active_project_id = Some(project_id);
+        app.workspace_tab_idx = 2;
+        app.workspace_sidebar_focused = false;
+
+        let press = |app: &mut App, code| {
+            app.handle_key_event(KeyEvent::new(code, KeyModifiers::empty())).unwrap();
+        };
+        press(&mut app, KeyCode::Char('n'));
+        assert_eq!(app.journal_editor.as_ref().unwrap().mode, crate::screens::editor::EditorMode::Insert);
+        app.handle_paste("First line\nSecond line");
+        assert_eq!(app.journal_editor.as_ref().unwrap().get_content(), "First line\nSecond line");
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('g'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('y'));
+        press(&mut app, KeyCode::Char('p'));
+        assert_eq!(app.journal_editor.as_ref().unwrap().get_content(), "First line\nFirst line\nSecond line");
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.journal_editor.as_ref().unwrap().get_content(), "First line\nSecond line");
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.modal_state, ModalType::None);
+        assert!(app.journal_editor.is_none());
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
@@ -29430,9 +30862,9 @@ mod app_tests {
         let _ = std::fs::remove_file(db_file);
         let mut app = App::new(db_file).unwrap();
 
-        // With sync enabled, confirming quit defers to a sync-then-exit pass. Disable
-        // auto-sync so 'y' exercises the immediate-quit path this test asserts.
+        // Cloud Sync disabled exercises the immediate local-only exit path.
         app.auto_sync = false;
+        app.config.sync_enabled = false;
 
         // 1. Pressing 'q' opens the confirmation modal with a non-empty quote
         assert_eq!(app.modal_state, ModalType::None);
@@ -29479,7 +30911,7 @@ mod app_tests {
         let db_file = Path::new("test_questline_quit_running_sync.db");
         let _ = std::fs::remove_file(db_file);
         let mut app = App::new(db_file).unwrap();
-        app.auto_sync = true;
+        app.auto_sync = false;
         app.config.sync_enabled = true;
         app.sync_in_progress = true;
         app.modal_state = ModalType::QuitConfirm {
@@ -29490,12 +30922,14 @@ mod app_tests {
             .unwrap();
 
         assert!(app.quitting_after_sync);
+        assert!(app.quit_needs_final_sync, "an in-flight sync needs a final pass after quit-time saves");
         assert!(!app.should_quit, "an active sync must not be abandoned");
         assert!(matches!(app.modal_state, ModalType::QuitConfirm { .. }));
 
         app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty()))
             .unwrap();
         assert!(!app.quitting_after_sync);
+        assert!(!app.quit_needs_final_sync);
         assert!(!app.should_quit);
         assert_eq!(app.modal_state, ModalType::None);
 
@@ -29515,12 +30949,81 @@ mod app_tests {
 
         assert!(!app.sync_in_progress);
         assert!(!app.quitting_after_sync);
+        assert!(!app.quit_needs_final_sync);
         assert!(!app.should_quit, "a failed final sync must pause exit");
         assert_eq!(app.modal_state, ModalType::None);
         assert!(app.sync_status_msg.contains("network unavailable"));
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quit_sync_policy_is_independent_of_auto_sync_and_reseeds_after_restore_hold() {
+        let db_file = Path::new("test_questline_quit_sync_policy.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.auto_sync = false;
+        app.config.sync_enabled = true;
+        assert!(app.should_sync_on_quit());
+        assert!(!app.final_sync_needs_full_state());
+        app.db.set_setting("sync_restore_hold", "1").unwrap();
+        assert!(app.should_sync_on_quit());
+        assert!(app.final_sync_needs_full_state());
+        app.db.set_setting("sync_restore_hold", "0").unwrap();
+        app.config.sync_enabled = false;
+        assert!(!app.should_sync_on_quit());
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn final_sync_failure_keeps_restore_hold_and_cancels_exit() {
+        let db_file = Path::new("test_questline_quit_restore_hold.db");
+        let _ = std::fs::remove_file(db_file);
+        let mut app = App::new(db_file).unwrap();
+        app.auto_sync = false;
+        app.config.sync_enabled = true;
+        app.server_url = "invalid-url".to_string();
+        app.db.set_setting("sync_restore_hold", "1").unwrap();
+
+        app.begin_graceful_quit();
+        assert!(app.quitting_after_sync);
+        assert!(app.sync_in_progress);
+        assert!(!app.should_quit);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.sync_result.lock().unwrap().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.sync_result.lock().unwrap().is_some(), "final sync should report its failure");
+        app.tick_auto_sync().unwrap();
+        assert!(!app.should_quit);
+        assert!(!app.quitting_after_sync);
+        assert_eq!(app.db.get_setting("sync_restore_hold").unwrap().as_deref(), Some("1"));
+
+        drop(app);
+        let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn quit_reuses_completed_sync_when_no_changes_remain() {
+        let path = std::env::temp_dir().join(format!("questline-quit-no-repeat-{}.db", Uuid::new_v4()));
+        let mut app = App::new(&path).unwrap();
+        app.config.sync_enabled = true;
+        app.sync_in_progress = true;
+        app.quitting_after_sync = true;
+        app.quit_needs_final_sync = true;
+        app.db.conn.execute("UPDATE sync_log SET synced=1", []).unwrap();
+        *app.sync_result.lock().unwrap() = Some(BackgroundSyncResult {
+            pushed: 1, pulled: 0, conflicts: Vec::new(), error: None,
+        });
+        app.tick_auto_sync().unwrap();
+        assert!(app.should_quit);
+        assert!(app.quit_completed_sync);
+        assert!(!app.sync_in_progress, "a second sync is unnecessary without pending edits");
+        assert!(!app.quit_needs_final_sync);
+        drop(app); let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -30094,6 +31597,86 @@ mod app_tests {
     // ── Phase 2 tier 3 mouse: Soundscapes/Library/Settings ──────────────────
 
     #[test]
+    fn local_music_folder_can_be_replaced_repeatedly_without_stale_tracks() {
+        let root = std::env::temp_dir().join(format!("questline-folder-switch-{}", Uuid::new_v4()));
+        let first = root.join("first");
+        let second = root.join("second");
+        let empty = root.join("empty");
+        for folder in [&first, &second, &empty] { std::fs::create_dir_all(folder).unwrap(); }
+        std::fs::write(first.join("first.mp3"), b"fixture").unwrap();
+        std::fs::write(second.join("second.ogg"), b"fixture").unwrap();
+        let mut app = app_for_mouse_tests(&root.join("profile.db"), ActiveScreen::Soundscapes);
+        app.selected_soundscape_idx = crate::audio::SOUNDSCAPES.iter()
+            .position(|source| source.name == "Local Folder").unwrap();
+        app.db.set_setting("local_music_folder", first.to_str().unwrap()).unwrap();
+        app.refresh_local_music_tracks_cache();
+        assert_eq!(app.local_audio_files(), vec![first.join("first.mp3")]);
+        for folder in [&second, &empty, &first] {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty())).unwrap();
+            assert!(matches!(&app.modal_state, ModalType::LocalMusicFolder { input, .. }
+                if Some(input.clone()) == app.db.get_setting("local_music_folder").unwrap()));
+            app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+            assert!(matches!(&app.modal_state, ModalType::LocalMusicFolder { input, .. } if input.is_empty()));
+            for c in folder.to_str().unwrap().chars() {
+                app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())).unwrap();
+            }
+            app.selected_local_track_idx = 8;
+            app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+            assert_eq!(app.modal_state, ModalType::None);
+            assert_eq!(app.db.get_setting("local_music_folder").unwrap(), Some(folder.to_str().unwrap().to_string()));
+            assert_eq!(app.audio_player.get_state().local_music_folder, folder.to_str().unwrap());
+            assert_eq!(app.selected_local_track_idx, 0);
+            assert!(app.local_audio_files().iter().all(|track| track.parent() == Some(folder.as_path())));
+            assert_eq!(app.local_audio_files().len(), if folder == &empty { 0 } else { 1 });
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::empty())).unwrap();
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL)).unwrap();
+        for c in root.join("missing").to_str().unwrap().chars() {
+            app.handle_key_event(KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())).unwrap();
+        }
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
+        assert!(matches!(app.modal_state, ModalType::LocalMusicFolder { .. }));
+        app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+        assert_eq!(app.db.get_setting("local_music_folder").unwrap(), Some(first.to_str().unwrap().to_string()));
+        assert_eq!(app.local_audio_files(), vec![first.join("first.mp3")]);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn local_music_folder_button_reopens_picker_with_or_without_tracks() {
+        let root = std::env::temp_dir().join(format!("questline-folder-button-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let mut app = app_for_mouse_tests(&root.join("profile.db"), ActiveScreen::Soundscapes);
+        app.selected_soundscape_idx = crate::audio::SOUNDSCAPES.iter()
+            .position(|source| source.name == "Local Folder").unwrap();
+        for configured in [false, true] {
+            if configured {
+                app.db.set_setting("local_music_folder", root.to_str().unwrap()).unwrap();
+                std::fs::write(root.join("track.mp3"), b"fixture").unwrap();
+                app.refresh_local_music_tracks_cache();
+            }
+            let backend = ratatui::backend::TestBackend::new(120, 50);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let mut regions = None;
+            terminal.draw(|frame| {
+                regions = Some(crate::screens::soundscapes::draw(frame, &app,
+                    &crate::theme::Theme::default_theme(), frame.size()));
+            }).unwrap();
+            let regions = regions.unwrap();
+            let button = regions.folder_picker.unwrap();
+            assert_eq!(regions.local_tracks.is_some(), configured);
+            app.hit_regions.soundscapes = Some(regions);
+            left_click(&mut app, button.x + 2, button.y, KeyModifiers::empty());
+            assert!(matches!(&app.modal_state, ModalType::LocalMusicFolder { input, .. }
+                if input == if configured { root.to_str().unwrap() } else { "" }));
+            app.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::empty())).unwrap();
+        }
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn soundscapes_click_selects_source_and_local_track_separately() {
         use crate::screens::hit_test::{LocalTracksHitRegions, SoundscapesHitRegions};
 
@@ -30102,6 +31685,7 @@ mod app_tests {
         app.hit_regions.soundscapes = Some(SoundscapesHitRegions {
             source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
             item_count: 4,
+            folder_picker: None,
             local_tracks: Some(LocalTracksHitRegions {
                 area: ratatui::layout::Rect { x: 30, y: 0, width: 20, height: 10 },
                 row_start: 3,
@@ -30135,6 +31719,7 @@ mod app_tests {
             source_list: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 16 },
             item_count: 4,
             local_tracks: None,
+            folder_picker: None,
         });
 
         // Each source row is 4 lines tall — row 4 is source index 1
@@ -30846,7 +32431,7 @@ mod app_tests {
         // those map to tab indices 3/0/1/4/2 respectively — not row order.
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 20, height: 5 },
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -30879,7 +32464,7 @@ mod app_tests {
         app.workspace_sidebar_focused = true;
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -30909,7 +32494,7 @@ mod app_tests {
         // Milestone 0 has 3 rows (header + 2 requirements), milestone 1 has 1.
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: Some(WorkspaceRowList {
                 area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 10 },
                 row_targets: vec![Some(0), Some(0), Some(0), Some(1)],
@@ -30940,7 +32525,7 @@ mod app_tests {
         app.workspace_tab_idx = 4;
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             // Table header row lives one row above area.y — the header
             // itself isn't part of this region at all.
@@ -30975,7 +32560,7 @@ mod app_tests {
         let (mut app, _project_id, entry_id) = treasury_role_app(db_file, "Owner");
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: Some(WorkspaceRowList {
                 area: ratatui::layout::Rect { x: 0, y: 0, width: 30, height: 5 },
@@ -31009,7 +32594,7 @@ mod app_tests {
         // rows), entry 1 follows right after.
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: Some(WorkspaceRowList {
@@ -31042,7 +32627,7 @@ mod app_tests {
         // Row 1 is a non-selectable "── Unassigned ──" divider.
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31081,7 +32666,7 @@ mod app_tests {
         app.workspace_tab_idx = 1;
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31146,7 +32731,7 @@ mod app_tests {
         app.selected_notes_flat_idx = 1;
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31200,7 +32785,7 @@ mod app_tests {
         app.selected_notes_flat_idx = 1; // same "Unassigned" layout as above
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31250,7 +32835,7 @@ mod app_tests {
         };
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31311,7 +32896,7 @@ mod app_tests {
         app.workspace_sidebar_focused = false;
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect { x: 0, y: 0, width: 15, height: 5 },
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31386,7 +32971,7 @@ mod app_tests {
         // fallback, which still cycles the selected quest.
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31420,7 +33005,7 @@ mod app_tests {
         app.quest_ledger_max_scroll.set(2);
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,
@@ -31513,7 +33098,7 @@ mod app_tests {
         app.note_preview_max_scroll.set(2);
         app.hit_regions.workspace = Some(WorkspaceHitRegions {
             sidebar: ratatui::layout::Rect::default(),
-            sidebar_tab_order: [3, 0, 1, 4, 2],
+            sidebar_tab_order: [3, 0, 1, 4, 5, 2],
             milestones: None,
             treasury: None,
             journal: None,

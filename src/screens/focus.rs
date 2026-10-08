@@ -39,7 +39,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> Option<FocusHitRegions> 
         );
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Double)
+            .border_type(BorderType::Thick)
             .border_style(Style::default().fg(theme.warning))
             .title(Span::styled(
                 " Custom Focus Duration ",
@@ -277,7 +277,7 @@ fn draw_active_session(f: &mut Frame, app: &App, theme: &Theme, size: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Double)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         )
         .alignment(Alignment::Center);
@@ -581,7 +581,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) -> Fo
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(app.selected_focus_field_idx == 0))
                 .border_style(border_style_0)
                 .title(" 1. Focus Duration "),
         )
@@ -627,7 +627,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) -> Fo
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(app.selected_focus_field_idx == 1))
                 .border_style(border_style_1)
                 .title(" 2. Bound Campaign"),
         )
@@ -673,7 +673,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) -> Fo
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(app.selected_focus_field_idx == 2))
                 .border_style(border_style_2)
                 .title(" 3. Focused Quest "),
         )
@@ -719,7 +719,7 @@ fn draw_config_screen(f: &mut Frame, app: &App, theme: &Theme, size: Rect) -> Fo
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(app.selected_focus_field_idx == 3))
                 .border_style(border_style_3)
                 .title(" 4. Soundscape "),
         )

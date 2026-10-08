@@ -11,6 +11,16 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, Paragraph},
 };
 
+/// Use heavier line glyphs for keyboard focus, independent of theme colors.
+/// Both variants occupy one cell, so panel geometry and mouse regions stay stable.
+pub fn focus_border_type(focused: bool) -> BorderType {
+    if focused {
+        BorderType::Thick
+    } else {
+        BorderType::Rounded
+    }
+}
+
 /// Compact fixed-size reminder that clamps safely inside small terminals.
 pub fn hydration_reminder_area(area: Rect) -> Rect {
     let width = 46.min(area.width);
@@ -50,7 +60,7 @@ pub fn draw_hydration_reminder_modal(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(hydration_border).bg(hydration_bg))
         .title(Span::styled(
             " Hydration Reminder ",

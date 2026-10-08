@@ -81,7 +81,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesH
 
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(
+            SOUNDSCAPES[app.selected_soundscape_idx].name != "Local Folder",
+        ))
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Sources ",
@@ -94,9 +96,9 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesH
     f.render_widget(list, chunks[0]);
 
     // RIGHT PANEL — cambia según si Media Player está seleccionado o no
-    let local_tracks = if SOUNDSCAPES[app.selected_soundscape_idx].name == "Media Player" {
+    let (local_tracks, folder_picker) = if SOUNDSCAPES[app.selected_soundscape_idx].name == "Media Player" {
         draw_mpris_panel(f, app, theme, chunks[1]);
-        None
+        (None, None)
     } else {
         draw_audio_control_panel(f, app, theme, chunks[1], &player_state, &playing_name)
     };
@@ -105,6 +107,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesH
         source_list: list_inner,
         item_count: SOUNDSCAPES.len(),
         local_tracks,
+        folder_picker,
     }
 }
 
@@ -115,7 +118,7 @@ fn draw_audio_control_panel(
     area: Rect,
     player_state: &crate::audio::state::AudioState,
     playing_name: &str,
-) -> Option<LocalTracksHitRegions> {
+) -> (Option<LocalTracksHitRegions>, Option<Rect>) {
     let accent_color = theme.primary;
     let selected = SOUNDSCAPES[app.selected_soundscape_idx].name;
     let is_local = selected == "Local Folder";
@@ -201,7 +204,7 @@ fn draw_audio_control_panel(
         draw_local_files_panel(f, app, theme, chunks[1])
     } else {
         draw_source_detail_panel(f, theme, chunks[1], selected);
-        None
+        (None, None)
     };
 
     let help_text = vec![
@@ -258,7 +261,7 @@ fn draw_audio_control_panel(
                     .fg(accent_color)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled("Local folder", Style::default().fg(theme.muted)),
+            Span::styled("Change folder", Style::default().fg(theme.muted)),
         ]),
     ];
 
@@ -375,7 +378,7 @@ fn draw_local_files_panel(
     app: &App,
     theme: &Theme,
     area: Rect,
-) -> Option<LocalTracksHitRegions> {
+) -> (Option<LocalTracksHitRegions>, Option<Rect>) {
     let folder = app
         .db
         .get_setting("local_music_folder")
@@ -401,7 +404,10 @@ fn draw_local_files_panel(
                 Style::default().fg(theme.text),
             ),
         ]),
-        Line::from(""),
+        Line::from(Span::styled(
+            if folder.trim().is_empty() { "  [f] Choose folder" } else { "  [f] Change folder" },
+            Style::default().fg(theme.primary).add_modifier(Modifier::BOLD),
+        )),
     ];
 
     let mut track_hit: Option<(usize, usize)> = None; // (row_start, track_count)
@@ -482,7 +488,7 @@ fn draw_local_files_panel(
 
     let panel_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(Span::styled(
             " Local Library ",
@@ -494,11 +500,14 @@ fn draw_local_files_panel(
     let panel = Paragraph::new(lines).block(panel_block);
     f.render_widget(panel, area);
 
-    track_hit.map(|(row_start, track_count)| LocalTracksHitRegions {
+    let folder_picker = (inner.height > 1).then_some(Rect {
+        x: inner.x, y: inner.y + 1, width: inner.width, height: 1,
+    });
+    (track_hit.map(|(row_start, track_count)| LocalTracksHitRegions {
         area: inner,
         row_start,
         track_count,
-    })
+    }), folder_picker)
 }
 
 fn draw_mpris_panel(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {

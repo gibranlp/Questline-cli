@@ -449,7 +449,7 @@ impl Database {
     /// column-existence-check block below, so upgraded installs re-run that
     /// whole block once (idempotent either way) instead of it silently
     /// staying skipped forever via a stale `PRAGMA user_version`.
-    const SCHEMA_VERSION: i64 = 3;
+    const SCHEMA_VERSION: i64 = 4;
 
     pub fn database_size_bytes(&self) -> Result<u64> {
         let page_count: u64 = self
@@ -487,6 +487,18 @@ impl Database {
         conn.execute_batch("PRAGMA busy_timeout = 5000;")?;
 
         conn.execute_batch(schema::CREATE_TABLES_SQL)?;
+
+        for (column, migration) in [
+            ("hidden", "ALTER TABLE atlas_nodes ADD COLUMN hidden INTEGER NOT NULL DEFAULT 0"),
+            ("color", "ALTER TABLE atlas_nodes ADD COLUMN color INTEGER"),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT count(*) FROM pragma_table_info('atlas_nodes') WHERE name=?1",
+                [column],
+                |row| row.get::<_, i64>(0).map(|count| count > 0),
+            )?;
+            if !exists { conn.execute(migration, [])?; }
+        }
 
         // The column-existence-check migrations below are all idempotent —
         // safe to rerun — but there are ~80 of them, each its own round trip
@@ -2917,6 +2929,19 @@ impl Database {
         Ok(list)
     }
 
+    pub fn update_ritual(&self, ritual: &Ritual) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        let changed = tx.execute(
+            "UPDATE rituals SET name = ?2, description = ?3, frequency = ?4, reward_xp = ?5, daily_target = ?6, updated_at = ?7 WHERE id = ?1",
+            params![ritual.id, ritual.name, ritual.description, ritual.frequency, ritual.reward_xp,
+                ritual.daily_target, ritual.updated_at.to_rfc3339()],
+        )?;
+        if changed == 0 { anyhow::bail!("Sidequest not found"); }
+        Self::log_change_on(&tx, "ritual", &ritual.id, "update")?;
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn delete_ritual(&self, id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
         tx.execute("DELETE FROM rituals WHERE id = ?1", params![id])?;
@@ -3776,7 +3801,7 @@ impl Database {
         Self::log_change_on(&self.conn, entity_type, entity_id, operation)
     }
 
-    fn log_change_on(
+    pub(crate) fn log_change_on(
         conn: &Connection,
         entity_type: &str,
         entity_id: &str,
@@ -3796,7 +3821,7 @@ impl Database {
         Self::create_revision_on(&self.conn, entity_type, entity_id, content)
     }
 
-    fn create_revision_on(
+    pub(crate) fn create_revision_on(
         conn: &Connection,
         entity_type: &str,
         entity_id: &str,
@@ -4085,6 +4110,8 @@ impl Database {
             ("codex", "codices", "id"),
             ("task", "tasks", "id"),
             ("note", "notes", "id"),
+            ("atlas_chart", "atlas_charts", "id"),
+            ("atlas_node", "atlas_nodes", "id"),
             ("journal_entry", "journal_entries", "id"),
             ("milestone", "milestones", "id"),
             ("achievement", "achievements", "id"),
@@ -4970,6 +4997,8 @@ impl Database {
                 ))
                 OR (entity_type = 'note' AND entity_id IN (SELECT id FROM notes WHERE project_id = ?1))
                 OR (entity_type = 'codex' AND entity_id IN (SELECT id FROM codices WHERE project_id = ?1))
+                OR (entity_type = 'atlas_chart' AND entity_id IN (SELECT id FROM atlas_charts WHERE project_id = ?1))
+                OR (entity_type = 'atlas_node' AND entity_id IN (SELECT id FROM atlas_nodes WHERE project_id = ?1))
                 OR (entity_type = 'journal_entry' AND entity_id IN (SELECT id FROM journal_entries WHERE project_id = ?1))
                 OR (entity_type = 'milestone' AND entity_id IN (SELECT id FROM milestones WHERE project_id = ?1))
                 OR (entity_type = 'focus_session' AND entity_id IN (SELECT id FROM focus_sessions WHERE project_id = ?1))

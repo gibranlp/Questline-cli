@@ -23,6 +23,7 @@ pub mod database;
 pub mod milestone_templates;
 pub mod models;
 pub mod screens;
+pub mod shell_api;
 pub mod services;
 pub mod storage;
 pub mod theme;

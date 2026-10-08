@@ -40,6 +40,15 @@ impl EditorMode {
     }
 }
 
+pub fn mode_style(mode: &EditorMode, theme: &Theme) -> Style {
+    let background = match mode {
+        EditorMode::Normal => theme.primary,
+        EditorMode::Insert => theme.success,
+        EditorMode::Visual { .. } => theme.warning,
+    };
+    Style::default().fg(Color::Black).bg(background).add_modifier(Modifier::BOLD)
+}
+
 // ── Snapshot for undo/redo ────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -1554,7 +1563,7 @@ pub fn draw_in_area(
         Paragraph::new(title_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(state.editing_title))
                 .border_style(title_border_style)
                 .title(title_block_label),
         ),
@@ -1585,7 +1594,7 @@ pub fn draw_in_area(
             Paragraph::new(project_text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(state.editing_project))
                     .border_style(project_style)
                     .title(project_label),
             ),
@@ -1629,7 +1638,7 @@ pub fn draw_in_area(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!state.editing_title && !state.editing_project))
                     .border_style(body_border_style)
                     .title(" Scroll Editor "),
             )
@@ -1643,20 +1652,7 @@ pub fn draw_in_area(
     let pending = &state.pending_cmd;
     let pos_str = format!(" {}:{} ", state.cursor_y + 1, state.cursor_x + 1);
 
-    let mode_style = match &state.mode {
-        EditorMode::Normal => Style::default()
-            .fg(Color::Black)
-            .bg(theme.primary)
-            .add_modifier(Modifier::BOLD),
-        EditorMode::Insert => Style::default()
-            .fg(Color::Black)
-            .bg(theme.success)
-            .add_modifier(Modifier::BOLD),
-        EditorMode::Visual { .. } => Style::default()
-            .fg(Color::Black)
-            .bg(theme.warning)
-            .add_modifier(Modifier::BOLD),
-    };
+    let mode_style = mode_style(&state.mode, theme);
 
     let mut status_spans = vec![
         Span::styled(format!(" {} ", mode_str), mode_style),

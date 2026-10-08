@@ -767,7 +767,7 @@ pub(super) fn draw_evergrowth_panel(f: &mut Frame, app: &App, theme: &Theme, are
         Line::from(vec![
             Span::styled(" Water: ", Style::default().fg(theme.muted)),
             Span::styled(
-                format!("{}/2 today", zen_tree.water_today),
+                format!("{}/1 today", zen_tree.water_today),
                 Style::default().fg(Color::Cyan),
             ),
             Span::styled("  Last: ", Style::default().fg(theme.muted)),

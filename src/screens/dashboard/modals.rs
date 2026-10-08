@@ -32,7 +32,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             );
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Double)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.warning))
                 .title(Span::styled(
                     " Daily Reflection Journal ",
@@ -66,6 +66,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(format!(" > {}", what_went_well)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 0))
                         .border_style(border_well)
                         .title(" 1. What went well today? "),
                 ),
@@ -75,6 +76,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(format!(" > {}", what_can_improve)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 1))
                         .border_style(border_improve)
                         .title(" 2. What can be improved? "),
                 ),
@@ -104,7 +106,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             );
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Double)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.warning))
                 .title(Span::styled(
                     " New Sidequest (Habit) ",
@@ -141,6 +143,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(format!(" > {}", name)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 0))
                         .border_style(border(0))
                         .title(" 1. Name "),
                 ),
@@ -150,6 +153,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(format!(" > {}", desc)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 1))
                         .border_style(border(1))
                         .title(" 2. Description (optional) "),
                 ),
@@ -159,6 +163,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(freq_str).alignment(Alignment::Center).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 2))
                         .border_style(border(2))
                         .title(" 3. Frequency "),
                 ),
@@ -168,6 +173,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(format!(" > {}", reward_xp)).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 3))
                         .border_style(border(3))
                         .title(" 4. XP Reward "),
                 ),
@@ -202,7 +208,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
             );
             let block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Double)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.secondary))
                 .title(Span::styled(
                     " Hydration Settings ",
@@ -241,6 +247,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(crate::ui::focus_border_type(*focus_idx == 0))
                             .border_style(border(0))
                             .title(" 1. Reminder Interval "),
                     ),
@@ -252,6 +259,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(crate::ui::focus_border_type(*focus_idx == 1))
                             .border_style(border(1))
                             .title(" 2. Active From (hour) "),
                     ),
@@ -263,6 +271,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(crate::ui::focus_border_type(*focus_idx == 2))
                             .border_style(border(2))
                             .title(" 3. Active To (hour) "),
                     ),
@@ -274,6 +283,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                     .block(
                         Block::default()
                             .borders(Borders::ALL)
+                            .border_type(crate::ui::focus_border_type(*focus_idx == 3))
                             .border_style(border(3))
                             .title(" 4. Daily Target "),
                     ),
@@ -288,6 +298,7 @@ pub(super) fn draw_modals(f: &mut Frame, app: &App, theme: &Theme, area: Rect) {
                 Paragraph::new(pause_str).block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(crate::ui::focus_border_type(*focus_idx == 4))
                         .border_style(border(4))
                         .title(" 5. Focus Pause "),
                 ),

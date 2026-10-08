@@ -119,7 +119,7 @@ pub fn denial(role: TreasuryRole, action: TreasuryAction) -> String {
             "Only the Owner or a Steward may set Treasury budgets.".to_string()
         }
         ManageCategories => {
-            "Only the Owner or a Steward may manage Treasury categories.".to_string()
+            "Only the Owner or a Steward may manage Treasury categories and accounts.".to_string()
         }
         SwitchCurrency => "Only the Campaign Owner may change the Treasury currency.".to_string(),
         SetTaskBilling => {

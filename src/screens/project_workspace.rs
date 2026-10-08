@@ -17,7 +17,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, BorderType, Borders, Cell, Clear, Gauge, List, ListItem, ListState, Paragraph, Row,
-        Table,
+        Table, TableState,
     },
 };
 
@@ -348,7 +348,8 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         ("  2 Tasks", 0),
         ("  3 Scrolls", 1),
         ("  4 Treasury", 4),
-        ("  5 Chronicle", 2),
+        ("  5 Atlas", 5),
+        ("  6 Chronicle", 2),
     ];
     let list_items: Vec<ListItem> = menu_items
         .iter()
@@ -356,7 +357,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         .map(|(_, (item, tab))| {
             let style = if *tab == active_tab {
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.selected_fg())
                     .bg(theme.selection)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -372,7 +373,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
     };
     let menu_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(app.workspace_sidebar_focused))
         .border_style(sidebar_border_style)
         .title(if app.workspace_sidebar_focused {
             " Workspace [FOCUS] "
@@ -380,7 +381,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             " Workspace "
         });
     let sidebar_inner = menu_block.inner(body_chunks[0]);
-    let sidebar_tab_order: [usize; 5] = std::array::from_fn(|i| menu_items[i].1);
+    let sidebar_tab_order: [usize; 6] = std::array::from_fn(|i| menu_items[i].1);
     let menu_list = List::new(list_items).block(menu_block);
     f.render_widget(menu_list, body_chunks[0]);
 
@@ -524,6 +525,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         4 => {
             treasury_hit = draw_treasury_tab(f, body_chunks[1], app, project.id, theme, sidebar_focused);
         }
+        5 => draw_atlas_tab(f, body_chunks[1], app, project.id, theme, sidebar_focused),
         _ => {
             let (overview_members, overview_activity) = if is_shared {
                 (
@@ -561,7 +563,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         let search_p = Paragraph::new(search_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(accent_color)),
         );
         f.render_widget(search_p, chunks[2]);
@@ -570,7 +572,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         2
     };
 
-    // 4. Footer de ayuda contextual — compacto, con [?] para el codex completo de atajos
+    // 4. Compact contextual footer; [F1] opens the unified shortcut reference.
     let key = |s: &'static str| {
         Span::styled(
             s,
@@ -639,7 +641,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         ],
         2 => vec![
             txt(" Journal  "),
-            key("j"),
+            key("n"),
             txt(" New Log"),
             sep(),
             key("v"),
@@ -660,29 +662,16 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             if allows(role, TreasuryAction::RecordEntry) {
                 push(&mut spans, "n", " New");
             }
-            if allows(role, TreasuryAction::ApproveEntry) {
-                push(&mut spans, "a", " Approve");
-            }
-            if allows(role, TreasuryAction::MarkPaid) {
-                push(&mut spans, "p", " Paid");
-            }
-            push(&mut spans, "f", " Type");
-            push(&mut spans, "F", " Status");
-            push(&mut spans, "g", " Account");
-            push(&mut spans, "s", " Sort");
-            push(&mut spans, "x", " Export");
-            if allows(role, TreasuryAction::SetOverallBudget) {
-                push(&mut spans, "B", " Budget");
-            }
-            if allows(role, TreasuryAction::ManageCategories) {
-                push(&mut spans, "c", " Category");
-                push(&mut spans, "A", " Account");
-            }
-            if allows(role, TreasuryAction::SwitchCurrency) {
-                push(&mut spans, "$", " Currency");
-            }
+            push(&mut spans, "r", " Show all");
+            push(&mut spans, "E", " Accounts");
             spans
         }
+        5 if app.active_atlas_chart_id.is_some() => vec![
+            txt(" Cartographer  "), key("n"), txt(" Sibling"), sep(), key("a"),
+            txt(" Child"), sep(), key("t"), txt(" Mark"), sep(), key("B"),
+            txt(" Color"), sep(), key("H"), txt(" Hide"), sep(), key("?"), txt(" Help"),
+        ],
+        5 => vec![txt(" Atlas  "), key("n"), txt(" New Chart"), sep(), key("Enter"), txt(" Open"), sep(), key("e"), txt(" Rename"), sep(), key("Del"), txt(" Remove")],
         _ => vec![
             txt(" Overview  "),
             key("m"),
@@ -696,31 +685,23 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         ],
     };
 
-    footer_spans.extend(vec![
-        sep(),
-        key("C"),
-        txt(" Calendar"),
-        sep(),
-        key("Tab"),
-        txt(" Panes"),
-        sep(),
-        key("1-5"),
-        txt(" Sections"),
-        sep(),
-        key("/"),
-        txt(" Search"),
-        sep(),
-        key("ESC"),
-        txt(" Exit"),
-        sep(),
-        Span::styled(
-            "?",
-            Style::default()
-                .fg(theme.warning)
-                .add_modifier(Modifier::BOLD),
-        ),
-        txt(" Help"),
-    ]);
+    // Show at most three primary actions; F1 contains the complete reference.
+    if let Some(index) = footer_spans.iter().enumerate()
+        .filter(|(_, span)| span.content == " | ").nth(2).map(|(index, _)| index) {
+        footer_spans.truncate(index);
+    }
+    // Reserve space for help even when the terminal cannot fit every primary action.
+    let navigation = vec![sep(), key("Esc"), txt(" Exit"), sep(), key("F1"), txt(" All keys")];
+    let available = chunks[help_chunk_idx].width.saturating_sub(2) as usize;
+    while Line::from(footer_spans.clone()).width() + Line::from(navigation.clone()).width() > available {
+        if let Some(index) = footer_spans.iter().rposition(|span| span.content == " | ") {
+            footer_spans.truncate(index);
+        } else {
+            footer_spans.clear();
+            break;
+        }
+    }
+    footer_spans.extend(navigation);
 
     let footer = Paragraph::new(Line::from(footer_spans)).block(
         Block::default()
@@ -824,7 +805,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             );
         }
         ModalType::NewJournalEntry { entry_id, content } => {
-            draw_journal_modal(f, entry_id.is_some(), content, theme);
+            draw_journal_modal(f, entry_id.is_some(), content, app.journal_editor.as_ref(), theme);
         }
         ModalType::TreasuryEntry {
             entry_id,
@@ -882,11 +863,14 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             entry_type_idx,
             focus_idx,
         } => draw_treasury_category_modal(f, name, *entry_type_idx, *focus_idx, theme),
+        ModalType::TreasuryAccounts { selected_idx } => draw_treasury_accounts_modal(f, app, *selected_idx, theme),
         ModalType::TreasuryAccount {
+            account_id,
             name,
             kind_idx,
             focus_idx,
-        } => draw_treasury_account_modal(f, name, *kind_idx, *focus_idx, theme),
+            ..
+        } => draw_treasury_account_modal(f, name, *kind_idx, *focus_idx, account_id.is_some(), theme),
         ModalType::TreasuryCurrency { selected_idx } => {
             draw_treasury_currency_modal(f, app, *selected_idx, theme)
         }
@@ -1024,6 +1008,29 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         );
     }
 
+    if let Some(input) = &app.atlas_input {
+        let choosing_color = matches!(input.kind, crate::app::AtlasInputKind::Color { .. });
+        let area = centered_rect(62, if choosing_color { 38 } else { 18 }, f.size());
+        f.render_widget(Clear, area);
+        let title = match input.kind {
+            crate::app::AtlasInputKind::NewChart => " Name a New Chart ",
+            crate::app::AtlasInputKind::NewNode { .. } => " Name this Branch ",
+            crate::app::AtlasInputKind::RenameChart { .. } => " Rename Chart ",
+            crate::app::AtlasInputKind::RenameNode { .. } => " Rename Branch ",
+            crate::app::AtlasInputKind::Color { .. } => " Branch Color · includes descendants ",
+        };
+        let content = if choosing_color {
+            format!("1 Red · 2 Orange · 3 Amber · 4 Yellow\n5 Lime · 6 Green · 7 Teal · 8 Cyan\n9 Sky · 10 Blue · 11 Indigo · 12 Violet\n13 Purple · 14 Pink · 15 Rose · 16 White\n0 Default\n\nColor number: {}▏", input.value)
+        } else { format!("{}▏", input.value) };
+        f.render_widget(
+            Paragraph::new(content)
+                .style(Style::default().fg(theme.text))
+                .block(Block::default().borders(Borders::ALL).border_type(BorderType::Thick)
+                    .border_style(Style::default().fg(theme.primary)).title(title)),
+            area,
+        );
+    }
+
     // 7. Codex de atajos — se abre con [?] y cubre todo
     if app.workspace_help_open {
         draw_workspace_help(f, app, theme, is_shared);
@@ -1040,6 +1047,214 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         kanban: kanban_hit,
         ledger: ledger_hit,
     }
+}
+
+fn draw_atlas_tab(
+    f: &mut Frame,
+    area: Rect,
+    app: &App,
+    campaign_id: uuid::Uuid,
+    theme: &Theme,
+    sidebar_focused: bool,
+) {
+    let service = crate::services::AtlasService::new(&app.db);
+    let border = if sidebar_focused {
+        theme.border
+    } else {
+        theme.primary
+    };
+    if let Some(chart_id) = app.active_atlas_chart_id {
+        let title = service
+            .chart(chart_id)
+            .ok()
+            .flatten()
+            .map(|c| c.name)
+            .unwrap_or_else(|| "Unknown Chart".to_string());
+        let visible = service.visible_nodes_for_view(chart_id, app.atlas_view.show_hidden, &app.atlas_view.expanded).unwrap_or_default();
+        let all_nodes = service.nodes(chart_id).unwrap_or_default();
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(crate::ui::focus_border_type(!sidebar_focused))
+            .border_style(Style::default().fg(border))
+            .title(format!(" The Cartographer · {title} · {} ideas ", visible.len()));
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        draw_atlas_map(f, inner, &visible, &all_nodes, app.selected_atlas_node_idx, &app.atlas_view, theme);
+    } else {
+        let charts = service.charts(campaign_id).unwrap_or_default();
+        let items = if charts.is_empty() {
+            vec![ListItem::new("No Charts yet. Press [n] to chart the first path.")]
+        } else {
+            charts.iter().map(|chart| {
+                let count = service.nodes(chart.id).map(|nodes| nodes.len()).unwrap_or(0);
+                ListItem::new(format!("  ◈ {}  ·  {} branches", chart.name, count))
+            }).collect()
+        };
+        let mut state = ListState::default().with_selected((!charts.is_empty()).then_some(app.selected_atlas_chart_idx.min(charts.len().saturating_sub(1))));
+        f.render_stateful_widget(
+            List::new(items).highlight_style(Style::default().fg(theme.selected_fg()).bg(theme.selection).add_modifier(Modifier::BOLD))
+                .block(Block::default().borders(Borders::ALL).border_type(crate::ui::focus_border_type(!sidebar_focused))
+                    .border_style(Style::default().fg(border)).title(" Campaign Atlas ")),
+            area,
+            &mut state,
+        );
+    }
+}
+
+/// Lay out leaf thoughts on separate rows and center each parent among its
+/// visible children, as in h-m-m. Coordinates remain tied to node IDs so the
+/// existing keyboard selection can move through the spatial map.
+fn atlas_map_positions(
+    visible: &[(crate::models::AtlasNode, usize)],
+    view: &crate::app::AtlasView,
+) -> std::collections::HashMap<uuid::Uuid, (usize, usize)> {
+    use std::collections::HashMap;
+    let mut children: HashMap<Option<uuid::Uuid>, Vec<uuid::Uuid>> = HashMap::new();
+    for (node, _) in visible {
+        children.entry(node.parent_id).or_default().push(node.id);
+    }
+    let mut level_widths = Vec::<usize>::new();
+    for (node, depth) in visible {
+        if level_widths.len() <= *depth { level_widths.resize(depth + 1, 0); }
+        let width = atlas_label(node, node.collapsed, view.node_width).chars().count();
+        level_widths[*depth] = level_widths[*depth].max(width);
+    }
+    let mut level_x = vec![0; level_widths.len()];
+    for depth in 1..level_x.len() {
+        level_x[depth] = level_x[depth - 1] + level_widths[depth - 1] + 7;
+    }
+    fn place(
+        id: uuid::Uuid,
+        depth: usize,
+        x: usize,
+        level_x: &[usize],
+        view: &crate::app::AtlasView,
+        labels: &HashMap<uuid::Uuid, usize>,
+        children: &HashMap<Option<uuid::Uuid>, Vec<uuid::Uuid>>,
+        positions: &mut HashMap<uuid::Uuid, (usize, usize)>,
+        next_leaf: &mut usize,
+    ) -> usize {
+        let descendants = children.get(&Some(id));
+        let y = if let Some(kids) = descendants.filter(|kids| !kids.is_empty()) {
+            let child_x = if view.align_levels { level_x[depth + 1] } else { x + labels[&id] + 7 };
+            let first = place(kids[0], depth + 1, child_x, level_x, view, labels, children, positions, next_leaf);
+            let mut last = first;
+            for child in kids.iter().skip(1) {
+                last = place(*child, depth + 1, child_x, level_x, view, labels, children, positions, next_leaf);
+            }
+            (first + last) / 2
+        } else {
+            let row = *next_leaf * (view.line_spacing + 1);
+            *next_leaf += 1;
+            row
+        };
+        positions.insert(id, (x, y));
+        y
+    }
+    let mut positions = HashMap::new();
+    let labels = visible.iter().map(|(node, _)| (node.id, atlas_label(node, node.collapsed, view.node_width).chars().count())).collect::<HashMap<_, _>>();
+    let mut next_leaf = 0;
+    for id in children.get(&None).into_iter().flatten() {
+        place(*id, 0, 0, &level_x, view, &labels, &children, &mut positions, &mut next_leaf);
+    }
+    positions
+}
+
+fn draw_atlas_map(
+    f: &mut Frame,
+    area: Rect,
+    visible: &[(crate::models::AtlasNode, usize)],
+    all_nodes: &[crate::models::AtlasNode],
+    selected: usize,
+    view: &crate::app::AtlasView,
+    theme: &Theme,
+) {
+    if area.width == 0 || area.height == 0 { return; }
+    if visible.is_empty() {
+        f.render_widget(Paragraph::new("  The parchment is blank. Press [a] to begin a branch."), area);
+        return;
+    }
+    let positions = atlas_map_positions(visible, view);
+    let selected_id = visible[selected.min(visible.len() - 1)].0.id;
+    let (selected_x, selected_y) = positions[&selected_id];
+    let anchored = if view.center_lock { None } else { view.anchor.and_then(|id| positions.get(&id)).copied() };
+    let (focus_x, focus_y) = anchored.unwrap_or((selected_x, selected_y));
+    let centered = view.center_lock || anchored.is_some();
+    let left = (focus_x as i32 - if centered { area.width as i32 / 2 } else { (area.width as i32 - view.node_width as i32 - 4).max(0) } + view.offset_x).max(0) as usize;
+    let top = (focus_y as i32 - area.height as i32 / 2 + view.offset_y).max(0) as usize;
+    let mut cells = vec![vec![(' ', theme.muted); area.width as usize]; area.height as usize];
+    let plot = |cells: &mut Vec<Vec<(char, Color)>>, x: usize, y: usize, glyph: char, color: Color| {
+        if let (Some(col), Some(row)) = (x.checked_sub(left), y.checked_sub(top))
+            && row < cells.len() && col < cells[row].len() {
+                cells[row][col] = (glyph, color);
+            }
+    };
+    let by_parent = visible.iter().fold(std::collections::HashMap::<_, Vec<_>>::new(), |mut map, (node, _)| {
+        map.entry(node.parent_id).or_default().push(node.id);
+        map
+    });
+    let parents = all_nodes.iter().filter_map(|node| node.parent_id).collect::<std::collections::HashSet<_>>();
+    for (node, _) in visible {
+        let Some(kids) = by_parent.get(&Some(node.id)) else { continue };
+        let (x, y) = positions[&node.id];
+        let wire_color = node.color.map(atlas_color).unwrap_or(theme.muted);
+        let junction = positions[&kids[0]].0.saturating_sub(3);
+        let label_end = x + atlas_label(node, !kids.is_empty(), view.node_width).chars().count();
+        for col in label_end..=junction { plot(&mut cells, col, y, '─', wire_color); }
+        if kids.len() > 1 {
+            let first_y = positions[&kids[0]].1;
+            let last_y = positions[kids.last().unwrap()].1;
+            for row in first_y..=last_y { plot(&mut cells, junction, row, '│', wire_color); }
+            plot(&mut cells, junction, y, '┤', wire_color);
+        }
+        for (index, child) in kids.iter().enumerate() {
+            let child_y = positions[child].1;
+            plot(&mut cells, junction, child_y, if kids.len() == 1 { '─' } else if index == 0 { '╭' } else if index + 1 == kids.len() { '╰' } else if child_y == y { '┤' } else { '├' }, wire_color);
+            plot(&mut cells, junction + 1, child_y, '─', wire_color);
+            plot(&mut cells, junction + 2, child_y, '─', wire_color);
+        }
+    }
+    for (row, chars) in cells.into_iter().enumerate() {
+        for (col, (glyph, color)) in chars.into_iter().enumerate() {
+            if glyph != ' ' { f.buffer_mut().get_mut(area.x + col as u16, area.y + row as u16).set_symbol(&glyph.to_string()).set_fg(color); }
+        }
+    }
+    for (node, _) in visible {
+        let (x, y) = positions[&node.id];
+        let (Some(col), Some(row)) = (x.checked_sub(left), y.checked_sub(top)) else { continue };
+        if col >= area.width as usize || row >= area.height as usize { continue; }
+        let has_children = parents.contains(&node.id);
+        let style = if let Some(color) = node.color {
+            Style::default().fg(Color::Black).bg(atlas_color(color)).add_modifier(if node.id == selected_id { Modifier::BOLD | Modifier::UNDERLINED } else { Modifier::empty() })
+        } else if node.id == selected_id {
+            theme.selected_style()
+        } else if node.marked {
+            Style::default().fg(theme.muted).add_modifier(Modifier::CROSSED_OUT)
+        } else {
+            Style::default().fg(theme.text)
+        };
+        f.buffer_mut().set_stringn(area.x + col as u16, area.y + row as u16,
+            atlas_label(node, has_children, view.node_width), (area.width as usize) - col, style);
+    }
+}
+
+fn atlas_label(node: &crate::models::AtlasNode, has_children: bool, width: usize) -> String {
+    let title: String = node.title.chars().take(width).collect();
+    let ellipsis = if node.title.chars().count() > width { "…" } else { "" };
+    let mark = if node.marked { "✓ " } else { "" };
+    let fold = if node.collapsed && has_children { " [+]" } else { "" };
+    format!("{mark}{title}{ellipsis}{fold}")
+}
+
+fn atlas_color(index: u8) -> Color {
+    const COLORS: [(u8, u8, u8); 16] = [
+        (220, 75, 75), (225, 120, 55), (225, 165, 55), (220, 195, 65),
+        (155, 195, 65), (75, 185, 105), (55, 180, 150), (65, 185, 190),
+        (75, 165, 215), (85, 125, 220), (110, 105, 210), (155, 100, 205),
+        (185, 95, 195), (215, 105, 160), (220, 100, 125), (215, 215, 215),
+    ];
+    let (r, g, b) = COLORS[index.min(15) as usize];
+    Color::Rgb(r, g, b)
 }
 
 fn draw_treasury_tab(
@@ -1073,9 +1288,6 @@ fn draw_treasury_tab(
         .unwrap_or_default();
     let overdue = service
         .overdue_payments(campaign_id, Utc::now())
-        .unwrap_or_default();
-    let monthly_metrics = service
-        .monthly_metrics(campaign_id, Utc::now(), 6)
         .unwrap_or_default();
     let currency = treasury
         .as_ref()
@@ -1130,7 +1342,7 @@ fn draw_treasury_tab(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!sidebar_focused))
                     .border_style(Style::default().fg(border)),
             ),
             summary_chunks[index],
@@ -1183,7 +1395,7 @@ fn draw_treasury_tab(
         .take(visible_transactions)
         .map(|(index, entry)| {
             let style = if index == app.selected_treasury_idx {
-                Style::default().fg(Color::Black).bg(theme.selection)
+                Style::default().fg(theme.selected_fg()).bg(theme.selection)
             } else {
                 Style::default().fg(theme.text)
             };
@@ -1243,7 +1455,7 @@ fn draw_treasury_tab(
         })
         .unwrap_or("All accounts");
     let title = format!(
-        " Recent Transactions · {:?} · {} · {} · {} · {} · {} · {} ",
+        " Transactions · {:?} · {} · {} · {} · {} · {} · {} ",
         app.treasury_sort,
         visible_range,
         type_filter,
@@ -1287,7 +1499,7 @@ fn draw_treasury_tab(
         Block::default()
             .title(title)
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(!sidebar_focused))
             .border_style(Style::default().fg(border)),
     );
     let entry_count = entries.len();
@@ -1297,67 +1509,36 @@ fn draw_treasury_tab(
         .direction(Direction::Horizontal)
         .constraints([Constraint::Ratio(3, 5), Constraint::Ratio(2, 5)])
         .split(sections[2]);
-    let mut monthly_lines = vec![Line::from(vec![
-        Span::styled("MONTH    ", Style::default().fg(theme.muted)),
-        Span::styled("INCOME", Style::default().fg(theme.success)),
-        Span::styled("       PAID", Style::default().fg(theme.danger)),
-        Span::styled("        OPEN", Style::default().fg(theme.warning)),
-        Span::styled("        NET", Style::default().fg(theme.primary)),
-    ])];
-    monthly_lines.extend(monthly_metrics.iter().map(|item| {
-        let net = item.net_minor();
-        let net_label = if net >= 0 {
-            format!(
-                "+{}",
-                crate::services::treasury::format_compact_money(net, currency)
-            )
-        } else {
-            crate::services::treasury::format_compact_money(net, currency)
-        };
-        Line::from(vec![
-            Span::styled(
-                format!("{:<8}", treasury_month_label(&item.month)),
-                Style::default().fg(theme.muted),
-            ),
-            Span::styled(
-                format!(
-                    "{:<12}",
-                    crate::services::treasury::format_compact_money(item.income_minor, currency)
-                ),
-                Style::default().fg(theme.success),
-            ),
-            Span::styled(
-                format!(
-                    "{:<12}",
-                    crate::services::treasury::format_compact_money(item.paid_minor, currency)
-                ),
-                Style::default().fg(theme.danger),
-            ),
-            Span::styled(
-                format!(
-                    "{:<12}",
-                    crate::services::treasury::format_compact_money(item.committed_minor, currency)
-                ),
-                Style::default().fg(theme.warning),
-            ),
-            Span::styled(
-                net_label,
-                Style::default()
-                    .fg(if net < 0 { theme.danger } else { theme.success })
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    }));
-    f.render_widget(
-        Paragraph::new(monthly_lines).block(
-            Block::default()
-                .title(" Monthly Flow · Last 6 Months ")
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(theme.primary)),
-        ),
-        lower[0],
-    );
+    let funded_accounts = account_balances.iter()
+        .filter(|balance| balance.balance_minor > 0)
+        .collect::<Vec<_>>();
+    let accounts_block = Block::default()
+        .title(" Accounts · E view all ")
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary));
+    if funded_accounts.is_empty() {
+        f.render_widget(
+            Paragraph::new("No accounts with a positive balance.")
+                .style(Style::default().fg(theme.muted))
+                .wrap(ratatui::widgets::Wrap { trim: true })
+                .block(accounts_block),
+            lower[0],
+        );
+    } else {
+        let rows = funded_accounts.iter().map(|balance| Row::new(vec![
+            Cell::from(balance.account.name.clone()).style(Style::default().fg(theme.text)),
+            Cell::from(crate::services::treasury::format_money(balance.balance_minor, currency))
+                .style(Style::default().fg(theme.success).add_modifier(Modifier::BOLD)),
+        ]));
+        f.render_widget(
+            Table::new(rows, [Constraint::Percentage(55), Constraint::Percentage(45)])
+                .header(Row::new(vec!["Account", "Balance"]).style(Style::default().fg(theme.muted)))
+                .column_spacing(1)
+                .block(accounts_block),
+            lower[0],
+        );
+    }
 
     let upcoming_amount = upcoming.iter().map(|entry| entry.amount_minor).sum::<i64>();
     let overdue_amount = overdue.iter().map(|entry| entry.amount_minor).sum::<i64>();
@@ -1367,7 +1548,7 @@ fn draw_treasury_tab(
     } else {
         0
     };
-    let mut signal_lines = vec![
+    let signal_lines = vec![
         Line::from(vec![
             Span::styled("Budget used  ", Style::default().fg(theme.muted)),
             Span::styled(
@@ -1411,43 +1592,7 @@ fn draw_treasury_tab(
                 }),
             ),
         ]),
-        Line::from(""),
-        Line::from(Span::styled(
-            "ACCOUNT BALANCES",
-            Style::default().fg(theme.muted),
-        )),
     ];
-    signal_lines.extend(
-        account_balances
-            .iter()
-            .take(3)
-            .map(|balance| {
-                Line::from(vec![
-                    Span::styled(
-                        format!(
-                            "{:<16}",
-                            balance.account.name.chars().take(15).collect::<String>()
-                        ),
-                        Style::default().fg(theme.text),
-                    ),
-                    Span::styled(
-                        crate::services::treasury::format_compact_money(
-                            balance.balance_minor,
-                            currency,
-                        ),
-                        Style::default().fg(if balance.balance_minor < 0 {
-                            theme.danger
-                        } else if balance.account.kind
-                            == crate::models::TreasuryAccountKind::Savings
-                        {
-                            theme.secondary
-                        } else {
-                            theme.success
-                        }),
-                    ),
-                ])
-            }),
-    );
     f.render_widget(
         Paragraph::new(signal_lines).block(
             Block::default()
@@ -1482,21 +1627,6 @@ fn centered_list_offset(selected: usize, item_count: usize, visible_count: usize
     selected
         .saturating_sub(visible_count / 2)
         .min(item_count - visible_count)
-}
-
-fn treasury_month_label(month: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let mut parts = month.split('-');
-    let year = parts.next().and_then(|value| value.parse::<i32>().ok());
-    let parsed_month = parts.next().and_then(|value| value.parse::<usize>().ok());
-    match (year, parsed_month) {
-        (Some(year), Some(month @ 1..=12)) => {
-            format!("{} {:02}", MONTHS[month - 1], year % 100)
-        }
-        _ => month.to_string(),
-    }
 }
 
 fn draw_treasury_entry_modal(
@@ -1685,7 +1815,7 @@ fn draw_treasury_entry_modal(
             Block::default()
                 .title(modal_title)
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
@@ -1706,7 +1836,7 @@ fn draw_task_expense_completion_modal(f: &mut Frame, selected_idx: usize, theme:
         .map(|(index, option)| {
             let style = if index == selected_idx {
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.selected_fg())
                     .bg(theme.selection)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -1718,7 +1848,7 @@ fn draw_task_expense_completion_modal(f: &mut Frame, selected_idx: usize, theme:
     let block = Block::default()
         .title(" Complete Task · Financial Choice ")
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -1812,7 +1942,7 @@ fn draw_treasury_budget_modal(
             Block::default()
                 .title(" Budget Management ")
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
@@ -1893,7 +2023,7 @@ fn draw_task_financials_modal(
             Block::default()
                 .title(" Task Financial Details ")
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
@@ -1949,11 +2079,32 @@ fn draw_treasury_category_modal(
             Block::default()
                 .title(" Custom Treasury Category ")
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
     );
+}
+
+fn draw_treasury_accounts_modal(f: &mut Frame, app: &App, selected_idx: usize, theme: &Theme) {
+    let area = centered_rect(76, 75, f.size());
+    f.render_widget(Clear, area);
+    let Some(campaign_id) = app.active_project_id else { return; };
+    let service = crate::services::TreasuryService::new(&app.db);
+    let balances = service.account_balances(campaign_id).unwrap_or_default();
+    let currency = service.campaign_currency(campaign_id).unwrap_or_default();
+    let block = Block::default().title(" Treasury Accounts · ↑↓ select · Enter edit · A add · Del delete · Esc close ")
+        .borders(Borders::ALL).border_type(BorderType::Thick).border_style(Style::default().fg(theme.primary));
+    let rows = balances.iter().map(|balance| Row::new(vec![
+        balance.account.name.clone(), balance.account.kind.as_str().to_string(),
+        crate::services::treasury::format_money(balance.balance_minor, currency),
+    ]));
+    let table = Table::new(rows, [Constraint::Percentage(45), Constraint::Percentage(25), Constraint::Percentage(30)])
+        .header(Row::new(vec!["Account", "Type", "Balance"]).style(Style::default().fg(theme.muted)))
+        .block(block).highlight_style(Style::default().bg(theme.primary).fg(theme.background)).highlight_symbol("▶ ");
+    let mut state = TableState::default();
+    if !balances.is_empty() { state.select(Some(selected_idx.min(balances.len() - 1))); }
+    f.render_stateful_widget(table, area, &mut state);
 }
 
 fn draw_treasury_account_modal(
@@ -1961,6 +2112,7 @@ fn draw_treasury_account_modal(
     name: &str,
     kind_idx: usize,
     focus_idx: usize,
+    editing: bool,
     theme: &Theme,
 ) {
     let area = centered_rect(56, 30, f.size());
@@ -1976,7 +2128,7 @@ fn draw_treasury_account_modal(
     };
     f.render_widget(
         Paragraph::new(vec![
-            Line::from("Create an account to separate spendable funds, savings, or cash."),
+            Line::from("Choose a name and type. Existing transactions stay linked."),
             Line::from(""),
             Line::from(vec![
                 Span::styled("Name  ", label_style(0)),
@@ -1995,9 +2147,9 @@ fn draw_treasury_account_modal(
         ])
         .block(
             Block::default()
-                .title(" New Treasury Account ")
+                .title(if editing { " Edit Treasury Account " } else { " New Treasury Account " })
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
@@ -2056,7 +2208,7 @@ fn draw_treasury_currency_modal(f: &mut Frame, app: &App, selected_idx: usize, t
             Block::default()
                 .title(" Campaign Currency ")
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(theme.primary)),
         ),
         area,
@@ -2140,7 +2292,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
     };
 
     let left: Vec<Line> = vec![
-        Line::from(vec![h("  1 · QUESTS")]),
+        Line::from(vec![h("  2 · QUESTS")]),
         binding("n", "New quest", can_edit),
         binding(
             "Enter",
@@ -2197,7 +2349,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         binding("← / Esc", "Back to quests", true),
         Line::from(vec![]),
         Line::from(vec![h("  NAVIGATION")]),
-        binding("1  2  3  4", "Switch sections", true),
+        binding("1  2  3  4  5  6", "Switch sections", true),
         binding("Tab", "Next pane", true),
         binding("Shift+Tab", "Previous pane", true),
         binding("↑ / ↓", "Navigate items", true),
@@ -2205,6 +2357,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         binding("B", "Council Briefing", is_shared),
         binding("K", "Toggle Ledger / Kanban", true),
         binding("L", "Link Quest blockers", can_edit),
+        binding("$", "Quest financial details", can_edit),
         binding("/", "Search", true),
         binding("Esc", "Exit workspace", true),
     ];
@@ -2240,20 +2393,20 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         ]);
     }
     right.extend(vec![
-        Line::from(vec![h("  2 · SCROLLS")]),
+        Line::from(vec![h("  3 · SCROLLS")]),
         binding("n", "New scroll", can_edit),
         binding("Enter / e", "Edit scroll", can_edit),
         binding("d", "New codex", can_edit),
         binding("r", "Move scroll / codex", can_edit),
         binding("Delete", "Delete scroll", can_edit),
         Line::from(vec![]),
-        Line::from(vec![h("  3 · CHRONICLES")]),
+        Line::from(vec![h("  6 · CHRONICLES")]),
         binding("n", "New journal log", can_edit),
         binding("e", "Edit entry", can_edit),
         binding("v", "Toggle visibility", can_edit),
         binding("Delete", "Delete entry", can_edit),
         Line::from(vec![]),
-        Line::from(vec![h("  4 · OVERVIEW")]),
+        Line::from(vec![h("  1 · OVERVIEW")]),
         binding("m", "New milestone", can_edit),
         binding("Space", "Toggle milestone", can_edit),
         binding("Delete", "Remove milestone", can_edit),
@@ -2275,7 +2428,7 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
         Line::from(vec![m("  Use ← / → / Space in the quest modal")]),
         Line::from(vec![m("  None → Daily → Weekly → Monthly → Yearly")]),
         Line::from(vec![]),
-        Line::from(vec![h("  5 · TREASURY")]),
+        Line::from(vec![h("  4 · TREASURY")]),
     ]);
     // Cada atajo se muestra activo o apagado según lo que el rol permite de verdad.
     {
@@ -2330,9 +2483,13 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
             "Switch currency",
             allows(treasury_role, TreasuryAction::SwitchCurrency),
         ));
+        right.push(binding("r", "Show all transactions, every month (clear filters)", true));
+        right.push(binding("Home / End", "First / last transaction", true));
         right.push(binding("f", "Filter transaction type", true));
         right.push(binding("F", "Filter payment status", true));
         right.push(binding("g", "Filter account", true));
+        right.push(binding("E", "Accounts: Enter edit · A add · Del delete unused", true));
+        right.push(binding("s", "Sort ledger", true));
         right.push(binding("x", "Export ledger", true));
         if is_shared {
             right.push(Line::from(vec![]));
@@ -2343,6 +2500,14 @@ fn draw_workspace_help(f: &mut Frame, app: &App, theme: &Theme, is_shared: bool)
                 "  Owner and Stewards approve and settle.",
             )]));
         }
+        right.push(Line::from(vec![]));
+        right.push(Line::from(vec![h("  5 · ATLAS / THE CARTOGRAPHER")]));
+        right.push(binding("n / a", "New sibling / child branch", can_edit));
+        right.push(binding("Enter", "Fold or unfold branch", can_edit));
+        right.push(binding("e / Del", "Rename / remove", can_edit));
+        right.push(binding("J / K", "Move among siblings", can_edit));
+        right.push(binding("Space", "Mark branch", can_edit));
+        right.push(binding("y / x", "Copy / export Chart", true));
     }
 
     let inner = Rect {
@@ -2404,7 +2569,7 @@ fn draw_new_codex_modal(f: &mut Frame, name: &str, theme: &Theme) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(" New Codex ");
     f.render_widget(Clear, area);
@@ -2433,7 +2598,7 @@ fn draw_rename_codex_modal(f: &mut Frame, name: &str, theme: &Theme) {
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(" Rename Codex ");
     f.render_widget(Clear, area);
@@ -2475,7 +2640,7 @@ fn draw_refile_scroll_modal(
     );
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(" Move Scroll to Campaign / Codex ");
     f.render_widget(block, area);
@@ -2490,7 +2655,7 @@ fn draw_refile_scroll_modal(
     for (i, destination) in destinations.iter().enumerate() {
         let style = if selected_idx == i {
             Style::default()
-                .fg(Color::Black)
+                .fg(theme.selected_fg())
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD)
         } else if destination.codex_id.is_none() {
@@ -2555,7 +2720,7 @@ fn draw_refile_codex_modal(
     let title = format!(" Move Codex: {} ", codex_name);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(title);
     f.render_widget(block, area);
@@ -2569,7 +2734,7 @@ fn draw_refile_codex_modal(
     let mut items: Vec<ListItem> = Vec::new();
     let root_style = if selected_idx == 0 {
         Style::default()
-            .fg(Color::Black)
+            .fg(theme.selected_fg())
             .bg(theme.selection)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -2580,7 +2745,7 @@ fn draw_refile_codex_modal(
     for (i, &target_id) in targets.iter().enumerate() {
         let style = if selected_idx == i + 1 {
             Style::default()
-                .fg(Color::Black)
+                .fg(theme.selected_fg())
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -2647,7 +2812,7 @@ fn draw_refile_task_modal(
     let title = format!(" Move Quest: {} ", task_title);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(title);
     f.render_widget(block, area);
@@ -2661,7 +2826,7 @@ fn draw_refile_task_modal(
     let mut items: Vec<ListItem> = Vec::new();
     let top_level_style = if selected_idx == 0 {
         Style::default()
-            .fg(Color::Black)
+            .fg(theme.selected_fg())
             .bg(theme.selection)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -2674,7 +2839,7 @@ fn draw_refile_task_modal(
     for (i, &target_id) in targets.iter().enumerate() {
         let style = if selected_idx == i + 1 {
             Style::default()
-                .fg(Color::Black)
+                .fg(theme.selected_fg())
                 .bg(theme.selection)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -2771,7 +2936,7 @@ fn draw_tasks_tab(
                                 .fg(accent_color)
                                 .add_modifier(Modifier::BOLD),
                             Style::default()
-                                .fg(Color::Black)
+                                .fg(theme.selected_fg())
                                 .bg(theme.selection)
                                 .add_modifier(Modifier::BOLD),
                         )
@@ -2813,11 +2978,11 @@ fn draw_tasks_tab(
                             .fg(theme.danger)
                             .add_modifier(Modifier::BOLD),
                         TaskPriority::Medium => Style::default().fg(theme.warning),
-                        TaskPriority::Low => Style::default().fg(Color::Cyan),
+                        TaskPriority::Low => Style::default().fg(theme.secondary),
                     };
                     let select_style = if is_sel {
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme.selected_fg())
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
                     } else {
@@ -2918,7 +3083,7 @@ fn draw_tasks_tab(
                                 .add_modifier(Modifier::BOLD)
                         } else if blocks_other_quests {
                             Style::default()
-                                .fg(Color::Magenta)
+                                .fg(theme.primary)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             select_style
@@ -2946,7 +3111,7 @@ fn draw_tasks_tab(
                                     theme.selected_style()
                                 } else {
                                     Style::default()
-                                        .fg(Color::Magenta)
+                                        .fg(theme.primary)
                                         .add_modifier(Modifier::BOLD)
                                 },
                             ));
@@ -2955,7 +3120,7 @@ fn draw_tasks_tab(
                             spans.push(Span::styled(step_badge, Style::default().fg(theme.muted)));
                         }
                         if !recur_badge.is_empty() {
-                            spans.push(Span::styled(recur_badge, Style::default().fg(Color::Cyan)));
+                            spans.push(Span::styled(recur_badge, Style::default().fg(theme.secondary)));
                         }
                         if let Some(date) = date_badge {
                             spans.push(Span::styled(
@@ -2975,7 +3140,7 @@ fn draw_tasks_tab(
                                     spans.push(Span::styled(
                                         format!(" @{}", owner),
                                         Style::default()
-                                            .fg(Color::Cyan)
+                                            .fg(theme.secondary)
                                             .add_modifier(Modifier::ITALIC),
                                     ));
                                 }
@@ -3010,7 +3175,7 @@ fn draw_tasks_tab(
 
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(!sidebar_focused && !ledger_focused))
         .border_style(Style::default().fg(content_border))
         .title(list_title);
     let list_inner = list_block.inner(sub_chunks[0]);
@@ -3022,7 +3187,7 @@ fn draw_tasks_tab(
         Paragraph::new("\n  Select a quest details report.").block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!sidebar_focused && ledger_focused))
                 .border_style(Style::default().fg(ledger_border))
                 .title(ledger_title),
         )
@@ -3058,7 +3223,7 @@ fn draw_tasks_tab(
                             .fg(theme.danger)
                             .add_modifier(Modifier::BOLD),
                         TaskPriority::Medium => Style::default().fg(theme.warning),
-                        TaskPriority::Low => Style::default().fg(Color::Cyan),
+                        TaskPriority::Low => Style::default().fg(theme.secondary),
                     },
                 ),
             ]),
@@ -3148,7 +3313,7 @@ fn draw_tasks_tab(
             text.push(Line::from(""));
             text.push(Line::from(vec![
                 Span::styled("  Assigned:    ", Style::default().fg(theme.muted)),
-                Span::styled(names.join(", "), Style::default().fg(Color::Cyan)),
+                Span::styled(names.join(", "), Style::default().fg(theme.secondary)),
             ]));
         }
 
@@ -3162,7 +3327,7 @@ fn draw_tasks_tab(
                         comments.len(),
                         if comments.len() == 1 { "" } else { "s" }
                     ),
-                    Style::default().fg(Color::Magenta),
+                    Style::default().fg(theme.primary),
                 ),
                 Span::styled("  [c] convene", Style::default().fg(theme.warning)),
             ]));
@@ -3181,7 +3346,7 @@ fn draw_tasks_tab(
                     Span::styled(
                         format!("  @{}: ", comment.author_username),
                         Style::default()
-                            .fg(Color::Cyan)
+                            .fg(theme.secondary)
                             .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(body, Style::default().fg(theme.text)),
@@ -3207,7 +3372,7 @@ fn draw_tasks_tab(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!sidebar_focused && ledger_focused))
                     .border_style(Style::default().fg(ledger_border))
                     .title(ledger_title),
             )
@@ -3280,7 +3445,7 @@ fn draw_quest_dependencies_modal(
     f.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(theme.primary))
         .title(format!(" Blockers for {} ", task.title));
     let inner = block.inner(area);
@@ -3675,7 +3840,7 @@ fn draw_quest_board(
                 };
                 let style = if is_header_selected {
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(theme.selected_fg())
                         .bg(theme.selection)
                         .add_modifier(Modifier::BOLD)
                 } else if task.completed {
@@ -3686,7 +3851,7 @@ fn draw_quest_board(
                         .add_modifier(Modifier::BOLD)
                 } else if is_blocker {
                     Style::default()
-                        .fg(Color::Magenta)
+                        .fg(theme.primary)
                         .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(theme.text)
@@ -3722,7 +3887,7 @@ fn draw_quest_board(
                     let step_marker = if is_step_selected { "  ▶ " } else { "    " };
                     let step_style = if is_step_selected {
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme.selected_fg())
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
                     } else if step.completed {
@@ -3765,7 +3930,7 @@ fn draw_quest_board(
             );
             let card_block = Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(content_focused))
                 .border_style(Style::default().fg(border))
                 .title(title);
             let card_inner = card_block.inner(*column);
@@ -3849,8 +4014,8 @@ fn draw_quest_council_modal(
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .border_style(Style::default().fg(Color::Magenta))
+        .border_type(BorderType::Thick)
+        .border_style(Style::default().fg(theme.primary))
         .title(format!(" Quest Council · {} ", quest));
     let inner = block.inner(area);
     f.render_widget(block, area);
@@ -3949,7 +4114,7 @@ fn draw_quest_council_modal(
     } else {
         f.render_widget(
             Paragraph::new(" Type @ to mention a Companion")
-                .style(Style::default().fg(Color::Cyan)),
+                .style(Style::default().fg(theme.secondary)),
             chunks[2],
         );
     }
@@ -4450,7 +4615,7 @@ fn draw_notes_tab(
             .map(|(i, n)| {
                 let style = if i == selected_flat_idx {
                     Style::default()
-                        .fg(Color::Black)
+                        .fg(theme.selected_fg())
                         .bg(theme.selection)
                         .add_modifier(Modifier::BOLD)
                 } else {
@@ -4475,7 +4640,7 @@ fn draw_notes_tab(
                 } else if *is_header {
                     let style = if flat_i == selected_flat_idx {
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme.selected_fg())
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
                     } else {
@@ -4487,7 +4652,7 @@ fn draw_notes_tab(
                 } else {
                     let style = if flat_i == selected_flat_idx {
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme.selected_fg())
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
                     } else {
@@ -4502,7 +4667,7 @@ fn draw_notes_tab(
     let total_items = list_items.len();
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(!sidebar_focused && !preview_focused))
         .border_style(Style::default().fg(content_border))
         .title(" Campaign Scrolls");
     let list_inner = list_block.inner(sub_chunks[0]);
@@ -4556,7 +4721,7 @@ fn draw_notes_tab(
         Paragraph::new("\n  No scroll selected.").block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(!sidebar_focused && preview_focused))
                 .border_style(Style::default().fg(preview_border))
                 .title(preview_title),
         )
@@ -4682,7 +4847,7 @@ fn draw_notes_tab(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!sidebar_focused && preview_focused))
                     .border_style(Style::default().fg(preview_border))
                     .title(preview_title),
             )
@@ -4745,7 +4910,7 @@ fn draw_journal_tab(
                 Block::default()
                     .title(" Treasury Events ")
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(!sidebar_focused))
                     .border_style(Style::default().fg(content_border)),
             ),
             chunks[0],
@@ -4805,7 +4970,7 @@ fn draw_journal_tab(
 
     let list_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(!sidebar_focused))
         .border_style(Style::default().fg(content_border))
         .title(" Campaign Chronicles");
     let list_inner = list_block.inner(journal_area);
@@ -5012,7 +5177,7 @@ fn draw_overview_tab(
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("  SCROLLS (NOTES):    ", Style::default().fg(Color::Cyan)),
+            Span::styled("  SCROLLS (NOTES):    ", Style::default().fg(theme.secondary)),
             Span::styled(
                 format!("{}  ", note_count),
                 Style::default()
@@ -5023,7 +5188,7 @@ fn draw_overview_tab(
         Line::from(vec![
             Span::styled(
                 "  CHRONICLES (LOGS):  ",
-                Style::default().fg(Color::Magenta),
+                Style::default().fg(theme.primary),
             ),
             Span::styled(
                 format!("{}  ", journal_count),
@@ -5037,7 +5202,7 @@ fn draw_overview_tab(
     let stats_p = Paragraph::new(stats_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(!sidebar_focused))
             .border_style(Style::default().fg(content_border))
             .title(" Adventure Metrics "),
     );
@@ -5129,7 +5294,7 @@ fn draw_overview_tab(
 
     let mil_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
+        .border_type(crate::ui::focus_border_type(!sidebar_focused))
         .border_style(Style::default().fg(content_border))
         .title(" Campaign Milestones — [Space] Toggle | [Delete] Slay | [m] New");
     let mil_inner = mil_block.inner(bottom_split[1]);
@@ -5322,7 +5487,7 @@ fn draw_task_modal(
 
     let main_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             title,
@@ -5373,7 +5538,7 @@ fn draw_task_modal(
     let title_p = Paragraph::new(title_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(focus_idx == 0))
             .border_style(title_border_style)
             .title(" Quest Title "),
     );
@@ -5474,7 +5639,7 @@ fn draw_task_modal(
                         Span::raw(before),
                         Span::styled(
                             cur_char,
-                            Style::default().fg(Color::Black).bg(theme.selection),
+                            Style::default().fg(theme.selected_fg()).bg(theme.selection),
                         ),
                         Span::raw(after),
                     ])
@@ -5524,7 +5689,7 @@ fn draw_task_modal(
         let desc_p = Paragraph::new(desc_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(focus_idx == 1))
                 .border_style(desc_border_style)
                 .title(desc_title),
         );
@@ -5549,7 +5714,7 @@ fn draw_task_modal(
         TaskPriority::Low => Span::styled(
             "Low",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(theme.secondary)
                 .add_modifier(Modifier::BOLD),
         ),
         TaskPriority::Medium => Span::styled(
@@ -5568,7 +5733,7 @@ fn draw_task_modal(
     let prio_p = Paragraph::new(Line::from(vec![priority_span])).block(
         Block::default()
             .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
+            .border_type(crate::ui::focus_border_type(focus_idx == 2))
             .border_style(prio_border_style)
             .title(" Priority Level "),
     );
@@ -5597,7 +5762,7 @@ fn draw_task_modal(
             let type_p = Paragraph::new(type_text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(focus_idx == 3))
                     .border_style(type_border_style)
                     .title(if focus_idx == 3 {
                         " Due Type  <-/-> "
@@ -5636,7 +5801,7 @@ fn draw_task_modal(
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
+                        .border_type(crate::ui::focus_border_type(focus_idx == 4))
                         .border_style(val_border_style)
                         .title(val_title),
                 )
@@ -5663,7 +5828,7 @@ fn draw_task_modal(
             let due_p = Paragraph::new(due_text).block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(focus_idx == 3))
                     .border_style(due_border_style)
                     .title(if focus_idx == 3 {
                         " Due Date  <-/-> "
@@ -5689,7 +5854,7 @@ fn draw_task_modal(
             Some(RecurrenceType::Daily) => Span::styled(
                 "↻ Daily",
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(theme.secondary)
                     .add_modifier(Modifier::BOLD),
             ),
             Some(RecurrenceType::Weekly) => Span::styled(
@@ -5714,7 +5879,7 @@ fn draw_task_modal(
         let recur_p = Paragraph::new(Line::from(vec![recur_label])).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(focus_idx == recurrence_focus_idx))
                 .border_style(recur_border_style)
                 .title(" Recurrence "),
         );
@@ -5764,7 +5929,7 @@ fn draw_task_modal(
                     let is_sel = focus_idx == steps_focus_idx && i == step_selected_idx;
                     let style = if is_sel {
                         Style::default()
-                            .fg(Color::Black)
+                            .fg(theme.selected_fg())
                             .bg(theme.selection)
                             .add_modifier(Modifier::BOLD)
                     } else if s.completed {
@@ -5791,7 +5956,7 @@ fn draw_task_modal(
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(focus_idx == steps_focus_idx))
                     .border_style(steps_border_style)
                     .title(steps_title),
             )
@@ -6028,7 +6193,7 @@ pub fn draw_task_calendar(
             };
             let number_style = if is_selected {
                 Style::default()
-                    .fg(Color::Black)
+                    .fg(theme.selected_fg())
                     .bg(theme.selection)
                     .add_modifier(Modifier::BOLD)
             } else if is_today {
@@ -6063,7 +6228,13 @@ pub fn draw_task_calendar(
 }
 
 // Modal sencillo para escribir la entrada de journal del día — sin mucho rollo
-fn draw_journal_modal(f: &mut Frame, is_editing: bool, content: &str, theme: &Theme) {
+fn draw_journal_modal(
+    f: &mut Frame,
+    is_editing: bool,
+    content: &str,
+    editor: Option<&EditorState>,
+    theme: &Theme,
+) {
     let area = centered_rect(55, 30, f.size());
     f.render_widget(Clear, area);
     f.render_widget(
@@ -6088,7 +6259,7 @@ fn draw_journal_modal(f: &mut Frame, is_editing: bool, content: &str, theme: &Th
 
     let main_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             modal_title,
@@ -6098,19 +6269,38 @@ fn draw_journal_modal(f: &mut Frame, is_editing: bool, content: &str, theme: &Th
         ));
     f.render_widget(main_block, area);
 
-    let content_text = if content.is_empty() { "_" } else { content };
-    let content_p = Paragraph::new(content_text)
+    let visible_height = chunks[0].height.saturating_sub(2) as usize;
+    let width = chunks[0].width.saturating_sub(2) as usize;
+    let lines = if let Some(state) = editor {
+        let mut rows = Vec::new();
+        let mut cursor_row = 0;
+        for (index, line) in state.lines.iter().enumerate() {
+            if index == state.cursor_y {
+                cursor_row = rows.len() + crate::screens::text_wrap::wrap_with_cursor(line, state.cursor_x, width).cursor_row;
+            }
+            let styled = render_body_line(line, index, state, theme);
+            rows.extend(crate::screens::text_wrap::split_styled_line(&styled, width));
+        }
+        let scroll = cursor_row.saturating_sub(visible_height.saturating_sub(1));
+        rows.into_iter().skip(scroll).take(visible_height).collect::<Vec<_>>()
+    } else {
+        vec![ratatui::text::Line::from(content)]
+    };
+    let content_p = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(BorderType::Thick)
                 .border_style(Style::default().fg(accent_color))
                 .title(" Today's Chronicle Log "),
-        )
-        .wrap(ratatui::widgets::Wrap { trim: true });
+        );
     f.render_widget(content_p, chunks[0]);
 
-    let helper = Paragraph::new("Enter: save chronicle | ESC: cancel")
+    let mode = editor.map(|state| &state.mode).unwrap_or(&EditorMode::Insert);
+    let helper = Paragraph::new(ratatui::text::Line::from(vec![
+        Span::styled(format!(" {} ", mode.label()), crate::screens::editor::mode_style(mode, theme)),
+        Span::raw("  Ctrl+S / Normal Enter: save  |  Esc: normal / cancel  |  v: select  y: copy  p: paste"),
+    ]))
         .style(Style::default().fg(theme.muted))
         .alignment(Alignment::Center);
     f.render_widget(helper, chunks[1]);
@@ -6129,7 +6319,7 @@ fn draw_tier_select_modal(f: &mut Frame, selected_idx: usize, theme: &Theme) {
 
     let main_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Select Milestone Tier ",
@@ -6207,7 +6397,7 @@ fn draw_tier_select_modal(f: &mut Frame, selected_idx: usize, theme: &Theme) {
         let tier_p = Paragraph::new(tier_text).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
+                .border_type(crate::ui::focus_border_type(is_sel))
                 .border_style(border_style)
                 .style(Style::default().bg(bg)),
         );
@@ -6239,7 +6429,7 @@ fn draw_template_select_modal(f: &mut Frame, tier: u8, selected_idx: usize, them
 
     let main_block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             title,
@@ -6323,7 +6513,7 @@ fn draw_template_select_modal(f: &mut Frame, tier: u8, selected_idx: usize, them
             .block(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
+                    .border_type(crate::ui::focus_border_type(is_sel))
                     .border_style(border_style),
             )
             .wrap(ratatui::widgets::Wrap { trim: true });
@@ -6351,7 +6541,7 @@ fn draw_assign_task_modal(f: &mut Frame, app: &App, selected_member_idx: usize, 
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Assign Quest to Companion ",
@@ -6417,7 +6607,7 @@ fn draw_share_note_modal(f: &mut Frame, permission_idx: usize, theme: &Theme) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Share Scroll Note Permissions ",
@@ -6477,7 +6667,7 @@ fn draw_journal_visibility_modal(f: &mut Frame, visibility_idx: usize, theme: &T
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Thick)
         .border_style(Style::default().fg(accent_color))
         .title(Span::styled(
             " Set Journal Entry Visibility ",
@@ -6528,6 +6718,38 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn atlas_map_centers_parents_over_spaced_children() {
+        let chart_id = uuid::Uuid::new_v4();
+        let project_id = uuid::Uuid::new_v4();
+        let root = uuid::Uuid::new_v4();
+        let first = uuid::Uuid::new_v4();
+        let second = uuid::Uuid::new_v4();
+        let leaf = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        let node = |id, parent_id, title: &str| crate::models::AtlasNode {
+            id, chart_id, project_id, parent_id, title: title.into(), position: 0,
+            collapsed: false, marked: false, hidden: false, color: None, created_at: now, updated_at: now,
+            owner_identity: None,
+        };
+        let visible = vec![
+            (node(root, None, "root"), 0),
+            (node(first, Some(root), "first"), 1),
+            (node(leaf, Some(first), "leaf"), 2),
+            (node(second, Some(root), "second"), 1),
+        ];
+        let positions = atlas_map_positions(&visible, &crate::app::AtlasView::default());
+        assert_eq!(positions[&leaf], (23, 0));
+        assert_eq!(positions[&second], (11, 3));
+        assert_eq!(positions[&root], (0, 1));
+        let mut view = crate::app::AtlasView::default();
+        view.align_levels = true;
+        view.line_spacing = 0;
+        let aligned = atlas_map_positions(&visible, &view);
+        assert_eq!(aligned[&leaf], (24, 0));
+        assert_eq!(aligned[&second], (11, 1));
+    }
 
     // ── Clickable links in the scroll preview ────────────────────────────
 
@@ -6655,11 +6877,11 @@ mod tests {
     }
 
     #[test]
-    fn treasury_monthly_metrics_render_at_wide_and_narrow_sizes() {
+    fn treasury_positive_account_balances_render_at_wide_and_narrow_sizes() {
         let db_path = std::env::current_dir()
             .unwrap()
             .join("target")
-            .join("test_treasury_monthly_metrics.db");
+            .join("test_treasury_positive_account_balances.db");
         let _ = std::fs::remove_file(&db_path);
         let mut app = App::new(&db_path).unwrap();
         let project_id = uuid::Uuid::new_v4();
@@ -6731,15 +6953,38 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Monthly Flow"));
+        assert!(!rendered.contains("Monthly Flow"));
         assert!(rendered.contains("Treasury Pulse"));
         assert!(rendered.contains("Saved"));
-        assert!(rendered.contains("ACCOUNT BALANCES"));
-        assert!(rendered.contains("Spending"));
-        assert!(rendered.contains("Savings"));
-        assert!(rendered.contains("Cash"));
-        assert!(rendered.contains("INCOME"));
-        assert!(rendered.contains("OPEN"));
+        assert!(rendered.contains("Accounts · E view all"));
+        assert!(rendered.contains("No accounts with a positive balance."));
+
+        let service = crate::services::TreasuryService::new(&app.db);
+        let funded = service.create_account(project_id, "MLSavings", crate::models::TreasuryAccountKind::Savings).unwrap();
+        let cash = service.accounts(project_id).unwrap().into_iter().find(|a| a.name == "Cash").unwrap();
+        let income_category = service.categories_for_type(project_id, crate::models::LedgerEntryType::Income).unwrap().remove(0);
+        let template = service.entries(project_id, &crate::models::LedgerFilter::default(), crate::models::LedgerSort::Newest).unwrap().remove(0);
+        for (account_id, amount) in [(funded.id, 123_456), (cash.id, 50_000)] {
+            let mut income = template.clone();
+            income.id = uuid::Uuid::new_v4();
+            income.title = "Account funding".into();
+            income.entry_type = crate::models::LedgerEntryType::Income;
+            income.category_id = income_category.id;
+            income.account_id = Some(account_id);
+            income.amount_minor = amount;
+            service.create_entry(income).unwrap();
+        }
+        wide.draw(|frame| {
+            draw_treasury_tab(frame, frame.size(), &app, project_id, &theme, false);
+        }).unwrap();
+        let account_panel = (20..30).flat_map(|y| (0..72).map(move |x| (x, y)))
+            .map(|(x, y)| wide.backend().buffer().get(x, y).symbol()).collect::<String>();
+        assert!(account_panel.contains("MLSavings"));
+        assert!(account_panel.contains("US$1,234.56"));
+        assert!(account_panel.contains("Cash"));
+        assert!(account_panel.contains("US$500.00"));
+        assert!(!account_panel.contains("Spending")); // Negative balance.
+        assert!(!account_panel.contains(" Savings")); // Zero balance.
         let treasury_hit = treasury_hit.unwrap();
         assert_eq!(treasury_hit.row_targets.first(), Some(&Some(4)));
         assert_eq!(treasury_hit.row_targets.last(), Some(&Some(15)));
@@ -6838,6 +7083,35 @@ mod tests {
         drop(terminal);
         drop(app);
         let _ = std::fs::remove_file(&db_path);
+    }
+
+    #[test]
+    fn compact_workspace_footer_keeps_help_visible_on_narrow_terminals() {
+        let db_path = std::env::current_dir().unwrap().join("target/test_compact_workspace_footer.db");
+        let _ = std::fs::remove_file(&db_path);
+        let mut app = App::new(&db_path).unwrap();
+        let project_id = uuid::Uuid::new_v4();
+        let now = Utc::now();
+        app.db.insert_project(&Project {
+            id: project_id, name: "Footer campaign".into(), description: None,
+            archived: false, completed: false, created_at: now, updated_at: now,
+            owner_identity: Some(app.identity.public_key.clone()),
+            owner_username: Some("Treasurer".into()), is_shared: false,
+        }).unwrap();
+        app.projects = app.db.get_projects().unwrap();
+        app.active_project_id = Some(project_id);
+        let theme = Theme::default_theme();
+        for width in [52, 80, 120] {
+            for tab in [0, 4] {
+                app.workspace_tab_idx = tab;
+                let mut terminal = Terminal::new(TestBackend::new(width, 30)).unwrap();
+                terminal.draw(|frame| { draw(frame, &app, &theme); }).unwrap();
+                let rendered = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect::<String>();
+                assert!(rendered.contains("F1 All keys"), "help missing at width {width}, tab {tab}");
+                if width == 120 && tab == 4 { assert!(rendered.contains("E Accounts")); }
+            }
+        }
+        drop(app); let _ = std::fs::remove_file(db_path);
     }
 
     #[test]

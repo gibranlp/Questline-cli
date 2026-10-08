@@ -144,7 +144,7 @@ pub fn draw(f: &mut Frame, quote: &str, author: &str, ticks: usize, theme: &Them
             Style::default().fg(theme.muted),
         )),
         Line::from(Span::styled(
-            "Found a bug? Go to About [?] and press [R] to report it.",
+            "Found a bug? Press [?] for About, then [R] to send a report.",
             Style::default().fg(Color::Rgb(249, 115, 22)),
         )),
     ];
