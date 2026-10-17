@@ -57,6 +57,14 @@ fn local_campaign(app: &App, id: Uuid) -> Result<()> {
     Ok(())
 }
 
+fn creation_id(request: &Value) -> Result<Uuid> {
+    if request["autosave"].as_bool() == Some(true) && request["autosave_id"].is_string() {
+        id_field(request, "autosave_id")
+    } else {
+        Ok(Uuid::new_v4())
+    }
+}
+
 pub fn run(path: &Path, request: &Value) -> Result<Value> {
     if !path.is_file() {
         bail!("Open Questline and complete onboarding first");
@@ -66,7 +74,36 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
         bail!("Open Questline and complete onboarding first");
     }
     let action = field(request, "action")?;
+    if action.starts_with("create_") && request["autosave"].as_bool() == Some(true)
+        && request["autosave_id"].is_string() {
+        let id = id_field(request, "autosave_id")?;
+        let existing_campaign = match action {
+            "create_task" | "create_step" => app.db.get_task_by_id(id).ok().and_then(|item| item.project_id),
+            "create_scroll" => app.db.get_note_by_id(id).ok().and_then(|item| item.project_id),
+            "create_entry" => TreasuryService::new(&app.db).get_entry(id)?.map(|item| item.campaign_id),
+            _ => None,
+        };
+        let existing_sidequest = action == "create_sidequest" && app.db.get_rituals()?.iter().any(|item| item.id == id.to_string());
+        if let Some(campaign_id) = existing_campaign {
+            local_campaign(&app, campaign_id)?;
+            let mut resumed = request.clone();
+            resumed["action"] = Value::String(action.replacen("create_", "update_", 1));
+            resumed["id"] = json!(id);
+            return run(path, &resumed);
+        }
+        if existing_sidequest {
+            let mut resumed = request.clone();
+            resumed["action"] = Value::String(action.replacen("create_", "update_", 1));
+            resumed["id"] = json!(id);
+            return run(path, &resumed);
+        }
+    }
+    let rewards = crate::desktop_notifications::RewardSnapshot::capture(&app.db)?;
+    app.external_notifications = false;
+    let result: Result<Value> = (|| {
     match action {
+        "drink_water" => crate::desktop_hydration::drink(&mut app,request["reminder_token"].as_str().unwrap_or("")),
+        "dismiss_hydration_reminder" => crate::desktop_hydration::dismiss(&app.db,request["reminder_token"].as_str().unwrap_or("")),
         "create_sidequest" | "update_sidequest" => {
             let name = text_field(request, "title", 200)?;
             let description = request["description"].as_str().unwrap_or("").trim().to_string();
@@ -88,7 +125,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
                 app.db.get_rituals()?.into_iter().find(|ritual| ritual.id == id).context("Sidequest not found")?
             } else {
                 crate::models::Ritual {
-                    id: Uuid::new_v4().to_string(), name: String::new(), description: None,
+                    id: creation_id(request)?.to_string(), name: String::new(), description: None,
                     frequency: String::new(), reward_xp: 0, daily_target: 1, created_at: now, updated_at: now,
                 }
             };
@@ -129,7 +166,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
                 .to_string();
             let now = Utc::now();
             let task = Task {
-                id: Uuid::new_v4(),
+                id: creation_id(request)?,
                 project_id: Some(project_id),
                 title,
                 description: if description.is_empty() {
@@ -232,7 +269,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             let description = request["description"].as_str().unwrap_or("").trim();
             let now = Utc::now();
             let step = Task {
-                id: Uuid::new_v4(),
+                id: creation_id(request)?,
                 project_id: Some(project_id),
                 title,
                 description: if description.is_empty() {
@@ -320,7 +357,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             let content = text_field(request, "content", 100_000)?;
             let now = Utc::now();
             let note = Note {
-                id: Uuid::new_v4(),
+                id: creation_id(request)?,
                 project_id: Some(project_id),
                 title,
                 markdown_content: content,
@@ -342,7 +379,9 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             note.title = text_field(request, "title", 200)?;
             note.markdown_content = text_field(request, "content", 100_000)?;
             app.db.update_note(&note)?;
-            app.grant_xp("Edit Scroll Note", 2)?;
+            if request["autosave"].as_bool() != Some(true) {
+                app.grant_xp("Edit Scroll Note", 2)?;
+            }
             Ok(json!({"id": note.id, "message": "Scroll updated"}))
         }
         "delete_scroll" => {
@@ -387,7 +426,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
                 .context("Treasury account not found")?;
             let now = Utc::now();
             let entry = LedgerEntry {
-                id: Uuid::new_v4(),
+                id: creation_id(request)?,
                 campaign_id,
                 title,
                 description: String::new(),
@@ -431,6 +470,21 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             if entry.amount_minor <= 0 {
                 bail!("Amount must be greater than zero");
             }
+            if let Some(kind) = request["entry_type"].as_str() {
+                if matches!(entry.entry_type, LedgerEntryType::Income | LedgerEntryType::Expense) {
+                    let desired = match kind {
+                        "Income" => LedgerEntryType::Income,
+                        "Expense" => LedgerEntryType::Expense,
+                        _ => bail!("Choose Income or Expense"),
+                    };
+                    if desired != entry.entry_type {
+                        entry.category_id = treasury.categories_for_type(entry.campaign_id, desired)?
+                            .into_iter().find(|category| category.name == if desired == LedgerEntryType::Income {"Other Income"} else {"Other"})
+                            .context("Default category not found")?.id;
+                        entry.entry_type = desired;
+                    }
+                }
+            }
             entry.status = LedgerStatus::parse(field(request, "status")?)
                 .context("Choose a valid treasury status")?;
             if entry.status == LedgerStatus::Paid && entry.payment_date.is_none() {
@@ -451,6 +505,8 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
         }
         _ => bail!("Unknown shell action"),
     }
+    })();
+    rewards.attach(&app.db,request,result?)
 }
 
 pub fn render_tree(request: &Value) -> Result<Value> {

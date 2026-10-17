@@ -7474,7 +7474,7 @@ impl App {
                     // d = drink and dismiss
                     KeyCode::Char('d') | KeyCode::Char('D') => {
                         self.modal_state = ModalType::None;
-                        let _ = self.record_hydration_drink(false);
+                        let _ = self.record_hydration_drink(true);
                     }
                     // s = snooze 15 min
                     KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -25607,7 +25607,7 @@ impl App {
         }
     }
 
-    fn record_hydration_drink(&mut self, enforce_wait: bool) -> Result<()> {
+    pub(crate) fn record_hydration_drink(&mut self, enforce_wait: bool) -> Result<()> {
         if enforce_wait {
             if let Some(last_drink_at) = self.db.hydration_last_drink_at()? {
                 let wait = chrono::Duration::minutes(self.hydration_interval_mins.max(1) as i64);

@@ -90,7 +90,7 @@ fn send_system_notification_with_icon_timeout(
     urgent: bool,
     icon: NotificationIcon,
     timeout: Option<Duration>,
-) {
+) -> std::thread::JoinHandle<()> {
     let title = strip_non_ascii(title);
     let message = strip_non_ascii(message);
     let icon_path = notification_icon_path(icon);
@@ -172,7 +172,7 @@ fn send_system_notification_with_icon_timeout(
                 .args(["-NoProfile", "-NonInteractive", "-Command", &ps])
                 .status();
         }
-    });
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -392,7 +392,7 @@ fn send_with_zenity(
     command_succeeded(&mut cmd)
 }
 
-fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
+pub(crate) fn notification_icon_path(icon: NotificationIcon) -> Option<PathBuf> {
     let relative = PathBuf::from("assets")
         .join("icons")
         .join("notifications")
@@ -587,4 +587,9 @@ mod tests {
             assert_eq!(&embedded_notification_icon(icon)[..8], b"\x89PNG\r\n\x1a\n");
         }
     }
+}
+
+// Espera al envío para que las acciones cortas no pierdan su notificación al salir.
+pub fn send_system_notification_blocking(title: &str, message: &str, icon: NotificationIcon) {
+    let _ = send_system_notification_with_icon_timeout(title,message,false,icon,Some(Duration::from_secs(8))).join();
 }

@@ -20,6 +20,8 @@ pub mod build_info;
 pub mod calendar_import;
 pub mod campaign_templates;
 pub mod database;
+pub mod desktop_notifications;
+pub mod desktop_hydration;
 pub mod milestone_templates;
 pub mod models;
 pub mod screens;

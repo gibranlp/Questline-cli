@@ -462,6 +462,7 @@ fn print_cli_help() {
     println!("                                 Preview, then import a Campaign template");
     println!("  calendar-import <name|id> <file> [--confirm|--reconcile]");
     println!("                                 Preview local iCalendar events as Quests");
+    println!("  desktop-notifications         Run background Swarm and hydration notifications");
     println!("  shell-action <json>           Run a local SpectrumShell action (including sidequests)");
     println!("  shell-tree <json>             Render the current procedural Evergrowth tree");
     println!("  shell-hero <json>             Describe hero class progression for SpectrumShell");
@@ -513,10 +514,16 @@ async fn main() -> Result<()> {
                 println!("{}", serde_json::to_string(&result)?);
                 return Ok(());
             }
+            "desktop-notifications" => {
+                let path = storage::get_storage_dir()?.join("questline.db");
+                questline::desktop_notifications::run(&path)?;
+                return Ok(());
+            }
             "shell-action" => {
                 let request: serde_json::Value = serde_json::from_str(&options.command_args[0])?;
                 let db_path = storage::get_storage_dir()?.join("questline.db");
                 let result = questline::shell_api::run(&db_path, &request)?;
+                questline::desktop_notifications::deliver_response(&result);
                 println!("{}", serde_json::to_string(&result)?);
                 return Ok(());
             }
@@ -994,6 +1001,7 @@ async fn main() -> Result<()> {
     app.corrupted_backups_found = corrupted_backups;
 
     // Loop principal — 50ms por tick = ~20fps, primero input luego render para reducir latencia
+    let _desktop_presence = questline::desktop_notifications::tui_presence(&storage::get_storage_dir()?)?;
     let tick_rate = std::time::Duration::from_millis(50);
     let mut last_notification_time: Option<std::time::Instant> = None;
     loop {

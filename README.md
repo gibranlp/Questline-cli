@@ -8,7 +8,7 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
-Current stable version: **1.1.3**. Version **2.0.0** is in release preparation.
+Current release: **2.0.2**.
 
 ---
 
@@ -419,6 +419,15 @@ If Questline helps you on your adventures, consider starring the repository and 
 ---
 
 ## Changelog
+
+### v2.0.2 — The Backlog Has Learned to Knock
+*October 17, 2026*
+
+- SpectrumOS shell actions announce actual XP gains, level-ups and newly unlocked achievements. The hero gets the reward; the backlog gets the memo.
+- Background Swarm and hydration reminders work with the terminal closed and pause while the full app is open, keeping the Swarm from forming a committee.
+- SpectrumOS water reminders show daily progress, stay blue until dismissed or handled with **Drink**, and use Questline's native hydration log and daily rewards. Swarm cards stay purple.
+- Reminder hours, interval, daily target and focus pauses follow existing Questline settings. Dismissal records no drink; repeated actions cannot count the same reminder twice.
+- Pending water reminders survive service restarts. Autosaved shell creations reuse their IDs, preserving drafts without spawning duplicate quests, scrolls or Treasury entries.
 
 ### v2.0.0 — Encrypted Fellowship
 *Unreleased*
@@ -928,3 +937,14 @@ If Questline helps you on your adventures, consider starring the repository and 
 
 ### v1.0.5 and earlier
 - See [GitHub Releases](https://github.com/gibranlp/Questline-cli/releases) for full history.
+
+
+### Desktop notifications in 2.0.2
+
+SpectrumOS shell actions now report actual awarded XP, level-ups and newly unlocked achievements. These notifications follow Questline's external-notification setting; rewards are calculated by the existing game services, not by the desktop widget. Autosave does not replay old rewards or achievements.
+
+Run `questline desktop-notifications` to keep the Notification Swarm and hydration reminders alive without leaving the terminal app open. SpectrumOS starts this command in a user service. Water reminders follow your existing hydration interval, active hours and focus-pause preference; they remind you to drink and do not record a drink automatically. The Swarm retains its chapter progression, cooldowns and session limit. The notifier uses local cached chapter progress and does not refresh chapter progress from the server or grant chapter rewards.
+
+The full terminal app holds a presence lock while running, so the background service pauses its reminders instead of duplicating them. SpectrumOS focus sessions also pause Swarm interruptions and, when configured, water reminders. Use Questline's existing external-notification toggle to silence both rewards and reminders.
+
+In SpectrumOS, Swarm notifications keep Questline's purple palette and water reminders keep its blue palette across wallpaper changes. Water reminders show today's progress (for example `3/12 today`) and stay visible until dismissed with **Ctrl + Space** or handled with **Drink**. Drink uses Questline's native hydration log, daily target XP and achievements. Dismissing a reminder does not record a drink. Pending reminders survive service restarts, and the next interval begins after the reminder is handled. New reminders stop when the daily target is reached.
