@@ -8,7 +8,7 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
-Current release: **2.0.2**.
+Current release: **2.0.3**.
 
 ---
 
@@ -419,6 +419,15 @@ If Questline helps you on your adventures, consider starring the repository and 
 ---
 
 ## Changelog
+
+### v2.0.3 — Profiles Across Every PC
+
+- Reliable encrypted sync with durable local changes, retries, transactional imports, and safer shutdown.
+- Independent encrypted profile backups, guarded identity/file restores, and private Transfer Codes.
+- Portals: shared Favorites, categories, and visit counts across Questline and SpectrumOS.
+- Background syncing with Questline closed and shared Cloud Sync/Auto Sync controls.
+- SpectrumOS profile export, backups, restore previews, and safe completed-task pruning.
+- Updated bundled SQLite to include the upstream WAL-reset corruption fix.
 
 ### v2.0.2 — The Backlog Has Learned to Knock
 *October 17, 2026*
@@ -948,3 +957,9 @@ Run `questline desktop-notifications` to keep the Notification Swarm and hydrati
 The full terminal app holds a presence lock while running, so the background service pauses its reminders instead of duplicating them. SpectrumOS focus sessions also pause Swarm interruptions and, when configured, water reminders. Use Questline's existing external-notification toggle to silence both rewards and reminders.
 
 In SpectrumOS, Swarm notifications keep Questline's purple palette and water reminders keep its blue palette across wallpaper changes. Water reminders show today's progress (for example `3/12 today`) and stay visible until dismissed with **Ctrl + Space** or handled with **Drink**. Drink uses Questline's native hydration log, daily target XP and achievements. Dismissing a reminder does not record a drink. Pending reminders survive service restarts, and the next interval begins after the reminder is handled. New reminders stop when the daily target is reached.
+
+### Portals and synced Favorites
+
+Open **[0] Portals** to manage categorized web bookmarks. SpectrumOS Favorites uses the same local Questline records and encrypted sync, with a desktop background service for use without an open terminal. See [Portals and SpectrumOS Favorites](docs/portals.md) for controls, commands, migration, and sync behavior.
+
+SpectrumOS also exposes a **Sync** tab for preferences, manual sync, profile export, backup, identity/file/cloud restore, and previewed task pruning. See [the Sync widget guide](docs/sync-widget.md).

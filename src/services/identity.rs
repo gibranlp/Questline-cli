@@ -21,6 +21,47 @@ pub struct Identity {
 }
 
 impl Identity {
+    pub fn load_for_database(db: &crate::database::Database, existing_user_id: Option<Uuid>) -> Result<Self> {
+        if let Some(json) = db.get_setting("_profile_identity")? {
+            let mut identity: Self = serde_json::from_str(&json)?;
+            identity.validate()?;
+            if let Some(user) = existing_user_id { identity.user_uuid = user; }
+            return Ok(identity);
+        }
+        Self::load_or_create(existing_user_id)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.secret_key.len()!=64 || self.public_key.len()!=64 || !self.secret_key.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return Err(anyhow!("Invalid profile identity encoding"));
+        }
+        let bytes: [u8; 32] = from_hex(&self.secret_key)?.try_into().map_err(|_| anyhow!("Invalid profile secret key"))?;
+        if to_hex(&SigningKey::from_bytes(&bytes).verifying_key().to_bytes()) != self.public_key {
+            return Err(anyhow!("Profile identity does not match its private key"));
+        }
+        Ok(())
+    }
+
+    pub fn save_compatibility_copy(&self, directory: &std::path::Path) -> Result<()> {
+        let path = directory.join("identity.key");
+        let temporary = directory.join(format!(".identity-{}.tmp", Uuid::new_v4()));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)] {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let result = (|| -> Result<()> {
+            use std::io::Write;
+            let mut file = options.open(&temporary)?;
+            file.write_all(serde_json::to_string_pretty(self)?.as_bytes())?;
+            file.sync_all()?;
+            std::fs::rename(&temporary, &path)?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(temporary); }
+        result
+    }
     // Carga la identidad existente del disco o genera una nueva — no manches, no toques sin saber cripto
     pub fn load_or_create(existing_user_id: Option<Uuid>) -> Result<Self> {
         let storage_dir = storage::get_storage_dir()?;
@@ -31,13 +72,16 @@ impl Identity {
 
         // Si ya existe el archivo, cárgalo y listo — no regeneres llaves innecesariamente
         if key_path.exists() {
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            }
             let file_content = std::fs::read_to_string(&key_path)?;
             let mut identity: Identity = serde_json::from_str(&file_content)?;
             if let Some(user_id) = existing_user_id {
                 if identity.user_uuid != user_id {
                     identity.user_uuid = user_id;
-                    let json_str = serde_json::to_string_pretty(&identity)?;
-                    std::fs::write(&key_path, json_str)?;
+                    identity.save_compatibility_copy(&storage_dir)?;
                 }
             }
             return Ok(identity);
@@ -65,8 +109,7 @@ impl Identity {
         };
 
         // Guarda la identidad en disco — este archivo es el pasaporte del héroe
-        let json_str = serde_json::to_string_pretty(&identity)?;
-        std::fs::write(&key_path, json_str)?;
+        identity.save_compatibility_copy(&storage_dir)?;
 
         Ok(identity)
     }

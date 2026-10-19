@@ -1,6 +1,6 @@
 [package]
 name = "questline"
-version = "2.0.2"
+version = "2.0.3"
 edition = "2024"
 license = "MIT"
 
@@ -16,11 +16,12 @@ chrono = { version = "0.4.38", features = ["serde"] }
 chrono-tz = "0.10.4"
 keyring = { version = "4.1.6", features = ["v1"] }
 directories = "5.0.1"
-rusqlite = { version = "0.31.0", features = ["bundled", "backup"] }
+rusqlite = { version = "0.40.1", features = ["bundled", "backup"] }
 rand = "0.8.5"
 rodio = "0.17.3"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
 ureq = { version = "2.9.7", features = ["json"] }
+url = "2.5"
 toml = "0.8.12"
 base64 = "0.22.1"
 aes-gcm = "0.10.3"

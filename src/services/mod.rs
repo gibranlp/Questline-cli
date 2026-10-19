@@ -12,6 +12,8 @@ pub mod logger;
 pub mod lore_manager;
 pub mod notifications;
 pub mod planner;
+pub mod profile_backup;
+pub mod profile_transfer;
 pub mod sync_engine;
 pub mod task_notifications;
 pub mod theme;

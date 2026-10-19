@@ -69,6 +69,15 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
     if !path.is_file() {
         bail!("Open Questline and complete onboarding first");
     }
+    let action=field(request,"action")?;
+    {
+        let db=crate::database::Database::new(path)?;
+        let epoch=db.get_setting("shell_profile_epoch")?.unwrap_or_default();
+        let key=format!("{}:{}",db.get_user()?.map(|u|u.id.to_string()).unwrap_or_default(),epoch);
+        if !matches!(action,"drink_water"|"dismiss_hydration_reminder") && ((!epoch.is_empty() && request["profile_key"].as_str()!=Some(key.as_str())) || request["profile_key"].as_str().is_some_and(|v|!v.is_empty() && v!=key)) {
+            bail!("The widget belongs to an older profile. Refresh Questline before saving.");
+        }
+    }
     let mut app = App::new_headless(path)?;
     if app.user.is_none() {
         bail!("Open Questline and complete onboarding first");

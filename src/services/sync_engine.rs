@@ -3,7 +3,7 @@
 // ─────────────────────────────────────────────────────────────────────────────
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
-use rusqlite::params;
+use rusqlite::{params, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use uuid::Uuid;
@@ -12,7 +12,7 @@ use crate::database::Database;
 use crate::models::{Note, QuestStatus, Task};
 use crate::services::Identity;
 
-const PULL_PAGE_SIZE: usize = 1000;
+const PULL_PAGE_SIZE: usize = 200;
 const MAX_DRAIN_PAGES: usize = 100;
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -54,6 +54,7 @@ struct PullPage {
     has_more: bool,
     metadata_supported: bool,
     signatures_required: bool,
+    generation: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -67,6 +68,8 @@ struct PullPageEnvelope {
     has_more: bool,
     #[serde(default)]
     signatures_required: bool,
+    #[serde(default)]
+    generation: Option<i64>,
 }
 
 fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
@@ -86,6 +89,7 @@ fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
             has_more: envelope.has_more,
             metadata_supported: true,
             signatures_required: envelope.signatures_required,
+            generation: envelope.generation,
         });
     }
 
@@ -98,6 +102,7 @@ fn parse_pull_page(data: &str, since_seq: i64) -> Result<PullPage> {
         events,
         metadata_supported: false,
         signatures_required: false,
+        generation: None,
     })
 }
 
@@ -115,6 +120,8 @@ pub trait CloudProvider {
         self.push(public_key, signature, payload)
     }
     fn pull(&self, public_key: &str, signature: &str, since_seq: i64) -> Result<String>;
+    fn history_generation(&self) -> Option<i64> { None }
+    fn head(&self) -> Result<Option<i64>> { Ok(None) }
 }
 
 // Simula el servidor en disco — para desarrollo y para que el sync funcione sin internet
@@ -239,26 +246,27 @@ fn apply_atlas_sync_event(
     operation: &str,
     entity_id: &str,
     content: Option<&str>,
-) -> bool {
+) -> Result<bool> {
     if operation == "delete" {
         let table = if entity_type == "atlas_chart" { "atlas_charts" } else { "atlas_nodes" };
-        return db.conn.execute(&format!("DELETE FROM {table} WHERE id=?1"), params![entity_id]).is_ok();
+        db.conn.execute(&format!("DELETE FROM {table} WHERE id=?1"), params![entity_id])?;
+        return Ok(true);
     }
     match entity_type {
-        "atlas_chart" => serde_json::from_str::<crate::models::AtlasChart>(content.unwrap_or(""))
-            .ok()
-            .and_then(|chart| db.conn.execute(
+        "atlas_chart" => {
+            let chart = serde_json::from_str::<crate::models::AtlasChart>(content.unwrap_or(""))?;
+            db.conn.execute(
                 "INSERT INTO atlas_charts (id,project_id,name,created_at,updated_at,owner_identity)
                  VALUES (?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET
                  project_id=excluded.project_id,name=excluded.name,updated_at=excluded.updated_at,
                  owner_identity=excluded.owner_identity",
                 params![chart.id.to_string(), chart.project_id.to_string(), chart.name,
                     chart.created_at.to_rfc3339(), chart.updated_at.to_rfc3339(), chart.owner_identity],
-            ).ok())
-            .is_some(),
-        "atlas_node" => serde_json::from_str::<crate::models::AtlasNode>(content.unwrap_or(""))
-            .ok()
-            .and_then(|node| db.conn.execute(
+            )?;
+        },
+        "atlas_node" => {
+            let node = serde_json::from_str::<crate::models::AtlasNode>(content.unwrap_or(""))?;
+            db.conn.execute(
                 "INSERT INTO atlas_nodes (id,chart_id,project_id,parent_id,title,position,collapsed,marked,created_at,updated_at,owner_identity,hidden,color)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13) ON CONFLICT(id) DO UPDATE SET
                  chart_id=excluded.chart_id,project_id=excluded.project_id,parent_id=excluded.parent_id,
@@ -269,17 +277,25 @@ fn apply_atlas_sync_event(
                     node.parent_id.map(|id| id.to_string()), node.title, node.position,
                     node.collapsed as i32, node.marked as i32, node.created_at.to_rfc3339(),
                     node.updated_at.to_rfc3339(), node.owner_identity, node.hidden as i32, node.color],
-            ).ok())
-            .is_some(),
-        _ => false,
+            )?;
+        },
+        _ => return Ok(false),
     }
+    Ok(true)
 }
 
 pub struct HttpCloudProvider {
     pub client: ApiClient,
+    generation: std::cell::Cell<Option<i64>>,
 }
 
 impl CloudProvider for HttpCloudProvider {
+    fn history_generation(&self) -> Option<i64> { self.generation.get() }
+    fn head(&self) -> Result<Option<i64>> {
+        let raw = self.client.send_request("GET", "sync/v2/head", "")?;
+        let value: serde_json::Value = serde_json::from_str(&raw)?;
+        Ok(value["head_seq"].as_i64())
+    }
     fn name(&self) -> &str {
         "Cloud Chronicle (HTTPS REST)"
     }
@@ -289,6 +305,21 @@ impl CloudProvider for HttpCloudProvider {
     }
 
     fn prepare_pull(&self, db: &Database, identity: &Identity) -> Result<()> {
+        match self.client.send_request("GET", "sync/v2/head", "") {
+            Ok(raw) => {
+                let head: serde_json::Value = serde_json::from_str(&raw)?;
+                if let Some(generation) = head["generation"].as_i64() {
+                    if self.generation.get().is_some_and(|known| known != generation) {
+                        return Err(anyhow!("Cloud history was reset on another device. Restore the profile before publishing local changes."));
+                    }
+                    self.generation.set(Some(generation));
+                    db.set_setting("sync_history_generation_v2", &generation.to_string())?;
+                }
+            }
+            Err(error) if error.downcast_ref::<crate::services::api_client::HttpError>().is_some_and(|error| error.status == 404) => {},
+            Err(error) => return Err(error),
+        }
+
         let response = self
             .client
             .send_request("GET", "project/key-envelopes", "")?;
@@ -353,7 +384,10 @@ impl CloudProvider for HttpCloudProvider {
     }
 
     fn push(&self, _public_key: &str, _signature: &str, payload: &str) -> Result<()> {
-        self.client.send_request("POST", "sync/v2/push", payload)?;
+        let route = self.generation.get().map(|generation| format!("sync/v2/push?expected_generation={generation}")).unwrap_or_else(|| "sync/v2/push".into());
+        let raw = self.client.send_request("POST", &route, payload)?;
+        let acknowledgment: serde_json::Value = serde_json::from_str(&raw)?;
+        if acknowledgment["status"] != "success" { return Err(anyhow!("Server did not acknowledge sync batch")); }
         Ok(())
     }
 
@@ -369,8 +403,13 @@ impl CloudProvider for HttpCloudProvider {
     }
 
     fn replace_snapshot(&self, _public_key: &str, _signature: &str, payload: &str) -> Result<()> {
-        self.client
-            .send_request("POST", "sync/v2/snapshot", payload)?;
+        let raw = self.client.send_request("GET", "sync/v2/head", "")?;
+        let head: serde_json::Value = serde_json::from_str(&raw)?;
+        let expected_head = head["head_seq"].as_i64().ok_or_else(|| anyhow!("Server did not report its reset head"))?;
+        let raw = self.client.send_request("POST", &format!("sync/v2/snapshot?expected_head={expected_head}"), payload)?;
+        let response: serde_json::Value = serde_json::from_str(&raw)?;
+        if response["status"] != "success" { return Err(anyhow!("Server did not acknowledge cloud reset")); }
+        self.generation.set(response["generation"].as_i64());
         Ok(())
     }
 }
@@ -391,7 +430,8 @@ impl<'a> SyncEngine<'a> {
     ) -> Result<Self> {
         let provider: Box<dyn CloudProvider> = if let Some(url) = server_url {
             let client = ApiClient::new(url, identity.clone(), device_id);
-            Box::new(HttpCloudProvider { client })
+            let generation = std::cell::Cell::new(db.get_setting("sync_history_generation_v2")?.and_then(|value| value.parse().ok()));
+            Box::new(HttpCloudProvider { client, generation })
         } else {
             Box::new(FileCloudProvider::new()?)
         };
@@ -604,47 +644,42 @@ impl<'a> SyncEngine<'a> {
         }
     }
 
+    fn role_can_publish(role: Option<&str>, kind: &str) -> bool {
+        match role {
+            Some("Observer") => kind == "chronicle_message",
+            Some("Companion") => !matches!(kind, "task_assignment" | "project_member"),
+            _ => true,
+        }
+    }
+
+    fn ensure_profile_identity(&self) -> Result<()> {
+        if let Some(json) = self.db.get_setting("_profile_identity")? {
+            let identity: Identity = serde_json::from_str(&json)?;
+            if identity.public_key != self.identity.public_key { return Err(anyhow!("Profile changed before this sync could start")); }
+        }
+        Ok(())
+    }
+
     pub fn sync(&self) -> Result<(usize, usize, Vec<String>)> {
+        let _lock = self.db.lock_sync()?;
+        self.ensure_profile_identity()?;
+        let started = std::time::Instant::now();
+        // Apply revocations before publishing, then send durable local edits
+        // promptly instead of putting a remote history backlog ahead of them.
         self.provider.prepare_pull(self.db, self.identity)?;
-        // Pull and drain remote history first, then push local changes. This keeps restore and
-        // normal sync incremental: a device learns the server head before it publishes anything.
-        let (mut pushed, mut pulled, mut conflicts, mut downloaded, mut has_more) =
-            self.sync_once(false, true, false)?;
-        let mut drain_pages = 0usize;
-
-        while has_more && drain_pages < MAX_DRAIN_PAGES {
-            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false, true, false)?;
-            pushed += more_pushed;
-            pulled += more_pulled;
-            downloaded += more_downloaded;
-            conflicts.extend(more_conflicts);
-            has_more = more_has_more && more_downloaded > 0;
-            drain_pages += 1;
+        let pushed = self.drain_push()?;
+        let mut pulled = 0;
+        let mut downloaded = 0;
+        let mut conflicts = Vec::new();
+        for _ in 0..MAX_DRAIN_PAGES {
+            let (_, count, warnings, received, more) = self.sync_once(false, true, false, 0)?;
+            pulled += count;
+            downloaded += received;
+            conflicts.extend(warnings);
+            if !more || received == 0 { break; }
         }
-
-        let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-            self.sync_once(true, true, false)?;
-        pushed += more_pushed;
-        pulled += more_pulled;
-        downloaded += more_downloaded;
-        conflicts.extend(more_conflicts);
-        has_more = more_has_more && more_downloaded > 0;
-
-        while has_more && drain_pages < MAX_DRAIN_PAGES {
-            let (more_pushed, more_pulled, more_conflicts, more_downloaded, more_has_more) =
-                self.sync_once(false, true, false)?;
-            pushed += more_pushed;
-            pulled += more_pulled;
-            downloaded += more_downloaded;
-            conflicts.extend(more_conflicts);
-            has_more = more_has_more && more_downloaded > 0;
-            drain_pages += 1;
-        }
-
-        let _ = self
-            .db
-            .set_setting("last_sync_downloaded", &downloaded.to_string());
+        self.db.set_setting("last_sync_downloaded", &downloaded.to_string())?;
+        self.db.set_setting("last_sync_duration_ms", &started.elapsed().as_millis().to_string())?;
         Ok((pushed, pulled, conflicts))
     }
 
@@ -653,14 +688,66 @@ impl<'a> SyncEngine<'a> {
     /// Cloud backup/export uses this so a known-good local snapshot can be uploaded even when the
     /// remote event stream still contains older destructive updates that must not be applied.
     pub fn push_pending_only(&self) -> Result<usize> {
-        let (pushed, _, _, _, _) = self.sync_once(true, false, false)?;
+        let _lock = self.db.lock_sync()?;
+        self.ensure_profile_identity()?;
+        self.drain_push()
+    }
+
+    fn drain_push(&self) -> Result<usize> {
+        self.db.compact_pending_sync_logs()?;
+        let mut after = self.db.get_setting("sync_push_scan_after")?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+        let mut pushed = 0;
+        for _ in 0..128 {
+            let next: Option<i64> = self.db.conn.query_row(
+                "SELECT MAX(rowid) FROM (SELECT rowid FROM sync_log WHERE synced=0 AND rowid>?1 ORDER BY rowid LIMIT 200)",
+                [after], |r| r.get(0),
+            )?;
+            let Some(next) = next else {
+                self.db.set_setting("sync_push_scan_after", "0")?;
+                if pushed == 0 && after == 0 { pushed += self.sync_once(true, false, false, 0)?.0; }
+                return Ok(pushed);
+            };
+            pushed += self.sync_once(true, false, false, after)?.0;
+            after = next;
+            self.db.set_setting("sync_push_scan_after", &after.to_string())?;
+        }
         Ok(pushed)
     }
 
     /// Atomically replaces this account's remote encrypted history with the queued full snapshot.
     pub fn replace_with_pending_snapshot(&self) -> Result<usize> {
-        let (pushed, _, _, _, _) = self.sync_once(true, false, true)?;
+        let _lock = self.db.lock_sync()?;
+        self.ensure_profile_identity()?;
+        let (pushed, _, _, _, _) = self.sync_once(true, false, true, 0)?;
+        if let Some(generation) = self.provider.history_generation() {
+            self.db.set_setting("sync_history_generation_v2", &generation.to_string())?;
+        }
+        self.db.set_setting("last_pull_seq_v2", "0")?;
         Ok(pushed)
+    }
+
+    /// Recovery must never publish the destination machine's existing data.
+    pub fn pull_only(&self) -> Result<(usize, Vec<String>)> {
+        let _lock = self.db.lock_sync()?;
+        self.ensure_profile_identity()?;
+        self.provider.prepare_pull(self.db, self.identity)?;
+        let mut total = 0;
+        let mut conflicts = Vec::new();
+        for _ in 0..MAX_DRAIN_PAGES {
+            let (_, pulled, warnings, downloaded, more) = self.sync_once(false, true, false, 0)?;
+            total += pulled;
+            conflicts.extend(warnings);
+            if !more {
+                let deferred: i64 = self.db.conn.query_row("SELECT COUNT(*) FROM sync_deferred_events", [], |r| r.get(0))?;
+                if deferred > 0 {
+                    if downloaded > 0 || pulled > 0 { continue; }
+                    return Err(anyhow!("Recovery has {deferred} deferred event(s); retry when missing data or keys arrive"));
+                }
+                return Ok((total, conflicts));
+            }
+            if downloaded == 0 { return Err(anyhow!("Recovery made no progress; changes remain pending")); }
+        }
+        Err(anyhow!("Recovery exceeded its page budget; retry to continue"))
     }
 
     /// Confirms the remote actually reflects a just-completed snapshot replace, rather than
@@ -669,6 +756,7 @@ impl<'a> SyncEngine<'a> {
     /// commits transactionally server-side, so this only needs to rule out "we never actually
     /// landed," not verify an exact event count. Returns the remote's reported head_seq.
     pub fn verify_remote_has_events(&self) -> Result<i64> {
+        if let Some(head) = self.provider.head()? { return Ok(head); }
         let raw = self.provider.pull(&self.identity.public_key, "", 0)?;
         let page = parse_pull_page(&raw, 0)?;
         Ok(page.head_seq)
@@ -681,21 +769,21 @@ impl<'a> SyncEngine<'a> {
         push_local: bool,
         pull_remote: bool,
         replace_snapshot: bool,
+        after_rowid: i64,
     ) -> Result<(usize, usize, Vec<String>, usize, bool)> {
         let mut conflicts = Vec::new();
         let mut pushed_count = 0;
         let mut pulled_count = 0;
 
         let pending = if push_local {
-            self.db.compact_pending_sync_logs()?;
-            self.db.get_pending_sync_logs()?
+            if replace_snapshot { self.db.compact_pending_sync_logs()?; }
+            self.db.get_pending_sync_log_batch_after(if replace_snapshot { i64::MAX } else { 200 }, after_rowid)?
         } else {
             Vec::new()
         };
         let mut local_payload = Vec::new();
         // Rol por campaña resuelto una sola vez — se consulta por cada evento pendiente.
-        let mut observer_routes: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
+        let mut route_roles = std::collections::HashMap::<String, Option<String>>::new();
         // Llave de cifrado por proyecto, cacheada igual que el rol de arriba — sin esto,
         // un lote grande de la misma campaña compartida repite la misma consulta a SQLite
         // una vez por evento pendiente en vez de una vez por proyecto distinto.
@@ -705,14 +793,44 @@ impl<'a> SyncEngine<'a> {
         > = std::collections::HashMap::new();
 
         for (log_id, entity_type, entity_id, operation, timestamp) in pending {
+            let frozen: Option<(String, String)> = self.db.conn.query_row(
+                "SELECT author_identity, envelope FROM sync_outbound_envelopes WHERE id=?1", [&log_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            if let Some((author, frozen)) = frozen {
+                if author != self.identity.public_key { return Err(anyhow!("Pending changes belong to a different profile identity")); }
+                let event: SyncLogEntry = serde_json::from_str(&frozen)?;
+                if event.scope == "project" {
+                    if let Some((project, _)) = self.db.get_project_encryption_key_by_routing_id(&event.routing_id)? {
+                        let current = self.db.get_project_encryption_key(&project)?;
+                        if self.db.is_project_route_revoked(&event.routing_id)? || current.as_ref().is_some_and(|(route,_)| *route != event.routing_id) {
+                            let tx = self.db.savepoint("reroute_frozen_event")?;
+                            self.db.mark_sync_logs_synced(&[log_id])?;
+                            self.db.conn.execute("INSERT INTO sync_log (id,entity_type,entity_id,operation,timestamp,synced) VALUES (?1,?2,?3,?4,?5,0)",
+                                params![Uuid::new_v4().to_string(),entity_type,entity_id,operation,timestamp])?;
+                            tx.commit()?;
+                            continue;
+                        }
+                        let role = self.db.get_member_role(&project,&self.identity.public_key)?;
+                        if !Self::role_can_publish(role.as_deref(),&entity_type) {
+                            if operation == "reseed" { self.db.mark_sync_logs_synced(&[log_id])?; }
+                            continue;
+                        }
+                    }
+                }
+                local_payload.push(event);
+                continue;
+            }
+
             let uuid = Uuid::parse_str(&entity_id).unwrap_or_default();
             let content = match entity_type.as_str() {
-                "user" => self
-                    .db
-                    .get_user()
-                    .ok()
-                    .and_then(|u| u)
-                    .and_then(|u| serde_json::to_string(&u).ok()),
+                "user" => self.db.get_user()?.map(|user| -> Result<String> {
+                    let recorded: i64 = self.db.conn.query_row("SELECT COALESCE(SUM(xp_gained),0) FROM xp_events", [], |r| r.get(0))?;
+                    let total = (1..user.level).map(|level| i64::from(crate::models::User::xp_for_next_level(level))).sum::<i64>() + i64::from(user.xp);
+                    let mut value = serde_json::to_value(&user)?;
+                    value["_xp_baseline_total"] = serde_json::json!(total - recorded);
+                    Ok(serde_json::to_string(&value)?)
+                }).transpose()?,
                 "task" => self
                     .db
                     .get_task_by_id(uuid)
@@ -1232,8 +1350,11 @@ impl<'a> SyncEngine<'a> {
                     .get_streak()
                     .ok()
                     .and_then(|s| serde_json::to_string(&s).ok()),
-                _ => None,
+                _ => self.db.record_sync_payload(&entity_type, &entity_id)?,
             };
+            if content.is_none() && operation != "delete" {
+                return Err(anyhow!("Pending {entity_type} {entity_id} has no serializable local state"));
+            }
 
             // Deletes no longer have a live row. Revisions retain the last complete
             // value, which lets us recover the Fellowship route for the tombstone.
@@ -1264,30 +1385,17 @@ impl<'a> SyncEngine<'a> {
                     })
                     .clone()
             });
-            // El servidor rechaza con 403 cualquier escritura de un Observer sobre una ruta
-            // compartida, y ese rechazo revierte el lote completo: un solo evento así
-            // dejaría el sync atascado para todo lo demás. Se queda local y pendiente,
-            // por si el rol cambia más adelante.
-            if project_encryption.is_some()
-                && entity_type != "chronicle_message"
-                && project_id
-                    .as_deref()
-                    .and_then(|project_id| {
-                        observer_routes
-                            .entry(project_id.to_string())
-                            .or_insert_with(|| {
-                                self.db
-                                    .get_member_role(project_id, &self.identity.public_key)
-                                    .ok()
-                                    .flatten()
-                                    .as_deref()
-                                    == Some("Observer")
-                            })
-                            .then_some(())
-                    })
-                    .is_some()
-            {
-                continue;
+            if let Some(project) = project_id.as_deref().filter(|_| project_encryption.is_some()) {
+                if !route_roles.contains_key(project) {
+                    route_roles.insert(project.to_string(),self.db.get_member_role(project,&self.identity.public_key)?);
+                }
+                let role = route_roles.get(project).and_then(|role| role.as_deref());
+                if !Self::role_can_publish(role,&entity_type) {
+                    // Reseeding a read-only view is not a new user mutation.
+                    // Genuine unauthorized edits remain local and pending.
+                    if operation == "reseed" { self.db.mark_sync_logs_synced(&[log_id])?; }
+                    continue;
+                }
             }
             let (key_id, scope, routing_id) = match &project_encryption {
                 Some((routing_id, _)) => ("project-v1", "project", routing_id.clone()),
@@ -1345,7 +1453,7 @@ impl<'a> SyncEngine<'a> {
         }
 
         // Heartbeat del dispositivo — lleva identidad del usuario para actualizar presencia en otros nodos
-        if push_local {
+        if push_local && (after_rowid == 0 || !local_payload.is_empty()) {
             let now_str = Utc::now().to_rfc3339();
             let username = self
                 .db
@@ -1419,25 +1527,41 @@ impl<'a> SyncEngine<'a> {
             event.event_signature = self.identity.sign(&message)?;
         }
 
-        // Si falla el push, no jalamos nada — así no pisamos cambios que aún no subimos
-        let pushed_ids: Vec<String> = if !local_payload.is_empty() {
+        let freeze = self.db.savepoint("freeze_sync_outbox")?;
+        for event in &local_payload {
+            let is_local: bool = self.db.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_log WHERE id=?1)", [&event.id], |r| r.get(0))?;
+            if is_local {
+                self.db.conn.execute("INSERT OR IGNORE INTO sync_outbound_envelopes (id, author_identity, envelope) VALUES (?1,?2,?3)",
+                    params![event.id, self.identity.public_key, serde_json::to_string(event)?])?;
+            }
+        }
+        freeze.commit()?;
+        let mut pushed_ids = Vec::new();
+        if replace_snapshot && !local_payload.is_empty() {
             let serialized = serde_json::to_string(&local_payload)?;
             let signature = self.identity.sign(serialized.as_bytes())?;
-            if replace_snapshot {
-                self.provider.replace_snapshot(
-                    &self.identity.public_key,
-                    &signature,
-                    &serialized,
-                )?;
-            } else {
-                self.provider
-                    .push(&self.identity.public_key, &signature, &serialized)?;
-            }
-            pushed_count = local_payload.len();
-            local_payload.iter().map(|l| l.id.clone()).collect()
+            self.provider.replace_snapshot(&self.identity.public_key, &signature, &serialized)?;
+            pushed_ids = local_payload.iter().map(|event| event.id.clone()).collect();
+            pushed_count = pushed_ids.len();
+            self.db.mark_sync_logs_synced(&pushed_ids)?;
         } else {
-            Vec::new()
-        };
+            let mut offset = 0;
+            while offset < local_payload.len() {
+                let mut end = (offset + 201).min(local_payload.len());
+                let mut serialized = serde_json::to_string(&local_payload[offset..end])?;
+                while serialized.len() > 2 * 1024 * 1024 && end > offset + 1 {
+                    end = offset + (end - offset) / 2;
+                    serialized = serde_json::to_string(&local_payload[offset..end])?;
+                }
+                let signature = self.identity.sign(serialized.as_bytes())?;
+                self.provider.push(&self.identity.public_key, &signature, &serialized)?;
+                let ids: Vec<String> = local_payload[offset..end].iter().map(|event| event.id.clone()).collect();
+                self.db.mark_sync_logs_synced(&ids)?;
+                pushed_count += ids.len();
+                pushed_ids.extend(ids);
+                offset = end;
+            }
+        }
 
         if !pull_remote {
             if !pushed_ids.is_empty() {
@@ -1459,13 +1583,31 @@ impl<'a> SyncEngine<'a> {
             .provider
             .pull(&self.identity.public_key, "", since_seq)?;
         let pull_page = parse_pull_page(&pulled_data, since_seq)?;
+        if let Some(generation) = pull_page.generation {
+            let known = self.db.get_setting("sync_history_generation_v2")?.and_then(|v| v.parse::<i64>().ok());
+            if known.is_some_and(|known| known != generation) {
+                return Err(anyhow!("Cloud history changed during sync; restore the profile before continuing"));
+            }
+        }
+
         let remote_downloaded = pull_page.events.len();
         let remote_head_seq = pull_page.head_seq;
         let remote_next_seq = pull_page.next_seq;
         let metadata_supported = pull_page.metadata_supported;
         let mut remote_has_more = pull_page.has_more;
         let mut remote_logs = pull_page.events;
-        for log in &mut remote_logs {
+        let mut queued = self.db.conn.prepare("SELECT envelope FROM sync_deferred_events ORDER BY rowid")?;
+        let deferred = queued.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for json in deferred {
+            let event: SyncLogEntry = serde_json::from_str(&json)?;
+            if !remote_logs.iter().any(|existing| existing.id == event.id) { remote_logs.push(event); }
+        }
+        let mut missing_keys = Vec::new();
+
+        let mut page_keys = std::collections::HashMap::<String, (String, [u8; 32])>::new();
+        let mut decryption_order: Vec<_> = remote_logs.iter_mut().collect();
+        decryption_order.sort_by_key(|log| log.key_id == "project-v1");
+        for log in decryption_order {
             if !self.provider.requires_encryption() {
                 continue;
             }
@@ -1533,12 +1675,12 @@ impl<'a> SyncEngine<'a> {
                 )
             };
             log.content = Some(if log.key_id == "project-v1" {
-                let (_, key) = self
-                    .db
-                    .get_project_encryption_key_by_routing_id(&log.routing_id)?
-                    .ok_or_else(|| {
-                        anyhow!("missing Fellowship key for routing id {}", log.routing_id)
-                    })?;
+                let record = page_keys.get(&log.routing_id).cloned()
+                    .or(self.db.get_project_encryption_key_by_routing_id(&log.routing_id)?);
+                let Some((_, key)) = record else {
+                    missing_keys.push(log.clone());
+                    continue;
+                };
                 crate::services::encryption::decrypt_project_payload(
                     &key,
                     &log.nonce,
@@ -1553,11 +1695,28 @@ impl<'a> SyncEngine<'a> {
                     &aad,
                 )?
             });
+            if log.entity_type == "project_key" && log.scope != "project" {
+                let value: serde_json::Value = serde_json::from_str(log.content.as_deref().unwrap_or("null"))?;
+                if let (Some(project), Some(route), Some(hex)) = (value["project_id"].as_str(), value["routing_id"].as_str(), value["key_hex"].as_str()) {
+                    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(anyhow!("Invalid project key encoding")); }
+                    let bytes: Vec<u8> = (0..64).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2], 16)).collect::<std::result::Result<_, _>>()?;
+                    page_keys.insert(route.to_string(), (project.to_string(), bytes.try_into().unwrap()));
+                }
+            }
+
+        }
+
+        remote_logs.retain(|event| !missing_keys.iter().any(|missing| missing.id == event.id));
+        let apply_page = self.db.savepoint("apply_sync_page")?;
+        self.db.conn.execute("UPDATE sync_context SET enabled=0", [])?;
+        for event in missing_keys {
+            self.defer_event(&event, "Fellowship key has not arrived yet")?;
+            conflicts.push(format!("Event {} deferred until its Fellowship key arrives", event.id));
         }
 
         // Dedup por ID — si el servidor no retorna seq reales (todos llegan con seq=0), este set
         // evita reprocesar eventos que ya aplicamos en sesiones anteriores, sea cual sea el cursor
-        let already_processed = self.db.load_processed_remote_ids().unwrap_or_default();
+        let already_processed = self.db.load_processed_remote_ids()?;
         let mut newly_processed_ids: Vec<String> = Vec::new();
         let remote_task_projects = remote_logs
             .iter()
@@ -1602,6 +1761,9 @@ impl<'a> SyncEngine<'a> {
                     }
                 }
                 "task" if log.operation != "delete" => {
+                    let missing_parent = log.content.as_deref().and_then(|value| serde_json::from_str::<Task>(value).ok())
+                        .and_then(|task| task.parent_task_id).is_some_and(|id| !remote_task_projects.contains_key(&id) && self.db.get_task_by_id(id).is_err());
+                    if missing_parent { continue; }
                     let reason = match log.content.as_deref() {
                         None => Some("missing payload".to_string()),
                         Some(content) => match serde_json::from_str::<Task>(content) {
@@ -1627,6 +1789,12 @@ impl<'a> SyncEngine<'a> {
                 _ => {}
             }
         }
+        for log in &remote_logs {
+            if let Some(reason) = quarantined_events.get(&log.id) {
+                self.db.conn.execute("INSERT OR REPLACE INTO sync_quarantine (id,envelope,reason) VALUES (?1,?2,?3)",
+                    params![log.id, serde_json::to_string(log)?, reason])?;
+            }
+        }
         if !quarantined_events.is_empty() {
             let quarantined_to = remote_next_seq.max(
                 remote_logs
@@ -1635,7 +1803,7 @@ impl<'a> SyncEngine<'a> {
                     .max()
                     .unwrap_or(since_seq),
             );
-            let _ = self.db.set_setting(
+            self.db.set_setting(
                 "last_quarantined_remote_page",
                 &format!(
                     "Selectively quarantined {} invalid event(s) while processing seq {}..{}; valid events continued syncing.",
@@ -1643,13 +1811,20 @@ impl<'a> SyncEngine<'a> {
                     since_seq,
                     quarantined_to,
                 ),
-            );
+            )?;
         }
 
         // Estrategia de conflictos: Latest Edit Wins, con la versión perdedora guardada en revisiones
         let mut max_seq: i64 = since_seq;
         let mut retry_from_seq: Option<i64> = None;
         for log in remote_logs {
+            let retry_event = log.clone();
+            let event_savepoint = self.db.savepoint("apply_one_sync_event")?;
+            let before_pulled = pulled_count;
+            let before_processed = newly_processed_ids.len();
+            let outcome = (|| -> Result<()> {
+            for log in std::iter::once(log) {
+
             if log.seq > max_seq {
                 max_seq = log.seq;
             }
@@ -1659,6 +1834,18 @@ impl<'a> SyncEngine<'a> {
                 if !already_processed.contains(&log.id) {
                     newly_processed_ids.push(log.id);
                 }
+                continue;
+            }
+
+            let supported = crate::database::sync_state::definition(&log.entity_type).is_some() || matches!(log.entity_type.as_str(),
+                "user" | "task" | "note" | "project" | "journal_entry" | "achievement" | "ritual" | "ritual_history" |
+                "setting" | "codex" | "atlas_chart" | "atlas_node" | "focus_session" | "task_assignment" | "task_status" |
+                "task_comment" | "task_dependency" | "notification_state" | "project_member" | "project_key" |
+                "chronicle_message" | "lore_unlock" | "zen_tree" | "campaign_treasury" | "ledger_entry" | "treasury_account" |
+                "ledger_category" | "category_budget" | "task_financials" | "xp_event" | "daily_adventure" | "hydration_log" | "streak" | "device" | "milestone");
+            if !supported {
+                self.defer_event(&log, "Unsupported entity type; retained for a compatible client")?;
+                conflicts.push(format!("{} retained until a compatible client can apply it", log.entity_type));
                 continue;
             }
             // Saltar eventos que ya aplicamos en un sync anterior — end del ciclo de replay infinito
@@ -1674,10 +1861,42 @@ impl<'a> SyncEngine<'a> {
                 continue;
             }
 
+            if log.entity_type == "task" && log.operation != "delete" {
+                if let Some(parent) = log.content.as_deref().and_then(|value| serde_json::from_str::<Task>(value).ok()).and_then(|task| task.parent_task_id) {
+                    if self.db.get_task_by_id(parent).is_err() && !remote_task_projects.contains_key(&parent) {
+                        self.defer_event(&log, "Parent quest has not arrived yet")?;
+                        continue;
+                    }
+                }
+            }
+            let version: Option<(String, String, bool)> = self.db.conn.query_row(
+                "SELECT timestamp,event_id,deleted FROM sync_entity_versions WHERE entity_type=?1 AND entity_id=?2",
+                params![log.entity_type, log.entity_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            ).optional()?;
+            let is_record = crate::database::sync_state::definition(&log.entity_type).is_some();
+            let change_timestamp = if log.operation != "delete" {
+                log.content.as_deref().and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                    .and_then(|value| value["updated_at"].as_str().map(str::to_string)).filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| log.timestamp.clone())
+            } else { log.timestamp.clone() };
+            let version_newer = version.as_ref().map(|(timestamp, event, _)| {
+                (Self::timestamp_or_epoch(Some(&change_timestamp)), &log.id) > (Self::timestamp_or_epoch(Some(timestamp)), event)
+            }).unwrap_or(true);
+            if !version_newer && (is_record || log.entity_type == "user" || log.entity_type == "setting" || version.as_ref().is_some_and(|v| v.2)) {
+                newly_processed_ids.push(log.id);
+                continue;
+            }
+            if is_record {
+                self.db.apply_sync_record(&log.entity_type, &log.entity_id, &log.operation, log.content.as_deref())?;
+                self.store_remote_version(&log)?;
+                newly_processed_ids.push(log.id);
+                pulled_count += 1;
+                continue;
+            }
             let ent_uuid = Uuid::parse_str(&log.entity_id).unwrap_or_default();
             let is_newer = match log.entity_type.as_str() {
                 // Solo aceptamos usuario remoto si no existe localmente — restauración en dispositivo nuevo
-                "user" => self.db.get_user().map(|u| u.is_none()).unwrap_or(true),
+                "user" => version_newer,
                 "task" => {
                     if log.operation == "delete" {
                         match self.db.get_task_by_id(ent_uuid) {
@@ -1711,11 +1930,11 @@ impl<'a> SyncEngine<'a> {
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_task)
                                                 {
-                                                    let _ = self.db.create_revision(
+                                                    self.db.create_revision(
                                                         "task",
                                                         &log.entity_id,
                                                         &local_json,
-                                                    );
+                                                    )?;
                                                 }
                                                 conflicts.push(format!(
                                             "Task conflict: '{}' resolved using Latest Edit Wins",
@@ -1780,11 +1999,11 @@ impl<'a> SyncEngine<'a> {
                                                 if let Ok(local_json) =
                                                     serde_json::to_string(&local_note)
                                                 {
-                                                    let _ = self.db.create_revision(
+                                                    self.db.create_revision(
                                                         "note",
                                                         &log.entity_id,
                                                         &local_json,
-                                                    );
+                                                    )?;
                                                 }
                                                 conflicts.push(format!(
                                             "Note conflict: '{}' resolved using Latest Edit Wins",
@@ -1968,18 +2187,18 @@ impl<'a> SyncEngine<'a> {
                     match log.entity_type.as_str() {
                         "task" => {
                             self.save_local_revision_before_delete("task", &log.entity_id);
-                            let _ = self
+                            self
                                 .db
                                 .conn
-                                .execute("DELETE FROM tasks WHERE id = ?1", params![log.entity_id]);
+                                .execute("DELETE FROM tasks WHERE id = ?1", params![log.entity_id])?;
                             pulled_count += 1;
                         }
                         "note" => {
                             self.save_local_revision_before_delete("note", &log.entity_id);
-                            let _ = self
+                            self
                                 .db
                                 .conn
-                                .execute("DELETE FROM notes WHERE id = ?1", params![log.entity_id]);
+                                .execute("DELETE FROM notes WHERE id = ?1", params![log.entity_id])?;
                             pulled_count += 1;
                         }
                         "atlas_chart" | "atlas_node" => {
@@ -1989,40 +2208,40 @@ impl<'a> SyncEngine<'a> {
                                 "delete",
                                 &log.entity_id,
                                 None,
-                            ) {
+                            )? {
                                 pulled_count += 1;
                             }
                         }
                         "project" => {
                             self.save_local_revision_before_delete("project", &log.entity_id);
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM projects WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "milestone" => {
                             self.save_local_revision_before_delete("milestone", &log.entity_id);
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM milestones WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "codex" => {
                             self.save_local_revision_before_delete("codex", &log.entity_id);
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM codices WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "ledger_entry" => {
                             self.save_local_revision_before_delete("ledger_entry", &log.entity_id);
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM ledger_entries WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "treasury_account" => {
@@ -2038,7 +2257,7 @@ impl<'a> SyncEngine<'a> {
                                     }
                                 }
                             }
-                            let transaction = self.db.conn.unchecked_transaction()?;
+                            let transaction = self.db.savepoint("apply_account_delete")?;
                             let tombstone = log.content.as_deref().and_then(|content|
                                 serde_json::from_str::<crate::models::TreasuryAccount>(content).ok());
                             let stored = self.db.conn.execute(
@@ -2071,10 +2290,10 @@ impl<'a> SyncEngine<'a> {
                                     .and_then(|id| self.db.get_task_by_id(id).ok())
                                     .map(|task| task.title)
                                     .unwrap_or_else(|| "A shared Quest".to_string());
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
                                     params![parts[0], parts[1]],
-                                );
+                                )?;
                                 if parts[1] == self.identity.public_key.as_str() {
                                     self.create_task_fellowship_notification(
                                         &format!("task_unassigned:{}", log.id),
@@ -2088,80 +2307,66 @@ impl<'a> SyncEngine<'a> {
                             }
                         }
                         "task_status" => {
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM task_statuses WHERE task_id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "task_comment" => {
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM task_comments WHERE id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "task_dependency" => {
                             let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                             if parts.len() == 2 {
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2",
                                     params![parts[0], parts[1]],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
                         "notification_state" => {
-                            let _ = self.db.conn.execute(
+                            self.db.conn.execute(
                                 "DELETE FROM notification_states WHERE notification_id = ?1",
                                 params![log.entity_id],
-                            );
+                            )?;
                             pulled_count += 1;
                         }
                         "project_member" => {
                             let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                             if parts.len() == 2 {
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
                                     params![parts[0], parts[1]],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
                         _ => {}
                     }
+                    self.store_remote_version(&log)?;
                     newly_processed_ids.push(log.id);
                     continue;
                 }
 
                 if let Some(ref content) = log.content {
                     if log.entity_type == "project_key" {
-                        if let Ok(value) = serde_json::from_str::<serde_json::Value>(content) {
-                            if let (Some(project_id), Some(routing_id), Some(key_hex)) = (
-                                value["project_id"].as_str(),
-                                value["routing_id"].as_str(),
-                                value["key_hex"].as_str(),
-                            ) {
-                                let decoded = (0..key_hex.len())
-                                    .step_by(2)
-                                    .map(|i| u8::from_str_radix(&key_hex[i..i + 2], 16))
-                                    .collect::<std::result::Result<Vec<_>, _>>();
-                                if let Ok(bytes) = decoded {
-                                    if let Ok(key) = <[u8; 32]>::try_from(bytes) {
-                                        if self
-                                            .db
-                                            .save_project_encryption_key_from_sync(
-                                                project_id, routing_id, &key,
-                                            )
-                                            .is_ok()
-                                        {
-                                            pulled_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let value: serde_json::Value = serde_json::from_str(content)?;
+                        let project = value["project_id"].as_str().ok_or_else(|| anyhow!("Missing project key owner"))?;
+                        let route = value["routing_id"].as_str().ok_or_else(|| anyhow!("Missing project key route"))?;
+                        let hex = value["key_hex"].as_str().ok_or_else(|| anyhow!("Missing project key"))?;
+                        if hex.len()!=64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(anyhow!("Invalid project key encoding")); }
+                        let bytes = (0..64).step_by(2).map(|i| u8::from_str_radix(&hex[i..i+2],16)).collect::<std::result::Result<Vec<_>,_>>()?;
+                        let key: [u8;32] = bytes.try_into().unwrap();
+                        self.db.save_project_encryption_key_from_sync(project, route, &key)?;
+                        self.store_remote_version(&log)?;
                         newly_processed_ids.push(log.id);
+                        pulled_count += 1;
                         continue;
                     }
                     match log.entity_type.as_str() {
@@ -2174,9 +2379,18 @@ impl<'a> SyncEngine<'a> {
                                 // keep their gains instead of whichever total happened to be
                                 // bigger silently winning. A snapshot's level/xp is only trusted
                                 // to seed a brand-new device that has no local profile yet.
-                                if let Ok(Some(local)) = self.db.get_user() {
+                                if let Some(local) = self.db.get_user()? {
                                     u.level = local.level;
                                     u.xp = local.xp;
+                                } else {
+                                    let metadata: serde_json::Value = serde_json::from_str(content)?;
+                                    if let Some(baseline) = metadata["_xp_baseline_total"].as_i64() {
+                                        let recorded: i64 = self.db.conn.query_row("SELECT COALESCE(SUM(xp_gained),0) FROM xp_events", [], |r| r.get(0))?;
+                                        let total: i32 = (baseline + recorded).try_into().map_err(|_| anyhow!("Invalid profile XP total"))?;
+                                        u.level = 1;
+                                        u.xp = 0;
+                                        u.apply_xp_delta(total);
+                                    }
                                 }
                                 // DELETE-then-INSERT as one transaction: if the
                                 // INSERT fails for any reason (constraint,
@@ -2186,7 +2400,7 @@ impl<'a> SyncEngine<'a> {
                                 // render that unwraps app.user (e.g. the
                                 // Character screen).
                                 let applied = (|| -> rusqlite::Result<()> {
-                                    let tx = self.db.conn.unchecked_transaction()?;
+                                    let tx = self.db.savepoint("apply_user_snapshot")?;
                                     tx.execute(
                                         "DELETE FROM users WHERE id != ?1",
                                         params![u.id.to_string()],
@@ -2211,25 +2425,17 @@ impl<'a> SyncEngine<'a> {
                                     )?;
                                     tx.commit()
                                 })();
-                                if let Err(e) = applied {
-                                    crate::services::logger::log_structured(
-                                        "warn",
-                                        "sync",
-                                        "failed to apply remote user snapshot, local user row left untouched",
-                                        Some(&e.to_string()),
-                                    );
-                                } else {
-                                    pulled_count += 1;
-                                }
+                                applied?;
+                                pulled_count += 1;
                             }
                         }
                         "task" => {
                             if log.operation == "delete" {
                                 self.save_local_revision_before_delete("task", &log.entity_id);
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM tasks WHERE id = ?1",
                                     params![log.entity_id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             } else if let Ok(mut t) = serde_json::from_str::<Task>(content) {
                                 t.normalize_schedule();
@@ -2261,7 +2467,7 @@ impl<'a> SyncEngine<'a> {
                                     pulled_count += 1;
                                 } else {
                                     // Bypass insert_task() para no disparar log_change de nuevo — evitamos el loop
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "INSERT INTO tasks (id, project_id, title, description, due_date, set_date, completed, priority, created_at, updated_at, owner_identity, owner_username, parent_task_id, xp_awarded, recurrence)
                                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
                                          ON CONFLICT(id) DO UPDATE SET
@@ -2290,7 +2496,7 @@ impl<'a> SyncEngine<'a> {
                                             if t.xp_awarded { 1 } else { 0 },
                                             t.recurrence.map(|r| r.name()),
                                         ],
-                                    );
+                                    )?;
                                     // XP para el usuario local si está asignado y la tarea acaba de completarse
                                     if t.completed && was_incomplete_locally {
                                         let my_key = self.identity.public_key.as_str();
@@ -2398,10 +2604,10 @@ impl<'a> SyncEngine<'a> {
                         "note" => {
                             if log.operation == "delete" {
                                 self.save_local_revision_before_delete("note", &log.entity_id);
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM notes WHERE id = ?1",
                                     params![log.entity_id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             } else if let Ok(mut n) = serde_json::from_str::<Note>(content) {
                                 if let Ok(local_note) = self.db.get_note_by_id(n.id) {
@@ -2420,7 +2626,7 @@ impl<'a> SyncEngine<'a> {
                                     newly_processed_ids.push(log.id);
                                     continue;
                                 }
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT OR REPLACE INTO notes (id, project_id, title, markdown_content, created_at, updated_at, sharing_permission, codex_id, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                                     params![
                                         n.id.to_string(),
@@ -2433,7 +2639,7 @@ impl<'a> SyncEngine<'a> {
                                         n.codex_id.map(|id| id.to_string()),
                                         n.owner_identity,
                                     ],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2444,17 +2650,17 @@ impl<'a> SyncEngine<'a> {
                                 &log.operation,
                                 &log.entity_id,
                                 Some(content),
-                            ) {
+                            )? {
                                 pulled_count += 1;
                             }
                         }
                         "project" => {
                             if log.operation == "delete" {
                                 self.save_local_revision_before_delete("project", &log.entity_id);
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM projects WHERE id = ?1",
                                     params![log.entity_id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             } else if let Ok(p) = serde_json::from_str::<serde_json::Value>(content)
                             {
@@ -2479,7 +2685,7 @@ impl<'a> SyncEngine<'a> {
                                     .unwrap_or(0)
                                     != 0;
                                 let merged_is_shared = is_shared || local_is_shared;
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO projects (id, name, description, created_at, updated_at, archived, completed, owner_identity, owner_username, is_shared)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -2496,7 +2702,7 @@ impl<'a> SyncEngine<'a> {
                                         owner_id, owner_name,
                                         if merged_is_shared { 1 } else { 0 }
                                     ],
-                                );
+                                )?;
                                 // A snapshot deliberately sends the account-encrypted project key
                                 // before project-v1 content. On an empty device it is staged in key
                                 // history until this project row satisfies the active-key FK.
@@ -2508,10 +2714,10 @@ impl<'a> SyncEngine<'a> {
                                     let owner_name_str =
                                         p["owner_username"].as_str().unwrap_or_default();
                                     if !owner_id_str.is_empty() {
-                                        let _ = self.db.conn.execute(
+                                        self.db.conn.execute(
                                             "INSERT OR IGNORE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, 'Owner')",
                                             params![id, owner_id_str, owner_name_str],
-                                        );
+                                        )?;
                                     }
                                 }
                                 pulled_count += 1;
@@ -2727,7 +2933,7 @@ impl<'a> SyncEngine<'a> {
                                 let visibility = j["visibility"].as_str().unwrap_or("Private");
                                 let author = j["author_username"].as_str().unwrap_or("");
 
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO journal_entries (id, project_id, entry_date, content, created_at, updated_at, visibility, author_username)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -2736,17 +2942,17 @@ impl<'a> SyncEngine<'a> {
                                         updated_at=excluded.updated_at, visibility=excluded.visibility,
                                         author_username=excluded.author_username",
                                     params![id, pid, date, body, created, updated, visibility, author],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
                         "milestone" => {
                             if log.operation == "delete" {
                                 self.save_local_revision_before_delete("milestone", &log.entity_id);
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM milestones WHERE id = ?1",
                                     params![log.entity_id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             } else if let Ok(m) = serde_json::from_str::<serde_json::Value>(content)
                             {
@@ -2761,7 +2967,7 @@ impl<'a> SyncEngine<'a> {
                                 let tier = m["tier"].as_i64().unwrap_or(0) as i32;
                                 let template_id = m["template_id"].as_str().unwrap_or("");
 
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO milestones (id, project_id, name, description, completed, xp_reward, created_at, updated_at, tier, template_id)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -2771,7 +2977,7 @@ impl<'a> SyncEngine<'a> {
                                         updated_at=excluded.updated_at, tier=excluded.tier,
                                         template_id=excluded.template_id",
                                     params![id, pid, name, desc, if completed { 1 } else { 0 }, xp, created, updated, tier, template_id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2782,10 +2988,10 @@ impl<'a> SyncEngine<'a> {
                                 let unlocked = l["unlocked"].as_bool().unwrap_or(false);
                                 let unlocked_at = l["unlocked_at"].as_str();
                                 if unlocked {
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "UPDATE lore_library SET unlocked = 1, unlocked_at = ?1 WHERE id = ?2 AND unlocked = 0",
                                         params![unlocked_at, id],
-                                    );
+                                    )?;
                                 }
                                 pulled_count += 1;
                             }
@@ -2795,10 +3001,10 @@ impl<'a> SyncEngine<'a> {
                             if let Ok(a) = serde_json::from_str::<serde_json::Value>(content) {
                                 let id = a["id"].as_str().unwrap_or_default();
                                 let unlocked = a["unlocked_at"].as_str();
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "UPDATE achievements SET unlocked_at = ?1 WHERE id = ?2 AND unlocked_at IS NULL",
                                     params![unlocked, id],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2812,7 +3018,7 @@ impl<'a> SyncEngine<'a> {
                                 let created = r["created_at"].as_str().unwrap_or_default();
                                 let updated = r["updated_at"].as_str().unwrap_or(created);
                                 let daily_target = r["daily_target"].as_i64().unwrap_or(1) as i32;
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO rituals (id, name, description, frequency, reward_xp, created_at, updated_at, daily_target)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -2821,7 +3027,7 @@ impl<'a> SyncEngine<'a> {
                                         created_at=excluded.created_at, updated_at=excluded.updated_at,
                                         daily_target=excluded.daily_target",
                                     params![id, name, desc, freq, xp, created, updated, daily_target],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2833,13 +3039,13 @@ impl<'a> SyncEngine<'a> {
                                 let completion_count =
                                     rh["completion_count"].as_i64().unwrap_or(1) as i32;
                                 let completed_at = rh["completed_at"].as_str();
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO ritual_history (ritual_id, completed_date, completion_count, completed_at) VALUES (?1, ?2, ?3, ?4)
                                      ON CONFLICT(ritual_id, completed_date) DO UPDATE SET
                                         completion_count = MAX(completion_count, excluded.completion_count),
                                         completed_at = COALESCE(excluded.completed_at, completed_at)",
                                     params![ritual_id, completed_date, completion_count, completed_at],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2851,7 +3057,7 @@ impl<'a> SyncEngine<'a> {
                                 if key == log.entity_id
                                     && crate::database::is_synced_setting_key(key)
                                 {
-                                    let _ = self.db.set_setting(key, value);
+                                    self.db.set_setting(key, value)?;
                                     pulled_count += 1;
                                 }
                             }
@@ -2859,14 +3065,14 @@ impl<'a> SyncEngine<'a> {
                         "codex" => {
                             if log.operation == "delete" {
                                 self.save_local_revision_before_delete("codex", &log.entity_id);
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "DELETE FROM codices WHERE id = ?1",
                                     params![log.entity_id],
-                                );
+                                )?;
                             } else if let Ok(c) =
                                 serde_json::from_str::<crate::models::Codex>(content)
                             {
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO codices (id, project_id, name, created_at, updated_at, parent_codex_id, collapsed)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -2883,7 +3089,7 @@ impl<'a> SyncEngine<'a> {
                                         c.parent_codex_id.map(|id| id.to_string()),
                                         c.collapsed as i32,
                                     ],
-                                );
+                                )?;
                             }
                             pulled_count += 1;
                         }
@@ -2892,15 +3098,15 @@ impl<'a> SyncEngine<'a> {
                                 let id = fs["id"].as_str().unwrap_or_default();
                                 let proj = fs["project_id"].as_str();
                                 let task = fs["task_id"].as_str();
-                                let duration = fs["duration_mins"].as_i64().unwrap_or(0) as i32;
+                                let duration = fs["duration_mins"].as_i64().or_else(|| fs["duration_minutes"].as_i64()).unwrap_or(0) as i32;
                                 let xp = fs["xp_gained"].as_i64().unwrap_or(0) as i32;
-                                let completed_at = fs["completed_at"].as_str().unwrap_or_default();
+                                let completed_at = fs["completed_at"].as_str().or_else(|| fs["ended_at"].as_str()).unwrap_or_default();
                                 let soundscape = fs["soundscape"].as_str().unwrap_or("Silent");
                                 let owner_identity = fs["owner_identity"].as_str();
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT OR IGNORE INTO focus_sessions (id, project_id, task_id, duration_mins, xp_gained, completed_at, soundscape, owner_identity) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                                     params![id, proj, task, duration, xp, completed_at, soundscape, owner_identity],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -2908,10 +3114,10 @@ impl<'a> SyncEngine<'a> {
                             if log.operation == "delete" {
                                 let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                                 if parts.len() == 2 {
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "DELETE FROM task_assignments WHERE task_id = ?1 AND user_identity = ?2",
                                         params![parts[0], parts[1]],
-                                    );
+                                    )?;
                                     pulled_count += 1;
                                 }
                             } else if let Ok(ta) =
@@ -2920,10 +3126,10 @@ impl<'a> SyncEngine<'a> {
                                 let task_id = ta["task_id"].as_str().unwrap_or_default();
                                 let identity = ta["user_identity"].as_str().unwrap_or_default();
                                 let username = ta["user_username"].as_str().unwrap_or_default();
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT OR REPLACE INTO task_assignments (task_id, user_identity, user_username) VALUES (?1, ?2, ?3)",
                                     params![task_id, identity, username],
-                                );
+                                )?;
                                 if identity == self.identity.public_key {
                                     let task_title = Uuid::parse_str(task_id)
                                         .ok()
@@ -2952,14 +3158,14 @@ impl<'a> SyncEngine<'a> {
                                     value["changed_by_username"].as_str().unwrap_or("Companion");
                                 let updated_at = value["updated_at"].as_str().unwrap_or_default();
                                 if !task_id.is_empty() && !project_id.is_empty() {
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "INSERT INTO task_statuses (task_id, project_id, status, changed_by_identity, changed_by_username, updated_at)
                                          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                                          ON CONFLICT(task_id) DO UPDATE SET project_id=excluded.project_id, status=excluded.status,
                                              changed_by_identity=excluded.changed_by_identity, changed_by_username=excluded.changed_by_username,
                                              updated_at=excluded.updated_at",
                                         params![task_id, project_id, status, actor_id, actor_name, updated_at],
-                                    );
+                                    )?;
                                     if actor_id != self.identity.public_key.as_str() {
                                         let quest_title = uuid::Uuid::parse_str(task_id)
                                             .ok()
@@ -3024,10 +3230,10 @@ impl<'a> SyncEngine<'a> {
                                             task_id, blocker_id, project_id, actor_id, actor_name,
                                         ) {
                                             Ok(()) => {
-                                                let _ = self.db.conn.execute(
+                                                self.db.conn.execute(
                                                     "UPDATE sync_log SET synced = 1 WHERE entity_type = 'task_dependency' AND entity_id = ?1",
                                                     params![log.entity_id],
-                                                );
+                                                )?;
                                                 pulled_count += 1;
                                             }
                                             Err(error) => conflicts.push(format!(
@@ -3133,16 +3339,16 @@ impl<'a> SyncEngine<'a> {
                                 let read = value["read"].as_bool().unwrap_or(false);
                                 let updated_at = value["updated_at"].as_str().unwrap_or_default();
                                 if !notification_id.is_empty() {
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "INSERT INTO notification_states (notification_id, read, updated_at)
                                          VALUES (?1, ?2, ?3)
                                          ON CONFLICT(notification_id) DO UPDATE SET read=excluded.read, updated_at=excluded.updated_at",
                                         params![notification_id, read as i32, updated_at],
-                                    );
-                                    let _ = self.db.conn.execute(
+                                    )?;
+                                    self.db.conn.execute(
                                         "UPDATE notifications SET read = ?1 WHERE id = ?2",
                                         params![read as i32, notification_id],
-                                    );
+                                    )?;
                                     pulled_count += 1;
                                 }
                             }
@@ -3151,10 +3357,10 @@ impl<'a> SyncEngine<'a> {
                             if log.operation == "delete" {
                                 let parts: Vec<&str> = log.entity_id.splitn(2, "__").collect();
                                 if parts.len() == 2 {
-                                    let _ = self.db.conn.execute(
+                                    self.db.conn.execute(
                                         "DELETE FROM project_members WHERE project_id = ?1 AND user_identity = ?2",
                                         params![parts[0], parts[1]],
-                                    );
+                                    )?;
                                     pulled_count += 1;
                                 }
                             } else if let Ok(pm) =
@@ -3164,10 +3370,10 @@ impl<'a> SyncEngine<'a> {
                                 let identity = pm["user_identity"].as_str().unwrap_or_default();
                                 let username = pm["user_username"].as_str().unwrap_or_default();
                                 let role = pm["role"].as_str().unwrap_or("Member");
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT OR REPLACE INTO project_members (project_id, user_identity, user_username, role) VALUES (?1, ?2, ?3, ?4)",
                                     params![project_id, identity, username, role],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -3181,10 +3387,10 @@ impl<'a> SyncEngine<'a> {
                                 let msg_content = cm["content"].as_str().unwrap_or_default();
                                 let msg_type = cm["message_type"].as_str().unwrap_or("Text");
                                 let timestamp = cm["timestamp"].as_str().unwrap_or_default();
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT OR IGNORE INTO chronicle_messages (id, project_id, sender_identity, sender_username, content, message_type, timestamp) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                                     params![id, project_id, sender_id, sender_name, msg_content, msg_type, timestamp],
-                                );
+                                )?;
                                 let my_username = self
                                     .db
                                     .get_user()
@@ -3267,7 +3473,7 @@ impl<'a> SyncEngine<'a> {
                                 // en schema.rs), así que no se filtra por id: el id remoto es
                                 // aleatorio por dispositivo y nunca coincide con el local, lo que
                                 // dejaba este UPDATE sin efecto.
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "UPDATE zen_tree SET growth = ?1, health = ?2, stage = ?3, last_watered = ?4, water_today = ?5, total_waterings = ?6",
                                     params![
                                         t.growth.max(local_growth),
@@ -3277,7 +3483,7 @@ impl<'a> SyncEngine<'a> {
                                         remote_water_today.max(local_water_today),
                                         t.total_waterings.max(local_total_waterings),
                                     ],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -3297,14 +3503,14 @@ impl<'a> SyncEngine<'a> {
                                         evt.xp_gained,
                                         evt.timestamp.to_rfc3339(),
                                     ],
-                                ).unwrap_or(0);
+                                )?;
                                 if inserted > 0 {
                                     if let Ok(Some(mut user)) = self.db.get_user() {
                                         user.apply_xp_delta(evt.xp_gained);
-                                        let _ = self.db.conn.execute(
+                                        self.db.conn.execute(
                                             "UPDATE users SET level = ?1, xp = ?2 WHERE id = ?3",
                                             params![user.level, user.xp, user.id.to_string()],
-                                        );
+                                        )?;
                                     }
                                 }
                                 pulled_count += 1;
@@ -3317,7 +3523,7 @@ impl<'a> SyncEngine<'a> {
                             if let Ok(adv) =
                                 serde_json::from_str::<crate::models::DailyAdventure>(content)
                             {
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO daily_adventures (id, title, quest_type, target_count, current_count, completed, created_date)
                                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
                                      ON CONFLICT(id) DO UPDATE SET
@@ -3332,7 +3538,7 @@ impl<'a> SyncEngine<'a> {
                                         if adv.completed { 1 } else { 0 },
                                         adv.created_date.format("%Y-%m-%d").to_string(),
                                     ],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -3371,7 +3577,7 @@ impl<'a> SyncEngine<'a> {
                                         (None, Some(l)) => Some(l.clone()),
                                         (None, None) => None,
                                     };
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "INSERT INTO hydration_log (log_date, count, reward_given, last_drink_at) VALUES (?1, ?2, ?3, ?4)
                                      ON CONFLICT(log_date) DO UPDATE SET
                                          count = excluded.count,
@@ -3383,7 +3589,7 @@ impl<'a> SyncEngine<'a> {
                                         remote_reward.max(local_reward),
                                         merged_last_drink,
                                     ],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -3419,7 +3625,7 @@ impl<'a> SyncEngine<'a> {
                                             .or(remote.last_active_day),
                                     )
                                 };
-                                let _ = self.db.conn.execute(
+                                self.db.conn.execute(
                                     "UPDATE streaks SET current_streak = ?1, best_streak = ?2, last_active_day = ?3 WHERE id = ?4",
                                     params![
                                         current_streak,
@@ -3427,7 +3633,7 @@ impl<'a> SyncEngine<'a> {
                                         last_active_day.map(|d| d.format("%Y-%m-%d").to_string()),
                                         remote.id,
                                     ],
-                                );
+                                )?;
                                 pulled_count += 1;
                             }
                         }
@@ -3481,18 +3687,42 @@ impl<'a> SyncEngine<'a> {
                         .ok()
                         .and_then(|value| value["version"].as_i64())
                         .unwrap_or(1);
-                    let _ = self.db.conn.execute(
+                    self.db.conn.execute(
                         "INSERT INTO treasury_history
                          (id, campaign_id, entity_type, entity_id, action, snapshot, version, created_at)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         params![Uuid::new_v4().to_string(), campaign_id, log.entity_type,
                             log.entity_id, format!("remote_{}", log.operation), snapshot,
                             version, log.timestamp],
-                    );
+                    )?;
                 }
             }
+            if is_newer { self.store_remote_version(&log)?; }
             // Marcar como procesado independientemente de si `is_newer` — queremos dedup siempre
             newly_processed_ids.push(log.id);
+            }
+            Ok(())
+            })();
+            match outcome {
+                Ok(()) => {
+                    if retry_from_seq.take().is_some() {
+                        drop(event_savepoint);
+                        pulled_count = before_pulled;
+                        newly_processed_ids.truncate(before_processed);
+                        self.defer_event(&retry_event, "Referenced state is not ready")?;
+                    } else { event_savepoint.commit()?; }
+                }
+                Err(error) => {
+                    drop(event_savepoint);
+                    if error.downcast_ref::<rusqlite::Error>().is_some_and(|error| matches!(error,
+                        rusqlite::Error::SqliteFailure(code, _) if code.extended_code == 787)) {
+                        pulled_count = before_pulled;
+                        newly_processed_ids.truncate(before_processed);
+                        self.defer_event(&retry_event, &error.to_string())?;
+                        conflicts.push(format!("{} {} deferred until referenced data arrives", retry_event.entity_type, retry_event.entity_id));
+                    } else { return Err(error); }
+                }
+            }
         }
 
         // Avanzamos el cursor — la próxima vez solo jalamos lo que llegó después de este punto
@@ -3501,22 +3731,28 @@ impl<'a> SyncEngine<'a> {
             max_seq = max_seq.min(retry_seq.saturating_sub(1));
         }
         if max_seq > since_seq {
-            let _ = self
+            self
                 .db
-                .set_setting("last_pull_seq_v2", &max_seq.to_string());
+                .set_setting("last_pull_seq_v2", &max_seq.to_string())?;
         }
         let last_remote_head_seq = remote_head_seq.max(max_seq);
-        let _ = self
+        self
             .db
-            .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string());
+            .set_setting("last_remote_head_seq", &last_remote_head_seq.to_string())?;
         let lag = last_remote_head_seq.saturating_sub(max_seq);
-        let _ = self.db.set_setting("last_sync_lag", &lag.to_string());
+        self.db.set_setting("last_sync_lag", &lag.to_string())?;
         if !metadata_supported {
             remote_has_more = remote_downloaded >= PULL_PAGE_SIZE && max_seq > since_seq;
         }
 
         // Persistir IDs de eventos aplicados — end del loop infinito de replay
-        let _ = self.db.mark_remote_events_processed(&newly_processed_ids);
+        self.db.mark_remote_events_processed(&newly_processed_ids)?;
+        for id in &newly_processed_ids {
+            self.db.conn.execute("DELETE FROM sync_deferred_events WHERE id=?1", [id])?;
+        }
+        let deferred: i64 = self.db.conn.query_row("SELECT COUNT(*) FROM sync_deferred_events", [], |r| r.get(0))?;
+        self.db.set_setting("last_sync_deferred", &deferred.to_string())?;
+
 
         // Solo marcamos como synced DESPUÉS de que el pull también termine — si pull falla, re-intentamos todo
         if !pushed_ids.is_empty() {
@@ -3528,6 +3764,11 @@ impl<'a> SyncEngine<'a> {
         // Limpiar entradas antiguas de dedup (>90 días) — housekeeping silencioso
         let _ = self.db.cleanup_processed_remote_events(90);
 
+        if let Some(generation) = pull_page.generation {
+            self.db.set_setting("sync_history_generation_v2", &generation.to_string())?;
+        }
+        self.db.conn.execute("UPDATE sync_context SET enabled=1", [])?;
+        apply_page.commit()?;
         Ok((
             pushed_count,
             pulled_count,
@@ -3535,6 +3776,31 @@ impl<'a> SyncEngine<'a> {
             remote_downloaded,
             remote_has_more,
         ))
+    }
+
+    fn defer_event(&self, event: &SyncLogEntry, reason: &str) -> Result<()> {
+        self.db.conn.execute("INSERT INTO sync_deferred_events (id,envelope,reason) VALUES (?1,?2,?3)
+            ON CONFLICT(id) DO UPDATE SET reason=excluded.reason", params![event.id, serde_json::to_string(event)?, reason])?;
+        Ok(())
+    }
+
+    fn store_remote_version(&self, log: &SyncLogEntry) -> Result<()> {
+        self.db.conn.execute(
+            "INSERT INTO sync_entity_versions (entity_type,entity_id,timestamp,event_id,deleted) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(entity_type,entity_id) DO UPDATE SET timestamp=excluded.timestamp,event_id=excluded.event_id,deleted=excluded.deleted",
+            params![log.entity_type, log.entity_id, log.timestamp, log.id, i32::from(log.operation == "delete")],
+        )?;
+        // An accepted remote delete supersedes older unsent local snapshots.
+        // Otherwise the next push attempts to serialize a row we just deleted.
+        if log.operation == "delete" {
+            let mut stmt = self.db.conn.prepare("SELECT id,timestamp FROM sync_log WHERE synced=0 AND entity_type=?1 AND entity_id=?2")?;
+            let older = stmt.query_map(params![log.entity_type, log.entity_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?.into_iter()
+                .filter(|(_, timestamp)| Self::timestamp_or_epoch(Some(timestamp)) <= Self::timestamp_or_epoch(Some(&log.timestamp)))
+                .map(|(id, _)| id).collect::<Vec<_>>();
+            self.db.mark_sync_logs_synced(&older)?;
+        }
+        Ok(())
     }
 
     /// Registra una notificación de Fellowship una sola vez por evento remoto aplicado.
@@ -4817,6 +5083,152 @@ mod tests {
         }
     }
 
+    #[test]
+    fn read_only_pending_prefix_cannot_starve_private_changes_in_later_batches() {
+        let db = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let identity = test_identity();
+        let project = shared_campaign_project(Uuid::new_v4(), &identity, true);
+        db.insert_project(&project).unwrap();
+        db.save_project_encryption_key(&project.id.to_string(), &Uuid::new_v4().to_string(), &[9u8;32]).unwrap();
+        db.add_project_member(&project.id.to_string(), &identity.public_key, "Observer", "Observer").unwrap();
+        for _ in 0..220 { db.insert_task(&campaign_task(Uuid::new_v4(), project.id, &identity)).unwrap(); }
+        db.unlock_trait("private-change-after-read-only-prefix").unwrap();
+        let events = SharedEventLog::default();
+        SyncEngine { db:&db,identity:&identity,device_id:"local",provider:Box::new(RecordingProvider{events:events.clone(),serve:false,project_scope_only:false,withhold:None}) }.push_pending_only().unwrap();
+        assert!(events.0.lock().unwrap().iter().any(|event| event.entity_type=="trait" && event.entity_id=="private-change-after-read-only-prefix"));
+        assert!(db.pending_sync_count().unwrap()>=220,"unauthorized edits stay local and pending");
+    }
+
+    #[test]
+    fn parent_on_later_page_unblocks_durable_child_without_rewinding_cursor() {
+        struct Pages { child: SyncLogEntry, parent: SyncLogEntry }
+        impl CloudProvider for Pages {
+            fn name(&self) -> &str { "paged dependencies" }
+            fn push(&self,_:&str,_:&str,_:&str)->Result<()> { Ok(()) }
+            fn pull(&self,_:&str,_:&str,since:i64)->Result<String> {
+                let events = if since==0 { vec![self.child.clone()] } else if since==1 { vec![self.parent.clone()] } else { vec![] };
+                Ok(serde_json::json!({"events":events,"head_seq":2,"next_seq":if since==0 {1}else{2},"has_more":since==0}).to_string())
+            }
+        }
+        let db = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let identity = test_identity();
+        let project = shared_campaign_project(Uuid::new_v4(), &identity, false);
+        db.insert_project(&project).unwrap();
+        let parent = campaign_task(Uuid::new_v4(), project.id, &identity);
+        let mut child = campaign_task(Uuid::new_v4(), project.id, &identity);
+        child.parent_task_id = Some(parent.id);
+        let envelope = |task:&Task, seq| -> SyncLogEntry { serde_json::from_value(serde_json::json!({
+            "id":format!("page-{seq}"),"entity_type":"task","entity_id":task.id.to_string(),"operation":"create",
+            "timestamp":task.updated_at.to_rfc3339(),"device_id":"remote","content":serde_json::to_string(task).unwrap(),"seq":seq
+        })).unwrap() };
+        SyncEngine { db:&db,identity:&identity,device_id:"local",provider:Box::new(Pages{child:envelope(&child,1),parent:envelope(&parent,2)}) }.pull_only().unwrap();
+        assert_eq!(db.get_task_by_id(child.id).unwrap().parent_task_id,Some(parent.id));
+        assert_eq!(db.get_setting("last_pull_seq_v2").unwrap().as_deref(),Some("2"));
+        assert_eq!(db.get_setting("last_sync_deferred").unwrap().as_deref(),Some("0"));
+    }
+
+    #[test]
+    fn failed_application_rolls_back_entities_dedup_and_cursor() {
+        let db = Database::new(std::path::Path::new(":memory:")).unwrap();
+        db.conn.execute_batch("CREATE TEMP TRIGGER fail_reflection BEFORE INSERT ON reflections BEGIN SELECT RAISE(ABORT,'simulated disk write failure'); END;").unwrap();
+        let identity = test_identity();
+        let page = serde_json::json!({"events":[
+            {"id":"first","entity_type":"trait","entity_id":"saved-only-if-whole-page-commits","operation":"upsert","timestamp":Utc::now().to_rfc3339(),"device_id":"remote","seq":1,"content":serde_json::json!({"id":"saved-only-if-whole-page-commits","unlocked_at":Utc::now().to_rfc3339()}).to_string()},
+            {"id":"second","entity_type":"reflection","entity_id":"2026-10-19","operation":"upsert","timestamp":Utc::now().to_rfc3339(),"device_id":"remote","seq":2,"content":serde_json::json!({"created_date":"2026-10-19","what_went_well":"saved","what_can_improve":"retry"}).to_string()}
+        ],"head_seq":2,"next_seq":2,"has_more":false}).to_string();
+        let engine = SyncEngine { db: &db, identity: &identity, device_id: "local", provider: Box::new(StaticCloudProvider { pull_payload: page }) };
+        assert!(engine.pull_only().is_err());
+        assert!(db.get_unlocked_traits().unwrap().is_empty());
+        assert!(db.get_setting("last_pull_seq_v2").unwrap().is_none());
+        assert!(db.load_processed_remote_ids().unwrap().is_empty());
+        db.conn.execute_batch("DROP TRIGGER fail_reflection").unwrap();
+        engine.pull_only().unwrap();
+        assert_eq!(db.get_unlocked_traits().unwrap().len(), 1);
+        assert_eq!(db.get_reflections().unwrap().len(), 1);
+        assert_eq!(db.get_setting("last_pull_seq_v2").unwrap().as_deref(), Some("2"));
+        assert!(db.get_pending_sync_logs().unwrap().is_empty(), "remote apply must not echo changes");
+    }
+
+    #[test]
+    fn accepted_push_with_lost_response_survives_restart_and_newer_local_edit() {
+        struct UncertainProvider { events: SharedEventLog, fail: std::sync::Arc<std::sync::atomic::AtomicBool> }
+        impl CloudProvider for UncertainProvider {
+            fn name(&self) -> &str { "lost acknowledgment" }
+            fn push(&self, _: &str, _: &str, payload: &str) -> Result<()> {
+                let entries: Vec<SyncLogEntry> = serde_json::from_str(payload)?;
+                let mut events = self.events.0.lock().unwrap();
+                for mut entry in entries.into_iter().filter(|event| event.entity_type != "device") {
+                    if let Some(old) = events.iter().find(|old| old.id == entry.id) {
+                        assert_eq!(old.ciphertext, entry.ciphertext, "retry must reuse the frozen ciphertext");
+                        assert_eq!(old.event_signature, entry.event_signature);
+                    } else { entry.seq = events.len() as i64+1; events.push(entry); }
+                }
+                if self.fail.swap(false, std::sync::atomic::Ordering::SeqCst) { return Err(anyhow!("response lost after commit")); }
+                Ok(())
+            }
+            fn pull(&self, _: &str, _: &str, _: i64) -> Result<String> { Ok("[]".into()) }
+        }
+        let (path, db) = treasury_test_db("durable_immutable_retry");
+        let identity = test_identity();
+        let date = chrono::NaiveDate::from_ymd_opt(2026,10,19).unwrap();
+        db.insert_reflection(&crate::models::DailyReflection { created_date: date, what_went_well: "first edit".into(), what_can_improve: "".into() }).unwrap();
+        let events = SharedEventLog::default();
+        let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        assert!(SyncEngine { db: &db, identity: &identity, device_id:"local", provider:Box::new(UncertainProvider{events:events.clone(),fail:fail.clone()}) }.push_pending_only().is_err());
+        drop(db);
+        let db = Database::new(&path).unwrap();
+        db.insert_reflection(&crate::models::DailyReflection { created_date: date, what_went_well: "second edit".into(), what_can_improve: "".into() }).unwrap();
+        SyncEngine { db: &db, identity: &identity, device_id:"local", provider:Box::new(UncertainProvider{events:events.clone(),fail}) }.push_pending_only().unwrap();
+        assert_eq!(events.0.lock().unwrap().len(), 2);
+        assert!(db.get_pending_sync_logs().unwrap().is_empty());
+        let receiver = Database::new(std::path::Path::new(":memory:")).unwrap();
+        SyncEngine { db:&receiver, identity:&identity, device_id:"other", provider:Box::new(RecordingProvider{events,serve:true,project_scope_only:false,withhold:None}) }.pull_only().unwrap();
+        assert_eq!(receiver.get_reflections().unwrap()[0].what_went_well, "second edit");
+        drop(db); let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn progression_preferences_and_reflections_round_trip_without_echo() {
+        let a = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let b = Database::new(std::path::Path::new(":memory:")).unwrap();
+        a.unlock_trait("focused").unwrap();
+        a.insert_reflection(&crate::models::DailyReflection { created_date:chrono::NaiveDate::from_ymd_opt(2026,10,19).unwrap(),what_went_well:"progress".into(),what_can_improve:"sleep".into() }).unwrap();
+        a.set_setting("equipped_theme","spectrumos").unwrap();
+        a.conn.execute("UPDATE relics SET unlocked=1 WHERE id=(SELECT id FROM relics LIMIT 1)",[]).unwrap();
+        let identity = test_identity();
+        let events = SharedEventLog::default();
+        SyncEngine { db:&a,identity:&identity,device_id:"a",provider:Box::new(RecordingProvider{events:events.clone(),serve:false,project_scope_only:false,withhold:None}) }.push_pending_only().unwrap();
+        SyncEngine { db:&b,identity:&identity,device_id:"b",provider:Box::new(RecordingProvider{events:events.clone(),serve:true,project_scope_only:false,withhold:None}) }.pull_only().unwrap();
+        assert_eq!(b.get_unlocked_traits().unwrap(), vec!["focused"]);
+        assert_eq!(b.get_reflections().unwrap()[0].what_went_well,"progress");
+        assert_eq!(b.get_setting("equipped_theme").unwrap().as_deref(),Some("spectrumos"));
+        assert_eq!(b.conn.query_row("SELECT COUNT(*) FROM relics WHERE unlocked=1",[],|r|r.get::<_,i32>(0)).unwrap(),1);
+        assert!(b.get_pending_sync_logs().unwrap().is_empty());
+        // A delayed replay must not resurrect a locally deleted reflection.
+        b.conn.execute("DELETE FROM reflections",[]).unwrap();
+        b.conn.execute("DELETE FROM processed_remote_events",[]).unwrap();
+        b.set_setting("last_pull_seq_v2","0").unwrap();
+        SyncEngine { db:&b,identity:&identity,device_id:"b",provider:Box::new(RecordingProvider{events,serve:true,project_scope_only:false,withhold:None}) }.pull_only().unwrap();
+        assert!(b.get_reflections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn fresh_device_receives_xp_history_once_even_when_events_precede_user_snapshot() {
+        let a = Database::new(std::path::Path::new(":memory:")).unwrap();
+        let b = Database::new(std::path::Path::new(":memory:")).unwrap();
+        seed_user(&a,Uuid::new_v4(),1,0);
+        let mut user = a.get_user().unwrap().unwrap();
+        crate::services::XPService::new(&a).grant_xp(&mut user,"Task",50).unwrap();
+        let identity = test_identity();
+        let events = SharedEventLog::default();
+        SyncEngine { db:&a,identity:&identity,device_id:"a",provider:Box::new(RecordingProvider{events:events.clone(),serve:false,project_scope_only:false,withhold:None}) }.push_pending_only().unwrap();
+        let engine = SyncEngine { db:&b,identity:&identity,device_id:"b",provider:Box::new(RecordingProvider{events,serve:true,project_scope_only:false,withhold:None}) };
+        engine.pull_only().unwrap(); engine.pull_only().unwrap();
+        let received = b.get_user().unwrap().unwrap();
+        assert_eq!(received.xp,user.xp);
+        assert_eq!(received.level,user.level);
+    }
+
     fn treasury_test_db(name: &str) -> (std::path::PathBuf, Database) {
         let path = std::env::current_dir()
             .unwrap()
@@ -5001,6 +5413,40 @@ mod tests {
             financials.payment_status,
             Some(crate::models::TaskPaymentStatus::Invoiced)
         );
+    }
+
+    #[test]
+    fn portals_round_trip_encrypted_offline_counts_tombstones_and_categories() {
+        let identity=test_identity();
+        let (path_a,db_a)=treasury_test_db("portal_sync_device_a");
+        let (path_b,db_b)=treasury_test_db("portal_sync_device_b");
+        seed_user(&db_a,identity.user_uuid,1,0);seed_user(&db_b,identity.user_uuid,1,0);
+        let server=SharedEventLog::default();
+        let sync=|db:&Database,device:&str| {SyncEngine{db,identity:&identity,device_id:device,provider:Box::new(RecordingProvider{events:server.clone(),serve:true,project_scope_only:false,withhold:None})}.sync().unwrap();};
+        let edit=|db:&Database,kind:&str,id:&str,value:serde_json::Value| db.apply_sync_record(kind,id,"upsert",Some(&value.to_string())).unwrap();
+        edit(&db_a,"favorite_category","work",serde_json::json!({"id":"work","name":"Private office"}));
+        edit(&db_a,"favorite","portal",serde_json::json!({"id":"portal","title":"Encrypted portal title","url":"https://private.example/secret?q=one#two","category":"work"}));
+        sync(&db_a,"portal-a");sync(&db_b,"portal-b");
+        assert_eq!(crate::portals::snapshot(&db_a).unwrap()["favorites"],crate::portals::snapshot(&db_b).unwrap()["favorites"]);
+        let wire=serde_json::to_string(&server.0.lock().unwrap().clone()).unwrap();
+        assert!(!wire.contains("Encrypted portal title") && !wire.contains("private.example") && !wire.contains("Private office"));
+        for (db,device,count) in [(&db_a,"portal-a",3),(&db_b,"portal-b",2)] {edit(db,"favorite_visit",&format!("portal__{device}"),serde_json::json!({"favorite_id":"portal","device_id":device,"count":count}));}
+        edit(&db_a,"favorite_category","work",serde_json::json!({"id":"work","name":"Office"}));
+        edit(&db_b,"favorite","other",serde_json::json!({"id":"other","title":"Another offline link","url":"https://other.example/","category":"uncategorized"}));
+        sync(&db_a,"portal-a");sync(&db_b,"portal-b");sync(&db_a,"portal-a");sync(&db_b,"portal-b");
+        for db in [&db_a,&db_b] {
+            let state=crate::portals::snapshot(db).unwrap();
+            assert_eq!(state["favorites"].as_array().unwrap().iter().find(|v|v["id"]=="portal").unwrap()["clickCount"],5);
+            assert!(state["favorites"].as_array().unwrap().iter().any(|v|v["id"]=="other"));
+            assert_eq!(state["categories"][1]["name"],"Office");
+        }
+        let stale=server.0.lock().unwrap().iter().find(|v|v.entity_type=="favorite" && v.entity_id=="portal").unwrap().clone();
+        db_a.apply_sync_record("favorite","portal","delete",None).unwrap();
+        sync(&db_a,"portal-a");sync(&db_b,"portal-b");
+        {let mut events=server.0.lock().unwrap();let mut replay=stale;replay.seq=events.len() as i64+1;events.push(replay);}
+        sync(&db_b,"portal-b");
+        assert!(!crate::portals::snapshot(&db_b).unwrap()["favorites"].as_array().unwrap().iter().any(|v|v["id"]=="portal"));
+        drop(db_a);drop(db_b);let _=std::fs::remove_file(path_a);let _=std::fs::remove_file(path_b);
     }
 
     #[test]

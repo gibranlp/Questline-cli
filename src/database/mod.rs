@@ -3,10 +3,11 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 pub mod schema;
+pub mod sync_state;
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Datelike, Local, NaiveDate, Timelike, Utc, Weekday};
-use rusqlite::{Connection, DatabaseName, OptionalExtension, params};
+use rusqlite::{Connection, MAIN_DB, OptionalExtension, params};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -18,6 +19,33 @@ use crate::models::{
 
 pub struct Database {
     pub conn: Connection,
+}
+
+pub struct DatabaseSavepoint<'a> {
+    conn: &'a Connection,
+    name: &'static str,
+    active: bool,
+}
+
+impl std::ops::Deref for DatabaseSavepoint<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection { self.conn }
+}
+
+impl DatabaseSavepoint<'_> {
+    pub fn commit(mut self) -> rusqlite::Result<()> {
+        self.conn.execute_batch(&format!("RELEASE {}", self.name))?;
+        self.active = false;
+        Ok(())
+    }
+}
+
+impl Drop for DatabaseSavepoint<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.conn.execute_batch(&format!("ROLLBACK TO {}; RELEASE {}", self.name, self.name));
+        }
+    }
 }
 
 fn sqlite_integrity_ok(path: &Path) -> Result<bool> {
@@ -73,7 +101,7 @@ fn backup_before_schema_upgrade(
         std::fs::remove_file(&temporary_path)?;
     }
     let backup_result = source
-        .backup(DatabaseName::Main, &temporary_path, None)
+        .backup(MAIN_DB, &temporary_path, None)
         .map_err(Into::into)
         .and_then(|()| {
             if sqlite_integrity_ok(&temporary_path)? {
@@ -348,9 +376,25 @@ pub const SYNCED_HYDRATION_SETTING_KEYS: [&str; 6] = [
 /// puramente local (tema, sonidos...). Una sola función para no repetir el `.contains()`
 /// en cada punto del sync engine que decide qué settings sincronizar.
 pub fn is_synced_setting_key(key: &str) -> bool {
-    SYNCED_STREAK_SETTING_KEYS.contains(&key)
-        || SYNCED_QUEST_SETTING_KEYS.contains(&key)
-        || SYNCED_HYDRATION_SETTING_KEYS.contains(&key)
+    synced_setting_keys().any(|candidate| candidate == key)
+        || SYNCED_PROGRESS_PREFIXES.iter().any(|prefix| key.starts_with(prefix))
+}
+
+pub const SYNCED_PROGRESS_PREFIXES: &[&str] = &[
+    "class_quest_completed:", "class_quest_rewarded:", "celebrated_", "lore_notified_",
+    "chapter_xp_rewarded_", "chapter_complete_modal_shown_",
+];
+
+pub const SYNCED_PREFERENCE_KEYS: &[&str] = &[
+    "equipped_theme", "dashboard_layout", "sound_effects_enabled", "sound_effects_volume",
+    "task_completion_ambient_effect", "external_notifications", "task_notifications_enabled",
+    "ambient_effects_enabled", "active_ambient_effect", "archive_escaped", "backlog_escaped",
+    "prologue_skip", "mentor_invite_count", "fellowship_onboarding_offered", "support_realm_shown",
+];
+
+pub fn synced_setting_keys() -> impl Iterator<Item = &'static str> {
+    SYNCED_STREAK_SETTING_KEYS.into_iter().chain(SYNCED_QUEST_SETTING_KEYS)
+        .chain(SYNCED_HYDRATION_SETTING_KEYS).chain(SYNCED_PREFERENCE_KEYS.iter().copied())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -445,6 +489,53 @@ impl StreakSchedule {
 }
 
 impl Database {
+    pub fn savepoint(&self, name: &'static str) -> rusqlite::Result<DatabaseSavepoint<'_>> {
+        assert!(name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'_'));
+        self.conn.execute_batch(&format!("SAVEPOINT {name}"))?;
+        Ok(DatabaseSavepoint { conn: &self.conn, name, active: true })
+    }
+    /// A process-scoped OS lock: released even if a sync worker crashes or the
+    /// process is killed. All network operations for a profile use this lock.
+    pub fn lock_sync(&self) -> Result<Option<std::fs::File>> {
+        let path: String = self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'", [], |r| r.get(0),
+        )?;
+        if path.is_empty() { return Ok(None); }
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(Path::new(&path).with_extension("sync.lock"))?;
+        lock.try_lock().map_err(|_| anyhow::anyhow!("Another sync or profile transfer is running; retry shortly"))?;
+        Ok(Some(lock))
+    }
+
+    pub fn path(&self) -> Result<PathBuf> {
+        let path: String = self.conn.query_row(
+            "SELECT file FROM pragma_database_list WHERE name = 'main'", [], |r| r.get(0),
+        )?;
+        if path.is_empty() { bail!("The active database has no file path"); }
+        Ok(PathBuf::from(path))
+    }
+
+    /// Read through SQLite so committed WAL pages are included. Publish only a
+    /// complete, validated snapshot; never leave a partially written backup.
+    pub fn backup_to(&self, destination: &Path) -> Result<()> {
+        if destination.exists() && std::fs::canonicalize(destination)? == std::fs::canonicalize(self.path()?)? {
+            bail!("Backup destination is the active database");
+        }
+        let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            self.conn.backup(MAIN_DB, &temporary, None)?;
+            #[cfg(unix)] {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))?;
+            }
+            if !Self::verify_db_backup(&temporary)? { bail!("Backup failed SQLite integrity/relationship checks"); }
+            std::fs::File::open(&temporary)?.sync_all()?;
+            std::fs::rename(&temporary, destination)?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(&temporary); }
+        result
+    }
     /// Bump this whenever a migration is added to `Database::new`'s
     /// column-existence-check block below, so upgraded installs re-run that
     /// whole block once (idempotent either way) instead of it silently
@@ -452,13 +543,13 @@ impl Database {
     const SCHEMA_VERSION: i64 = 4;
 
     pub fn database_size_bytes(&self) -> Result<u64> {
-        let page_count: u64 = self
+        let page_count: i64 = self
             .conn
             .query_row("PRAGMA page_count;", [], |row| row.get(0))?;
-        let page_size: u64 = self
+        let page_size: i64 = self
             .conn
             .query_row("PRAGMA page_size;", [], |row| row.get(0))?;
-        Ok(page_count.saturating_mul(page_size))
+        Ok(u64::try_from(page_count)?.saturating_mul(u64::try_from(page_size)?))
     }
 
     /// Finish a clean local save before the process exits. Writes throughout
@@ -466,14 +557,17 @@ impl Database {
     /// WAL pages back into the main database so shutdown has an explicit,
     /// verifiable durability boundary as well.
     pub fn flush_for_shutdown(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "PRAGMA busy_timeout = 5000; PRAGMA wal_checkpoint(TRUNCATE);",
-        )?;
+        let busy: i64 = self.conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+        if busy != 0 { bail!("Local checkpoint is busy; pending database readers must finish first"); }
         Ok(())
     }
 
     pub fn new(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            if path.exists() { std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?; }
+        }
 
         // Read and protect the old database before CREATE TABLE or ALTER TABLE can
         // touch it. v1.x databases have user_version 0; newer migrations advance it.
@@ -1232,7 +1326,25 @@ impl Database {
             )?;
         }
 
-        Ok(Self { conn })
+        sync_state::install(&conn)?;
+        let db = Self { conn };
+        if db.get_user()?.is_some() && db.get_setting("sync_coverage_version")?.as_deref() != Some("1") {
+            let upgrade = db.savepoint("seed_sync_coverage")?;
+            match db.queue_full_state_sync() {
+                Ok(_) => {
+                    db.set_setting("sync_coverage_version", "1")?;
+                    db.conn.execute("DELETE FROM settings WHERE key='sync_coverage_seed_error'", [])?;
+                    upgrade.commit()?;
+                }
+                Err(error) => {
+                    // An unhealthy historical profile must remain accessible
+                    // locally. Do not partially queue it or mark repair done.
+                    drop(upgrade);
+                    db.set_setting("sync_coverage_seed_error", &error.to_string())?;
+                }
+            }
+        }
+        Ok(db)
     }
 
     // ── Métodos públicos para sembrar lore desde el LoreManager ──────────────
@@ -3801,6 +3913,21 @@ impl Database {
         Self::log_change_on(&self.conn, entity_type, entity_id, operation)
     }
 
+    /// Re-publishing existing state is not a new edit. Keep its conflict time,
+    /// so a manual reseed cannot resurrect state deleted on another device.
+    pub fn queue_existing_state(&self, kind: &str, id: &str, operation: &str) -> Result<()> {
+        let pending: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM sync_log WHERE synced=0 AND entity_type=?1 AND entity_id=?2)", params![kind,id], |r| r.get(0))?;
+        if pending { return Ok(()); }
+        let operation = if operation == "delete" { operation } else { "reseed" };
+        let timestamp = self.conn.query_row(
+            "SELECT timestamp FROM sync_entity_versions WHERE entity_type=?1 AND entity_id=?2",
+            params![kind, id], |r| r.get::<_, String>(0),
+        ).optional()?.unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+        self.conn.execute("INSERT INTO sync_log (id,entity_type,entity_id,operation,timestamp,synced) VALUES (?1,?2,?3,?4,?5,0)",
+            params![Uuid::new_v4().to_string(), kind, id, operation, timestamp])?;
+        Ok(())
+    }
+
     pub(crate) fn log_change_on(
         conn: &Connection,
         entity_type: &str,
@@ -3812,6 +3939,11 @@ impl Database {
         conn.execute(
             "INSERT INTO sync_log (id, entity_type, entity_id, operation, timestamp, synced) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
             params![id, entity_type, entity_id, operation, timestamp],
+        )?;
+        conn.execute(
+            "INSERT INTO sync_entity_versions (entity_type,entity_id,timestamp,event_id,deleted) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(entity_type,entity_id) DO UPDATE SET timestamp=excluded.timestamp,event_id=excluded.event_id,deleted=excluded.deleted",
+            params![entity_type, entity_id, timestamp, id, i32::from(operation == "delete")],
         )?;
         Ok(())
     }
@@ -3924,8 +4056,20 @@ impl Database {
     }
 
     pub fn get_pending_sync_logs(&self) -> Result<Vec<(String, String, String, String, String)>> {
-        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0 ORDER BY rowid ASC")?;
-        let rows = stmt.query_map([], |row| {
+        self.get_pending_sync_log_batch_after(i64::MAX, 0)
+    }
+
+    pub fn pending_sync_count(&self) -> Result<usize> {
+        Ok(self.conn.query_row("SELECT COUNT(*) FROM sync_log WHERE synced=0", [], |r| r.get::<_,i64>(0))? as usize)
+    }
+
+    pub fn get_pending_sync_log_batch(&self, limit: i64) -> Result<Vec<(String, String, String, String, String)>> {
+        self.get_pending_sync_log_batch_after(limit, 0)
+    }
+
+    pub fn get_pending_sync_log_batch_after(&self, limit: i64, after: i64) -> Result<Vec<(String, String, String, String, String)>> {
+        let mut stmt = self.conn.prepare("SELECT id, entity_type, entity_id, operation, timestamp FROM sync_log WHERE synced = 0 AND rowid > ?2 ORDER BY rowid ASC LIMIT ?1")?;
+        let rows = stmt.query_map([limit, after], |row| {
             let id: String = row.get(0)?;
             let et: String = row.get(1)?;
             let ei: String = row.get(2)?;
@@ -3946,6 +4090,7 @@ impl Database {
         let deleted = self.conn.execute(
             "DELETE FROM sync_log
              WHERE synced = 0
+               AND id NOT IN (SELECT id FROM sync_outbound_envelopes)
                AND rowid NOT IN (
                    SELECT MAX(rowid)
                    FROM sync_log
@@ -3962,20 +4107,12 @@ impl Database {
         if ids.is_empty() {
             return Ok(());
         }
-        let placeholders = ids
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "UPDATE sync_log SET synced = 1 WHERE id IN ({})",
-            placeholders
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> =
-            ids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
-        stmt.execute(params.as_slice())?;
+        let tx = self.savepoint("ack_sync_outbox")?;
+        for id in ids {
+            tx.execute("UPDATE sync_log SET synced=1 WHERE id=?1", [id])?;
+            tx.execute("DELETE FROM sync_outbound_envelopes WHERE id=?1", [id])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -3998,10 +4135,10 @@ impl Database {
         }
         let now = Utc::now().to_rfc3339();
         for id in ids {
-            let _ = self.conn.execute(
+            self.conn.execute(
                 "INSERT OR IGNORE INTO processed_remote_events (id, processed_at) VALUES (?1, ?2)",
                 params![id, now],
-            );
+            )?;
         }
         Ok(())
     }
@@ -4084,10 +4221,10 @@ impl Database {
                 mismatched_steps
             ));
         }
-        let mut queued = 0usize;
+        let mut queued = self.queue_record_sync()?;
 
         if let Ok(Some(user)) = self.get_user() {
-            self.log_change("user", &user.id.to_string(), "upsert")?;
+            self.queue_existing_state("user", &user.id.to_string(), "upsert")?;
             queued += 1;
         }
 
@@ -4101,7 +4238,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in key_project_ids {
-            self.log_change("project_key", &id, "upsert")?;
+            self.queue_existing_state("project_key", &id, "upsert")?;
             queued += 1;
         }
 
@@ -4140,7 +4277,7 @@ impl Database {
                 .filter_map(|row| row.ok())
                 .collect::<Vec<_>>();
             for id in ids {
-                self.log_change(entity_type, &id, "upsert")?;
+                self.queue_existing_state(entity_type, &id, "upsert")?;
                 queued += 1;
             }
         }
@@ -4153,7 +4290,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in lore_ids {
-            self.log_change("lore_unlock", &id, "unlock")?;
+            self.queue_existing_state("lore_unlock", &id, "unlock")?;
             queued += 1;
         }
 
@@ -4169,19 +4306,14 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in ritual_history_ids {
-            self.log_change("ritual_history", &id, "upsert")?;
+            self.queue_existing_state("ritual_history", &id, "upsert")?;
             queued += 1;
         }
 
-        for key in SYNCED_STREAK_SETTING_KEYS
-            .iter()
-            .chain(SYNCED_QUEST_SETTING_KEYS.iter())
-            .chain(SYNCED_HYDRATION_SETTING_KEYS.iter())
-        {
-            if self.get_setting(key)?.is_some() {
-                self.log_change("setting", key, "upsert")?;
-                queued += 1;
-            }
+        let setting_keys = self.conn.prepare("SELECT key FROM settings")?.query_map([], |r| r.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        for key in setting_keys.into_iter().filter(|key| is_synced_setting_key(key)) {
+            self.queue_existing_state("setting", &key, "upsert")?;
+            queued += 1;
         }
 
         let mut notification_state_stmt = self
@@ -4192,7 +4324,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in notification_state_ids {
-            self.log_change("notification_state", &id, "upsert")?;
+            self.queue_existing_state("notification_state", &id, "upsert")?;
             queued += 1;
         }
 
@@ -4208,7 +4340,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in assignment_ids {
-            self.log_change("task_assignment", &id, "assign")?;
+            self.queue_existing_state("task_assignment", &id, "assign")?;
             queued += 1;
         }
 
@@ -4218,7 +4350,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in status_ids {
-            self.log_change("task_status", &id, "upsert")?;
+            self.queue_existing_state("task_status", &id, "upsert")?;
             queued += 1;
         }
 
@@ -4236,7 +4368,7 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in dependency_ids {
-            self.log_change("task_dependency", &id, "upsert")?;
+            self.queue_existing_state("task_dependency", &id, "upsert")?;
             queued += 1;
         }
 
@@ -4252,70 +4384,41 @@ impl Database {
             .filter_map(|row| row.ok())
             .collect::<Vec<_>>();
         for id in member_ids {
-            self.log_change("project_member", &id, "upsert")?;
+            self.queue_existing_state("project_member", &id, "upsert")?;
             queued += 1;
         }
 
         if let Ok(tree) = self.get_zen_tree() {
-            self.log_change("zen_tree", &tree.id.to_string(), "upsert")?;
+            self.queue_existing_state("zen_tree", &tree.id.to_string(), "upsert")?;
             queued += 1;
         }
 
         Ok(queued)
     }
 
-    pub fn count_prunable_tasks(&self, days: i64) -> Result<usize> {
-        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
-        let count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM tasks WHERE completed = 1 AND (
-                (updated_at != '' AND updated_at < ?1) OR
-                (updated_at = '' AND created_at < ?1)
-            )",
-            params![cutoff],
-            |row| row.get(0),
-        )?;
-        Ok(count as usize)
+    pub fn prunable_task_ids(&self, days:i64)->Result<Vec<String>> {
+        if !(1..=3650).contains(&days) {bail!("Choose a retention period between 1 and 3650 days");}
+        let cutoff=(Utc::now()-chrono::Duration::days(days)).to_rfc3339();
+        // Se conserva cualquier rama con pasos recientes o pendientes, y no se podan campañas compartidas.
+        let mut stmt=self.conn.prepare("WITH RECURSIVE eligible(id) AS (
+            SELECT t.id FROM tasks t LEFT JOIN projects p ON p.id=t.project_id
+            WHERE t.completed=1 AND COALESCE(p.is_shared,0)=0 AND COALESCE(NULLIF(t.updated_at,''),t.created_at)<?1
+        ), protected(id) AS (
+            SELECT id FROM tasks WHERE id NOT IN (SELECT id FROM eligible)
+            UNION SELECT t.parent_task_id FROM tasks t JOIN protected p ON p.id=t.id WHERE t.parent_task_id IS NOT NULL
+        ) SELECT id FROM eligible WHERE id NOT IN (SELECT id FROM protected) ORDER BY id")?;
+        Ok(stmt.query_map([cutoff],|r|r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    pub fn prune_completed_tasks(&self, days: i64) -> Result<usize> {
-        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    pub fn count_prunable_tasks(&self, days:i64)->Result<usize> {Ok(self.prunable_task_ids(days)?.len())}
 
-        // CUIDADO: los tombstones van antes del DELETE — si se hace al revés, otros dispositivos resucitan la tarea en el siguiente pull
-        let ids: Vec<String> = {
-            let mut stmt = self.conn.prepare(
-                "SELECT id FROM tasks WHERE completed = 1 AND (
-                    (updated_at != '' AND updated_at < ?1) OR
-                    (updated_at = '' AND created_at < ?1)
-                )",
-            )?;
-            stmt.query_map(params![cutoff], |row| row.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let count = ids.len();
-        let tx = self.conn.unchecked_transaction()?;
-        for id in &ids {
-            Self::log_change_on(&tx, "task", id, "delete")?;
-        }
-
-        // el CASCADE del schema borra las subtareas automáticamente al borrar la tarea raíz
-        tx.execute(
-            "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NULL AND (
-                (updated_at != '' AND updated_at < ?1) OR
-                (updated_at = '' AND created_at < ?1)
-            )",
-            params![cutoff],
-        )?;
-        // subtareas completadas cuyo padre sobrevivió la poda — hay que borrarlas por separado
-        tx.execute(
-            "DELETE FROM tasks WHERE completed = 1 AND parent_task_id IS NOT NULL AND (
-                (updated_at != '' AND updated_at < ?1) OR
-                (updated_at = '' AND created_at < ?1)
-            )",
-            params![cutoff],
-        )?;
-
+    pub fn prune_completed_tasks(&self,days:i64)->Result<usize> {
+        let tx=self.savepoint("prune_completed_tasks")?;
+        let ids=self.prunable_task_ids(days)?;
+        for id in &ids {Self::log_change_on(&tx,"task",id,"delete")?;}
+        for id in &ids {tx.execute("DELETE FROM tasks WHERE id=?",[id])?;}
         tx.commit()?;
-        Ok(count)
+        Ok(ids.len())
     }
 
     pub fn cleanup_local_history(&self) -> Result<(usize, usize, usize)> {
@@ -4464,11 +4567,35 @@ impl Database {
     }
 
     pub fn export_to_json(&self) -> Result<String> {
-        self.export_to_json_skipping(&[])
+        let tx = self.conn.unchecked_transaction()?;
+        let json = self.export_to_json_skipping(&[])?;
+        tx.commit()?;
+        Ok(json)
+    }
+
+    pub fn write_json_export(&self, destination: &Path) -> Result<()> {
+        use std::io::Write;
+        let json = self.export_to_json()?;
+        let temporary = destination.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let result = (|| -> Result<()> {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)] { use std::os::unix::fs::OpenOptionsExt; options.mode(0o600); }
+            let mut output = options.open(&temporary)?;
+            output.write_all(json.as_bytes())?;
+            output.sync_all()?;
+            std::fs::rename(&temporary, destination)?;
+            Ok(())
+        })();
+        if result.is_err() { let _ = std::fs::remove_file(temporary); }
+        result
     }
 
     pub fn export_to_recovery_json(&self) -> Result<String> {
-        self.export_to_json_skipping(&["processed_remote_events", "revisions", "sync_log"])
+        let tx = self.conn.unchecked_transaction()?;
+        let json = self.export_to_json_skipping(&["processed_remote_events", "revisions", "sync_log", "sync_outbound_envelopes"])?;
+        tx.commit()?;
+        Ok(json)
     }
 
     fn export_to_json_skipping(&self, skipped_tables: &[&str]) -> Result<String> {
@@ -4615,6 +4742,7 @@ impl Database {
         }
 
         let res = (|| -> Result<()> {
+            self.conn.execute("UPDATE sync_context SET enabled=0", [])?;
             for (table_name, rows_val) in map {
                 if table_name.starts_with('_') {
                     continue;
@@ -4726,7 +4854,9 @@ impl Database {
             // so it reaches the same state as the backup source.
             self.conn
                 .execute("DELETE FROM settings WHERE key = 'last_pull_seq'", [])?;
+            self.conn.execute("DELETE FROM settings WHERE key IN ('last_pull_seq_v2', 'last_remote_head_seq', 'last_sync_lag', 'last_sync_downloaded', 'sync_history_generation_v2', 'sync_push_scan_after', 'last_sync_deferred')", [])?;
             self.conn.execute("UPDATE sync_log SET synced = 1", [])?;
+            self.conn.execute("DELETE FROM sync_outbound_envelopes", [])?;
             // Clear dedup IDs from the backup source — they belong to a different device's
             // view of the event stream and would cause this machine to skip events it has
             // never actually applied.
@@ -4778,6 +4908,7 @@ impl Database {
                 ));
             }
 
+            self.conn.execute("UPDATE sync_context SET enabled=1", [])?;
             let foreign_key_errors: i64 = self.conn.query_row(
                 "SELECT COUNT(*) FROM pragma_foreign_key_check",
                 [],
@@ -4788,6 +4919,14 @@ impl Database {
                     "Imported backup contains {} foreign key violation(s)",
                     foreign_key_errors
                 ));
+            }
+
+            if let Some(json) = self.get_setting("_profile_identity")? {
+                let identity: crate::services::Identity = serde_json::from_str(&json)?;
+                identity.validate()?;
+                if self.get_user()?.is_some_and(|user| user.id != identity.user_uuid) {
+                    bail!("Backup identity belongs to a different user profile");
+                }
             }
 
             Ok(())
@@ -6728,24 +6867,10 @@ impl Database {
     }
 
     pub fn verify_db_backup(backup_path: &Path) -> Result<bool> {
-        let conn = Connection::open(backup_path)?;
-        let integrity: String = conn.query_row("PRAGMA integrity_check;", [], |row| row.get(0))?;
-
-        let mut stmt = conn.prepare("PRAGMA foreign_key_check;")?;
-        let foreign_keys: Vec<String> = stmt
-            .query_map([], |row| {
-                let table: String = row.get(0)?;
-                let rowid: i64 = row.get(1)?;
-                let parent: String = row.get(2)?;
-                Ok(format!(
-                    "Table {} (rowid {}) has invalid reference to {}",
-                    table, rowid, parent
-                ))
-            })?
-            .filter_map(Result::ok)
-            .collect();
-
-        Ok(integrity == "ok" && foreign_keys.is_empty())
+        let conn = Connection::open_with_flags(backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let foreign_keys: i64 = conn.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |row| row.get(0))?;
+        Ok(integrity == "ok" && foreign_keys == 0)
     }
 
     pub fn get_all_known_usernames(&self) -> Result<Vec<String>> {
@@ -6961,6 +7086,11 @@ impl Database {
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn bundled_sqlite_contains_the_wal_reset_fix() {
+        assert!(rusqlite::version_number() >= 3_051_003, "SQLite {} lacks the WAL-reset fix", rusqlite::version());
+    }
 
     #[test]
     fn schema_upgrade_creates_a_verified_backup_and_preserves_existing_data() {
@@ -7338,6 +7468,50 @@ mod tests {
         assert_eq!(last_drink_at.timestamp(), now.timestamp());
 
         let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn backup_includes_committed_wal_and_does_not_overwrite_source() {
+        let path = std::env::temp_dir().join(format!("questline-wal-{}.db", Uuid::new_v4()));
+        let backup = path.with_extension("backup.db");
+        let db = Database::new(&path).unwrap();
+        db.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        db.set_setting("latest-committed", "included").unwrap();
+        db.backup_to(&backup).unwrap();
+        let copy = Connection::open(&backup).unwrap();
+        assert_eq!(copy.query_row("SELECT value FROM settings WHERE key='latest-committed'", [], |r| r.get::<_, String>(0)).unwrap(), "included");
+        assert!(db.backup_to(&path).is_err());
+        drop(copy); drop(db);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(backup);
+    }
+
+    #[test]
+    fn profile_operations_are_exclusive_and_lock_releases_on_drop() {
+        let path = std::env::temp_dir().join(format!("questline-lock-{}.db", Uuid::new_v4()));
+        let db = Database::new(&path).unwrap();
+        let other = Database::new(&path).unwrap();
+        let lock = db.lock_sync().unwrap();
+        assert!(other.lock_sync().is_err());
+        drop(lock);
+        assert!(other.lock_sync().is_ok());
+        drop(other); drop(db);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("sync.lock"));
+    }
+
+    #[test]
+    fn json_restore_resets_v2_cursors_and_preserves_destination_device() {
+        let source = Database::new(Path::new(":memory:")).unwrap();
+        source.set_setting("device_id", "source").unwrap();
+        source.set_setting("last_pull_seq_v2", "9999").unwrap();
+        source.set_setting("last_remote_head_seq", "10000").unwrap();
+        let destination = Database::new(Path::new(":memory:")).unwrap();
+        destination.set_setting("device_id", "destination").unwrap();
+        destination.import_from_json(&source.export_to_json().unwrap()).unwrap();
+        assert_eq!(destination.get_setting("device_id").unwrap().as_deref(), Some("destination"));
+        assert!(destination.get_setting("last_pull_seq_v2").unwrap().is_none());
+        assert!(destination.get_setting("last_remote_head_seq").unwrap().is_none());
     }
 
     #[test]
@@ -8128,7 +8302,9 @@ mod tests {
         assert!(is_synced_setting_key(QUEST_VISIBILITY_HORIZON_KEY));
         assert!(is_synced_setting_key(STREAK_ACTIVE_FROM_KEY));
         assert!(!is_synced_setting_key("theme"));
-        assert!(!is_synced_setting_key("sound_effects_volume"));
+        assert!(is_synced_setting_key("sound_effects_volume"));
+        assert!(!is_synced_setting_key("device_id"));
+        assert!(!is_synced_setting_key("local_music_folder"));
     }
 
     #[test]

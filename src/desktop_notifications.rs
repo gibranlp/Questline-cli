@@ -281,11 +281,15 @@ pub fn run(path: &Path) -> Result<()> {
         return Ok(());
     }
     let presence = lock_file(&directory.join("desktop-tui.lock"))?;
-    let mut app = None;
+    let mut app:Option<App> = None;
+    let mut loaded_epoch=None;
     loop {
         if presence.try_lock().is_ok() {
             let result = (|| -> Result<Vec<Value>> {
                 let mut alerts = Vec::new();
+                if let Some(current)=app.as_ref() {
+                    if current.db.get_setting("shell_profile_epoch")? != loaded_epoch || current.db.get_user()?.map(|u|u.id)!=current.user.as_ref().map(|u|u.id) {app=None;}
+                }
                 if path.is_file() && app.is_none() {
                     let mut loaded = App::new_headless(path)?;
                     if loaded.user.is_some() {
@@ -294,6 +298,7 @@ pub fn run(path: &Path) -> Result<()> {
                         if let Some(reminder) = crate::desktop_hydration::resume(&mut loaded)? {
                             alerts.push(reminder);
                         }
+                        loaded_epoch=loaded.db.get_setting("shell_profile_epoch")?;
                         app = Some(loaded);
                     }
                 }

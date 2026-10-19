@@ -17,6 +17,7 @@ pub mod library;
 pub mod onboarding;
 pub mod project_workspace;
 pub mod projects;
+pub mod portals;
 pub mod prologue;
 pub mod restore;
 pub mod settings;
@@ -34,6 +35,7 @@ pub enum ActiveScreen {
     Onboarding,
     Dashboard,
     Projects,
+    Portals,
     Character,
     Library,
     Legends,

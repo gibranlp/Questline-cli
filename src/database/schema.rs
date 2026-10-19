@@ -1,4 +1,20 @@
 pub const CREATE_TABLES_SQL: &str = "
+CREATE TABLE IF NOT EXISTS favorite_categories (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS favorites (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    category TEXT NOT NULL DEFAULT 'uncategorized'
+);
+CREATE TABLE IF NOT EXISTS favorite_visits (
+    favorite_id TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    count INTEGER NOT NULL DEFAULT 0 CHECK(count >= 0),
+    PRIMARY KEY(favorite_id, device_id)
+);
 
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -222,6 +238,33 @@ CREATE TABLE IF NOT EXISTS sync_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_sync_log_synced ON sync_log(synced);
+
+CREATE TABLE IF NOT EXISTS sync_outbound_envelopes (
+    id TEXT PRIMARY KEY,
+    author_identity TEXT NOT NULL,
+    envelope TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_entity_versions (
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    deleted INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(entity_type, entity_id)
+);
+
+CREATE TABLE IF NOT EXISTS sync_quarantine (
+    id TEXT PRIMARY KEY,
+    envelope TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sync_deferred_events (
+    id TEXT PRIMARY KEY,
+    envelope TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS revisions (
     id TEXT PRIMARY KEY,

@@ -1128,6 +1128,7 @@ pub struct App {
     // El usuario actual — None si no ha hecho onboarding todavía
     pub user: Option<User>,
     pub active_screen: ActiveScreen,
+    pub portal_state: crate::screens::portals::PortalState,
 
     // Onboarding Form States — campos del formulario de creación de héroe
     pub onboarding_username: String,
@@ -1252,6 +1253,7 @@ pub struct App {
     pub sync_failure_count: u32,
     pub config: crate::services::Config,
     pub last_auto_sync: std::time::Instant,
+    pub last_sync_settings_check: Option<std::time::Instant>,
     pub last_sync_status_time: Option<std::time::Instant>,
     // Registra cuándo fue la última mutación para decidir si hay que hacer auto-sync
     pub last_mutation: Option<std::time::Instant>,
@@ -1357,13 +1359,15 @@ pub struct App {
     pub stats_cache: AppStatsCache,
 
     // El sync corre en un hilo aparte — este Arc/Mutex permite pasarle el resultado al hilo principal
+    pub manual_sync_reward_pending: bool,
     pub sync_in_progress: bool,
     pub sync_result: std::sync::Arc<std::sync::Mutex<Option<BackgroundSyncResult>>>,
     // El backup de nube al exportar perfil corre en hilo aparte — evita bloquear la UI
+    pub profile_operation_in_progress: bool,
+    pub profile_transfer_result: std::sync::Arc<std::sync::Mutex<Option<Result<crate::services::profile_transfer::PreparedRestore, String>>>>,
     pub export_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     pub cloud_backup_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
     // El restore desde la nube también corre en hilo aparte — comunica pasos al hilo principal
-    pub cloud_restore_result: std::sync::Arc<std::sync::Mutex<Option<Result<String, String>>>>,
 
     pub chat_poll_active: bool,
     pub chat_rx: Option<std::sync::mpsc::Receiver<ChatPollResult>>,
@@ -2459,7 +2463,8 @@ impl App {
             storage_dir.join("identity.key").exists()
         };
 
-        let identity = crate::services::identity::Identity::load_or_create(existing_user_id)?;
+        let identity = crate::services::identity::Identity::load_for_database(&db, existing_user_id)?;
+        db.set_setting("_profile_identity", &serde_json::to_string(&identity)?)?;
 
         let device_name = crate::services::identity::get_local_device_name();
 
@@ -2529,16 +2534,14 @@ impl App {
         // La URL/config base viven en config.toml, pero el toggle visible de Auto Sync
         // debe persistir desde la DB porque el usuario lo cambia dentro del TUI con [a].
         let mut config = crate::services::config::Config::load().unwrap_or_default();
+        config.sync_enabled=crate::background_sync::cloud_enabled(&db,&config)?;
         if headless {
             config.sync_enabled = false;
             config.auto_sync = false;
         }
-        let server_url = if config.sync_enabled {
-            config.server_url.clone()
-        } else {
-            db.get_setting("server_url")?
-                .unwrap_or_else(|| "http://localhost:8080".to_string())
-        };
+        let server_url = if headless {
+            db.get_setting("server_url")?.unwrap_or_else(||config.server_url.clone())
+        } else {config.server_url.clone()};
         let mut auto_sync = !headless && db
             .get_setting("auto_sync")?
             .map(|s| s == "true")
@@ -2580,7 +2583,7 @@ impl App {
                 &device_id,
                 Some(&server_url),
             )
-            .and_then(|engine| engine.sync());
+            .and_then(|engine| engine.pull_only());
             if encrypted_restore.is_ok() && db.get_user()?.is_some() {
                 let _ = db.set_setting("sync_restore_hold", "1");
                 let _ = db.set_setting("auto_sync", "false");
@@ -2649,6 +2652,7 @@ impl App {
             db,
             user,
             active_screen,
+            portal_state: crate::screens::portals::PortalState::default(),
             onboarding_username: String::new(),
             onboarding_class_idx: 0,
             onboarding_focus: OnboardingFocus::NameInput,
@@ -2745,6 +2749,7 @@ impl App {
             sync_failure_count: 0,
             config,
             last_auto_sync: std::time::Instant::now(),
+            last_sync_settings_check: Some(std::time::Instant::now()),
             last_sync_status_time: None,
             last_mutation: None,
             last_sync_warlock_xp: 0,
@@ -2819,14 +2824,16 @@ impl App {
             all_notes: Vec::new(),
             all_journals: Vec::new(),
             stats_cache: AppStatsCache::default(),
+            manual_sync_reward_pending: false,
             sync_in_progress: false,
             sync_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             companion_lookup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             companion_lookup_in_flight: None,
             companion_lookup_cache: None,
+            profile_operation_in_progress: false,
+            profile_transfer_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             export_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             cloud_backup_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
-            cloud_restore_result: std::sync::Arc::new(std::sync::Mutex::new(None)),
             chat_poll_active: false,
             chat_rx: None,
             last_chat_poll: std::time::Instant::now()
@@ -4582,9 +4589,9 @@ impl App {
     /// eventos horizontales sueltos y antes bastaba para saltar de panel sin querer.
     const SWIPE_EVENTS_TO_FIRE: u8 = 3;
 
-    /// Los 9 paneles principales en el mismo orden que los atajos 1-9, que es el orden en que se
+    /// Los 10 paneles principales en el mismo orden que los atajos 1-9 y 0, que es el orden en que se
     /// dibujan las pestañas. `handle_pane_swipe` se mueve por esta lista.
-    const SWIPEABLE_PANES: [(ActiveScreen, char); 9] = [
+    const SWIPEABLE_PANES: [(ActiveScreen, char); 10] = [
         (ActiveScreen::Dashboard, '1'),
         (ActiveScreen::Projects, '2'),
         (ActiveScreen::Character, '3'),
@@ -4594,6 +4601,7 @@ impl App {
         (ActiveScreen::GreatChronicle, '7'),
         (ActiveScreen::SyncSettings, '8'),
         (ActiveScreen::Settings, '9'),
+        (ActiveScreen::Portals, '0'),
     ];
 
     /// Hueco a partir del cual un evento vertical cuenta como "notch suelto" y no como parte de
@@ -4702,7 +4710,7 @@ impl App {
             _ => return Ok(false),
         };
 
-        // Fuera de los 9 paneles no hay nada que recorrer. En Workspace los 1-4 son sub-tabs y en
+        // Fuera de los 10 paneles no hay nada que recorrer. En Workspace los 1-4 son sub-tabs y en
         // el Editor se está escribiendo, así que ninguno entra en la lista a propósito.
         let Some(current) = Self::SWIPEABLE_PANES
             .iter()
@@ -5727,6 +5735,7 @@ impl App {
     /// "Cloud Sync: ... [s] toggle" row.
     fn toggle_cloud_sync_enabled(&mut self) -> Result<()> {
         self.config.sync_enabled = !self.config.sync_enabled;
+        self.db.set_setting("cloud_sync_enabled",if self.config.sync_enabled {"true"} else {"false"})?;
         #[cfg(not(test))]
         self.config.save()?;
         self.sync_status_msg = if self.config.sync_enabled {
@@ -6941,6 +6950,12 @@ impl App {
             return Ok(());
         }
 
+        if self.active_screen == ActiveScreen::Portals && self.modal_state == ModalType::None {
+            let (handled, changed) = self.portal_state.key(&self.db, key)?;
+            if changed { self.last_mutation = Some(std::time::Instant::now()); }
+            if handled { return Ok(()); }
+        }
+
         // Fellowship sharing must be handled before chat/navigation remapping.
         // Lowercase `j` remains vim-style Down; v/V are the unambiguous
         // invitation shortcuts advertised by the Fellowship UI.
@@ -7629,6 +7644,21 @@ impl App {
                     | KeyCode::Char('Q') => {
                         self.begin_graceful_quit();
                     }
+                    KeyCode::Char('l') | KeyCode::Char('L') => {
+                        if self.editor_state.as_ref().is_some_and(|editor| editor.has_unsaved_changes()) {
+                            self.save_editor_note(false, true)?;
+                        }
+                        match self.db.flush_for_shutdown() {
+                            Ok(()) => {
+                                self.quitting_after_sync = false;
+                                self.quit_completed_sync = false;
+                                self.quit_needs_final_sync = false;
+                                self.run_installer_on_exit = false;
+                                self.should_quit = true;
+                            }
+                            Err(error) => { self.sync_status_msg = format!("Local save failed: {error}"); }
+                        }
+                    }
                     KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                         if self.quitting_after_sync {
                             self.quitting_after_sync = false;
@@ -8118,94 +8148,7 @@ impl App {
                         self.modal_state = ModalType::RestoreIdentity { input: val };
                     }
                     KeyCode::Enter => {
-                        use base64::{Engine as _, engine::general_purpose::STANDARD};
-                        let trimmed = val.trim().to_string();
-                        match STANDARD.decode(&trimmed) {
-                            Ok(decoded_bytes)
-                                if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 =>
-                            {
-                                use ed25519_dalek::{SigningKey, VerifyingKey};
-
-                                let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
-                                    let mut uuid_bytes = [0u8; 16];
-                                    uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
-                                    let user_uuid = Uuid::from_bytes(uuid_bytes);
-                                    let mut secret_bytes = [0u8; 32];
-                                    secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
-                                    (user_uuid, secret_bytes)
-                                } else {
-                                    let mut secret_bytes = [0u8; 32];
-                                    secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
-                                    (self.identity.user_uuid, secret_bytes)
-                                };
-
-                                let signing_key = SigningKey::from_bytes(&secret_arr);
-                                let verifying_key: VerifyingKey = signing_key.verifying_key();
-                                let secret_hex: String =
-                                    secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
-                                let public_hex: String = verifying_key
-                                    .to_bytes()
-                                    .iter()
-                                    .map(|b| format!("{:02x}", b))
-                                    .collect();
-
-                                let storage_dir = crate::storage::get_storage_dir()?;
-                                let db_path = storage_dir.join("questline.db");
-                                let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-                                let backup_path = storage_dir
-                                    .join(format!("questline_backup_prerestore_{}.db", ts));
-                                let _ = std::fs::copy(&db_path, &backup_path);
-
-                                let new_identity = crate::services::identity::Identity {
-                                    user_uuid,
-                                    public_key: public_hex,
-                                    secret_key: secret_hex,
-                                    created_at: self.identity.created_at.clone(),
-                                };
-                                let key_path = storage_dir.join("identity.key");
-                                if let Ok(json_str) = serde_json::to_string_pretty(&new_identity) {
-                                    let _ = std::fs::write(&key_path, json_str);
-                                }
-                                self.identity = new_identity;
-                                if self.config.sync_enabled {
-                                    self.sync_status_msg =
-                                        "Restoring encrypted chronicle...".to_string();
-                                    crate::services::sync_engine::SyncEngine::new(
-                                        &self.db,
-                                        &self.identity,
-                                        &self.device_id,
-                                        Some(&self.server_url),
-                                    )?
-                                    .sync()?;
-                                    self.pause_auto_sync(
-                                        "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
-                                    );
-                                    if let Ok(Some(u)) = self.db.get_user() {
-                                        self.identity.user_uuid = u.id;
-                                        if let Ok(json_str) =
-                                            serde_json::to_string_pretty(&self.identity)
-                                        {
-                                            let _ = std::fs::write(&key_path, json_str);
-                                        }
-                                    }
-                                }
-                                let _ = self.db.set_setting("conflict_count", "0");
-                                self.modal_state = ModalType::None;
-                                self.sync_status_msg = "Identity restored.".to_string();
-                                self.notifications.push(Notification::info(
-                                    "Identity Restored from Transfer Code!".to_string(),
-                                ));
-                                self.reload_data()?;
-                            }
-                            Ok(_) => {
-                                self.sync_status_msg =
-                                    "Invalid transfer code: wrong key length".to_string();
-                            }
-                            Err(_) => {
-                                self.sync_status_msg =
-                                    "Invalid transfer code: not valid base64".to_string();
-                            }
-                        }
+                        self.start_profile_restore(&val)?;
                     }
                     _ => {}
                 }
@@ -9053,7 +8996,7 @@ impl App {
                                                 &self.device_id,
                                                 Some(&self.server_url),
                                             )?
-                                            .replace_with_pending_snapshot()?;
+                                            .push_pending_only()?;
                                             self.notifications.push(Notification::info(format!(
                                                 "Invitation sent to {}!",
                                                 name_str
@@ -10030,113 +9973,7 @@ impl App {
                 self.restore_error = None;
             }
             KeyCode::Enter => {
-                use base64::{Engine as _, engine::general_purpose::STANDARD};
-                let trimmed = self.restore_input.trim().to_string();
-                match STANDARD.decode(&trimmed) {
-                    Ok(decoded_bytes) if decoded_bytes.len() == 48 || decoded_bytes.len() == 32 => {
-                        use ed25519_dalek::{SigningKey, VerifyingKey};
-
-                        let (user_uuid, secret_arr) = if decoded_bytes.len() == 48 {
-                            let mut uuid_bytes = [0u8; 16];
-                            uuid_bytes.copy_from_slice(&decoded_bytes[0..16]);
-                            let user_uuid = Uuid::from_bytes(uuid_bytes);
-                            let mut secret_bytes = [0u8; 32];
-                            secret_bytes.copy_from_slice(&decoded_bytes[16..48]);
-                            (user_uuid, secret_bytes)
-                        } else {
-                            let mut secret_bytes = [0u8; 32];
-                            secret_bytes.copy_from_slice(&decoded_bytes[0..32]);
-                            (self.identity.user_uuid, secret_bytes)
-                        };
-
-                        let signing_key = SigningKey::from_bytes(&secret_arr);
-                        let verifying_key: VerifyingKey = signing_key.verifying_key();
-                        let secret_hex: String =
-                            secret_arr.iter().map(|b| format!("{:02x}", b)).collect();
-                        let public_hex: String = verifying_key
-                            .to_bytes()
-                            .iter()
-                            .map(|b| format!("{:02x}", b))
-                            .collect();
-
-                        let storage_dir = crate::storage::get_storage_dir()?;
-                        let db_path = storage_dir.join("questline.db");
-                        let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
-                        let backup_path =
-                            storage_dir.join(format!("questline_backup_prerestore_{}.db", ts));
-                        let _ = std::fs::copy(&db_path, &backup_path);
-
-                        let new_identity = crate::services::identity::Identity {
-                            user_uuid,
-                            public_key: public_hex,
-                            secret_key: secret_hex,
-                            created_at: self.identity.created_at.clone(),
-                        };
-                        let key_path = storage_dir.join("identity.key");
-                        if let Ok(json_str) = serde_json::to_string_pretty(&new_identity) {
-                            let _ = std::fs::write(&key_path, json_str);
-                        }
-                        self.identity = new_identity;
-
-                        let mut restored_from_cloud = false;
-                        if self.config.sync_enabled {
-                            let encrypted_restore = crate::services::sync_engine::SyncEngine::new(
-                                &self.db,
-                                &self.identity,
-                                &self.device_id,
-                                Some(&self.server_url),
-                            )
-                            .and_then(|engine| engine.sync());
-                            match encrypted_restore {
-                                Ok((_pushed, pulled, _conflicts)) => {
-                                    restored_from_cloud = pulled > 0;
-                                }
-                                Err(error) => {
-                                    self.restore_error =
-                                        Some(format!("Encrypted restore failed: {}", error));
-                                    return Ok(());
-                                }
-                            }
-                            if restored_from_cloud {
-                                self.pause_auto_sync(
-                                    "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
-                                );
-                                if let Ok(Some(u)) = self.db.get_user() {
-                                    self.identity.user_uuid = u.id;
-                                    if let Ok(json_str) =
-                                        serde_json::to_string_pretty(&self.identity)
-                                    {
-                                        let _ = std::fs::write(&key_path, json_str);
-                                    }
-                                }
-                            }
-                        }
-
-                        let _ = self.db.set_setting("conflict_count", "0");
-                        self.reload_data()?;
-                        let message = if restored_from_cloud {
-                            "Welcome back! Your chronicle has been restored from encrypted sync."
-                        } else {
-                            "Identity restored, but no encrypted sync data was restored."
-                        };
-                        self.notifications
-                            .push(Notification::info(message.to_string()));
-                        self.active_screen = ActiveScreen::Dashboard;
-                        self.active_tab_idx = 0;
-                    }
-                    Ok(_) => {
-                        self.restore_error = Some(
-                            "Invalid code — wrong key length. Did you type it by hand? Bold move."
-                                .to_string(),
-                        );
-                    }
-                    Err(_) => {
-                        self.restore_error = Some(
-                            "That is not valid base64. The Encoding Grimoire weeps for you."
-                                .to_string(),
-                        );
-                    }
-                }
+                self.start_profile_restore(&self.restore_input.clone())?;
             }
             _ => {}
         }
@@ -10383,107 +10220,8 @@ impl App {
     }
 
     pub fn trigger_sync(&mut self) -> Result<()> {
-        self.sync_status_msg = "S󰓦".to_string();
-
-        let server_url_opt = if self.config.sync_enabled {
-            Some(self.server_url.as_str())
-        } else {
-            None
-        };
-
-        let sync_engine = match crate::services::sync_engine::SyncEngine::new(
-            &self.db,
-            &self.identity,
-            &self.device_id,
-            server_url_opt,
-        ) {
-            Ok(se) => se,
-            Err(e) => {
-                self.sync_status_msg = format!("Sync init failed: {}", e);
-                return Err(e);
-            }
-        };
-
-        match sync_engine.sync() {
-            Ok((pushed, pulled, conflicts)) => {
-                let now_str = chrono::Utc::now().to_rfc3339();
-                let _ = self.db.set_setting("last_sync", &now_str);
-
-                if self.config.sync_enabled {
-                    let client = crate::services::api_client::ApiClient::new(
-                        &self.server_url,
-                        self.identity.clone(),
-                        &self.device_id,
-                    );
-
-                    if let Ok(resp_str) = client.send_request("GET", "pending", "") {
-                        if let Ok(server_invites) =
-                            serde_json::from_str::<serde_json::Value>(&resp_str)
-                        {
-                            if let Some(arr) = server_invites.as_array() {
-                                for inv_val in arr {
-                                    if let Err(error) = Self::store_validated_server_invitation(
-                                        &self.db,
-                                        &self.identity,
-                                        inv_val,
-                                    ) {
-                                        self.notifications.push(Notification::warning(format!(
-                                            "Ignored an invalid Fellowship invitation: {error}"
-                                        )));
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // Fellowship messages are sync-v2 project events. Never fetch their
-                    // plaintext through the legacy Chronicle endpoint.
-                    let _ = self.refresh_companions(&client);
-                    self.submit_chapter_contribution(&client);
-                    self.refresh_chapter_progress_sync(&client);
-                }
-                // Local-only mode (sync_enabled == false) has nothing to
-                // contact and used to fall back to simulate_fellowship_sync()
-                // here — a demo fixture that wrote fake companions ("Alex",
-                // "Fiona", "Diana"), a fake invitation, and fake chronicle
-                // messages straight into the real database on every manual
-                // sync trigger (Ctrl+Y / the command palette's "sync"
-                // action). Removed: local-only mode simply has nothing to do
-                // once sync_engine.sync()'s local bookkeeping above is done.
-
-                let sync_count = self
-                    .db
-                    .get_setting("sync_count")?
-                    .and_then(|s| s.parse::<i32>().ok())
-                    .unwrap_or(0);
-                self.db
-                    .set_setting("sync_count", &(sync_count + 1).to_string())?;
-
-                if !conflicts.is_empty() {
-                    let conflict_count = self
-                        .db
-                        .get_setting("conflict_count")?
-                        .and_then(|s| s.parse::<i32>().ok())
-                        .unwrap_or(0);
-                    self.db.set_setting(
-                        "conflict_count",
-                        &(conflict_count + conflicts.len() as i32).to_string(),
-                    )?;
-                    self.sync_conflicts = conflicts;
-                }
-
-                self.last_sync_warlock_xp = 0;
-                self.sync_status_msg = format!("↑{}↓{}", pushed, pulled);
-                self.last_sync_status_time = Some(std::time::Instant::now());
-                self.apply_class_passive("sync_complete", 0)?;
-            }
-            Err(e) => {
-                self.sync_status_msg = format!("Sync failed: {}", e);
-                self.last_sync_status_time = Some(std::time::Instant::now());
-            }
-        }
-
-        self.reload_data()?;
+        if self.config.sync_enabled { self.manual_sync_reward_pending = true; self.do_background_sync(false); }
+        else { self.sync_status_msg = "Cloud Sync disabled — local data only".to_string(); }
         Ok(())
     }
 
@@ -11147,6 +10885,10 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.active_screen == ActiveScreen::Portals && self.modal_state == ModalType::None && self.portal_state.editor.is_some() {
+            self.portal_state.paste(text);
+            return;
+        }
         // Bracketed paste arrives as Event::Paste rather than a stream of Char events.
         // Transfer Codes are Base64, so terminal-added newlines/spaces are never meaningful.
         let transfer_code_text: String = text.chars().filter(|c| !c.is_whitespace()).collect();
@@ -12251,6 +11993,13 @@ impl App {
                     return Ok(());
                 }
                 KeyCode::Char('b') => {
+                    if self.sync_in_progress || self.profile_operation_in_progress {
+                        self.sync_status_msg = "Wait for the current sync or profile transfer to finish.".to_string();
+                        return Ok(());
+                    }
+                    if self.editor_state.as_ref().is_some_and(|editor| editor.has_unsaved_changes()) {
+                        self.save_editor_note(false, true)?;
+                    }
                     if self.config.sync_enabled {
                         self.sync_status_msg = "Creating Backup...".to_string();
                         self.modal_state = ModalType::CloudBackupProgress {
@@ -12261,30 +12010,15 @@ impl App {
                         let server_url = self.server_url.clone();
                         let identity = self.identity.clone();
                         let device_id = self.device_id.clone();
+                        let db_path = self.db.path()?;
+                        self.profile_operation_in_progress = true;
                         std::thread::spawn(move || {
                             let outcome: Result<String, String> = (|| {
-                                let storage_dir = crate::storage::get_storage_dir()
-                                    .map_err(|e| format!("Storage error: {}", e))?;
-                                let db_path = storage_dir.join("questline.db");
                                 let db = crate::database::Database::new(&db_path)
                                     .map_err(|e| format!("Database error: {}", e))?;
-                                let sync_result = db.queue_full_state_sync().and_then(|_| {
-                                    crate::services::sync_engine::SyncEngine::new(
-                                        &db,
-                                        &identity,
-                                        &device_id,
-                                        Some(&server_url),
-                                    )?
-                                    .replace_with_pending_snapshot()
-                                    .map(|_| ())
-                                });
-                                match sync_result {
-                                    Ok(()) => Ok("Cloud Backup Successful!".to_string()),
-                                    Err(error) => Ok(format!(
-                                        "Cloud Backup Successful! Sync snapshot warning: {}",
-                                        error
-                                    )),
-                                }
+                                crate::services::profile_backup::upload(&db, &identity, &device_id, &server_url)
+                                    .map_err(|error| format!("Cloud backup failed: {error}"))?;
+                                Ok("Encrypted cloud backup saved.".to_string())
                             })();
                             if let Ok(mut slot) = result_slot.lock() {
                                 *slot = Some(outcome);
@@ -12304,54 +12038,20 @@ impl App {
                         self.start_cloud_sync_reset();
                         return Ok(());
                     }
-                    if self.config.sync_enabled {
-                        // Show progress modal immediately and run the restore in the background
-                        self.modal_state = ModalType::CloudRestoreProgress {
-                            step: 0,
-                            message: "Contacting the Æther...".to_string(),
-                        };
-                        let result_slot = std::sync::Arc::clone(&self.cloud_restore_result);
-                        let server_url = self.server_url.clone();
-                        let identity = self.identity.clone();
-                        let device_id = self.device_id.clone();
-                        std::thread::spawn(move || {
-                            let outcome: Result<String, String> = (|| {
-                                let storage_dir = crate::storage::get_storage_dir()
-                                    .map_err(|e| format!("Storage error: {}", e))?;
-                                let db = crate::database::Database::new(
-                                    &storage_dir.join("questline.db"),
-                                )
-                                .map_err(|e| format!("Database error: {}", e))?;
-                                db.set_setting("last_pull_seq_v2", "0")
-                                    .map_err(|e| format!("Cursor reset failed: {}", e))?;
-                                let _ = db.conn.execute("DELETE FROM processed_remote_events", []);
-                                let (_pushed, pulled, _conflicts) =
-                                    crate::services::sync_engine::SyncEngine::new(
-                                        &db,
-                                        &identity,
-                                        &device_id,
-                                        Some(&server_url),
-                                    )
-                                    .and_then(|engine| engine.sync())
-                                    .map_err(|e| format!("Encrypted restore failed: {}", e))?;
-                                if pulled == 0 {
-                                    return Err("No encrypted snapshot was found".to_string());
-                                }
-                                Ok(format!("{} encrypted events restored", pulled))
-                            })();
-                            if let Ok(mut slot) = result_slot.lock() {
-                                *slot = Some(outcome);
-                            }
-                        });
-                    } else {
-                        self.sync_status_msg = "Restore requires Cloud Sync enabled".to_string();
-                    }
+                    self.start_profile_restore_identity(self.identity.clone())?;
                     return Ok(());
                 }
                 KeyCode::Char('e') => {
+                    if self.sync_in_progress || self.profile_operation_in_progress {
+                        self.sync_status_msg = "Wait for the current sync or profile transfer to finish.".to_string();
+                        return Ok(());
+                    }
+                    if self.editor_state.as_ref().is_some_and(|editor| editor.has_unsaved_changes()) {
+                        self.save_editor_note(false, true)?;
+                    }
                     use base64::{Engine as _, engine::general_purpose::STANDARD};
                     let storage_dir = crate::storage::get_storage_dir()?;
-                    let db_path = storage_dir.join("questline.db");
+                    let db_path = self.db.path()?;
                     let ts = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
                     let backup_path = storage_dir.join(format!("questline_backup_{}.db", ts));
 
@@ -12371,7 +12071,7 @@ impl App {
                     let transfer_code = STANDARD.encode(&transfer_bytes);
 
                     // Copia local primero (rápida), luego abre el modal de inmediato
-                    match std::fs::copy(&db_path, &backup_path) {
+                    match self.db.backup_to(&backup_path) {
                         Ok(_) => {
                             let (backup_in_progress, backup_message) = if self.config.sync_enabled {
                                 // El upload a nube corre en hilo aparte — el modal se abre sin esperar
@@ -12380,32 +12080,14 @@ impl App {
                                 let identity = self.identity.clone();
                                 let device_id = self.device_id.clone();
                                 let backup_display = backup_path.display().to_string();
+                                self.profile_operation_in_progress = true;
                                 std::thread::spawn(move || {
                                     let outcome: Result<String, String> = (|| {
-                                        let storage_dir = crate::storage::get_storage_dir()
-                                            .map_err(|e| format!("Storage error: {}", e))?;
-                                        let db_path = storage_dir.join("questline.db");
                                         let db = crate::database::Database::new(&db_path)
                                             .map_err(|e| format!("Database error: {}", e))?;
-                                        let sync_result =
-                                            db.queue_full_state_sync().and_then(|_| {
-                                                crate::services::sync_engine::SyncEngine::new(
-                                                    &db,
-                                                    &identity,
-                                                    &device_id,
-                                                    Some(&server_url),
-                                                )?
-                                                .replace_with_pending_snapshot()
-                                                .map(|_| ())
-                                            });
-                                        let warning = sync_result
-                                            .err()
-                                            .map(|e| format!(" Sync snapshot warning: {}", e))
-                                            .unwrap_or_default();
-                                        Ok(format!(
-                                            "Profile exported & cloud backup saved! Local: {}{}",
-                                            backup_display, warning
-                                        ))
+                                        crate::services::profile_backup::upload(&db, &identity, &device_id, &server_url)
+                                            .map_err(|error| format!("Local export saved at {backup_display}. Cloud backup failed: {error}"))?;
+                                        Ok(format!("Local export: {backup_display}. Encrypted cloud backup saved."))
                                     })(
                                     );
                                     if let Ok(mut slot) = result_slot.lock() {
@@ -12494,7 +12176,12 @@ impl App {
         }
 
         match nav_code {
-            // Los atajos 1-9 solo aplican fuera del Workspace — ahí el 1-4 son sub-tabs.
+            // Los atajos 1-9 y 0 solo aplican fuera del Workspace — ahí el 1-4 son sub-tabs.
+            KeyCode::Char('0') if self.active_screen != ActiveScreen::Workspace => {
+                self.active_screen=ActiveScreen::Portals;
+                self.active_tab_idx=16;
+                self.portal_state.refresh(&self.db,true)?;
+            }
             KeyCode::Char('1') if self.active_screen != ActiveScreen::Workspace => {
                 self.active_screen = ActiveScreen::Dashboard;
                 self.active_tab_idx = 0;
@@ -13484,6 +13171,7 @@ impl App {
             ActiveScreen::Workspace => 3,
             ActiveScreen::Character
             | ActiveScreen::Library
+            | ActiveScreen::Portals
             | ActiveScreen::Legends
             | ActiveScreen::Archive
             | ActiveScreen::Focus => 4,
@@ -22368,6 +22056,18 @@ impl App {
     }
 
     pub fn tick_auto_sync(&mut self) -> Result<()> {
+        if self.last_sync_settings_check.is_none_or(|time|time.elapsed()>=std::time::Duration::from_secs(1)) {
+            self.last_sync_settings_check=Some(std::time::Instant::now());
+            self.config.sync_enabled=crate::background_sync::cloud_enabled(&self.db,&self.config)?;
+            self.auto_sync=self.db.get_setting("auto_sync")?.map(|v|v=="true").unwrap_or(self.config.auto_sync);
+        }
+        if self.profile_operation_in_progress { return Ok(()); }
+        if self.quitting_after_sync && !self.sync_in_progress {
+            self.quitting_after_sync = false;
+            self.begin_graceful_quit();
+            return Ok(());
+        }
+
         // Apply result from completed background sync
         if self.sync_in_progress {
             if let ModalType::SyncProgress {
@@ -22386,6 +22086,7 @@ impl App {
                 let _ = self.db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
                 match bg.error {
                     Some(e) => {
+                        self.manual_sync_reward_pending = false;
                         self.sync_failure_count = self.sync_failure_count.saturating_add(1);
                         self.sync_status_msg = format!("Sync failed: {}", e);
                         if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
@@ -22427,6 +22128,14 @@ impl App {
                         } else {
                             format!("↑{}↓{} · {} handled", bg.pushed, bg.pulled, self.sync_conflicts.len())
                         };
+                        let queued = self.db.pending_sync_count()?;
+                        let waiting: i64 = self.db.conn.query_row("SELECT COUNT(*) FROM sync_deferred_events", [], |r| r.get(0))?;
+                        if queued > 0 || waiting > 0 {
+                            self.sync_status_msg.push_str(&format!(" · {queued} queued, {waiting} waiting"));
+                            if queued > 0 && bg.pushed > 1 {
+                                self.last_mutation = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+                            }
+                        }
                         if matches!(self.modal_state, ModalType::SyncProgress { .. }) {
                             self.modal_state = ModalType::SyncProgress {
                                 step: 2,
@@ -22434,10 +22143,11 @@ impl App {
                             };
                         }
                         self.last_sync_status_time = Some(std::time::Instant::now());
-                        if !self.quitting_after_sync {
+                        let reward_manual_sync = std::mem::take(&mut self.manual_sync_reward_pending);
+                        if reward_manual_sync && !self.quitting_after_sync {
                             self.apply_class_passive("sync_complete", 0)?;
                         }
-                        if !self.quitting_after_sync {
+                        if !self.quitting_after_sync && (bg.pushed > 1 || bg.pulled > 0 || !self.sync_conflicts.is_empty()) {
                             self.reload_data()?;
                             self.last_task_notification_tick = None;
                             self.load_chapter_progress_from_cache();
@@ -22445,11 +22155,22 @@ impl App {
                         }
                         if self.quitting_after_sync {
                             let needs_final_pass = self.quit_needs_final_sync
-                                && (self.final_sync_needs_full_state() || !self.db.get_pending_sync_logs()?.is_empty());
+                                && (self.final_sync_needs_full_state() || self.db.pending_sync_count()? > 0);
                             self.quit_needs_final_sync = false;
                             if needs_final_pass {
                                 self.sync_status_msg = "Running final cloud sync before exit…".to_string();
                                 self.do_background_sync(self.final_sync_needs_full_state());
+                                return Ok(());
+                            }
+                            let pending = self.db.pending_sync_count()?;
+                            let lag = self.db.get_setting("last_sync_lag")?.and_then(|v| v.parse::<i64>().ok()).unwrap_or(0);
+                            let deferred: i64 = self.db.conn.query_row("SELECT COUNT(*) FROM sync_deferred_events", [], |r| r.get(0))?;
+                            if pending > 0 || lag > 0 || deferred > 0 {
+                                self.quitting_after_sync = false;
+                                self.run_installer_on_exit = false;
+                                self.modal_state = ModalType::None;
+                                self.sync_status_msg = format!("Exit paused: {pending} local change(s) queued; {lag} remote event(s) pending; {deferred} deferred.");
+                                self.notifications.push(Notification::warning(self.sync_status_msg.clone()));
                                 return Ok(());
                             }
                             match self.db.flush_for_shutdown() {
@@ -22489,7 +22210,7 @@ impl App {
             return Ok(());
         }
 
-        let debounce = std::time::Duration::from_secs(2);
+        let debounce = std::time::Duration::from_millis(500);
         let is_shared_workspace = self.active_screen == ActiveScreen::Workspace
             && self
                 .active_project_id
@@ -22499,8 +22220,9 @@ impl App {
         let interval = if is_shared_workspace {
             std::time::Duration::from_secs(8)
         } else {
-            std::time::Duration::from_secs(30)
+            std::time::Duration::from_secs(5)
         };
+        let interval = interval.saturating_mul(1u32 << self.sync_failure_count.min(6));
         let mutation_ready = self
             .last_mutation
             .map(|t| t.elapsed() >= debounce)
@@ -22552,6 +22274,7 @@ impl App {
             return;
         };
         if let Some(result) = outcome {
+            self.profile_operation_in_progress = false;
             let msg = match result {
                 Ok(m) => m,
                 Err(m) => m,
@@ -22571,25 +22294,6 @@ impl App {
 
     /// Revisa si el backup manual terminó y actualiza el modal de progreso.
     pub fn tick_cloud_backup(&mut self) {
-        let is_active = matches!(
-            &self.modal_state,
-            ModalType::CloudBackupProgress { step: 0 | 1, .. }
-        );
-        if !is_active {
-            return;
-        }
-
-        if let ModalType::CloudBackupProgress {
-            ref mut step,
-            ref mut message,
-        } = self.modal_state
-        {
-            if *step == 0 && self.intro_ticks % 12 == 0 {
-                *step = 1;
-                *message = "Uploading backup to cloud...".to_string();
-            }
-        }
-
         let outcome = if let Ok(mut slot) = self.cloud_backup_result.lock() {
             slot.take()
         } else {
@@ -22599,6 +22303,7 @@ impl App {
             return;
         };
 
+        self.profile_operation_in_progress = false;
         match result {
             Ok(msg) => {
                 self.sync_status_msg = msg.clone();
@@ -22837,49 +22542,73 @@ impl App {
 
     /// Polls the cloud restore background thread and advances the progress modal through steps.
     pub fn tick_cloud_restore(&mut self) -> Result<()> {
-        // Only drive this if the progress modal is showing in downloading state
-        let is_downloading = matches!(
-            &self.modal_state,
-            ModalType::CloudRestoreProgress { step: 0, .. }
-        );
-        if !is_downloading {
-            return Ok(());
-        }
-        let outcome = if let Ok(mut slot) = self.cloud_restore_result.lock() {
-            slot.take()
-        } else {
-            return Ok(());
-        };
-        let Some(result) = outcome else {
-            return Ok(());
-        };
-
-        match result {
-            Err(msg) => {
-                self.modal_state = ModalType::CloudRestoreProgress {
-                    step: 3,
-                    message: msg,
-                };
+        let result = self.profile_transfer_result.lock().ok().and_then(|mut slot| slot.take());
+        let Some(result) = result else { return Ok(()); };
+        self.profile_operation_in_progress = false;
+        let outcome = result.and_then(|prepared| {
+            crate::services::profile_transfer::activate(&mut self.db, &prepared)
+                .map_err(|e| format!("Profile activation failed: {e}"))?;
+            self.identity = prepared.identity.clone();
+            // The identity in SQLite is authoritative after activation.
+            if let Err(error) = self.identity.save_compatibility_copy(&crate::storage::get_storage_dir().map_err(|e| e.to_string())?) {
+                self.notifications.push(Notification::warning(format!("Profile restored; identity file copy needs retry: {error}")));
             }
-            Ok(message) => {
-                self.modal_state = ModalType::CloudRestoreProgress {
-                    step: 1,
-                    message: "Loading decrypted chronicle data...".to_string(),
-                };
-                let _ = self.db.set_setting("conflict_count", "0");
-                self.pause_auto_sync(
-                    "Encrypted restore complete. Auto Sync disabled; toggle [a] when ready.",
-                );
+            Ok(())
+        });
+        match outcome {
+            Err(message) => {
+                self.restore_error = Some(message.clone());
+                self.sync_status_msg = message.clone();
+                self.modal_state = ModalType::CloudRestoreProgress { step: 3, message };
+            }
+            Ok(()) => {
+                self.auto_sync = false;
                 self.reload_data()?;
-                self.notifications.push(Notification::info(
-                    "Chronicle restored from encrypted sync!".to_string(),
-                ));
-                self.modal_state = ModalType::CloudRestoreProgress {
-                    step: 2,
-                    message: format!("{}. Automatic sync remains paused.", message),
-                };
+                self.active_screen = ActiveScreen::Dashboard;
+                self.active_tab_idx = 0;
+                self.restore_error = None;
+                self.sync_status_msg = "Profile restored. Automatic sync is paused.".to_string();
+                self.modal_state = ModalType::CloudRestoreProgress { step: 2, message: self.sync_status_msg.clone() };
             }
         }
+        Ok(())
+    }
+
+    fn start_profile_restore(&mut self, code: &str) -> Result<()> {
+        match crate::services::profile_transfer::decode_transfer_code(code, self.identity.user_uuid) {
+            Ok(identity) => self.start_profile_restore_identity(identity),
+            Err(error) => {
+                self.restore_error = Some(error.to_string());
+                self.sync_status_msg = error.to_string();
+                Ok(())
+            }
+        }
+    }
+
+    fn start_profile_restore_identity(&mut self, identity: crate::services::Identity) -> Result<()> {
+        if self.sync_in_progress || self.profile_operation_in_progress {
+            self.sync_status_msg = "Wait for the current sync or profile transfer to finish.".to_string();
+            return Ok(());
+        }
+        if !self.config.sync_enabled {
+            self.sync_status_msg = "Enable Cloud Sync before restoring a transfer code.".to_string();
+            self.restore_error = Some(self.sync_status_msg.clone());
+            return Ok(());
+        }
+        if self.editor_state.as_ref().is_some_and(|editor| editor.has_unsaved_changes()) {
+            self.save_editor_note(false, true)?;
+        }
+        let path = self.db.path()?;
+        let server = self.server_url.clone();
+        let device = self.device_id.clone();
+        let slot = std::sync::Arc::clone(&self.profile_transfer_result);
+        self.profile_operation_in_progress = true;
+        self.modal_state = ModalType::CloudRestoreProgress { step: 0, message: "Downloading and validating profile…".to_string() };
+        std::thread::spawn(move || {
+            let outcome = crate::services::profile_transfer::prepare_cloud(&path, identity, &device, &server)
+                .map_err(|e| format!("Profile restore failed: {e}"));
+            if let Ok(mut slot) = slot.lock() { *slot = Some(outcome); }
+        });
         Ok(())
     }
 
@@ -23075,6 +22804,11 @@ impl App {
         if self.quitting_after_sync {
             return;
         }
+        if self.profile_operation_in_progress {
+            self.quitting_after_sync = true;
+            self.sync_status_msg = "Finishing profile transfer before exit…".to_string();
+            return;
+        }
         let editor_is_dirty = self
             .editor_state
             .as_ref()
@@ -23125,7 +22859,7 @@ impl App {
         if sync_on_quit {
             self.should_quit = false;
             self.quitting_after_sync = true;
-            self.quit_needs_final_sync = false;
+            self.quit_needs_final_sync = true;
             self.sync_status_msg = "Saving locally and syncing before exit…".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             if !matches!(self.modal_state, ModalType::QuitConfirm { .. }) {
@@ -23277,7 +23011,7 @@ impl App {
     }
 
     fn start_cloud_sync_reset(&mut self) {
-        if self.sync_in_progress {
+        if self.sync_in_progress || self.profile_operation_in_progress {
             self.sync_status_msg = "S󰓦".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             return;
@@ -23300,10 +23034,10 @@ impl App {
         let device_id = self.device_id.clone();
         let server_url = self.server_url.clone();
 
+        let db_path = self.db.path().ok();
         let _ = std::thread::spawn(move || {
             let outcome: Result<(usize, usize, Vec<String>)> = (|| {
-                let storage_dir = crate::storage::get_storage_dir()?;
-                let db_path = storage_dir.join("questline.db");
+                let db_path = db_path.ok_or_else(|| anyhow::anyhow!("Could not resolve active profile"))?;
                 let db = crate::database::Database::new(&db_path)?;
                 let _ = db.conn.execute_batch("PRAGMA busy_timeout = 5000;");
 
@@ -23358,7 +23092,7 @@ impl App {
     }
 
     fn start_forced_sync(&mut self) {
-        if self.sync_in_progress {
+        if self.sync_in_progress || self.profile_operation_in_progress {
             self.sync_status_msg = "S󰓦".to_string();
             self.last_sync_status_time = Some(std::time::Instant::now());
             return;
@@ -23371,20 +23105,21 @@ impl App {
         self.sync_status_msg = "S󰓦".to_string();
         self.modal_state = ModalType::SyncProgress {
             step: 0,
-            message: "Preparing full synchronization...".to_string(),
+            message: "Synchronizing pending changes...".to_string(),
         };
-        self.do_background_sync(true);
+        self.manual_sync_reward_pending = true;
+        self.do_background_sync(false);
     }
 
     fn do_background_sync(&mut self, include_contributions: bool) {
-        if self.sync_in_progress {
+        if self.sync_in_progress || self.profile_operation_in_progress {
             return;
         }
         self.sync_in_progress = true;
         self.sync_status_msg = "S󰓦".to_string();
-        let _ = self.db.conn.execute_batch("PRAGMA busy_timeout = 50;");
 
         let quitting = self.quitting_after_sync;
+        let submit_contributions = self.manual_sync_reward_pending;
         let result_slot = std::sync::Arc::clone(&self.sync_result);
         let identity = self.identity.clone();
         let device_id = self.device_id.clone();
@@ -23430,6 +23165,15 @@ impl App {
                 }
 
                 if !quitting {
+                    let optional_path = db_path.clone();
+                    let optional_identity = identity.clone();
+                    let optional_server = server_url.clone();
+                    let optional_device = device_id.clone();
+                    std::thread::spawn(move || {
+                    let Ok(db) = crate::database::Database::new(&optional_path) else { return; };
+                    let identity = optional_identity;
+                    let server_url = optional_server;
+                    let device_id = optional_device;
                     let client = crate::services::api_client::ApiClient::new(
                         &server_url,
                         identity.clone(),
@@ -23438,6 +23182,11 @@ impl App {
 
                     // Pull pending invitations
                     if let Ok(resp) = client.send_request("GET", "pending", "") {
+                        let Ok(_guard) = db.lock_sync() else { return; };
+                        let matches = db.get_setting("_profile_identity").ok().flatten()
+                            .and_then(|json| serde_json::from_str::<crate::services::Identity>(&json).ok())
+                            .is_none_or(|active| active.public_key == identity.public_key);
+                        if !matches { return; }
                         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                             if let Some(list) = arr.as_array() {
                                 for inv in list {
@@ -23468,6 +23217,11 @@ impl App {
 
                     // Refresh companion presence
                     if let Ok(resp) = client.send_request("GET", "project/companions", "") {
+                        let Ok(_guard) = db.lock_sync() else { return; };
+                        let matches = db.get_setting("_profile_identity").ok().flatten()
+                            .and_then(|json| serde_json::from_str::<crate::services::Identity>(&json).ok())
+                            .is_none_or(|active| active.public_key == identity.public_key);
+                        if !matches { return; }
                         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                             if let Some(companions) = arr.as_array() {
                                 for comp in companions {
@@ -23499,6 +23253,11 @@ impl App {
 
                     // Pull Realm Activity (global chronicle) entries from server into local DB
                     if let Ok(resp) = client.send_request("GET", "global_chronicle", "") {
+                        let Ok(_guard) = db.lock_sync() else { return; };
+                        let matches = db.get_setting("_profile_identity").ok().flatten()
+                            .and_then(|json| serde_json::from_str::<crate::services::Identity>(&json).ok())
+                            .is_none_or(|active| active.public_key == identity.public_key);
+                        if !matches { return; }
                         if let Ok(arr) = serde_json::from_str::<serde_json::Value>(&resp) {
                             if let Some(entries) = arr.as_array() {
                                 let _ = db.cleanup_global_chronicle_entries(1);
@@ -23527,7 +23286,7 @@ impl App {
                     }
 
                     // Submit chapter contribution increments (only on forced/manual sync)
-                    if include_contributions {
+                    if submit_contributions {
                         if let Some(chapter) = crate::models::chapter::get_active_chapter() {
                             // Only count tasks owned by this user — prevents shared-project
                             // pulls (other users' completed tasks) from inflating the delta.
@@ -23584,6 +23343,7 @@ impl App {
                         }
                     }
 
+                    });
                 }
 
                 // Update sync and conflict counters
@@ -25511,6 +25271,7 @@ impl App {
     /// meant as literal text; `tick_hydration` below uses the same check so
     /// the reminder can't pop up (and then swallow keystrokes) mid-typing.
     fn is_in_text_entry(&self) -> bool {
+        if self.active_screen == ActiveScreen::Portals && self.portal_state.editor.is_some() { return true; }
         self.searching
             || self.atlas_input.is_some()
             || self.modal_state != ModalType::None
@@ -28388,20 +28149,20 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Settings);
         assert_eq!(app.active_tab_idx, 15);
 
-        // Key '0' -> should NOT switch screens
+        // El cero abre la colección de vínculos sincronizados.
         app.handle_key_event(KeyEvent::new(KeyCode::Char('0'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Settings);
+        assert_eq!(app.active_screen, ActiveScreen::Portals);
 
         // Key 'Y' -> should NOT switch screens
         app.handle_key_event(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Settings);
+        assert_eq!(app.active_screen, ActiveScreen::Portals);
 
-        // Key 'S' -> should NOT switch screens globally anymore (stays on Settings)
+        // Key 'S' -> should NOT switch screens globally anymore (stays on Portals)
         app.handle_key_event(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::empty()))
             .unwrap();
-        assert_eq!(app.active_screen, ActiveScreen::Settings);
+        assert_eq!(app.active_screen, ActiveScreen::Portals);
 
         // Switch to SyncSettings using key '8' for the next test ('6' now opens Fellowship)
         app.handle_key_event(KeyEvent::new(KeyCode::Char('8'), KeyModifiers::empty()))
@@ -28743,10 +28504,10 @@ mod app_tests {
         assert_eq!(app.active_screen, ActiveScreen::Dashboard);
 
         // Extremo derecho: tampoco vuelve a Dashboard.
-        app.active_screen = ActiveScreen::Settings;
+        app.active_screen = ActiveScreen::Portals;
         app.pane_swipe = None;
         full_swipe(&mut app, MouseEventKind::ScrollRight);
-        assert_eq!(app.active_screen, ActiveScreen::Settings);
+        assert_eq!(app.active_screen, ActiveScreen::Portals);
 
         // Workspace queda fuera a propósito: ahí 1-4 son sub-tabs, igual que con el teclado.
         app.active_screen = ActiveScreen::Workspace;
@@ -31004,6 +30765,37 @@ mod app_tests {
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn final_sync_cannot_claim_success_with_undelivered_local_changes() {
+        let path = std::env::temp_dir().join(format!("questline-quit-pending-{}.db",Uuid::new_v4()));
+        let mut app = App::new(&path).unwrap();
+        app.config.sync_enabled = true;
+        app.sync_in_progress = true;
+        app.quitting_after_sync = true;
+        app.quit_needs_final_sync = false;
+        app.db.unlock_trait("still-queued").unwrap();
+        *app.sync_result.lock().unwrap() = Some(BackgroundSyncResult { pushed:0,pulled:0,conflicts:vec![],error:None });
+        app.tick_auto_sync().unwrap();
+        assert!(!app.should_quit);
+        assert!(!app.quit_completed_sync);
+        assert!(app.sync_status_msg.contains("queued"));
+        drop(app); let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_local_exit_keeps_pending_changes_and_does_not_claim_cloud_success() {
+        let path = std::env::temp_dir().join(format!("questline-quit-local-{}.db",Uuid::new_v4()));
+        let mut app = App::new(&path).unwrap();
+        app.config.sync_enabled = true;
+        app.db.unlock_trait("offline-change").unwrap();
+        app.modal_state = ModalType::QuitConfirm { quote:"Saved locally".into() };
+        app.handle_key_event(KeyEvent::new(KeyCode::Char('l'),KeyModifiers::empty())).unwrap();
+        assert!(app.should_quit);
+        assert!(!app.quit_completed_sync);
+        assert!(!app.db.get_pending_sync_logs().unwrap().is_empty());
+        drop(app); let _ = std::fs::remove_file(path);
     }
 
     #[test]
@@ -34089,4 +33881,23 @@ mod app_tests {
 
         let _ = std::fs::remove_file(db_file);
     }
+    #[test]
+    fn portals_native_editor_keeps_navigation_keys_as_text_and_queues_changes() {
+        let path=std::env::temp_dir().join(format!("questline-portals-ui-{}.db",Uuid::new_v4()));
+        let mut app=App::new_headless(&path).unwrap();
+        app.db.insert_user(&crate::models::User{id:Uuid::new_v4(),username:"Explorer".into(),class:crate::models::ClassType::CodeWarlock,level:1,xp:0,specialization:None,created_at:Utc::now()}).unwrap();
+        app.active_screen=ActiveScreen::Dashboard;
+        let press=|app:&mut App,code|app.handle_key_event(KeyEvent::new(code,KeyModifiers::empty())).unwrap();
+        press(&mut app,KeyCode::Char('0'));assert_eq!(app.active_screen,ActiveScreen::Portals);
+        press(&mut app,KeyCode::Char('n'));
+        for c in "q123 Portal".chars(){press(&mut app,KeyCode::Char(c));}
+        press(&mut app,KeyCode::Tab);app.handle_paste("https://example.com/path?q=1#two");
+        press(&mut app,KeyCode::Enter);
+        assert!(!app.should_quit);assert_eq!(app.active_screen,ActiveScreen::Portals);assert!(app.portal_state.editor.is_none());
+        let state=crate::portals::snapshot(&app.db).unwrap();assert_eq!(state["favorites"][0]["title"],"q123 Portal");assert!(app.last_mutation.is_some());
+        press(&mut app,KeyCode::Char('e'));app.handle_paste(" unfinished");press(&mut app,KeyCode::Esc);
+        assert_eq!(crate::portals::snapshot(&app.db).unwrap()["favorites"],state["favorites"]);
+        drop(app);let _=std::fs::remove_file(path);
+    }
+
 }

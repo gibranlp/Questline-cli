@@ -728,7 +728,7 @@ try {
     $requestCount = (int)$stmt->fetchColumn();
     $syncRoutes = [
         'sync/pull', 'sync/full', 'sync/push', 'sync/head', 'sync/status', 'sync/reset',
-        'sync/v2/pull', 'sync/v2/push', 'sync/v2/snapshot',
+        'sync/v2/pull', 'sync/v2/push', 'sync/v2/snapshot', 'sync/v2/head', 'profile/v2/backup', 'profile/v2/backup/latest',
         'project/key-envelopes', 'project/revocations',
         'recovery', 'recovery/latest'
     ];
@@ -1087,6 +1087,58 @@ try {
             ]);
             break;
 
+        case 'profile/v2/backup':
+            if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            $envelope = json_decode($body, true);
+            $nonce = base64_decode($envelope['nonce'] ?? '', true);
+            $ciphertext = base64_decode($envelope['ciphertext'] ?? '', true);
+            if (($envelope['format'] ?? '') !== 'questline-profile-backup-v1'
+                || $nonce === false || strlen($nonce) !== 12
+                || $ciphertext === false || strlen($ciphertext) < 16
+                || strlen($body) > 64 * 1024 * 1024) {
+                http_response_code(400);
+                echo json_encode(["error" => "Invalid encrypted profile backup"]);
+                break;
+            }
+            $encryptedDb = e2ee_database();
+            $encryptedDb->beginTransaction();
+            $generation = lock_sync_v2_generation($encryptedDb, $userId);
+            if (!isset($envelope['generation']) || (int)$envelope['generation'] !== $generation) {
+                $encryptedDb->rollBack();
+                http_response_code(409);
+                echo json_encode(["error" => "Profile backup belongs to an older cloud history generation"]);
+                break;
+            }
+            $stmt = $encryptedDb->prepare("INSERT INTO profile_v2_backups (account_id, envelope)
+                VALUES (?, ?) ON DUPLICATE KEY UPDATE envelope=VALUES(envelope), updated_at=CURRENT_TIMESTAMP");
+            $stmt->execute([$userId, $body]);
+            $encryptedDb->commit();
+            echo json_encode(["status" => "success"]);
+            break;
+
+        case 'profile/v2/backup/latest':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $stmt = e2ee_database()->prepare("SELECT envelope FROM profile_v2_backups WHERE account_id=?");
+            $stmt->execute([$userId]);
+            $envelope = $stmt->fetchColumn();
+            if ($envelope === false) {
+                http_response_code(404);
+                echo json_encode(["error" => "No encrypted profile backup exists"]);
+            } else { echo $envelope; }
+            break;
+
+        case 'sync/v2/head':
+            if ($_SERVER['REQUEST_METHOD'] !== 'GET') send_method_not_allowed();
+            $encryptedDb = e2ee_database();
+            $encryptedDb->beginTransaction();
+            $generation = lock_sync_v2_generation($encryptedDb, $userId);
+            $stmt = $encryptedDb->prepare("SELECT COALESCE(MAX(seq),0) FROM sync_v2_events WHERE account_id=?");
+            $stmt->execute([$userId]);
+            $head = (int)$stmt->fetchColumn();
+            $encryptedDb->commit();
+            echo json_encode(["head_seq" => $head, "generation" => $generation]);
+            break;
+
         case 'sync/v2/push':
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
             $entries = json_decode($body, true);
@@ -1107,6 +1159,19 @@ try {
                   AND NOT EXISTS (SELECT 1 FROM project_v2_retired_routes r WHERE r.routing_id = m.routing_id)");
             $routeMembers = $encryptedDb->prepare("SELECT account_id FROM project_v2_members WHERE routing_id = ? AND account_id != ?");
             $encryptedDb->beginTransaction();
+            $generation = lock_sync_v2_generation($encryptedDb, $userId);
+            if ($generation > 0 && !isset($_GET['expected_generation'])) {
+                $encryptedDb->rollBack();
+                http_response_code(428);
+                echo json_encode(["error" => "This account's cloud history was reset. Update the client and restore its profile before publishing changes"]);
+                break;
+            }
+            if (isset($_GET['expected_generation']) && (int)$_GET['expected_generation'] !== $generation) {
+                $encryptedDb->rollBack();
+                http_response_code(409);
+                echo json_encode(["error" => "Cloud history changed; restore the profile before publishing older local changes"]);
+                break;
+            }
             $inserted = 0;
             foreach ($entries as $event) {
                 $required = ['id', 'entity_type', 'entity_id', 'operation', 'timestamp', 'key_id', 'nonce', 'ciphertext'];
@@ -1198,6 +1263,8 @@ try {
         case 'sync/v2/pull':
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
             $encryptedDb = e2ee_database();
+            $encryptedDb->beginTransaction();
+            $generation = lock_sync_v2_generation($encryptedDb, $userId);
             $security = $encryptedDb->prepare("SELECT signatures_required FROM account_v2_security WHERE account_id = ?");
             $security->execute([$userId]);
             $signaturesRequired = (bool)$security->fetchColumn();
@@ -1213,13 +1280,19 @@ try {
             $headSeq = (int)$head->fetchColumn();
             $nextSeq = $sinceSeq;
             foreach ($events as $event) $nextSeq = max($nextSeq, (int)$event['seq']);
-            echo json_encode(["events" => $events, "head_seq" => $headSeq,
+            $encryptedDb->commit();
+            echo json_encode(["generation" => $generation, "events" => $events, "head_seq" => $headSeq,
                 "next_seq" => $nextSeq, "has_more" => $nextSeq < $headSeq,
                 "signatures_required" => $signaturesRequired]);
             break;
 
         case 'sync/v2/snapshot':
             if ($_SERVER['REQUEST_METHOD'] !== 'POST') send_method_not_allowed();
+            if (!isset($_GET['expected_head'])) {
+                http_response_code(428);
+                echo json_encode(["error" => "Cloud reset requires a current expected_head. Update the client before resetting history"]);
+                break;
+            }
             $entries = json_decode($body, true);
             if (!is_array($entries) || count($entries) === 0 || count($entries) > 100000) {
                 http_response_code(400);
@@ -1264,9 +1337,20 @@ try {
             $encryptedDb = e2ee_database();
             $encryptedDb->beginTransaction();
             try {
-                $delete = $encryptedDb->prepare("DELETE FROM sync_v2_events WHERE account_id = ?");
+                $generation = lock_sync_v2_generation($encryptedDb, $userId);
+                $head = $encryptedDb->prepare("SELECT seq FROM sync_v2_events WHERE account_id=? ORDER BY seq FOR UPDATE");
+                $head->execute([$userId]);
+                $sequences = $head->fetchAll(PDO::FETCH_COLUMN);
+                $headSeq = empty($sequences) ? 0 : (int)max($sequences);
+                if (isset($_GET['expected_head']) && (int)$_GET['expected_head'] !== $headSeq) {
+                    $encryptedDb->rollBack();
+                    http_response_code(409);
+                    echo json_encode(["error" => "Cloud changed while preparing reset; retry after syncing"]);
+                    break;
+                }
+                $delete = $encryptedDb->prepare("DELETE FROM sync_v2_events WHERE account_id = ? AND scope = 'account'");
                 $delete->execute([$userId]);
-                $stmt = $encryptedDb->prepare("INSERT INTO sync_v2_events
+                $stmt = $encryptedDb->prepare("INSERT IGNORE INTO sync_v2_events
                     (id, account_id, version, entity_type, entity_id, operation, event_timestamp, key_id, nonce, ciphertext, scope, routing_id, device_id, author_public_key, event_signature)
                     VALUES (?, ?, 2, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
                 $fanout = $encryptedDb->prepare("INSERT IGNORE INTO sync_v2_events
@@ -1309,6 +1393,7 @@ try {
                 $cutover = $encryptedDb->prepare("INSERT INTO account_v2_security (account_id, signatures_required, cutover_at)
                     VALUES (?, 1, CURRENT_TIMESTAMP) ON DUPLICATE KEY UPDATE signatures_required=1, cutover_at=CURRENT_TIMESTAMP");
                 $cutover->execute([$userId]);
+                $encryptedDb->prepare("UPDATE sync_v2_generations SET generation=generation+1 WHERE account_id=?")->execute([$userId]);
                 $encryptedDb->commit();
                 $legacyBackupDeleted = mark_sync_v2_account($pdo, $userId);
             } catch (Throwable $error) {
@@ -1318,6 +1403,7 @@ try {
             echo json_encode([
                 "status" => "success",
                 "replaced" => count($entries),
+                "generation" => $generation + 1,
                 "protocol" => 2,
                 "legacy_backup_deleted" => $legacyBackupDeleted,
             ]);
@@ -2536,6 +2622,14 @@ function is_project_scoped_sync_type($entityType) {
         'project_member',
         'chronicle_message'
     ], true);
+}
+
+// The generation row serializes same-account pull, push, and explicit reset.
+function lock_sync_v2_generation($db, $accountId) {
+    $db->prepare("INSERT IGNORE INTO sync_v2_generations (account_id,generation) VALUES (?,0)")->execute([$accountId]);
+    $stmt = $db->prepare("SELECT generation FROM sync_v2_generations WHERE account_id=? FOR UPDATE");
+    $stmt->execute([$accountId]);
+    return (int)$stmt->fetchColumn();
 }
 
 function e2ee_database() {

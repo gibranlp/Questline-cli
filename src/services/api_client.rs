@@ -9,6 +9,23 @@ use serde_json::Value;
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY_MS: u64 = 500;
 
+fn http_agent() -> &'static ureq::Agent {
+    static AGENT: std::sync::OnceLock<ureq::Agent> = std::sync::OnceLock::new();
+    AGENT.get_or_init(ureq::Agent::new)
+}
+
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub body: String,
+}
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "HTTP {}: {}", self.status, self.body)
+    }
+}
+impl std::error::Error for HttpError {}
+
 pub struct ApiClient {
     pub server_url: String,
     pub identity: Identity,
@@ -37,18 +54,10 @@ impl ApiClient {
             match self.send_request_once(method, path, body) {
                 Ok(response) => return Ok(response),
                 Err(e) => {
-                    let msg = e.to_string();
                     // No reintentes errores de auth (401/403) ni errores del cliente (4xx)
                     // A rate-limit window is much longer than the sub-second retry
                     // schedule. Retrying here only consumes more nonces and prolongs it.
-                    if msg.contains("429") {
-                        return Err(e);
-                    }
-                    if msg.contains("401")
-                        || msg.contains("403")
-                        || msg.contains("400")
-                        || msg.contains("422")
-                    {
+                    if e.downcast_ref::<HttpError>().is_some_and(|error| (400..500).contains(&error.status)) {
                         return Err(e);
                     }
                     last_err = e;
@@ -96,17 +105,18 @@ impl ApiClient {
         };
 
         let req = match method {
-            "GET" => ureq::get(&url),
+            "GET" => http_agent().get(&url),
             "POST" => {
-                let mut r = ureq::post(&url);
+                let mut r = http_agent().post(&url);
                 r = r.set("Content-Type", "application/json");
                 r
             }
             _ => return Err(anyhow::anyhow!("Unsupported HTTP method")),
         };
 
+        let timeout = if path.starts_with("profile/") || path.starts_with("sync/v2/snapshot") { 30 } else { 10 };
         let result = req
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(timeout))
             .set("X-User-Id", &self.identity.user_uuid.to_string())
             .set("X-Identity", &self.identity.public_key)
             .set("X-Device-Id", &self.device_id)
@@ -121,15 +131,7 @@ impl ApiClient {
                 let mut error_body = String::new();
                 use std::io::Read;
                 let _ = response.into_reader().read_to_string(&mut error_body);
-                if error_body.trim().is_empty() {
-                    return Err(anyhow::anyhow!("{}: status code {}", url, code));
-                }
-                return Err(anyhow::anyhow!(
-                    "{}: status code {}: {}",
-                    url,
-                    code,
-                    error_body
-                ));
+                return Err(HttpError { status: code, body: error_body }.into());
             }
             Err(e) => return Err(e.into()),
         };

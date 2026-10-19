@@ -81,3 +81,54 @@ Do not set the cutover flag manually. Replacing the snapshot retires the old
 unsigned rows without invalidating signed Fellowship history copied between
 member accounts; copied project events retain the original author's public key
 and signature.
+
+
+## Sync reliability and profile transfer upgrade
+
+For an existing encrypted database, apply `008_profile_backups.sql`, then
+`009_sync_generations.sql` **before** deploying the updated PHP API. A fresh
+`001_sync_v2.sql` bootstrap already includes both tables.
+
+The new profile backup routes store an AES-GCM envelope independently of
+`sync_v2_events`. They never replace or prune the live account event history. The backup generation
+is authenticated as AES-GCM associated data. Uploads from an old generation are
+rejected, and recovery ignores an older backup after an explicit history reset.
+The CLI uses these snapshots for transfer-code recovery and then pulls the event
+tail through a temporary recovery device ID.
+
+Updated clients check `sync/v2/head` and retain its account history generation.
+Explicit history replacement requires `expected_head`; a changed head returns
+409 without deleting history. Successful replacement increments the generation. Account replacement preserves
+project-scoped history and its original authors: an Observer cannot republish
+that history, so deleting it would make subsequent recovery incomplete.
+After a replacement, pushes must provide the matching `expected_generation`.
+Missing preconditions return 428, and a stale generation returns 409. Update
+clients before using reset: older clients must not replace history as a side
+effect of exporting a profile. An affected updated client can restore into a
+staging database; unsent local changes should be exported before replacing its
+profile.
+
+Deploy the PHP API and browser build together, then release the CLI. Do not run
+live reset/security tests against production accounts. The security script now
+defaults to localhost and creates disposable identities. Validation used a local
+MariaDB 11.4 container and PHP 8.3 with `pdo_mysql`, with separate disposable
+legacy and encrypted databases, and only `api/index.php` and `load_env.php`
+mounted (no environment/credential files).
+
+Against that disposable API:
+
+```sh
+QUESTLINE_API_URL=http://127.0.0.1:18092/api/ node scripts/test_sync_v2_security.mjs
+QUESTLINE_TEST_API_URL=http://127.0.0.1:18092/api/ cargo test --lib encrypted_cloud_transfer_preserves_source -- --ignored
+```
+
+Normal local checks:
+
+```sh
+questline_test_state=$(mktemp -d /tmp/questline-sync-tests.XXXXXX)
+QUESTLINE_STORAGE_DIR="$questline_test_state" cargo test --lib --bins -- --test-threads=2
+npm --prefix webapp test
+npm --prefix webapp run build
+php -l server/api/index.php
+php -l webapp/api/index.php
+```

@@ -59,3 +59,17 @@ CREATE TABLE IF NOT EXISTS project_v2_key_envelopes (
     UNIQUE KEY uq_project_v2_rotation_recipient (new_routing_id, recipient_account_id),
     INDEX idx_project_v2_envelope_recipient (recipient_account_id, created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Run against the encrypted (E2EE) database before deploying the new clients.
+-- Profile backups must never delete or replace sync_v2_events.
+CREATE TABLE IF NOT EXISTS profile_v2_backups (
+    account_id VARCHAR(36) PRIMARY KEY,
+    envelope LONGTEXT NOT NULL,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Apply to the encrypted database. Incremented only by an explicit cloud reset.
+CREATE TABLE IF NOT EXISTS sync_v2_generations (
+    account_id VARCHAR(36) PRIMARY KEY,
+    generation BIGINT UNSIGNED NOT NULL DEFAULT 0
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;

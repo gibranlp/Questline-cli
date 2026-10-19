@@ -17,6 +17,7 @@ server/.env
 
 # Databases & Backups
 *.db
+*.sync.lock
 *.db-shm
 *.db-wal
 *.db-journal
@@ -27,6 +28,7 @@ questline.db
 test_questline*.db*
 
 # Logs
+__pycache__/
 *.log
 debug_picker.log
 

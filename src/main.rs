@@ -423,6 +423,7 @@ fn parse_cli_options(args: impl IntoIterator<Item = String>) -> Result<CliOption
             "shell-action" if command_args.len() != 1 => {
                 return Err(anyhow!("shell-action requires one JSON request"));
             }
+            "portals" => {}
             "shell-hero" if command_args.len() != 1 => {
                 return Err(anyhow!("shell-hero requires one JSON request"));
             }
@@ -453,6 +454,11 @@ fn print_cli_help() {
     println!("  -p, --profile <name>  Use an isolated database, identity, and config");
     println!();
     println!("Commands:");
+    println!("  portals [list|add|edit|delete|category|rename|remove-category|open] [arguments]");
+    println!("                                 Manage synced bookmarks and categories");
+    println!("  favorites-json               Exchange Favorites JSON over standard input");
+    println!("  sync-json                    Manage sync and profile recovery over standard input");
+    println!("  sync-background              Sync the local profile while the TUI is closed");
     println!("  export                         Export the complete profile backup");
     println!("  import                         Import the complete profile backup");
     println!("  backup                         Copy the local database");
@@ -502,6 +508,31 @@ async fn main() -> Result<()> {
     // Checa si corrieron el binario con un subcomando (export / import / backup / --version)
     if let Some(cmd) = options.command.as_deref() {
         match cmd {
+            "sync-json" => {
+                let path=storage::get_storage_dir()?.join("questline.db");
+                questline::sync_control::run_stream(&path)?;
+                return Ok(());
+            }
+            "favorites-json" => {
+                use std::io::Read;
+                let mut raw=String::new();
+                io::stdin().take(16*1024*1024+1).read_to_string(&mut raw)?;
+                if raw.len()>16*1024*1024 {return Err(anyhow!("Favorites request exceeds 16 MiB"));}
+                let request:serde_json::Value=serde_json::from_str(&raw)?;
+                let path=storage::get_storage_dir()?.join("questline.db");
+                println!("{}",questline::portals::run_json(&path,&request)?);
+                return Ok(());
+            }
+            "portals" => {
+                let path=storage::get_storage_dir()?.join("questline.db");
+                questline::portals::cli(&path,&options.command_args)?;
+                return Ok(());
+            }
+            "sync-background" => {
+                let path=storage::get_storage_dir()?.join("questline.db");
+                questline::background_sync::run(&path)?;
+                return Ok(());
+            }
             "shell-hero" => {
                 let request: serde_json::Value = serde_json::from_str(&options.command_args[0])?;
                 let result = questline::shell_api::hero_metadata(&request)?;
@@ -583,17 +614,22 @@ async fn main() -> Result<()> {
             "export" => {
                 let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let db = database::Database::new(&db_path)?;
-                let json = db.export_to_json()?;
-                std::fs::write(".questline-export", json)?;
+                let identity = questline::services::Identity::load_for_database(&db, db.get_user()?.map(|user| user.id))?;
+                db.set_setting("_profile_identity", &serde_json::to_string(&identity)?)?;
+                db.write_json_export(std::path::Path::new(".questline-export"))?;
                 println!("Exported database to .questline-export");
                 return Ok(());
             }
             "import" => {
                 let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
-                let db = database::Database::new(&db_path)?;
+                let mut db = database::Database::new(&db_path)?;
                 if std::path::Path::new(".questline-export").exists() {
                     let json = std::fs::read_to_string(".questline-export")?;
-                    db.import_from_json(&json)?;
+                    let prepared = questline::services::profile_transfer::prepare_json(&db, &json)?;
+                    questline::services::profile_transfer::activate(&mut db, &prepared)?;
+                    if let Err(error) = prepared.identity.save_compatibility_copy(&storage::get_storage_dir()?) {
+                        eprintln!("Profile restored; identity file copy needs retry: {error}");
+                    }
                     println!("Imported database from .questline-export");
                 } else {
                     println!("Error: .questline-export file not found");
@@ -679,7 +715,7 @@ async fn main() -> Result<()> {
                 let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let db = database::Database::new(&db_path)?;
                 let existing_user = db.get_user()?;
-                let identity = questline::services::identity::Identity::load_or_create(
+                let identity = questline::services::identity::Identity::load_for_database(&db,
                     existing_user.as_ref().map(|user| user.id),
                 )?;
                 let owner_username = existing_user
@@ -807,7 +843,7 @@ async fn main() -> Result<()> {
                 }
 
                 let existing_user = db.get_user()?;
-                let identity = questline::services::identity::Identity::load_or_create(
+                let identity = questline::services::identity::Identity::load_for_database(&db,
                     existing_user.as_ref().map(|user| user.id),
                 )?;
                 let owner_username = existing_user
@@ -847,7 +883,7 @@ async fn main() -> Result<()> {
                 let db_path = storage::ensure_storage_dir_exists()?.join("questline.db");
                 let date_str = chrono::Utc::now().format("%Y_%m_%d").to_string();
                 let backup_filename = format!("questline_backup_{}.db", date_str);
-                std::fs::copy(&db_path, &backup_filename)?;
+                database::Database::new(&db_path)?.backup_to(std::path::Path::new(&backup_filename))?;
                 println!("Created backup: {}", backup_filename);
 
                 // Lleva conteo de cuántos backups se han hecho — se guarda en settings de la DB
@@ -1027,6 +1063,7 @@ async fn main() -> Result<()> {
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_note_autosave()?;
         app.tick_auto_sync()?;
+        if app.active_screen==ActiveScreen::Portals {app.portal_state.refresh(&app.db,false)?;}
         let sync_busy = app.sync_in_progress;
         if !sync_busy {
             app.tick_export_backup();
@@ -1176,6 +1213,7 @@ async fn main() -> Result<()> {
 
                     // Render Screen Body
                     match app.active_screen {
+                        ActiveScreen::Portals => screens::portals::draw(f,&app.portal_state,&theme,chunks[0]),
                         ActiveScreen::Dashboard => {
                             let regions = screens::dashboard::draw(f, &app, &theme, chunks[0]);
                             app.hit_regions.dashboard = Some(regions);
@@ -1347,12 +1385,13 @@ async fn main() -> Result<()> {
                         ("Chronicle",  ActiveScreen::GreatChronicle),
                         ("Sync",       ActiveScreen::SyncSettings),
                         ("Settings",   ActiveScreen::Settings),
+                        ("Portals",    ActiveScreen::Portals),
                     ];
 
                     let muted = Color::Rgb(90, 90, 90);
                     let mut tab_spans: Vec<Span> = vec![Span::styled(" ", Style::default())];
                     for (i, (name, screen)) in nav_tabs.iter().enumerate() {
-                        let num = i + 1;
+                        let num = (i + 1) % 10;
                         if app.active_screen == *screen {
                             tab_spans.push(Span::styled(
                                 format!("[{}]{}", num, name),
@@ -2370,6 +2409,9 @@ async fn main() -> Result<()> {
                     lines.push(Line::from(Span::styled("Are you sure you want to quit? [Y/N]", Style::default().fg(Color::White).add_modifier(Modifier::BOLD))));
                 }
 
+                if app.config.sync_enabled {
+                    lines.push(Line::from("[L] Exit with local save; queued changes retry on the next sync"));
+                }
                 let p = Paragraph::new(lines)
                     .block(block)
                     .alignment(ratatui::layout::Alignment::Center)

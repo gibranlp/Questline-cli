@@ -14,9 +14,12 @@ pub struct Note {
     pub markdown_content: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(default = "default_sharing_permission")]
     pub sharing_permission: String, // "read_only", "editable", "collaborative"
     #[serde(default)]
     pub codex_id: Option<Uuid>,
     #[serde(default)]
     pub owner_identity: Option<String>,
 }
+
+fn default_sharing_permission() -> String { "collaborative".into() }

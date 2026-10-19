@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import crypto from 'node:crypto';
 
-const baseUrl = process.env.QUESTLINE_API_URL || 'https://questlinecli.com/api/';
+const baseUrl = process.env.QUESTLINE_API_URL || 'http://127.0.0.1:18092/api/';
+const generations = new Map();
 
 function identity() {
   const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
@@ -47,17 +48,24 @@ function signedRequest(who, route, payload, method = 'POST') {
   const timestamp = new Date().toISOString();
   const nonce = crypto.randomUUID();
   const signature = crypto.sign(null, Buffer.from(`${timestamp}.${nonce}.${body}`), who.privateKey).toString('hex');
-  return { url: `${baseUrl}?route=${encodeURIComponent(route)}`, body, method, headers: {
+  const generation = generations.get(who.userId);
+  return { url: `${baseUrl}?route=${encodeURIComponent(route)}${route === 'sync/v2/push' && generation !== undefined ? `&expected_generation=${generation}` : ''}`, body, method, who, headers: {
     'X-User-Id': who.userId, 'X-Identity': who.publicHex, 'X-Device-Id': who.deviceId,
     'X-Timestamp': timestamp, 'X-Nonce': nonce, 'X-Signature': signature,
     'Content-Type': 'application/json' } };
 }
 
 async function send(request) {
+  if (new URL(request.url).searchParams.get('route') === 'sync/v2/snapshot'
+      && !new URL(request.url).searchParams.has('expected_head')) {
+    const head = await send(signedRequest(request.who, 'sync/v2/head', null, 'GET'));
+    request.url += `&expected_head=${head.json.head_seq}`;
+  }
   const response = await fetch(request.url, { method: request.method, headers: request.headers,
     body: request.method === 'POST' ? (request.body || undefined) : undefined });
   const text = await response.text();
   let json; try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  if (response.ok && json.generation !== undefined) generations.set(request.who.userId, json.generation);
   return { status: response.status, json };
 }
 
@@ -172,4 +180,43 @@ expect('owner replacement-route write accepted',
 const removedPull = await send(signedRequest(mallory, 'sync/v2/pull', null));
 expect('replacement-route event not delivered to removed client', removedPull,
   r => r.status === 200 && !r.json.events.some(x => x.id === replacementEvent.id));
-console.log('All live sync-v2 security tests passed.');
+const beforeBackup = await send(signedRequest(alice, 'sync/v2/head', null, 'GET'));
+expect('head includes this device events', beforeBackup, r => r.status === 200 && r.json.head_seq > 0);
+const profileEnvelope = { format: 'questline-profile-backup-v1', generation: beforeBackup.json.generation,
+  nonce: crypto.randomBytes(12).toString('base64'), ciphertext: crypto.randomBytes(80).toString('base64') };
+expect('encrypted profile backup stored separately', await send(signedRequest(alice, 'profile/v2/backup', profileEnvelope)),
+  r => r.status === 200 && r.json.status === 'success');
+expect('profile backup is returned only to its account', await send(signedRequest(mallory, 'profile/v2/backup/latest', null, 'GET')),
+  r => r.status === 404);
+expect('encrypted profile backup round trip', await send(signedRequest(alice, 'profile/v2/backup/latest', null, 'GET')),
+  r => r.status === 200 && r.json.ciphertext === profileEnvelope.ciphertext);
+const afterBackup = await send(signedRequest(alice, 'sync/v2/head', null, 'GET'));
+expect('backup preserves history and generation', afterBackup,
+  r => r.status === 200 && r.json.head_seq === beforeBackup.json.head_seq && r.json.generation === beforeBackup.json.generation);
+
+const resetEvent = makeEvent(alice);
+const staleReset = signedRequest(alice, 'sync/v2/snapshot', [resetEvent]);
+staleReset.url += `&expected_head=${afterBackup.json.head_seq - 1}`;
+expect('reset refuses a changed remote head', await send(staleReset), r => r.status === 409);
+const reset = signedRequest(alice, 'sync/v2/snapshot', [resetEvent]);
+reset.url += `&expected_head=${afterBackup.json.head_seq}`;
+expect('explicit reset increments history generation', await send(reset),
+  r => r.status === 200 && r.json.generation === afterBackup.json.generation + 1);
+const stalePush = signedRequest(alice, 'sync/v2/push', [makeEvent(alice)]);
+stalePush.url += `&expected_generation=${afterBackup.json.generation}`;
+expect('stale device cannot publish after a reset', await send(stalePush), r => r.status === 409);
+expect('pull advertises the new history generation', await send(signedRequest(alice, 'sync/v2/pull', null)),
+  r => r.status === 200 && r.json.generation === afterBackup.json.generation + 1);
+expect('account reset preserves independently authored Fellowship history',
+  await send(signedRequest({ ...alice, deviceId: crypto.randomUUID() }, 'sync/v2/pull', null)),
+  r => r.status === 200 && r.json.events.some(event => event.id === replacementEvent.id));
+const unguardedPush = signedRequest(alice, 'sync/v2/push', [makeEvent(alice)]);
+const unguardedUrl = new URL(unguardedPush.url);
+unguardedUrl.searchParams.delete('expected_generation');
+unguardedPush.url = unguardedUrl.toString();
+expect('older clients cannot publish unguarded after reset', await send(unguardedPush), r => r.status === 428);
+expect('explicit reset retains independent profile backup', await send(signedRequest(alice, 'profile/v2/backup/latest', null, 'GET')),
+  r => r.status === 200 && r.json.ciphertext === profileEnvelope.ciphertext);
+expect('old-generation backup cannot replace current recovery state', await send(signedRequest(alice, 'profile/v2/backup', profileEnvelope)),
+  r => r.status === 409);
+console.log('All sync-v2 security, profile backup, and reset tests passed.');

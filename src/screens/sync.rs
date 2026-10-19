@@ -26,7 +26,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SyncHitRegio
         .split(area);
 
     // jalamos cuántos cambios no se han mandado al servidor todavía
-    let pending_changes = app.db.get_pending_sync_logs().map(|l| l.len()).unwrap_or(0);
+    let pending_changes = app.db.pending_sync_count().unwrap_or(0);
     let last_sync_time = app
         .db
         .get_setting("last_sync")
