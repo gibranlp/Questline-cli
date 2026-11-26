@@ -822,6 +822,7 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
             f,
             app,
             entry_id.is_some(),
+            *entry_id,
             title,
             *title_cursor,
             amount,
@@ -867,10 +868,10 @@ pub fn draw(f: &mut Frame, app: &App, theme: &Theme) -> WorkspaceHitRegions {
         ModalType::TreasuryAccount {
             account_id,
             name,
-            kind_idx,
+            kind_idx, savings_status_idx, rate, rate_period_idx,
             focus_idx,
             ..
-        } => draw_treasury_account_modal(f, name, *kind_idx, *focus_idx, account_id.is_some(), theme),
+        } => draw_treasury_account_modal(f, name, *kind_idx, *savings_status_idx, rate, *rate_period_idx, *focus_idx, account_id.is_some(), theme),
         ModalType::TreasuryCurrency { selected_idx } => {
             draw_treasury_currency_modal(f, app, *selected_idx, theme)
         }
@@ -1278,11 +1279,7 @@ fn draw_treasury_tab(
         .entries(campaign_id, &filter, app.treasury_sort)
         .unwrap_or_default();
     let account_balances = service.account_balances(campaign_id).unwrap_or_default();
-    let saved_minor = account_balances
-        .iter()
-        .filter(|balance| balance.account.kind == crate::models::TreasuryAccountKind::Savings)
-        .map(|balance| balance.balance_minor)
-        .sum::<i64>();
+    let saved_minor = totals.saved_minor;
     let upcoming = service
         .upcoming_payments(campaign_id, Utc::now(), 30)
         .unwrap_or_default();
@@ -1313,11 +1310,12 @@ fn draw_treasury_tab(
         ("Paid", totals.paid_minor),
         ("Committed", totals.committed_minor),
         ("Saved", saved_minor),
+        ("Invested", totals.invested_minor),
         ("Available", totals.available_minor),
     ];
     let summary_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Ratio(1, 6); 6])
+        .constraints([Constraint::Ratio(1, 7); 7])
         .split(sections[0]);
     for (index, (label, amount)) in summary.into_iter().enumerate() {
         let color = match label {
@@ -1325,7 +1323,7 @@ fn draw_treasury_tab(
             "Paid" => theme.danger,
             "Committed" => theme.warning,
             "Saved" if amount < 0 => theme.danger,
-            "Saved" => theme.secondary,
+            "Saved" | "Invested" => theme.secondary,
             "Available" if amount < 0 => theme.danger,
             "Available" => theme.success,
             _ => theme.primary,
@@ -1633,6 +1631,7 @@ fn draw_treasury_entry_modal(
     f: &mut Frame,
     app: &App,
     is_editing: bool,
+    existing_entry_id: Option<uuid::Uuid>,
     title: &str,
     title_cursor: usize,
     amount: &str,
@@ -1667,7 +1666,7 @@ fn draw_treasury_entry_modal(
         .active_project_id
         .and_then(|id| {
             crate::services::TreasuryService::new(&app.db)
-                .accounts(id)
+                .entry_accounts(id, existing_entry_id)
                 .ok()
         })
         .unwrap_or_default();
@@ -1680,7 +1679,7 @@ fn draw_treasury_entry_modal(
     let account = accounts
         .get(app.treasury_account_idx.min(accounts.len().saturating_sub(1)))
         .map(|value| value.name.as_str())
-        .unwrap_or("Spending");
+        .unwrap_or("Create an account: E, then A");
     let destination = accounts
         .get(
             app.treasury_transfer_account_idx
@@ -2095,12 +2094,18 @@ fn draw_treasury_accounts_modal(f: &mut Frame, app: &App, selected_idx: usize, t
     let currency = service.campaign_currency(campaign_id).unwrap_or_default();
     let block = Block::default().title(" Treasury Accounts · ↑↓ select · Enter edit · A add · Del delete · Esc close ")
         .borders(Borders::ALL).border_type(BorderType::Thick).border_style(Style::default().fg(theme.primary));
-    let rows = balances.iter().map(|balance| Row::new(vec![
-        balance.account.name.clone(), balance.account.kind.as_str().to_string(),
-        crate::services::treasury::format_money(balance.balance_minor, currency),
-    ]));
-    let table = Table::new(rows, [Constraint::Percentage(45), Constraint::Percentage(25), Constraint::Percentage(30)])
-        .header(Row::new(vec!["Account", "Type", "Balance"]).style(Style::default().fg(theme.muted)))
+    let rows = balances.iter().map(|balance| {
+        let account = &balance.account;
+        let terms = if account.kind == crate::models::TreasuryAccountKind::Savings {
+            format!("{} · {}% {} · est {}", account.savings_status.as_str(),
+                crate::services::treasury::format_interest_rate(account.interest_rate_bps), account.interest_period.as_str(),
+                account.estimated_interest_minor(balance.balance_minor).map(|value| crate::services::treasury::format_money(value,currency)).unwrap_or_else(|| "—".into()))
+        } else { String::new() };
+        Row::new(vec![account.name.clone(), account.kind.as_str().to_string(),terms,
+            crate::services::treasury::format_money(balance.balance_minor,currency)])
+    });
+    let table = Table::new(rows,[Constraint::Percentage(22),Constraint::Percentage(12),Constraint::Percentage(43),Constraint::Percentage(23)])
+        .header(Row::new(vec!["Account","Type","Savings / estimated interest per period","Balance"]).style(Style::default().fg(theme.muted)))
         .block(block).highlight_style(Style::default().bg(theme.primary).fg(theme.background)).highlight_symbol("▶ ");
     let mut state = TableState::default();
     if !balances.is_empty() { state.select(Some(selected_idx.min(balances.len() - 1))); }
@@ -2108,52 +2113,30 @@ fn draw_treasury_accounts_modal(f: &mut Frame, app: &App, selected_idx: usize, t
 }
 
 fn draw_treasury_account_modal(
-    f: &mut Frame,
-    name: &str,
-    kind_idx: usize,
-    focus_idx: usize,
-    editing: bool,
-    theme: &Theme,
+    f: &mut Frame, name: &str, kind_idx: usize, savings_status_idx: usize,
+    rate: &str, rate_period_idx: usize, focus_idx: usize, editing: bool, theme: &Theme,
 ) {
-    let area = centered_rect(56, 30, f.size());
+    let area = centered_rect(56, 75, f.size());
     f.render_widget(Clear, area);
-    let kinds = crate::models::TreasuryAccountKind::ALL;
-    let kind = kinds[kind_idx.min(kinds.len() - 1)].as_str();
-    let label_style = |index| {
-        Style::default().fg(if focus_idx == index {
-            theme.primary
-        } else {
-            theme.muted
-        })
-    };
-    f.render_widget(
-        Paragraph::new(vec![
-            Line::from("Choose a name and type. Existing transactions stay linked."),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Name  ", label_style(0)),
-                Span::styled(format!("{name}_"), Style::default().fg(theme.text)),
-            ]),
-            Line::from(""),
-            Line::from(vec![
-                Span::styled("Type  ", label_style(1)),
-                Span::styled(format!("◀ {kind} ▶"), Style::default().fg(theme.text)),
-            ]),
-            Line::from(""),
-            Line::from(Span::styled(
-                "Tab/↑↓ field · ←→ type · Enter continue/save · Esc cancel",
-                Style::default().fg(theme.muted),
-            )),
-        ])
-        .block(
-            Block::default()
-                .title(if editing { " Edit Treasury Account " } else { " New Treasury Account " })
-                .borders(Borders::ALL)
-                .border_type(BorderType::Thick)
-                .border_style(Style::default().fg(theme.primary)),
-        ),
-        area,
-    );
+    let kind = crate::models::TreasuryAccountKind::ALL[kind_idx.min(3)];
+    let label_style = |index| Style::default().fg(if focus_idx == index { theme.primary } else { theme.muted });
+    let mut lines = vec![Line::from("Savings stay separate from spendable funds."),Line::from("")];
+    let mut values = vec![("Name", format!("{name}_")), ("Type", format!("◀ {} ▶", kind.as_str()))];
+    if kind == crate::models::TreasuryAccountKind::Savings {
+        values.extend([
+            ("Savings", if savings_status_idx == 1 {"◀ Invested ▶"} else {"◀ Available ▶"}.to_string()),
+            ("Rate %", format!("{rate}_")),
+            ("Period", if rate_period_idx == 0 {"◀ Monthly ▶"} else {"◀ Annual ▶"}.to_string()),
+        ]);
+    }
+    for (index, (label, value)) in values.into_iter().enumerate() {
+        lines.push(Line::from(vec![Span::styled(format!("{label:<10}"), label_style(index)),Span::styled(value, Style::default().fg(theme.text))]));
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled("Estimates only; interest is never added automatically.",Style::default().fg(theme.muted))));
+    lines.push(Line::from(Span::styled("Tab/↑↓ field · ←→ choice · Enter save · Esc cancel",Style::default().fg(theme.muted))));
+    f.render_widget(Paragraph::new(lines).block(Block::default().title(if editing {" Edit Treasury Account "} else {" New Treasury Account "})
+        .borders(Borders::ALL).border_type(BorderType::Thick).border_style(Style::default().fg(theme.primary))),area);
 }
 
 fn draw_treasury_currency_modal(f: &mut Frame, app: &App, selected_idx: usize, theme: &Theme) {
@@ -6860,6 +6843,17 @@ mod tests {
         assert_eq!(workload_band(4, 1, 0, 0), "BALANCED");
         assert_eq!(workload_band(3, 0, 0, 2), "OVERLOADED");
         assert_eq!(workload_band(8, 0, 0, 0), "OVERLOADED");
+    }
+
+    #[test]
+    fn treasury_savings_account_controls_fit_a_standard_terminal() {
+        let mut terminal = Terminal::new(TestBackend::new(80,24)).unwrap();
+        let theme = Theme::default_theme();
+        terminal.draw(|frame| draw_treasury_account_modal(frame,"Reserve",1,1,"12.50",1,3,true,&theme)).unwrap();
+        let rendered = terminal.backend().buffer().content.iter().map(|cell|cell.symbol()).collect::<String>();
+        for label in ["Reserve","Savings","Invested","12.50","Annual","Estimates only"] {
+            assert!(rendered.contains(label),"missing {label}: {rendered}");
+        }
     }
 
     #[test]

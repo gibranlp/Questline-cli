@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::app::App;
 use crate::models::{
-    LedgerEntry, LedgerEntryType, LedgerRecurrence, LedgerStatus, Note, Task, TaskPriority,
+    JournalEntry, LedgerEntry, LedgerEntryType, LedgerRecurrence, LedgerStatus, Note, RecurrenceType, Task, TaskPriority,
 };
 use crate::services::{TreasuryService, XPService};
 
@@ -14,6 +14,17 @@ fn field<'a>(request: &'a Value, name: &str) -> Result<&'a str> {
     request[name]
         .as_str()
         .with_context(|| format!("Missing {name}"))
+}
+
+fn task_recurrence(request: &Value) -> Result<Option<RecurrenceType>> {
+    match request.get("recurrence") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value == "None" || value.is_empty() => Ok(None),
+        Some(Value::String(value)) => RecurrenceType::from_str(value)
+            .map(Some)
+            .context("Choose a valid task recurrence"),
+        _ => bail!("Choose a valid task recurrence"),
+    }
 }
 
 fn text_field(request: &Value, name: &str, maximum: usize) -> Result<String> {
@@ -29,7 +40,11 @@ fn id_field(request: &Value, name: &str) -> Result<Uuid> {
 }
 
 fn due_date(request: &Value) -> Result<Option<chrono::DateTime<Utc>>> {
-    let value = request["due_date"].as_str().unwrap_or("").trim();
+    date_field(request, "due_date")
+}
+
+fn date_field(request: &Value, name: &str) -> Result<Option<chrono::DateTime<Utc>>> {
+    let value = request[name].as_str().unwrap_or("").trim();
     if value.is_empty() {
         return Ok(None);
     }
@@ -39,6 +54,79 @@ fn due_date(request: &Value) -> Result<Option<chrono::DateTime<Utc>>> {
         .single()
         .context("Invalid local due date")?;
     Ok(Some(local.with_timezone(&Utc)))
+}
+
+fn optional_id(request: &Value, name: &str) -> Result<Option<Uuid>> {
+    match request[name].as_str() {
+        Some(value) if !value.is_empty() => Ok(Some(Uuid::parse_str(value)?)),
+        _ if request[name].is_null() || request[name].as_str() == Some("") => Ok(None),
+        _ => bail!("Invalid {name}"),
+    }
+}
+
+fn apply_entry_fields(request: &Value, entry: &mut LedgerEntry, treasury: &TreasuryService) -> Result<()> {
+    let desired = LedgerEntryType::parse(request["entry_type"].as_str().unwrap_or(entry.entry_type.as_str()))
+        .context("Choose a valid transaction type")?;
+    let changed_type = desired != entry.entry_type;
+    entry.entry_type = desired;
+    if request.get("category_id").is_some() || changed_type || entry.category_id.is_nil() {
+        entry.category_id = match optional_id(request, "category_id")? {
+            Some(id) => id,
+            None => {
+                let preferred = match desired {
+                    LedgerEntryType::Income => "Other Income",
+                    LedgerEntryType::Expense => "Other",
+                    LedgerEntryType::Transfer => "Internal Transfer",
+                    LedgerEntryType::Adjustment => "Other Adjustment",
+                };
+                treasury.categories_for_type(entry.campaign_id, desired)?.into_iter()
+                    .find(|category| category.name == preferred).context("Default category not found")?.id
+            }
+        };
+    }
+    if request.get("account_id").is_some() || entry.account_id.is_none() {
+        entry.account_id = optional_id(request, "account_id")?.or(
+            treasury.accounts(entry.campaign_id)?.first().map(|account| account.id));
+    }
+    if request.get("transfer_account_id").is_some() || changed_type {
+        entry.transfer_account_id = optional_id(request, "transfer_account_id")?;
+    }
+    if let Some(value) = request.get("description") {
+        entry.description = value.as_str().context("Invalid description")?.to_string();
+    }
+    for name in ["vendor_source", "notes", "attachment_ref", "custom_recurrence"] {
+        if let Some(value) = request.get(name) {
+            let text = value.as_str().context("Invalid treasury text field")?.trim();
+            if text.chars().count() > 100000 { bail!("Treasury text is too long"); }
+            let value = if text.is_empty() { None } else { Some(text.to_string()) };
+            match name {
+                "vendor_source" => entry.vendor_source = value,
+                "notes" => entry.notes = value,
+                "attachment_ref" => entry.attachment_ref = value,
+                _ => entry.custom_recurrence = value,
+            }
+        }
+    }
+    if request.get("related_task_id").is_some() {
+        entry.related_task_id = optional_id(request, "related_task_id")?;
+    }
+    if request.get("recurrence").is_some() {
+        entry.recurrence = LedgerRecurrence::parse(field(request, "recurrence")?)
+            .context("Choose a valid recurrence")?;
+    }
+    if entry.recurrence != LedgerRecurrence::Custom { entry.custom_recurrence = None; }
+    if request.get("due_date").is_some() { entry.due_date = date_field(request, "due_date")?; }
+    if request.get("payment_date").is_some() { entry.payment_date = date_field(request, "payment_date")?; }
+    if request.get("entry_date").is_some() {
+        let date = date_field(request, "entry_date")?.context("Choose an entry date")?;
+        if entry.created_at.with_timezone(&Local).date_naive() != date.with_timezone(&Local).date_naive() {
+            entry.created_at = date;
+        }
+    }
+    if entry.status == LedgerStatus::Paid && entry.payment_date.is_none() {
+        entry.payment_date = Some(Utc::now());
+    }
+    Ok(())
 }
 
 fn local_campaign(app: &App, id: Uuid) -> Result<()> {
@@ -66,6 +154,14 @@ fn creation_id(request: &Value) -> Result<Uuid> {
 }
 
 pub fn run(path: &Path, request: &Value) -> Result<Value> {
+    if request["action"].as_str() == Some("capabilities") {
+        return Ok(json!({"treasury_fields": true, "savings_accounts": true, "task_recurrence": true, "task_live_refresh": true,
+            "treasury_defaults": {
+                "accounts": crate::services::treasury::DEFAULT_ACCOUNTS.iter().map(|(name, kind)| json!({"name":name,"kind":kind.as_str()})).collect::<Vec<_>>(),
+                "categories": crate::services::treasury::DEFAULT_CATEGORIES.iter().map(|(name, kind)| json!({"name":name,"entry_type":kind.as_str()})).collect::<Vec<_>>()
+            }
+        }));
+    }
     if !path.is_file() {
         bail!("Open Questline and complete onboarding first");
     }
@@ -89,6 +185,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
         let existing_campaign = match action {
             "create_task" | "create_step" => app.db.get_task_by_id(id).ok().and_then(|item| item.project_id),
             "create_scroll" => app.db.get_note_by_id(id).ok().and_then(|item| item.project_id),
+            "create_chronicle" => app.db.get_journal_entries()?.into_iter().find(|item| item.id == id).map(|item| item.project_id),
             "create_entry" => TreasuryService::new(&app.db).get_entry(id)?.map(|item| item.campaign_id),
             _ => None,
         };
@@ -193,7 +290,7 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
                 owner_username: app.user.as_ref().map(|user| user.username.clone()),
                 parent_task_id: None,
                 xp_awarded: false,
-                recurrence: None,
+                recurrence: task_recurrence(request)?,
             };
             app.db.insert_task(&task)?;
             if let Some(user) = app.user.as_mut() {
@@ -214,6 +311,9 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             task.due_date = due_date(request)?;
             task.priority =
                 TaskPriority::from_str(request["priority"].as_str().unwrap_or("Medium"));
+            if request.get("recurrence").is_some() {
+                task.recurrence = task_recurrence(request)?;
+            }
             app.db.update_task(&task)?;
             Ok(json!({"id": task.id, "message": "Quest updated"}))
         }
@@ -359,6 +459,38 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
                 json!({"id": parent_id, "message": if was_completed { "Step reopened" } else { "Step completed" }}),
             )
         }
+        "create_chronicle" => {
+            let project_id = id_field(request, "project_id")?;
+            local_campaign(&app, project_id)?;
+            let content = text_field(request, "content", crate::app::JOURNAL_ENTRY_CHAR_LIMIT)?;
+            let now = Utc::now();
+            let entry = JournalEntry {
+                id: creation_id(request)?,
+                project_id,
+                entry_date: now.date_naive(),
+                content,
+                created_at: now,
+                updated_at: now,
+                visibility: "Private".to_string(),
+                author_username: app.user.as_ref().context("Character not found")?.username.clone(),
+            };
+            app.db.insert_journal_entry(&entry)?;
+            app.apply_class_passive("journal_create", 0)?;
+            app.complete_productive_action()?;
+            app.increment_quest_progress(60, 1)?;
+            app.update_daily_adventure_progress("write_journal", 1)?;
+            app.check_action_achievements()?;
+            Ok(json!({"id": entry.id, "message": "Chronicle created"}))
+        }
+        "update_chronicle" => {
+            let id = id_field(request, "id")?;
+            let entry = app.db.get_journal_entries()?.into_iter()
+                .find(|item| item.id == id).context("Chronicle not found")?;
+            local_campaign(&app, entry.project_id)?;
+            let content = text_field(request, "content", crate::app::JOURNAL_ENTRY_CHAR_LIMIT)?;
+            app.db.update_journal_entry(id, &content)?;
+            Ok(json!({"id": id, "message": "Chronicle updated"}))
+        }
         "create_scroll" => {
             let project_id = id_field(request, "project_id")?;
             local_campaign(&app, project_id)?;
@@ -401,106 +533,68 @@ pub fn run(path: &Path, request: &Value) -> Result<Value> {
             app.db.delete_note(note.id)?;
             Ok(json!({"message": "Scroll deleted"}))
         }
-        "create_entry" => {
-            let campaign_id = id_field(request, "project_id")?;
-            local_campaign(&app, campaign_id)?;
-            let title = text_field(request, "title", 200)?;
-            let amount_minor = request["amount_minor"].as_i64().context("Missing amount")?;
-            if amount_minor <= 0 {
-                bail!("Amount must be greater than zero");
-            }
-            let entry_type = match field(request, "entry_type")? {
-                "Income" => LedgerEntryType::Income,
-                "Expense" => LedgerEntryType::Expense,
-                _ => bail!("Choose Income or Expense"),
-            };
+        "treasury_snapshot" => {
+            let campaign_id = id_field(request,"project_id")?;
+            local_campaign(&app,campaign_id)?;
             let treasury = TreasuryService::new(&app.db);
-            let campaign = treasury.ensure_campaign(campaign_id)?;
-            let category = treasury
-                .categories_for_type(campaign_id, entry_type)?
-                .into_iter()
-                .find(|category| {
-                    category.name
-                        == if entry_type == LedgerEntryType::Income {
-                            "Other Income"
-                        } else {
-                            "Other"
-                        }
-                })
-                .context("Default category not found")?;
-            let account = treasury
-                .accounts(campaign_id)?
-                .into_iter()
-                .next()
-                .context("Treasury account not found")?;
-            let now = Utc::now();
-            let entry = LedgerEntry {
-                id: creation_id(request)?,
-                campaign_id,
-                title,
-                description: String::new(),
-                entry_type,
-                category_id: category.id,
-                amount_minor,
-                currency_code: campaign.currency_code,
-                status: LedgerStatus::parse(request["status"].as_str().unwrap_or("Planned"))
-                    .context("Choose a valid treasury status")?,
-                due_date: None,
-                payment_date: if request["status"].as_str() == Some("Paid") {
-                    Some(now)
-                } else {
-                    None
-                },
-                vendor_source: None,
-                related_task_id: None,
-                notes: None,
-                attachment_ref: None,
-                recurrence: LedgerRecurrence::None,
-                custom_recurrence: None,
-                version: 1,
-                created_at: now,
-                updated_at: now,
-                created_by_identity: Some(app.identity.public_key.clone()),
-                account_id: Some(account.id),
-                transfer_account_id: None,
-            };
-            let created = treasury.create_entry(entry)?;
-            Ok(json!({"id": created.id, "message": "Treasury entry created"}))
+            Ok(json!({"accounts":treasury.account_balances(campaign_id)?,
+                "totals":crate::models::treasury::CampaignTotalsReport::from(treasury.calculate_campaign_totals(campaign_id)?)}))
         }
-        "update_entry" => {
+        "configure_savings" => {
             let treasury = TreasuryService::new(&app.db);
-            let id = id_field(request, "id")?;
-            let mut entry = treasury
-                .get_entry(id)?
-                .context("Treasury entry not found")?;
+            let mut account = treasury.get_account(id_field(request,"id")?)?.context("Account not found")?;
+            local_campaign(&app, account.campaign_id)?;
+            if account.kind != crate::models::TreasuryAccountKind::Savings { bail!("Choose a savings account"); }
+            if request["version"].as_i64() != Some(account.version) { bail!("Account changed; refresh before saving"); }
+            account.savings_status = crate::models::SavingsStatus::parse(field(request,"savings_status")?).context("Choose Available or Invested")?;
+            account.interest_rate_bps = crate::services::treasury::parse_interest_rate(field(request,"interest_rate")?)?;
+            account.interest_period = crate::models::InterestPeriod::parse(field(request,"interest_period")?).context("Choose Monthly or Annual")?;
+            let saved = treasury.update_account(account)?;
+            Ok(json!({"id":saved.id,"message":"Savings settings saved; interest estimates do not change balances"}))
+        }
+        "create_entry" | "update_entry" => {
+            let treasury = TreasuryService::new(&app.db);
+            let updating = field(request, "action")? == "update_entry";
+            let now = Utc::now();
+            let mut entry = if updating {
+                treasury.get_entry(id_field(request, "id")?)?.context("Treasury entry not found")?
+            } else {
+                let campaign_id = id_field(request, "project_id")?;
+                local_campaign(&app, campaign_id)?;
+                let campaign = treasury.ensure_campaign(campaign_id)?;
+                LedgerEntry {
+                    id: creation_id(request)?, campaign_id, title: String::new(),
+                    description: String::new(), entry_type: LedgerEntryType::Expense,
+                    category_id: Uuid::nil(), amount_minor: 0, currency_code: campaign.currency_code,
+                    status: LedgerStatus::Planned, due_date: None, payment_date: None,
+                    vendor_source: None, related_task_id: None, notes: None, attachment_ref: None,
+                    recurrence: LedgerRecurrence::None, custom_recurrence: None,
+                    version: 1, created_at: now, updated_at: now,
+                    created_by_identity: Some(app.identity.public_key.clone()),
+                    account_id: None, transfer_account_id: None,
+                }
+            };
             local_campaign(&app, entry.campaign_id)?;
             entry.title = text_field(request, "title", 200)?;
             entry.amount_minor = request["amount_minor"].as_i64().context("Missing amount")?;
-            if entry.amount_minor <= 0 {
-                bail!("Amount must be greater than zero");
-            }
-            if let Some(kind) = request["entry_type"].as_str() {
-                if matches!(entry.entry_type, LedgerEntryType::Income | LedgerEntryType::Expense) {
-                    let desired = match kind {
-                        "Income" => LedgerEntryType::Income,
-                        "Expense" => LedgerEntryType::Expense,
-                        _ => bail!("Choose Income or Expense"),
-                    };
-                    if desired != entry.entry_type {
-                        entry.category_id = treasury.categories_for_type(entry.campaign_id, desired)?
-                            .into_iter().find(|category| category.name == if desired == LedgerEntryType::Income {"Other Income"} else {"Other"})
-                            .context("Default category not found")?.id;
-                        entry.entry_type = desired;
+            if entry.amount_minor <= 0 { bail!("Amount must be greater than zero"); }
+            entry.status = LedgerStatus::parse(request["status"].as_str().unwrap_or("Planned"))
+                .context("Choose a valid treasury status")?;
+            let legacy_source = if entry.account_id.is_none() && updating {
+                treasury.accounts(entry.campaign_id)?.into_iter().find(|account| account.is_default && account.name == "Spending").map(|account| account.id)
+            } else { None };
+            let previous_accounts = [entry.account_id.or(legacy_source), entry.transfer_account_id];
+            apply_entry_fields(request, &mut entry, &treasury)?;
+            if request["custom_accounts_only"].as_bool() == Some(true) {
+                for id in [entry.account_id, entry.transfer_account_id].into_iter().flatten() {
+                    let account = treasury.get_account(id)?.context("Account not found")?;
+                    if account.is_default && !(updating && previous_accounts.contains(&Some(id))) {
+                        bail!("Choose a user-created account");
                     }
                 }
             }
-            entry.status = LedgerStatus::parse(field(request, "status")?)
-                .context("Choose a valid treasury status")?;
-            if entry.status == LedgerStatus::Paid && entry.payment_date.is_none() {
-                entry.payment_date = Some(Utc::now());
-            }
-            let updated = treasury.update_entry(entry)?;
-            Ok(json!({"id": updated.id, "message": "Treasury entry updated"}))
+            let saved = if updating { treasury.update_entry(entry)? } else { treasury.create_entry(entry)? };
+            Ok(json!({"id": saved.id, "message": if updating {"Treasury entry updated"} else {"Treasury entry created"}}))
         }
         "water_tree" => {
             if let Err(message) = app.is_watering_allowed()? {

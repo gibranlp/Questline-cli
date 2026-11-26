@@ -3,7 +3,7 @@ use crate::{
     database::Database,
 };
 use anyhow::{Context, Result};
-use chrono::{Local, Utc};
+use chrono::{Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Reminder {
     token: String,
     day: String,
@@ -20,6 +20,8 @@ struct Reminder {
     target: i32,
     pending: bool,
     acknowledged_at: Option<i64>,
+    #[serde(default)]
+    configuration: Option<String>,
 }
 fn path(db: &Database, suffix: &str) -> Result<PathBuf> {
     Ok(std::path::Path::new(
@@ -72,16 +74,38 @@ fn today() -> String {
     Local::now().date_naive().to_string()
 }
 
-pub fn resume(app: &mut App) -> Result<Option<Value>> {
+fn configuration(app: &App) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        app.hydration_interval_mins.max(1),
+        app.hydration_active_from,
+        app.hydration_active_to,
+        app.hydration_pause_focus
+    )
+}
+
+fn allowed(app: &App, focused: bool, count: i32) -> Result<bool> {
+    Ok(
+        app.db.get_setting("external_notifications")?.as_deref() != Some("false")
+            && app.hydration_enabled
+            && count < app.hydration_target.max(1)
+            && !(focused && app.hydration_pause_focus)
+            && app.hydration_is_active_at_hour(Local::now().hour()),
+    )
+}
+
+pub fn resume(app: &mut App, focused: bool) -> Result<Option<Value>> {
     let _guard = lock(&app.db)?;
     app.reload_hydration_config();
-    if app.db.get_setting("external_notifications")?.as_deref() == Some("false")
-        || !app.hydration_enabled
-    {
+    let count = app.db.hydration_get_today()?.0;
+    if !allowed(app, focused, count)? {
         return Ok(None);
     }
     if let Some(mut state) = load(&app.db)? {
-        if state.pending && state.day == today() {
+        if state.pending
+            && state.day == today()
+            && state.configuration.as_deref() == Some(configuration(app).as_str())
+        {
             app.reload_hydration_config();
             state.count = app.db.hydration_get_today()?.0;
             state.target = app.hydration_target.max(1);
@@ -100,23 +124,32 @@ pub fn tick(app: &mut App, focused: bool) -> Result<Vec<Value>> {
     app.hydration_interval_mins = app.hydration_interval_mins.max(1);
     app.hydration_target = app.hydration_target.max(1);
     let count = app.db.hydration_get_today()?.0;
-    if !app.hydration_enabled {
+    let mut previous = load(&app.db)?;
+    let settings = configuration(app);
+    let permitted = allowed(app, focused, count)?;
+    if let Some(state) = previous.as_mut().filter(|state| state.pending) {
+        if !permitted
+            || state.day != today()
+            || state.configuration.as_deref() != Some(settings.as_str())
+        {
+            let token = state.token.clone();
+            state.pending = false;
+            state.acknowledged_at = Some(Utc::now().timestamp());
+            state.configuration = Some(settings.clone());
+            save(&app.db, state)?;
+            app.hydration_next_reminder_at = None;
+            return Ok(vec![
+                json!({"title":"Hydration reminder withdrawn", "body":"",
+                "icon":"hydration-clear", "reminder_token":token}),
+            ]);
+        }
+    }
+    if !permitted {
         app.hydration_next_reminder_at = None;
         return Ok(vec![]);
     }
-    let previous = load(&app.db)?.filter(|state| state.day == today());
-    if let Some(mut state) = previous
-        .as_ref()
-        .filter(|state| state.pending)
-        .map(|state| Reminder {
-            token: state.token.clone(),
-            day: state.day.clone(),
-            count: state.count,
-            target: state.target,
-            pending: true,
-            acknowledged_at: state.acknowledged_at,
-        })
-    {
+    let previous = previous.filter(|state| state.day == today());
+    if let Some(mut state) = previous.as_ref().filter(|state| state.pending).cloned() {
         if state.count != count || state.target != app.hydration_target {
             state.count = count;
             state.target = app.hydration_target;
@@ -124,13 +157,6 @@ pub fn tick(app: &mut App, focused: bool) -> Result<Vec<Value>> {
             save(&app.db, &state)?;
             return Ok(vec![value]);
         }
-        return Ok(vec![]);
-    }
-    if !app.hydration_enabled
-        || count >= app.hydration_target
-        || (focused && app.hydration_pause_focus)
-    {
-        app.hydration_next_reminder_at = None;
         return Ok(vec![]);
     }
     let last_ack = previous.and_then(|state| state.acknowledged_at);
@@ -160,6 +186,7 @@ pub fn tick(app: &mut App, focused: bool) -> Result<Vec<Value>> {
         target: app.hydration_target,
         pending: true,
         acknowledged_at: None,
+        configuration: Some(configuration(app)),
     };
     let value = alert(&state);
     save(&app.db, &state)?;
@@ -206,6 +233,7 @@ pub fn drink(app: &mut App, token: &str) -> Result<Value> {
         target: app.hydration_target,
         pending: false,
         acknowledged_at: Some(Utc::now().timestamp()),
+        configuration: Some(configuration(app)),
     };
     save(&app.db, &state)?;
     Ok(
@@ -272,7 +300,7 @@ mod tests {
         app.hydration_next_reminder_at = Some(Instant::now() - Duration::from_secs(1));
         assert!(tick(&mut app, false).unwrap().is_empty());
         assert_eq!(
-            resume(&mut app).unwrap().unwrap()["reminder_token"],
+            resume(&mut app, false).unwrap().unwrap()["reminder_token"],
             alerts[0]["reminder_token"]
         );
         cleanup(app, path);
@@ -338,6 +366,7 @@ mod tests {
         state.day = "2000-01-01".into();
         save(&app.db, &state).unwrap();
         assert_eq!(drink(&mut app, &token).unwrap()["recorded"], false);
+        assert_eq!(tick(&mut app, false).unwrap()[0]["icon"], "hydration-clear");
         app.hydration_next_reminder_at = Some(Instant::now() - Duration::from_secs(1));
         let new = token_for(&mut app);
         assert_ne!(new, token);
@@ -361,5 +390,63 @@ mod tests {
         assert!(update[0]["body"].as_str().unwrap().contains("0/8 today"));
         assert!(tick(&mut app, false).unwrap().is_empty());
         cleanup(app, path);
+    }
+    #[test]
+    fn pending_reminder_is_withdrawn_when_interval_changes_and_waits_full_interval() {
+        let (mut app, path) = app();
+        let old = token(&mut app);
+        app.db.set_setting("hydration_interval_mins", "90").unwrap();
+        assert!(resume(&mut app, false).unwrap().is_none());
+        let alerts = tick(&mut app, false).unwrap();
+        assert_eq!(alerts[0]["icon"], "hydration-clear");
+        assert_eq!(alerts[0]["reminder_token"], old);
+        assert!(!load(&app.db).unwrap().unwrap().pending);
+        assert_eq!(drink(&mut app, &old).unwrap()["recorded"], false);
+        assert!(tick(&mut app, false).unwrap().is_empty());
+        assert!(
+            app.hydration_next_reminder_at.unwrap() > Instant::now() + Duration::from_secs(5300)
+        );
+        cleanup(app, path);
+    }
+
+    #[test]
+    fn pending_reminder_obeys_disabled_settings_active_hours_focus_and_completed_goal() {
+        for setting in [
+            "hydration_enabled",
+            "external_notifications",
+            "hours",
+            "focus",
+            "goal",
+        ] {
+            let (mut app, path) = app();
+            token(&mut app);
+            match setting {
+                "hours" => {
+                    let hour = Local::now().hour();
+                    app.db
+                        .set_setting("hydration_active_from", &((hour + 1) % 24).to_string())
+                        .unwrap();
+                    app.db
+                        .set_setting("hydration_active_to", &((hour + 2) % 24).to_string())
+                        .unwrap();
+                }
+                "focus" => app.db.set_setting("hydration_pause_focus", "true").unwrap(),
+                "goal" => {
+                    app.db.set_setting("hydration_target", "1").unwrap();
+                    app.db.conn.execute("UPDATE hydration_log SET count=1 WHERE log_date=?1", [today()]).unwrap();
+                }
+                _ => app.db.set_setting(setting, "false").unwrap(),
+            }
+            assert!(
+                resume(&mut app, setting == "focus").unwrap().is_none(),
+                "{}",
+                setting
+            );
+            let alerts = tick(&mut app, setting == "focus").unwrap();
+            assert_eq!(alerts[0]["icon"], "hydration-clear", "{}", setting);
+            assert!(!load(&app.db).unwrap().unwrap().pending);
+            assert!(tick(&mut app, setting == "focus").unwrap().is_empty());
+            cleanup(app, path);
+        }
     }
 }

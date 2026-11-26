@@ -209,13 +209,12 @@ fn chapter_cache(app: &mut App) {
 
 pub fn tick(app: &mut App, focused: bool) -> Result<Vec<Value>> {
     let mut alerts = Vec::new();
-    if !enabled(&app.db)? {
-        app.hydration_next_reminder_at = None;
-        return Ok(alerts);
-    }
     app.external_notifications = false;
     app.active_screen = ActiveScreen::Dashboard;
     alerts.extend(crate::desktop_hydration::tick(app, focused)?);
+    if !enabled(&app.db)? {
+        return Ok(alerts);
+    }
     if !focused {
         chapter_cache(app);
         app.tick_sprite_notifications();
@@ -295,7 +294,7 @@ pub fn run(path: &Path) -> Result<()> {
                     if loaded.user.is_some() {
                         loaded.notifications.clear();
                         loaded.last_sprite_notification_time = Some(Instant::now());
-                        if let Some(reminder) = crate::desktop_hydration::resume(&mut loaded)? {
+                        if let Some(reminder) = crate::desktop_hydration::resume(&mut loaded, spectrum_focus_active())? {
                             alerts.push(reminder);
                         }
                         loaded_epoch=loaded.db.get_setting("shell_profile_epoch")?;

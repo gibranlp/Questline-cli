@@ -1742,6 +1742,27 @@ impl<'a> SyncEngine<'a> {
                 continue;
             }
             match log.entity_type.as_str() {
+                "ritual_history" if log.operation != "delete" => {
+                    if let Some(ritual_id) = log.content.as_deref()
+                        .and_then(|content| serde_json::from_str::<serde_json::Value>(content).ok())
+                        .and_then(|value| value["ritual_id"].as_str().map(str::to_owned))
+                    {
+                        let parent_exists: bool = self.db.conn.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM rituals WHERE id=?1)", [&ritual_id], |r| r.get(0),
+                        )?;
+                        let deleted_at: Option<String> = self.db.conn.query_row(
+                            "SELECT timestamp FROM sync_entity_versions WHERE entity_type='ritual' AND entity_id=?1 AND deleted=1",
+                            [&ritual_id], |r| r.get(0),
+                        ).optional()?;
+                        if !parent_exists && deleted_at.as_deref().is_some_and(|deleted_at|
+                            Self::timestamp_or_epoch(Some(deleted_at)) >= Self::timestamp_or_epoch(Some(&log.timestamp)))
+                        {
+                            quarantined_events.insert(log.id.clone(), format!(
+                                "Ritual history {} quarantined: parent ritual was deleted", log.entity_id,
+                            ));
+                        }
+                    }
+                }
                 "note" if log.operation != "delete" => {
                     let reason = match log.content.as_deref() {
                         None => Some("missing payload".to_string()),
@@ -2820,16 +2841,22 @@ impl<'a> SyncEngine<'a> {
                             if let Ok(value) =
                                 serde_json::from_str::<crate::models::TreasuryAccount>(content)
                             {
+                                let fields: serde_json::Value = serde_json::from_str(content).unwrap_or_default();
                                 let stored = self.db.conn.execute(
                                     "INSERT INTO treasury_accounts
-                                     (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
-                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                                     (id, campaign_id, name, kind, is_default, version, created_at, updated_at, savings_status, interest_rate_bps, interest_period)
+                                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                                      ON CONFLICT(id) DO UPDATE SET name=excluded.name,
                                       kind=excluded.kind, is_default=excluded.is_default,
-                                      version=excluded.version, updated_at=excluded.updated_at",
+                                      version=excluded.version, updated_at=excluded.updated_at,
+                                      savings_status=CASE WHEN ?12 THEN excluded.savings_status ELSE treasury_accounts.savings_status END,
+                                      interest_rate_bps=CASE WHEN ?13 THEN excluded.interest_rate_bps ELSE treasury_accounts.interest_rate_bps END,
+                                      interest_period=CASE WHEN ?14 THEN excluded.interest_period ELSE treasury_accounts.interest_period END",
                                     params![value.id.to_string(), value.campaign_id.to_string(), value.name,
                                         value.kind.as_str(), value.is_default as i32, value.version,
-                                        value.created_at.to_rfc3339(), value.updated_at.to_rfc3339()],
+                                        value.created_at.to_rfc3339(), value.updated_at.to_rfc3339(),
+                                        value.savings_status.as_str(), value.interest_rate_bps, value.interest_period.as_str(),
+                                        fields.get("savings_status").is_some(), fields.get("interest_rate_bps").is_some(), fields.get("interest_period").is_some()],
                                 );
                                 if Self::defer_treasury_event(
                                     &log,
@@ -4384,6 +4411,41 @@ mod tests {
     }
 
     #[test]
+    fn orphan_ritual_history_retries_until_parent_deletion_then_quarantines_once() {
+        let path = std::env::temp_dir().join(format!("questline-orphan-history-{}.db", Uuid::new_v4()));
+        let db = Database::new(&path).unwrap();
+        let identity = test_identity();
+        let event = serde_json::json!({
+            "id": "orphan-history", "entity_type": "ritual_history",
+            "entity_id": "deleted-ritual__2026-06-25", "operation": "reseed",
+            "timestamp": "1970-01-01T00:00:00Z", "device_id": "other-device", "seq": 1,
+            "content": serde_json::json!({"ritual_id": "deleted-ritual", "completed_date": "2026-06-25",
+                "completion_count": 1, "completed_at": null}).to_string()
+        });
+        let engine = SyncEngine {
+            db: &db, identity: &identity, device_id: "local-device",
+            provider: Box::new(StaticCloudProvider { pull_payload: serde_json::json!({
+                "events": [event], "head_seq": 1, "next_seq": 1, "has_more": false
+            }).to_string() }),
+        };
+        assert!(!engine.sync().unwrap().2.is_empty());
+        let count = |table: &str| db.conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get::<_, i64>(0)).unwrap();
+        assert_eq!(count("sync_deferred_events"), 1);
+        assert_eq!(count("sync_quarantine"), 0);
+        db.conn.execute("INSERT INTO sync_entity_versions (entity_type,entity_id,timestamp,event_id,deleted)
+            VALUES ('ritual','deleted-ritual','2026-10-30T15:57:35Z','parent-delete',1)", []).unwrap();
+        assert!(engine.sync().unwrap().2.iter().any(|reason| reason.contains("parent ritual was deleted")));
+        assert_eq!(count("sync_deferred_events"), 0);
+        assert_eq!(count("sync_quarantine"), 1);
+        assert_eq!(count("ritual_history"), 0);
+        assert!(engine.sync().unwrap().2.is_empty());
+        assert_eq!(count("sync_quarantine"), 1);
+        drop(engine);
+        drop(db);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn remote_ritual_update_preserves_completion_history() {
         let temp_db_path = std::env::current_dir()
             .unwrap()
@@ -5638,7 +5700,8 @@ mod tests {
             sync(&db_b, receiver, "account-edit-b", true);
             let service = crate::services::TreasuryService::new(&db_a);
             let bank1 = service.create_account(campaign_id, "bank1", crate::models::TreasuryAccountKind::Spending).unwrap();
-            let bank2 = service.create_account(campaign_id, "bank2", crate::models::TreasuryAccountKind::Savings).unwrap();
+            let bank2 = service.create_account_with_savings(campaign_id, "bank2", crate::models::TreasuryAccountKind::Savings,
+                crate::models::SavingsStatus::Invested,1250,crate::models::InterestPeriod::Annual).unwrap();
             sync(&db_a, &owner, "account-edit-a", false);
             sync(&db_b, receiver, "account-edit-b", true);
             let mut edited = bank1.clone();
@@ -5653,6 +5716,7 @@ mod tests {
             sync(&db_b, receiver, "account-edit-b", true);
             let received = crate::services::TreasuryService::new(&db_b);
             assert_eq!(received.get_account(bank1.id).unwrap().unwrap(), edited);
+            assert_eq!(received.get_account(bank2.id).unwrap().unwrap(), bank2);
             assert_eq!(serde_json::to_value(received.get_entry(entry_id).unwrap().unwrap()).unwrap(), serde_json::to_value(&moved).unwrap());
             assert_eq!(moved.payment_date, old_payment_date);
             assert_eq!(received.account_balances(campaign_id).unwrap(), service.account_balances(campaign_id).unwrap());

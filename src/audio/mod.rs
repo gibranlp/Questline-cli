@@ -13,3 +13,5 @@ pub mod streams;
 pub use player::AudioPlayer;
 pub use soundscapes::SOUNDSCAPES;
 pub use state::PlaybackStatus;
+
+pub mod stash_library;

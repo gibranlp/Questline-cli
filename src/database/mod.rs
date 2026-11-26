@@ -540,7 +540,7 @@ impl Database {
     /// column-existence-check block below, so upgraded installs re-run that
     /// whole block once (idempotent either way) instead of it silently
     /// staying skipped forever via a stale `PRAGMA user_version`.
-    const SCHEMA_VERSION: i64 = 4;
+    const SCHEMA_VERSION: i64 = 5;
 
     pub fn database_size_bytes(&self) -> Result<u64> {
         let page_count: i64 = self
@@ -674,6 +674,17 @@ impl Database {
                 "ALTER TABLE ledger_categories ADD COLUMN entry_type TEXT NOT NULL DEFAULT 'Expense'",
                 [],
             )?;
+        }
+
+        for (column, definition) in [
+            ("savings_status", "TEXT NOT NULL DEFAULT 'Available' CHECK(savings_status IN ('Available','Invested'))"),
+            ("interest_rate_bps", "INTEGER NOT NULL DEFAULT 0 CHECK(interest_rate_bps BETWEEN 0 AND 1000000)"),
+            ("interest_period", "TEXT NOT NULL DEFAULT 'Annual' CHECK(interest_period IN ('Monthly','Annual'))"),
+        ] {
+            let exists: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('treasury_accounts') WHERE name=?1)",
+                params![column], |row| row.get(0))?;
+            if !exists { conn.execute(&format!("ALTER TABLE treasury_accounts ADD COLUMN {column} {definition}"), [])?; }
         }
 
         for (column, migration) in [

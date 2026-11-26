@@ -12,7 +12,7 @@ use crate::models::{
     CategoryReport, CategoryTotals, Currency, LedgerCategory, LedgerEntry, LedgerEntryType,
     LedgerFilter, LedgerRecurrence, LedgerSort, LedgerStatus, MonthlySpending,
     MonthlyTreasuryMetrics, TaskFinancials, TaskPaymentStatus, TreasuryAccount,
-    TreasuryAccountBalance, TreasuryAccountKind, TreasuryReport,
+    TreasuryAccountBalance, TreasuryAccountKind, TreasuryReport, SavingsStatus, InterestPeriod,
 };
 
 pub const DEFAULT_CATEGORIES: [(&str, LedgerEntryType); 25] = [
@@ -347,7 +347,7 @@ impl<'a> TreasuryService<'a> {
     pub fn accounts(&self, campaign_id: Uuid) -> Result<Vec<TreasuryAccount>> {
         self.ensure_campaign(campaign_id)?;
         let mut stmt = self.db.conn.prepare(
-            "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at
+            "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at, savings_status, interest_rate_bps, interest_period
              FROM treasury_accounts WHERE campaign_id=?1
              ORDER BY is_default DESC,
                       CASE kind WHEN 'Spending' THEN 0 WHEN 'Savings' THEN 1 WHEN 'Cash' THEN 2 ELSE 3 END,
@@ -358,12 +358,32 @@ impl<'a> TreasuryService<'a> {
             .map_err(Into::into)
     }
 
+    pub fn entry_accounts(&self, campaign_id: Uuid, existing: Option<Uuid>) -> Result<Vec<TreasuryAccount>> {
+        let entry = existing.map(|id| self.get_entry(id)).transpose()?.flatten();
+        let accounts = self.accounts(campaign_id)?;
+        Ok(accounts.into_iter().filter(|account| {
+            if !account.is_default { return true; }
+            entry.as_ref().is_some_and(|entry| {
+                entry.account_id == Some(account.id) || entry.transfer_account_id == Some(account.id) ||
+                    (entry.account_id.is_none() && account.id == deterministic_account_id(campaign_id, "Spending"))
+            })
+        }).collect())
+    }
+
     pub fn create_account(
         &self,
         campaign_id: Uuid,
         name: &str,
         kind: TreasuryAccountKind,
     ) -> Result<TreasuryAccount> {
+        self.create_account_with_savings(campaign_id, name, kind, SavingsStatus::Available, 0, InterestPeriod::Annual)
+    }
+
+    pub fn create_account_with_savings(
+        &self, campaign_id: Uuid, name: &str, kind: TreasuryAccountKind,
+        savings_status: SavingsStatus, interest_rate_bps: i64, interest_period: InterestPeriod,
+    ) -> Result<TreasuryAccount> {
+        if !(0..=1000000).contains(&interest_rate_bps) { bail!("Interest rate must be between 0 and 10000 percent"); }
         self.ensure_campaign(campaign_id)?;
         let name = name.trim();
         if name.is_empty() {
@@ -375,14 +395,14 @@ impl<'a> TreasuryService<'a> {
         let now = Utc::now();
         self.db.conn.execute(
             "INSERT INTO treasury_accounts
-             (id, campaign_id, name, kind, is_default, version, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, ?5)",
+             (id, campaign_id, name, kind, is_default, version, created_at, updated_at, savings_status, interest_rate_bps, interest_period)
+             VALUES (?1, ?2, ?3, ?4, 0, 1, ?5, ?5, ?6, ?7, ?8)",
             params![
                 id.to_string(),
                 campaign_id.to_string(),
                 name,
                 kind.as_str(),
-                now.to_rfc3339()
+                now.to_rfc3339(), savings_status.as_str(), interest_rate_bps, interest_period.as_str()
             ],
         )?;
         self.db
@@ -414,6 +434,7 @@ impl<'a> TreasuryService<'a> {
         if previous.campaign_id != account.campaign_id {
             bail!("An account cannot move between campaigns");
         }
+        if !(0..=1000000).contains(&account.interest_rate_bps) { bail!("Interest rate must be between 0 and 10000 percent"); }
         account.name = account.name.trim().to_string();
         self.validate_account_name(account.campaign_id, &account.name, Some(account.id))?;
         account.is_default = previous.is_default;
@@ -422,8 +443,8 @@ impl<'a> TreasuryService<'a> {
         account.version += 1;
         account.updated_at = Utc::now();
         let changed = self.db.conn.execute(
-            "UPDATE treasury_accounts SET name=?1, kind=?2, version=?3, updated_at=?4 WHERE id=?5 AND version=?6",
-            params![account.name, account.kind.as_str(), account.version, account.updated_at.to_rfc3339(), account.id.to_string(), expected_version],
+            "UPDATE treasury_accounts SET name=?1, kind=?2, version=?3, updated_at=?4, savings_status=?7, interest_rate_bps=?8, interest_period=?9 WHERE id=?5 AND version=?6",
+            params![account.name, account.kind.as_str(), account.version, account.updated_at.to_rfc3339(), account.id.to_string(), expected_version, account.savings_status.as_str(), account.interest_rate_bps, account.interest_period.as_str()],
         )?;
         if changed == 0 {
             bail!("Treasury account changed on another device; reload before editing");
@@ -469,7 +490,7 @@ impl<'a> TreasuryService<'a> {
         self.db
             .conn
             .query_row(
-                "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at
+                "SELECT id, campaign_id, name, kind, is_default, version, created_at, updated_at, savings_status, interest_rate_bps, interest_period
                  FROM treasury_accounts WHERE id=?1",
                 params![id.to_string()],
                 map_account,
@@ -760,12 +781,18 @@ impl<'a> TreasuryService<'a> {
             params![campaign_id.to_string()],
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
+        let balances = self.account_balances(campaign_id)?;
+        let savings = balances.iter().filter(|balance| balance.account.kind == TreasuryAccountKind::Savings);
+        let saved_minor = savings.clone().try_fold(0i64, |total, balance| total.checked_add(balance.balance_minor).context("Savings total is too large"))?;
+        let invested_minor = savings.filter(|balance| balance.account.savings_status == SavingsStatus::Invested)
+            .try_fold(0i64, |total, balance| total.checked_add(balance.balance_minor).context("Invested total is too large"))?;
         Ok(CampaignTotals {
             budget_minor: treasury.overall_budget_minor,
             income_minor: income,
             paid_minor: paid,
             committed_minor: committed,
-            available_minor: income - paid - committed,
+            available_minor: (income - paid - committed).checked_sub(saved_minor).context("Available total is too large")?,
+            saved_minor, invested_minor, liquid_savings_minor: saved_minor - invested_minor,
         })
     }
 
@@ -1356,6 +1383,9 @@ fn map_account(row: &Row<'_>) -> rusqlite::Result<TreasuryAccount> {
         kind: TreasuryAccountKind::parse(&kind)
             .ok_or_else(|| conversion_error(3, "treasury account kind"))?,
         is_default: row.get::<_, i32>(4)? != 0,
+        savings_status: SavingsStatus::parse(&row.get::<_, String>(8)?).ok_or_else(|| conversion_error(8,"savings status"))?,
+        interest_rate_bps: row.get(9)?,
+        interest_period: InterestPeriod::parse(&row.get::<_, String>(10)?).ok_or_else(|| conversion_error(10,"interest period"))?,
         version: row.get(5)?,
         created_at: parse_datetime(row, 6)?,
         updated_at: parse_datetime(row, 7)?,
@@ -1650,6 +1680,20 @@ fn deterministic_account_id(campaign_id: Uuid, name: &str) -> Uuid {
     Uuid::from_bytes(bytes)
 }
 
+pub fn parse_interest_rate(value: &str) -> Result<i64> {
+    let (whole, fraction) = value.trim().split_once('.').unwrap_or((value.trim(), ""));
+    if whole.is_empty() || !whole.chars().all(|c| c.is_ascii_digit()) || fraction.len() > 2 || !fraction.chars().all(|c| c.is_ascii_digit()) {
+        bail!("Enter a percentage with up to two decimal places");
+    }
+    let whole: i64 = whole.parse().context("Interest rate is too large")?;
+    let fractional: i64 = format!("{fraction:0<2}").parse()?;
+    let rate = whole.checked_mul(100).and_then(|v| v.checked_add(fractional)).context("Interest rate is too large")?;
+    if rate > 1000000 { bail!("Interest rate must be between 0 and 10000 percent"); }
+    Ok(rate)
+}
+
+pub fn format_interest_rate(rate: i64) -> String { format!("{}.{:02}", rate / 100, rate % 100) }
+
 pub fn format_minor(value: i64) -> String {
     let sign = if value < 0 { "-" } else { "" };
     let absolute = value.unsigned_abs();
@@ -1854,6 +1898,65 @@ mod tests {
     }
 
     #[test]
+    fn treasury_savings_terms_and_estimates_preserve_actual_balances() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let spending = service.create_account(campaign_id,"Checking",TreasuryAccountKind::Spending).unwrap();
+        let savings = service.create_account_with_savings(campaign_id,"Investment",TreasuryAccountKind::Savings,
+            SavingsStatus::Invested,1250,InterestPeriod::Annual).unwrap();
+        let mut income = entry(campaign_id,category_id(&service,campaign_id,LedgerEntryType::Income),LedgerEntryType::Income,LedgerStatus::Paid,100000);
+        income.account_id = Some(spending.id); service.create_entry(income).unwrap();
+        let mut transfer = entry(campaign_id,category_id(&service,campaign_id,LedgerEntryType::Transfer),LedgerEntryType::Transfer,LedgerStatus::Paid,40000);
+        transfer.account_id = Some(spending.id); transfer.transfer_account_id = Some(savings.id); service.create_entry(transfer).unwrap();
+        let before = service.entries(campaign_id,&LedgerFilter::default(),LedgerSort::Newest).unwrap().len();
+        let totals = service.calculate_campaign_totals(campaign_id).unwrap();
+        assert_eq!((totals.available_minor,totals.saved_minor,totals.invested_minor,totals.liquid_savings_minor),(60000,40000,40000,0));
+        assert_eq!(savings.estimated_interest_minor(40000),Some(5000));
+        assert_eq!(savings.estimated_interest_minor(-100),Some(0));
+        let mut edited = savings.clone(); edited.savings_status = SavingsStatus::Available; edited.interest_period = InterestPeriod::Monthly; edited.interest_rate_bps=125;
+        let saved = service.update_account(edited).unwrap();
+        assert_eq!(saved.estimated_interest_minor(40000),Some(500));
+        assert!(service.update_account(savings).is_err());
+        let totals = service.calculate_campaign_totals(campaign_id).unwrap();
+        assert_eq!((totals.available_minor,totals.saved_minor,totals.invested_minor,totals.liquid_savings_minor),(60000,40000,0,40000));
+        assert_eq!(service.entries(campaign_id,&LedgerFilter::default(),LedgerSort::Newest).unwrap().len(),before);
+        let history: String = db.conn.query_row("SELECT snapshot FROM treasury_history WHERE entity_id=?1 AND action='updated'",params![saved.id.to_string()],|row|row.get(0)).unwrap();
+        assert!(history.contains("interest_rate_bps"));
+        assert_eq!(service.get_account(saved.id).unwrap().unwrap(),saved);
+    }
+
+    #[test]
+    fn treasury_entry_accounts_only_offer_user_accounts_and_preserve_existing_legacy_links() {
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        assert!(service.entry_accounts(campaign_id,None).unwrap().is_empty());
+        let custom = service.create_account(campaign_id,"My bank",TreasuryAccountKind::Spending).unwrap();
+        assert_eq!(service.entry_accounts(campaign_id,None).unwrap(),vec![custom.clone()]);
+        let legacy = entry(campaign_id,category_id(&service,campaign_id,LedgerEntryType::Income),LedgerEntryType::Income,LedgerStatus::Paid,100);
+        let legacy = service.create_entry(legacy).unwrap();
+        let choices = service.entry_accounts(campaign_id,Some(legacy.id)).unwrap();
+        assert!(choices.iter().any(|account| account.id == custom.id));
+        assert!(choices.iter().any(|account| account.is_default && account.name == "Spending"));
+        assert!(!choices.iter().any(|account| account.name == "Savings" || account.name == "Cash"));
+    }
+
+    #[test]
+    fn treasury_interest_rates_are_decimal_and_legacy_payloads_have_safe_defaults() {
+        assert_eq!(parse_interest_rate("12.50").unwrap(),1250);
+        assert_eq!(parse_interest_rate("0.1").unwrap(),10);
+        for value in ["-1","1.001","NaN","1e3","10000.01",""] { assert!(parse_interest_rate(value).is_err(),"{value}"); }
+        let (_file, db, campaign_id) = test_db();
+        let service = TreasuryService::new(&db);
+        let account = service.create_account(campaign_id,"Safe",TreasuryAccountKind::Savings).unwrap();
+        let mut legacy = serde_json::to_value(&account).unwrap();
+        for name in ["savings_status","interest_rate_bps","interest_period"] {legacy.as_object_mut().unwrap().remove(name);}
+        let decoded: TreasuryAccount = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.savings_status,SavingsStatus::Available);
+        assert_eq!(decoded.interest_rate_bps,0);assert_eq!(decoded.interest_period,InterestPeriod::Annual);
+        assert!(service.create_account_with_savings(campaign_id,"Bad",TreasuryAccountKind::Savings,SavingsStatus::Invested,-1,InterestPeriod::Monthly).is_err());
+    }
+
+    #[test]
     fn default_categories_are_idempotent() {
         let (_file, db, campaign_id) = test_db();
         let service = TreasuryService::new(&db);
@@ -2031,7 +2134,7 @@ mod tests {
     }
 
     #[test]
-    fn transfers_move_money_between_accounts_without_changing_campaign_totals() {
+    fn transfers_separate_savings_from_spendable_campaign_funds() {
         let (_file, db, campaign_id) = test_db();
         let service = TreasuryService::new(&db);
         let income_category = category_id(&service, campaign_id, LedgerEntryType::Income);
@@ -2100,7 +2203,9 @@ mod tests {
         let totals = service.calculate_campaign_totals(campaign_id).unwrap();
         assert_eq!(totals.income_minor, 10_000);
         assert_eq!(totals.paid_minor, 1_000);
-        assert_eq!(totals.available_minor, 9_000);
+        assert_eq!(totals.available_minor, 6_000);
+        assert_eq!(totals.saved_minor, 3_000);
+        assert_eq!(totals.available_minor + totals.saved_minor, 9_000);
     }
 
     #[test]

@@ -8,7 +8,7 @@
 
 [Download](https://questlinecli.com) &nbsp;|&nbsp; [Website](https://questlinecli.com) &nbsp;|&nbsp; [Releases](https://github.com/gibranlp/Questline-cli/releases)
 
-Current release: **2.0.3**.
+Current release: **2.0.4**.
 
 ---
 
@@ -419,6 +419,14 @@ If Questline helps you on your adventures, consider starring the repository and 
 ---
 
 ## Changelog
+
+### v2.0.4 — Music and Savings
+*November 26, 2026*
+
+- Browse and play your Stash music library directly in Questline.
+- Track savings accounts, invested funds, and estimated interest in Treasury.
+- Hydration reminders respect updated settings, focus sessions, and daily goals.
+- Keep the CLI up to date with changes made through SpectrumOS widgets.
 
 ### v2.0.3 — Profiles Across Every PC
 

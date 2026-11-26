@@ -30,7 +30,7 @@ pub use treasury::{
     CategoryReport, CategoryTotals, Currency, LedgerCategory, LedgerEntry, LedgerEntryType,
     LedgerFilter, LedgerRecurrence, LedgerSort, LedgerStatus, MonthlySpending,
     MonthlyTreasuryMetrics, TaskFinancials, TaskPaymentStatus, TreasuryAccount,
-    TreasuryAccountBalance, TreasuryAccountKind, TreasuryReport,
+    TreasuryAccountBalance, TreasuryAccountKind, TreasuryReport, SavingsStatus, InterestPeriod,
 };
 pub use user::{ClassType, User};
 pub use xp_event::XPEvent;

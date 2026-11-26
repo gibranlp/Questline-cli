@@ -582,6 +582,9 @@ pub enum ModalType {
         version: i64,
         name: String,
         kind_idx: usize,
+        savings_status_idx: usize,
+        rate: String,
+        rate_period_idx: usize,
         focus_idx: usize,
     },
     // Divisa de trabajo de la campaña — solo cambia la denominación, no convierte importes
@@ -1236,6 +1239,7 @@ pub struct App {
     pub local_music_tracks_cache: Vec<std::path::PathBuf>,
     pub selected_focus_soundscape_idx: usize, // 0 = None (Silent), 1..=SOUNDSCAPES.len() = specific soundscape
 
+    pub stash_library: crate::audio::stash_library::Library,
     pub mpris_now_playing: Option<crate::audio::mpris_player::NowPlaying>,
     pub mpris_last_poll: std::time::Instant,
 
@@ -2873,6 +2877,7 @@ impl App {
             restore_error: None,
             onboarding_from_gateway: false,
 
+            stash_library: crate::audio::stash_library::Library::default(),
             mpris_now_playing: None,
             mpris_last_poll: std::time::Instant::now(),
 
@@ -2978,7 +2983,7 @@ impl App {
             .set_sound_effects_enabled(app.sound_effects_enabled);
         app.audio_player
             .set_sound_effects_volume(app.sound_effects_volume);
-        if !headless && let Ok(Some(last_source)) = app.db.get_setting("last_music_source") {
+        if !headless && !crate::audio::mpris_player::uses_stash() && let Ok(Some(last_source)) = app.db.get_setting("last_music_source") {
             if !last_source.is_empty() && last_source != "Silent" && last_source != "None" {
                 if let Some(idx) = crate::audio::SOUNDSCAPES
                     .iter()
@@ -3689,26 +3694,14 @@ impl App {
                 let visible = inner(popup).height.saturating_sub(1) as usize;
                 rows(popup, 1, count, selected_idx.saturating_add(1).saturating_sub(visible))
             }
-            ModalType::TreasuryAccount { .. } => {
-                let popup = pct(56, 30, term);
+            ModalType::TreasuryAccount { kind_idx, .. } => {
+                let popup = pct(56, 75, term);
                 let block_inner = inner(popup);
-                fields(
-                    popup,
-                    vec![
-                        Rect {
-                            x: block_inner.x,
-                            y: block_inner.y + 2,
-                            width: block_inner.width,
-                            height: 1,
-                        },
-                        Rect {
-                            x: block_inner.x,
-                            y: block_inner.y + 4,
-                            width: block_inner.width,
-                            height: 1,
-                        },
-                    ],
-                )
+                let count = if *kind_idx == 1 { 5 } else { 2 };
+                fields(popup, (0..count).map(|index| Rect {
+                    x: block_inner.x, y: block_inner.y + 2 + index * 2,
+                    width: block_inner.width, height: 1,
+                }).collect())
             }
             ModalType::CustomFocusDuration { .. } => outside_only(pct(40, 25, term)),
             ModalType::EditServerUrl { .. } => outside_only(pct(50, 20, content_area)),
@@ -5469,6 +5462,33 @@ impl App {
             return;
         };
 
+        if crate::audio::mpris_player::uses_stash() {
+            if !crate::audio::stash_library::installed() {
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && regions.folder_picker.is_some_and(|button|HitRegions::contains(button,mouse.column,mouse.row)) {
+                    self.open_scroll_link(crate::audio::stash_library::download_url());
+                }
+                return;
+            }
+            if HitRegions::contains(regions.source_list, mouse.column, mouse.row) {
+                match mouse.kind {
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let row = (mouse.row - regions.source_list.y) as usize;
+                        let visible_start = self.stash_library.selected.saturating_sub(regions.source_list.height.saturating_sub(1) as usize)
+                            .max(self.stash_library.offset);
+                        if visible_start + row < self.stash_library.snapshot["total"].as_u64().unwrap_or(0) as usize {
+                            self.stash_library.selected = visible_start + row;
+                            if self.register_click_run(mouse.column, mouse.row) >= 2 { self.stash_library.play_selected(); }
+                        }
+                    },
+                    MouseEventKind::ScrollUp => { self.stash_library.key(crossterm::event::KeyCode::Up); },
+                    MouseEventKind::ScrollDown => { self.stash_library.key(crossterm::event::KeyCode::Down); },
+                    _ => {},
+                }
+            }
+            return;
+        }
+
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(button) = regions.folder_picker
@@ -6677,7 +6697,7 @@ impl App {
         }
         let categories = crate::services::TreasuryService::new(&self.db)
             .categories_for_type(p_id, entry.entry_type)?;
-        let accounts = crate::services::TreasuryService::new(&self.db).accounts(p_id)?;
+        let accounts = crate::services::TreasuryService::new(&self.db).entry_accounts(p_id, Some(entry.id))?;
         self.treasury_account_idx = entry
             .account_id
             .and_then(|id| accounts.iter().position(|account| account.id == id))
@@ -6948,6 +6968,27 @@ impl App {
         let modal_handled = self.handle_rpg_modal_key(key)?;
         if modal_handled {
             return Ok(());
+        }
+
+        if self.active_screen == ActiveScreen::Soundscapes
+            && self.modal_state == ModalType::None
+            && crate::audio::mpris_player::uses_stash()
+            && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+        {
+            if !crate::audio::stash_library::installed() {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('d') => {
+                        self.open_scroll_link(crate::audio::stash_library::download_url());
+                        return Ok(());
+                    },
+                    KeyCode::Char('g') => {
+                        self.open_scroll_link(crate::audio::stash_library::RELEASES_URL);
+                        return Ok(());
+                    },
+                    _ => {},
+                }
+            }
+            if self.stash_library.key(key.code) { return Ok(()); }
         }
 
         if self.active_screen == ActiveScreen::Portals && self.modal_state == ModalType::None {
@@ -15429,7 +15470,7 @@ impl App {
                     version: 1,
                     name: String::new(),
                     kind_idx: 0,
-                    focus_idx: 0,
+                    savings_status_idx: 0, rate: "0".into(), rate_period_idx: 1, focus_idx: 0,
                 };
             }
             KeyCode::Char('p') if self.workspace_tab_idx == 4 => {
@@ -16501,7 +16542,7 @@ impl App {
                                 account_id: Some(account.id), version: account.version,
                                 name: account.name.clone(),
                                 kind_idx: crate::models::TreasuryAccountKind::ALL.iter().position(|kind| *kind == account.kind).unwrap_or(0),
-                                focus_idx: 0,
+                                savings_status_idx: usize::from(account.savings_status == crate::models::SavingsStatus::Invested), rate: crate::services::treasury::format_interest_rate(account.interest_rate_bps), rate_period_idx: usize::from(account.interest_period == crate::models::InterestPeriod::Annual), focus_idx: 0,
                             };
                             return Ok(());
                         }
@@ -16525,7 +16566,7 @@ impl App {
                     }
                     KeyCode::Char('A') => {
                         if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
-                        self.modal_state = ModalType::TreasuryAccount { account_id: None, version: 1, name: String::new(), kind_idx: 0, focus_idx: 0 };
+                        self.modal_state = ModalType::TreasuryAccount { account_id: None, version: 1, name: String::new(), kind_idx: 0, savings_status_idx: 0, rate: "0".into(), rate_period_idx: 1, focus_idx: 0 };
                         return Ok(());
                     }
                     _ => {}
@@ -16536,17 +16577,24 @@ impl App {
                 account_id,
                 version,
                 ref name,
-                kind_idx,
+                kind_idx, savings_status_idx, ref rate, rate_period_idx,
                 focus_idx,
             } => {
                 let mut name = name.clone();
                 let mut kind_idx = kind_idx.min(crate::models::TreasuryAccountKind::ALL.len() - 1);
-                let mut focus_idx = focus_idx.min(1);
+                let mut savings_status_idx = savings_status_idx.min(1);
+                let mut rate = rate.clone();
+                let mut rate_period_idx = rate_period_idx.min(1);
+                let field_count = if kind_idx == 1 { 5 } else { 2 };
+                let mut focus_idx = focus_idx.min(field_count - 1);
                 match key.code {
                     KeyCode::Esc => self.modal_state = ModalType::None,
-                    KeyCode::Tab | KeyCode::Down | KeyCode::BackTab | KeyCode::Up => {
-                        focus_idx = (focus_idx + 1) % 2
-                    }
+                    KeyCode::Tab | KeyCode::Down => focus_idx = (focus_idx + 1) % field_count,
+                    KeyCode::BackTab | KeyCode::Up => focus_idx = (focus_idx + field_count - 1) % field_count,
+                    KeyCode::Left | KeyCode::Right if focus_idx == 2 => savings_status_idx = 1 - savings_status_idx,
+                    KeyCode::Left | KeyCode::Right if focus_idx == 4 => rate_period_idx = 1 - rate_period_idx,
+                    KeyCode::Backspace if focus_idx == 3 => { rate.pop(); }
+                    KeyCode::Char(character) if focus_idx == 3 && (character.is_ascii_digit() || character == '.') && rate.len() < 10 => rate.push(character),
                     KeyCode::Left if focus_idx == 1 => {
                         kind_idx = (kind_idx + crate::models::TreasuryAccountKind::ALL.len() - 1)
                             % crate::models::TreasuryAccountKind::ALL.len();
@@ -16565,15 +16613,26 @@ impl App {
                     KeyCode::Enter if focus_idx == 0 => focus_idx = 1,
                     KeyCode::Enter if !name.trim().is_empty() => {
                         if !self.treasury_allows(project_id, crate::services::treasury_policy::TreasuryAction::ManageCategories) { return Ok(()); }
+                        let parsed_rate = if kind_idx == 1 {
+                            match crate::services::treasury::parse_interest_rate(&rate) {
+                                Ok(value) => value,
+                                Err(error) => { self.notifications.push(Notification::warning(error.to_string())); return Ok(()); }
+                            }
+                        } else { 0 };
+                        let savings_status = if savings_status_idx == 1 { crate::models::SavingsStatus::Invested } else { crate::models::SavingsStatus::Available };
+                        let interest_period = if rate_period_idx == 0 { crate::models::InterestPeriod::Monthly } else { crate::models::InterestPeriod::Annual };
                         let service = crate::services::TreasuryService::new(&self.db);
                         let result = if let Some(id) = account_id {
                             let mut account = service.get_account(id)?.context("Treasury account no longer exists")?;
                             account.version = version;
                             account.name = name.clone();
                             account.kind = crate::models::TreasuryAccountKind::ALL[kind_idx];
+                            account.savings_status = savings_status;
+                            account.interest_rate_bps = parsed_rate;
+                            account.interest_period = interest_period;
                             service.update_account(account)
                         } else {
-                            service.create_account(project_id, &name, crate::models::TreasuryAccountKind::ALL[kind_idx])
+                            service.create_account_with_savings(project_id, &name, crate::models::TreasuryAccountKind::ALL[kind_idx], savings_status, parsed_rate, interest_period)
                         };
                         if let Err(error) = result {
                             self.notifications.push(Notification::warning(error.to_string()));
@@ -16592,7 +16651,7 @@ impl App {
                         account_id,
                         version,
                         name,
-                        kind_idx,
+                        kind_idx, savings_status_idx, rate, rate_period_idx,
                         focus_idx,
                     };
                 }
@@ -17965,7 +18024,7 @@ impl App {
         let entry_types = crate::models::LedgerEntryType::ALL;
         let categories = crate::services::TreasuryService::new(&self.db)
             .categories_for_type(project_id, entry_types[entry_type_idx.min(3)])?;
-        let accounts = crate::services::TreasuryService::new(&self.db).accounts(project_id)?;
+        let accounts = crate::services::TreasuryService::new(&self.db).entry_accounts(project_id, entry_id)?;
         title_cursor = title_cursor.min(title.len());
         amount_cursor = amount_cursor.min(amount.len());
         // El campo Date siempre está disponible — al crear nace en "hoy", al editar en la
@@ -18113,6 +18172,10 @@ impl App {
                 let account_id = accounts
                     .get(self.treasury_account_idx.min(accounts.len().saturating_sub(1)))
                     .map(|account| account.id);
+                if entry_id.is_none() && account_id.is_none() {
+                    self.notifications.push(Notification::warning("Create a Treasury account first (E, then A).".to_string()));
+                    return Ok(());
+                }
                 let transfer_account_id = (entry_type == crate::models::LedgerEntryType::Transfer)
                     .then(|| {
                         accounts
@@ -21733,7 +21796,7 @@ impl App {
         self.ambient_particles = active_particles;
     }
 
-    fn check_action_achievements(&mut self) -> Result<()> {
+    pub(crate) fn check_action_achievements(&mut self) -> Result<()> {
         let stats = self.db.get_statistics()?;
 
         // Logros retroactivos por umbral; cada bloque usa datos persistidos para no depender del evento actual.
@@ -22118,7 +22181,7 @@ impl App {
                         }
                         if !self.sync_conflicts.is_empty() {
                             self.notifications.push(Notification::warning(format!(
-                                "{} sync conflict(s) resolved or quarantined — automatic sync continues",
+                                "{} sync event(s) need attention — see Sync for details",
                                 self.sync_conflicts.len()
                             )));
                         }
@@ -22530,9 +22593,13 @@ impl App {
     // poll de now-playing vía MPRIS cada 3 segundos cuando Media Player está seleccionado
     pub fn tick_mpris(&mut self) {
         use crate::audio::SOUNDSCAPES;
+        if self.active_screen == ActiveScreen::Soundscapes && crate::audio::mpris_player::uses_stash() {
+            self.stash_library.poll();
+        }
         let is_selected = self.active_screen == ActiveScreen::Soundscapes
             && self.selected_soundscape_idx < SOUNDSCAPES.len()
-            && SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player";
+            && (crate::audio::mpris_player::uses_stash()
+                || SOUNDSCAPES[self.selected_soundscape_idx].name == "Media Player");
 
         if is_selected && self.mpris_last_poll.elapsed().as_secs() >= 3 {
             self.mpris_last_poll = std::time::Instant::now();
@@ -28962,8 +29029,11 @@ mod app_tests {
                 && account.kind == crate::models::TreasuryAccountKind::Savings
         }));
 
-        app.treasury_account_idx = 1;
-        app.treasury_transfer_account_idx = 0;
+        let service = crate::services::TreasuryService::new(&app.db);
+        let daily = service.create_account(project_id,"Everyday",crate::models::TreasuryAccountKind::Spending).unwrap();
+        let choices = service.entry_accounts(project_id,None).unwrap();
+        app.treasury_account_idx = choices.iter().position(|account|account.name == "Rainy Day").unwrap();
+        app.treasury_transfer_account_idx = choices.iter().position(|account|account.id == daily.id).unwrap();
         app.modal_state = ModalType::TreasuryEntry {
             entry_id: None,
             title: "Move savings to spending".into(),
@@ -28989,11 +29059,27 @@ mod app_tests {
             )
             .unwrap()
             .remove(0);
-        assert_eq!(transfer.account_id, Some(accounts[1].id));
-        assert_eq!(transfer.transfer_account_id, Some(accounts[0].id));
+        assert_eq!(transfer.account_id, Some(choices.iter().find(|account|account.name == "Rainy Day").unwrap().id));
+        assert_eq!(transfer.transfer_account_id, Some(daily.id));
 
         drop(app);
         let _ = std::fs::remove_file(db_file);
+    }
+
+    #[test]
+    fn treasury_account_modal_saves_savings_availability_and_percentage() {
+        let db_file = Path::new("test_questline_savings_terms_modal.db");
+        let (mut app, project_id, _) = treasury_role_app(db_file,"Owner");
+        let account = crate::services::TreasuryService::new(&app.db).create_account(project_id,"Reserve",crate::models::TreasuryAccountKind::Savings).unwrap();
+        app.modal_state = ModalType::TreasuryAccount {account_id:Some(account.id),version:account.version,name:account.name,
+            kind_idx:1,savings_status_idx:1,rate:"12.50".into(),rate_period_idx:1,focus_idx:3};
+        app.handle_key_event(KeyEvent::new(KeyCode::Enter,KeyModifiers::empty())).unwrap();
+        assert_eq!(app.modal_state,ModalType::None);
+        let saved = crate::services::TreasuryService::new(&app.db).get_account(account.id).unwrap().unwrap();
+        assert_eq!(saved.savings_status,crate::models::SavingsStatus::Invested);
+        assert_eq!(saved.interest_rate_bps,1250);
+        assert_eq!(saved.interest_period,crate::models::InterestPeriod::Annual);
+        drop(app);let _ = std::fs::remove_file(db_file);
     }
 
     #[test]
@@ -29005,7 +29091,7 @@ mod app_tests {
         let original = crate::services::TreasuryService::new(&app.db).accounts(project_id).unwrap()[0].clone();
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
         assert!(matches!(app.modal_state, ModalType::TreasuryAccount { account_id: Some(id), .. } if id == original.id));
-        app.modal_state = ModalType::TreasuryAccount { account_id: Some(original.id), version: original.version, name: "bank1".into(), kind_idx: 1, focus_idx: 1 };
+        app.modal_state = ModalType::TreasuryAccount { account_id: Some(original.id), version: original.version, name: "bank1".into(), kind_idx: 1, savings_status_idx: 0, rate: "0".into(), rate_period_idx: 1, focus_idx: 1 };
         app.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty())).unwrap();
         let updated = crate::services::TreasuryService::new(&app.db).get_account(original.id).unwrap().unwrap();
         assert_eq!(updated.name, "bank1");
@@ -29177,6 +29263,9 @@ mod app_tests {
         // "321" dejaba "3210.00" ($3,210.00) en vez de $321.00.
         let db_file = Path::new("test_questline_treasury_new_entry_typed_amount.db");
         let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        crate::services::TreasuryService::new(&app.db)
+            .create_account(project_id, "Everyday", crate::models::TreasuryAccountKind::Spending)
+            .unwrap();
 
         app.handle_key_event(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::empty()))
             .unwrap();
@@ -29226,6 +29315,9 @@ mod app_tests {
         // rewritten, so ChangeEntryDate doesn't apply here.
         let db_file = Path::new("test_questline_treasury_new_entry_stepped_date.db");
         let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        crate::services::TreasuryService::new(&app.db)
+            .create_account(project_id, "Everyday", crate::models::TreasuryAccountKind::Spending)
+            .unwrap();
         let category_idx = 0;
 
         app.modal_state = ModalType::TreasuryEntry {
@@ -29302,6 +29394,9 @@ mod app_tests {
     fn companion_cannot_use_the_status_field_to_self_approve() {
         let db_file = Path::new("test_questline_treasury_self_approve.db");
         let (mut app, project_id, _) = treasury_role_app(db_file, "Companion");
+        crate::services::TreasuryService::new(&app.db)
+            .create_account(project_id, "Everyday", crate::models::TreasuryAccountKind::Spending)
+            .unwrap();
         app.modal_state = ModalType::TreasuryEntry {
             entry_id: None,
             title: "My own expense".to_string(),
@@ -31390,6 +31485,7 @@ mod app_tests {
 
     #[test]
     fn local_music_folder_can_be_replaced_repeatedly_without_stale_tracks() {
+        let _music_mode = crate::audio::mpris_player::legacy_music_test_mode();
         let root = std::env::temp_dir().join(format!("questline-folder-switch-{}", Uuid::new_v4()));
         let first = root.join("first");
         let second = root.join("second");
@@ -31437,6 +31533,7 @@ mod app_tests {
 
     #[test]
     fn local_music_folder_button_reopens_picker_with_or_without_tracks() {
+        let _music_mode = crate::audio::mpris_player::legacy_music_test_mode();
         let root = std::env::temp_dir().join(format!("questline-folder-button-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let mut app = app_for_mouse_tests(&root.join("profile.db"), ActiveScreen::Soundscapes);
@@ -31470,6 +31567,7 @@ mod app_tests {
 
     #[test]
     fn soundscapes_click_selects_source_and_local_track_separately() {
+        let _music_mode = crate::audio::mpris_player::legacy_music_test_mode();
         use crate::screens::hit_test::{LocalTracksHitRegions, SoundscapesHitRegions};
 
         let db_file = Path::new("test_questline_mouse_soundscapes.db");
@@ -31503,6 +31601,7 @@ mod app_tests {
 
     #[test]
     fn soundscapes_double_click_plays_the_selected_source() {
+        let _music_mode = crate::audio::mpris_player::legacy_music_test_mode();
         use crate::screens::hit_test::SoundscapesHitRegions;
 
         let db_file = Path::new("test_questline_mouse_soundscapes_double_click.db");

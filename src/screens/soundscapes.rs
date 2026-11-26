@@ -15,6 +15,9 @@ use ratatui::{
 use std::path::{Path, PathBuf};
 
 pub fn draw(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesHitRegions {
+    if crate::audio::mpris_player::uses_stash() {
+        return draw_stash(f, app, theme, area);
+    }
     let accent_color = theme.primary;
 
     let chunks = Layout::default()
@@ -691,3 +694,76 @@ fn volume_bar(volume: f32, width: usize) -> String {
         (volume.clamp(0.0, 1.0) * 100.0).round() as i32
     )
 }
+
+fn draw_stash(f: &mut Frame, app: &App, theme: &Theme, area: Rect) -> SoundscapesHitRegions {
+    let block = Block::default().borders(Borders::ALL).border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.primary)).title(" Stash Library ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if !crate::audio::stash_library::installed() {
+        let lines = vec![
+            Line::from(""),
+            Line::from(Span::styled("Stash is not installed", Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))),
+            Line::from(""),
+            Line::from(compact_text("Get the music player from its official GitHub releases.",inner.width as usize)),
+            Line::from(Span::styled("[Enter / d] Download Stash", theme.primary_selected_style())),
+            Line::from(crate::audio::stash_library::download_url()),
+            Line::from(""),
+            Line::from("[g] Other downloads / GitHub releases"),
+            Line::from("Install Stash, then return here. Press r to check again."),
+        ];
+        f.render_widget(Paragraph::new(lines).style(Style::default().fg(theme.text)).wrap(ratatui::widgets::Wrap { trim:false }), inner);
+        return SoundscapesHitRegions {
+            source_list:Rect::default(),item_count:0,local_tracks:None,
+            folder_picker: (inner.height > 4).then_some(Rect { x:inner.x,y:inner.y+4,width:inner.width.min(26),height:1 }),
+        };
+    }
+    let library = &app.stash_library;
+    let snapshot = &library.snapshot;
+    let title = snapshot["title"].as_str().unwrap_or("Select a track and press Enter");
+    let status = snapshot["status"].as_str().unwrap_or("Starting Stash in the background...");
+    let input = if library.editing {
+        format!("{}: {}_", if library.adding_folder { "Add music folder" } else { "Search" }, library.input)
+    } else if !library.error.is_empty() { library.error.clone() }
+    else { format!("Search: {}   |   {} tracks{}", library.query, snapshot["total"].as_u64().unwrap_or(0),
+        if snapshot["scanning"].as_bool().unwrap_or(false) { " (scanning)" } else { "" }) };
+    let mut header_lines = vec![
+        Line::from(Span::styled(compact_text(title, inner.width as usize), Style::default().fg(theme.primary).add_modifier(Modifier::BOLD))),
+        Line::from(format!("{} | Volume {}% | {}", status, snapshot["volume"].as_u64().unwrap_or(75), snapshot["artist"].as_str().unwrap_or(""))),
+        Line::from(compact_text(&input, inner.width as usize)),
+    ];
+    if library.editing && library.adding_folder {
+        header_lines.push(Line::from("Tab: complete / cycle | Up/Down: choose | Enter: add | Esc: cancel"));
+        let first = library.folder_match_selected.unwrap_or(0).saturating_sub(3);
+        for (index, path) in library.folder_matches.iter().enumerate().skip(first).take(4) {
+            let selected = library.folder_match_selected == Some(index);
+            header_lines.push(Line::from(Span::styled(
+                compact_text(&format!("{} {}", if selected { ">" } else { " " }, path), inner.width as usize),
+                if selected { theme.primary_selected_style() } else { Style::default().fg(theme.muted) },
+            )));
+        }
+    } else { header_lines.push(Line::from("")); }
+    header_lines.push(Line::from("TITLE / ARTIST / ALBUM"));
+    let header = Rect { height: inner.height.min(header_lines.len() as u16), ..inner };
+    f.render_widget(Paragraph::new(header_lines).style(Style::default().fg(theme.text)), header);
+    let list_area = Rect { x:inner.x, y:inner.y+header.height, width:inner.width, height:inner.height.saturating_sub(header.height+3) };
+    let visible_start = library.selected.saturating_sub(list_area.height.saturating_sub(1) as usize).max(library.offset);
+    let mut items = Vec::new();
+    if let Some(tracks) = snapshot["tracks"].as_array() {
+        for (index, track) in tracks.iter().enumerate().skip(visible_start.saturating_sub(library.offset)).take(list_area.height as usize) {
+            let selected = library.offset + index == library.selected;
+            let text = format!("{} {} / {} / {}", if selected { ">" } else { " " }, track["title"].as_str().unwrap_or("Unknown track"),
+                track["artist"].as_str().unwrap_or("Unknown artist"), track["album"].as_str().unwrap_or(""));
+            items.push(ListItem::new(compact_text(&text, inner.width as usize)).style(if selected { theme.primary_selected_style() } else { Style::default().fg(theme.text) }));
+        }
+    }
+    if items.is_empty() { items.push(ListItem::new("No tracks yet. Press [f] to add your music folder.")); }
+    f.render_widget(List::new(items), list_area);
+    let footer = Rect { x:inner.x, y:list_area.y+list_area.height, width:inner.width, height:inner.height.saturating_sub(header.height+list_area.height) };
+    f.render_widget(Paragraph::new(vec![Line::from("Enter: play | Space/p: pause | b/n: previous/next | +/-: volume"),
+        Line::from("Up/Down: select | /: search | f: add folder | r: rescan"),
+        Line::from("Stash plays in the background. Focus sounds remain in Focus sessions.")]).style(Style::default().fg(theme.muted)), footer);
+    SoundscapesHitRegions { source_list:list_area, item_count:items_count(snapshot), local_tracks:None, folder_picker:None }
+}
+
+fn items_count(snapshot: &serde_json::Value) -> usize { snapshot["tracks"].as_array().map_or(0, Vec::len) }

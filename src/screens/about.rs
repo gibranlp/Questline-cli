@@ -200,6 +200,17 @@ fn changelog_lines(theme: &Theme, accent: Color) -> Vec<Line<'static>> {
     // hardcodeado — hay que actualizar esto con cada release
     const VERSIONS: &[(&str, &str, &str, &[&str])] = &[
         (
+            "v2.0.4",
+            "Nov 26, 2026",
+            "Music and Savings",
+            &[
+                "Browse and play your Stash music library directly in Questline",
+                "Track savings, invested funds, and estimated interest in Treasury",
+                "Hydration reminders follow updated settings, focus sessions, and daily goals",
+                "Live refresh keeps SpectrumOS widget changes visible in the CLI",
+            ],
+        ),
+        (
             "v2.0.0",
             "Aug 1, 2026",
             "Encrypted Fellowship",

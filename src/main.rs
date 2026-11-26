@@ -469,7 +469,7 @@ fn print_cli_help() {
     println!("  calendar-import <name|id> <file> [--confirm|--reconcile]");
     println!("                                 Preview local iCalendar events as Quests");
     println!("  desktop-notifications         Run background Swarm and hydration notifications");
-    println!("  shell-action <json>           Run a local SpectrumShell action (including sidequests)");
+    println!("  shell-action <json>           Run a local SpectrumShell action (including sidequests and chronicles)");
     println!("  shell-tree <json>             Render the current procedural Evergrowth tree");
     println!("  shell-hero <json>             Describe hero class progression for SpectrumShell");
     println!("  --version, --help");
@@ -1040,6 +1040,8 @@ async fn main() -> Result<()> {
     let _desktop_presence = questline::desktop_notifications::tui_presence(&storage::get_storage_dir()?)?;
     let tick_rate = std::time::Duration::from_millis(50);
     let mut last_notification_time: Option<std::time::Instant> = None;
+    let mut last_database_check = std::time::Instant::now();
+    let mut database_version: i64 = app.db.conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
     loop {
         // Primero checar si hay tecla presionada antes de dibujar — así el input se siente más rápido
         if event::poll(tick_rate)? {
@@ -1062,6 +1064,14 @@ async fn main() -> Result<()> {
         app.terminal_height = terminal_size.map(|s| s.height).unwrap_or(40);
         // Todos los ticks del frame: sync, chat, focus timer, partículas, updates, animaciones
         app.tick_note_autosave()?;
+        if last_database_check.elapsed() >= std::time::Duration::from_secs(1) {
+            let current_version: i64 = app.db.conn.query_row("PRAGMA data_version", [], |row| row.get(0))?;
+            if current_version != database_version {
+                app.reload_data()?;
+                database_version = current_version;
+            }
+            last_database_check = std::time::Instant::now();
+        }
         app.tick_auto_sync()?;
         if app.active_screen==ActiveScreen::Portals {app.portal_state.refresh(&app.db,false)?;}
         let sync_busy = app.sync_in_progress;
@@ -1380,7 +1390,7 @@ async fn main() -> Result<()> {
                         ("Campaigns",   ActiveScreen::Projects),
                         ("Hero",       ActiveScreen::Character),
                         ("Library",    ActiveScreen::Library),
-                        ("Music",      ActiveScreen::Soundscapes),
+                        (if questline::audio::mpris_player::uses_stash() { "Stash" } else { "Music" }, ActiveScreen::Soundscapes),
                         ("Fellowship", ActiveScreen::Fellowship),
                         ("Chronicle",  ActiveScreen::GreatChronicle),
                         ("Sync",       ActiveScreen::SyncSettings),
@@ -3173,7 +3183,7 @@ async fn main() -> Result<()> {
                         ("b / n", "Previous / next media or local track"),
                         ("j / k", "Select local tracks"),
                         ("r", "Random local-folder playback"),
-                        ("f", "Choose local music folder"),
+                        ("f / o", "Local folder / open Stash in SpectrumOS"),
                         ("+ / - / *", "Volume up / down / reset to 50%"),
                         ("", ""),
                         ("SETTINGS", ""),
@@ -3240,6 +3250,24 @@ async fn main() -> Result<()> {
                         ("q / Esc", "Leave a mini-game"),
                     ]),
                 };
+
+                let (page_title, entries) = if page == 6 && questline::audio::mpris_player::uses_stash() {
+                    let mut entries = entries;
+                    let settings = entries.iter().position(|entry| entry.0 == "SETTINGS").unwrap_or(0);
+                    entries.splice(..settings, [
+                        ("STASH", ""),
+                        ("Enter", "Play the selected library track"),
+                        ("p / Space", "Play / pause Stash"),
+                        ("b / n", "Previous / next Stash track"),
+                        ("s", "Pause Stash"),
+                        ("Up / Down", "Select a library track"),
+                        ("/ / f / r", "Search / add music folder / rescan"),
+                        ("+ / -", "Adjust Stash volume"),
+                        ("", "Focus sounds are available in Focus sessions."),
+                        ("", ""),
+                    ]);
+                    ("Stash, Settings & About", entries)
+                } else { (page_title, entries) };
 
                 let block = Block::default()
                     .borders(Borders::ALL)

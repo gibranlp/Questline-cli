@@ -133,6 +133,30 @@ impl TreasuryAccountKind {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SavingsStatus {
+    #[default]
+    Available,
+    Invested,
+}
+
+impl SavingsStatus {
+    pub fn as_str(self) -> &'static str { match self { Self::Available => "Available", Self::Invested => "Invested" } }
+    pub fn parse(value: &str) -> Option<Self> { match value { "Available" => Some(Self::Available), "Invested" => Some(Self::Invested), _ => None } }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InterestPeriod {
+    Monthly,
+    #[default]
+    Annual,
+}
+
+impl InterestPeriod {
+    pub fn as_str(self) -> &'static str { match self { Self::Monthly => "Monthly", Self::Annual => "Annual" } }
+    pub fn parse(value: &str) -> Option<Self> { match value { "Monthly" => Some(Self::Monthly), "Annual" => Some(Self::Annual), _ => None } }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreasuryAccount {
     pub id: Uuid,
@@ -140,9 +164,22 @@ pub struct TreasuryAccount {
     pub name: String,
     pub kind: TreasuryAccountKind,
     pub is_default: bool,
+    #[serde(default)]
+    pub savings_status: SavingsStatus,
+    #[serde(default)]
+    pub interest_rate_bps: i64,
+    #[serde(default)]
+    pub interest_period: InterestPeriod,
     pub version: i64,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+impl TreasuryAccount {
+    pub fn estimated_interest_minor(&self, balance_minor: i64) -> Option<i64> {
+        if self.kind != TreasuryAccountKind::Savings { return Some(0); }
+        i64::try_from(i128::from(balance_minor.max(0)) * i128::from(self.interest_rate_bps) / 10000).ok()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -368,6 +405,9 @@ pub struct CampaignTotals {
     pub paid_minor: i64,
     pub committed_minor: i64,
     pub available_minor: i64,
+    pub saved_minor: i64,
+    pub invested_minor: i64,
+    pub liquid_savings_minor: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,6 +487,12 @@ pub struct CampaignTotalsReport {
     pub paid_minor: i64,
     pub committed_minor: i64,
     pub available_minor: i64,
+    #[serde(default)]
+    pub saved_minor: i64,
+    #[serde(default)]
+    pub invested_minor: i64,
+    #[serde(default)]
+    pub liquid_savings_minor: i64,
 }
 
 impl From<CampaignTotals> for CampaignTotalsReport {
@@ -457,6 +503,9 @@ impl From<CampaignTotals> for CampaignTotalsReport {
             paid_minor: value.paid_minor,
             committed_minor: value.committed_minor,
             available_minor: value.available_minor,
+            saved_minor: value.saved_minor,
+            invested_minor: value.invested_minor,
+            liquid_savings_minor: value.liquid_savings_minor,
         }
     }
 }
