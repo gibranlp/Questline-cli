@@ -334,13 +334,15 @@ mod completion_tests {
         let root = std::env::temp_dir().join(format!("questline-completion-{}", uuid::Uuid::new_v4()));
         for name in ["Music One", "Music Two", "Videos"] { std::fs::create_dir_all(root.join(name)).unwrap(); }
         let mut library = Library::default();
+        let (requests, received) = mpsc::sync_channel(8);
+        library.request = Some(requests);
         library.key(KeyCode::Char('f'));
         library.input = root.join("Vid").to_string_lossy().into_owned();
         library.key(KeyCode::Tab);
         assert!(library.input.ends_with("/Videos/"));
         assert!(library.folder_matches.is_empty());
         assert!(library.editing);
-        assert!(library.request.is_none());
+        assert!(received.try_recv().is_err());
         library.input = root.join("Mu").to_string_lossy().into_owned();
         library.key(KeyCode::Tab);
         assert!(library.input.ends_with("/Music "));
@@ -355,7 +357,7 @@ mod completion_tests {
         assert!(library.folder_matches.is_empty());
         library.key(KeyCode::Esc);
         assert!(!library.editing);
-        assert!(library.request.is_none());
+        assert!(received.try_recv().is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 }

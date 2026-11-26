@@ -3,8 +3,9 @@ use questline::{app::{App, ModalType}, screens::{self, ActiveScreen}, theme::The
 use ratatui::{backend::TestBackend, Terminal};
 
 #[test]
-fn stash_screen_replaces_local_music_and_keeps_focus_sources() {
+fn stash_screen_shows_library_or_install_prompt_and_keeps_focus_sources() {
     if !questline::audio::mpris_player::uses_stash() { return; }
+    let installed = questline::audio::stash_library::installed();
     let root = std::env::temp_dir().join(format!("questline-stash-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&root).unwrap();
     let mut app = App::new_headless(&root.join("profile.db")).unwrap();
@@ -15,12 +16,21 @@ fn stash_screen_replaces_local_music_and_keeps_focus_sources() {
     let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
     terminal.draw(|frame| {
         let regions = screens::soundscapes::draw(frame, &app, &Theme::default_theme(), frame.size());
-        assert_eq!(regions.item_count, 2);
+        assert_eq!(regions.item_count, if installed { 2 } else { 0 });
         assert!(regions.local_tracks.is_none());
         app.hit_regions.soundscapes = Some(regions);
     }).unwrap();
     let text: String = terminal.backend().buffer().content.iter().map(|cell| cell.symbol()).collect();
     assert!(text.contains("Stash"));
+    if !installed {
+        assert!(text.contains("Stash is not installed"));
+        assert!(text.contains("Download Stash"));
+        assert!(questline::audio::SOUNDSCAPES.iter().any(|source| source.name == "Rain Sounds"));
+        assert!(!app.stash_library.editing);
+        drop(app);
+        std::fs::remove_dir_all(root).unwrap();
+        return;
+    }
     assert!(text.contains("First song"));
     assert!(text.contains("add folder"));
     assert!(!text.contains("Local Library"));
